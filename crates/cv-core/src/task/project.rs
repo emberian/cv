@@ -237,9 +237,7 @@ pub fn uuid_v7_timestamp(s: &str) -> Option<DateTime<Utc>> {
 /// one. A blocker that finished, was abandoned or superseded no longer blocks; nothing has to be
 /// appended to unblock.
 pub fn is_blocked(model: &TaskReadModel, task: &TaskProjection) -> bool {
-    task.blocked_by
-        .iter()
-        .any(|id| model.tasks.get(id).is_none_or(|b| !b.state.is_terminal()))
+    task.blocked_by.iter().any(|id| super::stall::waiting(model, task, id))
 }
 
 /// The tasks that recorded a `blocked_by` on `task_id` — the reverse relation (`blocks:` in
@@ -554,6 +552,8 @@ mod tests {
             &done,
             "a",
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },
@@ -698,6 +698,7 @@ mod tests {
             "h",
             "2026-07-16T00:00:00Z",
             TaskEventKind::Noted {
+                claim: None,
                 text: "still thinking?".into(),
                 session_ref: None,
             },

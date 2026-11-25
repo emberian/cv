@@ -20,6 +20,8 @@ use super::store::ReplayOutcome;
 /// flattened into the fields a reader looks at, not embedded.
 #[derive(Clone, Debug, Serialize)]
 pub struct InboxItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall: Option<super::stall::Stall>,
     pub id: String,
     pub short: String,
     pub title: String,
@@ -188,6 +190,7 @@ fn item_of(ctx: &PageCtx<'_>, t: &TaskProjection, reason: Option<InboxReason>, s
     let (model, who, plen, children, now) = (ctx.model, ctx.who, ctx.plen, &ctx.children, ctx.now);
     let last_by = ctx.authors.get(t.task_id.as_str()).copied().unwrap_or("");
     InboxItem {
+        stall: None,
         id: t.task_id.clone(),
         short: t.task_id.get(..plen).unwrap_or(&t.task_id).to_string(),
         title: t.title.clone(),
@@ -385,6 +388,7 @@ mod tests {
             "task",
             "orchestrator",
             TaskEventKind::Noted {
+                claim: None,
                 text: "old unread note".into(),
                 session_ref: None,
             },
@@ -394,6 +398,7 @@ mod tests {
             "task",
             "web:ember",
             TaskEventKind::Noted {
+                claim: None,
                 text: "I read it".into(),
                 session_ref: None,
             },
@@ -426,6 +431,8 @@ mod tests {
             "task",
             "web:ember",
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },

@@ -766,6 +766,12 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// The session id this store gives the sub-agent a hook payload names `agent`, when the
+    /// sub-agent is a session of its own. Default: sub-agents share their parent's session.
+    fn agent_session_id(&self, _agent: &str) -> Option<String> {
+        None
+    }
+
     /// Where the sub-agent transcript at `transcript` ended (last turn, last stop, a fatal API
     /// notice), when the store records it there. Default: it records none.
     fn subagent_end(&self, _transcript: &std::path::Path) -> Result<Option<crate::lanes::SubagentEnd>> {

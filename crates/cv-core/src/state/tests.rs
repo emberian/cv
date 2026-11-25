@@ -1534,3 +1534,94 @@ fn rejected_state_snapshot_releases_its_private_backing() {
     assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
     assert_eq!(std::fs::read(store.path()).unwrap(), b"not a SQLite database");
 }
+
+/// #tooth A v4 store (hook observations, no file versions) upgrades in place to v5 and then
+/// admits a `pre` receipt carrying file versions; expiry advances the forgotten-time horizon.
+#[test]
+fn state_v4_upgrades_to_v5_and_records_pre_receipt_files() {
+    let dir = tmp_state_dir("migrate-v4-to-v5");
+    {
+        let mut raw = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+        apply_migrations_with(&mut raw, 4, &schema::MIGRATIONS[..4]).unwrap();
+        assert_eq!(current_schema_version(&raw).unwrap(), 4);
+        raw.execute(
+            "INSERT INTO task_folds(slot, upto_seq, model_json, applied_json, garbage_json, refused_json)
+             VALUES (1, 0, '{}', '{}', '[]', '[]')",
+            [],
+        )
+        .unwrap();
+    }
+    let store = StateStore::at_dir(&dir);
+    let file = |blob: &str| json!({"path": "/w/src/lib.rs", "blob": blob, "edit": true, "span": [0, 4]});
+    let body = json!({"kind": "pre", "tool": "Edit", "tool_use_id": "call-1", "files": [file("b0")]});
+    store
+        .append_receipt_with_inbox("sess-v4", "codex", body.as_object().unwrap().clone())
+        .unwrap();
+    let conn = store.open_writable().unwrap();
+    assert_eq!(current_schema_version(&conn).unwrap(), 5);
+    let folds: i64 = conn
+        .query_row("SELECT COUNT(*) FROM task_folds", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(folds, 0, "v5 drops cached task folds so new projection fields replay");
+    let pending: (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT call, base, lo, hi FROM pending_file_versions WHERE session='sess-v4'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, ("call-1".into(), "b0".into(), 0, 4));
+
+    // An unanswered call is superseded by the same writer's next call on the same path, and an
+    // expired row moves the horizon forward without ever moving it back.
+    conn.execute(
+        "UPDATE pending_file_versions SET started = unixepoch() - 90000 WHERE call='call-1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO pending_file_versions(harness,session,agent,call,path,edit,base,started)
+         VALUES ('codex','other','','old','/w/x',1,'b',unixepoch() - 100000)",
+        [],
+    )
+    .unwrap();
+    // A peer's edit that never answered, twenty minutes old, no longer blinds the path.
+    conn.execute(
+        "INSERT INTO pending_file_versions(harness,session,agent,call,path,edit,base,started)
+         VALUES ('codex','peer','','quiet','/w/src/lib.rs',1,'b0',unixepoch() - 1200)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let body = json!({"kind": "pre", "tool": "Edit", "tool_use_id": "call-2", "files": [file("b1")]});
+    store
+        .append_receipt_with_inbox("sess-v4", "codex", body.as_object().unwrap().clone())
+        .unwrap();
+    let conn = store.open_writable().unwrap();
+    let calls: Vec<String> = conn
+        .prepare("SELECT call FROM pending_file_versions ORDER BY call")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(calls, ["call-2", "quiet"]);
+    let ambiguous: i64 = conn
+        .query_row(
+            "SELECT ambiguous FROM pending_file_versions WHERE call='call-2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ambiguous, 0);
+    let horizon: i64 = conn
+        .query_row(
+            "SELECT newest_forgotten_time FROM horizons WHERE name='pending_file_versions'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    assert!((now - 90010..=now - 89990).contains(&horizon), "{horizon} vs {now}");
+    std::fs::remove_dir_all(&dir).ok();
+}

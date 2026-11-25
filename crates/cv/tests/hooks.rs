@@ -960,7 +960,7 @@ fn codex_rollout(w: &World, id: &str, parent: Option<&str>, file: &str) -> PathB
 }
 
 #[test]
-fn codex_edit_guard_exempts_the_root_threads_lineage_and_denies_strangers() {
+fn hooks_codex_edit_guard_advises_kin_and_denies_strangers() {
     let w = World::new("codex-lineage");
     let parent = "01a14d90-0000-7000-8000-000000000001";
     let child = "01a14d90-0000-7000-8000-000000000002";
@@ -974,17 +974,12 @@ fn codex_edit_guard_exempts_the_root_threads_lineage_and_denies_strangers() {
         json!({"session_id": sid, "transcript_path": path, "cwd": "/work/proj", "hook_event_name": "PreToolUse",
             "permission_mode": "bypassPermissions", "tool_name": "apply_patch", "tool_input": {"command": patch(file)}})
     };
-    // All three rollouts were just written: every editor is live. The child edited shared.txt
-    // moments ago, yet the parent patching it is not a conflict, and neither is the child patching
-    // what its root edited.
-    assert_eq!(
-        codex_hook(&w, "edit", &input(parent, &parent_path, "shared.txt"), &[]),
-        ""
-    );
-    assert_eq!(
-        codex_hook(&w, "edit", &input(child, &child_path, "shared.txt"), &[]),
-        ""
-    );
+    // #tooth Siblings receive context without a permission decision.
+    for (sid, path, peer) in [(parent, &parent_path, child), (child, &child_path, parent)] {
+        let out = codex_hook(&w, "edit", &input(sid, path, "shared.txt"), &[]);
+        assert!(context_of(&out).contains(peer), "{out}");
+        assert!(!out.contains("permissionDecision"));
+    }
     // An unrelated root thread is denied, as before.
     let out = codex_hook(&w, "edit", &input(parent, &parent_path, "other.txt"), &[]);
     let out: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1005,7 +1000,7 @@ fn codex_edit_guard_exempts_the_root_threads_lineage_and_denies_strangers() {
             "agent_id": late, "agent_type": "default", "cwd": "/work/proj"}),
         &[],
     );
-    assert_eq!(codex_hook(&w, "edit", &input(late, &late_path, "shared.txt"), &[]), "");
+    assert!(context_of(&codex_hook(&w, "edit", &input(late, &late_path, "shared.txt"), &[])).contains("cv show"));
 }
 
 /// `$CV_HOOK_HARNESS` (0.17's Codex entries) was removed: it exits 2 with the reinstall pointer.

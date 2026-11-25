@@ -185,3 +185,51 @@ note, `--notes-last N` and `--notes-grep PAT` query them, and `--json` always ca
 `tasks/events.jsonl` is append-only and unbounded. The prompt hook, mutations, `cv task list` and
 `GET /api/tasks` resume from a stored fold and parse only events appended since; `events`, `show`
 and the inbox still replay the whole log. There is no compaction yet; the log is one file you can archive by hand.
+
+## Conditional findings and prerequisites
+
+A typed note publishes a fact or an open failure. Scope paths are relative to the task’s repository.
+Use full task IDs inside conditions. Each inner array requires every condition, and any matching
+inner array makes the claim current.
+
+```sh
+cv task note "$work" 'The legacy schema rejects empty names' \
+  --claim fail --scope src/schema --from "claude:$session"
+cv task note "$work" 'Legacy mode only fails under strict validation' --claim \
+  "{\"kind\":\"fail\",\"scope\":[\"src/schema\"],\"any_of\":[[{\"kind\":\"choice_is\",\"task\":\"$decision\",\"choice\":\"legacy\"}]]}"
+cv task events --scope src/schema --since "$cursor"
+cv task block "$work" --by "$prerequisite" --require-success
+cv task inbox "$owner" --sort stall
+```
+
+`--claim fact|fail` with `--scope <path>` (and optional `--session-ref` / `--from` or `--resolves`)
+automatically populates `file_at` digests from the session's touched/read files (or the scoped
+checkout paths) plus active provisional decisions whenever `any_of` is omitted. An explicit JSON
+claim with `any_of` overrides automatic inference; an explicit empty `any_of` array is stale, and
+an empty conjunction is current. `file_at` checks the BLAKE3 digest of the named path in the task
+checkout.
+`task_active` names a task. Missing tasks and unavailable checkouts give unknown support.
+`choice_is` accepts `final_only`. A veto changes support on the next read. A current note can
+address prior findings by listing their note event IDs in `resolves`.
+`session_at` and `task_seq_at` pin a peer session's message count or a task's event count.
+Inference adds them for a `--session-ref` other than the author's and for non-decision blockers.
+When the subject advances, the note is stale and `task show` reports the drift (`+3 messages in
+claude:<id>`). A `--scope` directory over 16 files is refused rather than left unpinned.
+
+An unqualified blocker clears on any terminal state. `--require-success` and `--final-only`
+wait for a completed action or a final decision. Stall order groups cycles and counts distinct
+assigned lanes currently waiting. Unassigned work contributes no measured lane time.
+
+`task done` accepts repeatable `--evidence` JSON objects and optional `--disclosure`.
+For a tool receipt, use `{"kind":"receipt","event":"receipt:<harness>:<session>:<seq>","digest":"<receipt_hash>"}`.
+`task show --json` exposes each cited exit code, local capture-log anchors and chronological
+failure followed by success for the same command in one session. A success assertion such as
+“tests passed” on a note citing a failed run appears under `completion.divergence`.
+
+A pinned status or ordinary note may cite a receipt inline as
+`receipt:<harness>:<session>:<seq>@<receipt_hash>`. The same pointer fits a note’s
+`--session-ref`. When one assertion cites several outcomes for the same command in one session,
+the most recent cited run supplies the comparison. An uncited report is also read against the
+claimant's own latest test, check, lint, or build run per command (from `--session-ref`, else the
+author), so “all tests passed” after a newer failing run diverges. A broken receipt chain supplies
+no evidence.

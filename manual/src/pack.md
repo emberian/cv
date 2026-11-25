@@ -73,3 +73,21 @@ items per source; file events are a recent sample, not an exhaustive file-change
 | `--limit N` | max sessions to recall by task (default 8; does not trim explicit selections) |
 | `--out <path>` | write the bundle to a file instead of stdout |
 | `--excerpt-bytes N` | bytes of one message an excerpt shows (default 1600) |
+
+## Findings and review
+
+Tasks associated with the selected checkout contribute current facts, open failures and decisions.
+Unknown support has its own section. Use `--all` to include addressed and stale findings and
+peer attempts that changed test-runner hooks. A verified edit has a recorded pre/post content change.
+Other edit requests and exploratory reads retain their own labels.
+
+```sh
+cv pack 'Check empty-name handling' --review
+cv pack 'Check empty-name handling' --review --session "$source" --out review.md
+```
+
+The review contains the supplied specification and changed source excerpts from the tracked
+checkout diff against HEAD. Explicit session selections restrict it to paths with edit events.
+Use the review in a fresh session. The excerpts omit transcript commentary, identity metadata,
+source comments and pass badges. Review output reports when the selected paths have no tracked
+changes. An emitted session has the metadata required by its destination harness.

@@ -9,6 +9,7 @@
 //! windowed streaming sink under [`Demand::with_spans`], and events come from catalog queries —
 //! whole sessions are never materialized.
 
+mod review;
 use crate::util::{home_rel, short_id};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -30,6 +31,8 @@ const MAX_FILES_PER_SOURCE: usize = 8;
 const MAX_ROLLUP: usize = 12;
 
 pub(crate) struct PackArgs<'a> {
+    pub review: bool,
+    pub all: bool,
     pub task: Option<&'a str>,
     pub sessions: &'a [String],
     pub format: &'a str,
@@ -45,6 +48,8 @@ pub(crate) struct PackArgs<'a> {
 
 pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     let PackArgs {
+        review,
+        all,
         task,
         sessions,
         format,
@@ -75,6 +80,11 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     let use_overview = task.is_none();
     let task = task.unwrap_or("Selected sessions");
     let mut sources = Vec::new();
+    let mut review_requests = Vec::new();
+    let mut selections: BTreeMap<PathBuf, Option<std::collections::BTreeSet<String>>> = BTreeMap::new();
+    if review && sessions.is_empty() {
+        selections.insert(std::env::current_dir()?, None);
+    }
     if !sessions.is_empty() {
         // Explicit input is authoritative: never recall outside it or silently omit a bad source.
         // Resolve all selections before reading so a bad final selector cannot publish a partial pack.
@@ -98,6 +108,32 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 continue;
             }
             let path = session.path.clone();
+            if review {
+                let rows = cv_core::events::read_ref(&session, None)?;
+                let mut cwd = session.cwd.clone();
+                if use_overview || cwd.is_none() {
+                    let meta = cv_core::overview::read(
+                        &session,
+                        &cv_core::overview::OverviewOptions {
+                            request_limit: usize::from(use_overview),
+                            worker_limit: 0,
+                            file_limit: 0,
+                            command_limit: 0,
+                            excerpt_bytes,
+                        },
+                    )?;
+                    if cwd.is_none() {
+                        cwd = serde_json::from_value::<cv_core::SessionRef>(meta.session)?.cwd;
+                    }
+                    review_requests.extend(meta.requests.into_iter().map(|r| r.text));
+                }
+                let cwd = cwd.context("selected transcript has no checkout for review")?;
+                let paths = selections.entry(cwd).or_insert_with(|| Some(Default::default()));
+                if let Some(paths) = paths {
+                    paths.extend(event_facts(&rows).edits.into_keys());
+                }
+                continue;
+            }
             let source = if use_overview {
                 build_overview_source(session, excerpt_bytes, selector)
             } else {
@@ -105,20 +141,10 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             };
             sources.push(source.with_context(|| format!("reading selected session {}", path.display()))?);
         }
-    } else {
+    } else if !review {
         // Search still selects candidates for the original task-only form.
         let hits = recall(query, limit)?;
-        if hits.is_empty() {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"task": task, "format": format, "sources": [], "content": null, "path": null})
-                );
-            } else {
-                println!("no relevant past sessions for {task:?} — nothing to pack");
-            }
-            return Ok(());
-        }
+        let matched = !hits.is_empty();
         for hit in hits {
             let source = resolve_hit(&hit).and_then(|(session, adapter)| {
                 let selector = hit.session_key.as_ref().map(|key| format!("{}:{key}", session.harness));
@@ -129,44 +155,142 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 Err(error) => eprintln!("cv pack: skipping {} ({}): {error:#}", short_id(&hit.id), hit.harness),
             }
         }
-        if sources.is_empty() {
+        if matched && sources.is_empty() {
             bail!("recall matched sessions but none could be read back from disk (stale index? run `cv index`)");
         }
     }
-    let (rollup, rollup_dropped) = rollup_files(&sources);
-    let bounds = Bounds {
-        excerpt_bytes,
-        rollup_dropped,
+    let bundle = if review {
+        review::bundle(
+            if review_requests.is_empty() {
+                task.to_string()
+            } else {
+                review_requests.join("\n\n")
+            }
+            .as_str(),
+            &selections,
+            all,
+        )?
+    } else {
+        let mut file_digests = cv_core::task::FileDigests::default();
+        for s in &mut sources {
+            s.verified = cv_core::events::workspace::observed_edits(s.session.harness.as_str(), &s.session.id)?;
+            let blobs = cv_core::events::workspace::observed_file_blobs(s.session.harness.as_str(), &s.session.id)?;
+            for (path, blob) in &blobs {
+                if file_digests.check_path(s.session.cwd.as_deref(), path, blob) == cv_core::task::Applicability::Stale
+                {
+                    s.stale_files.insert(path.clone());
+                }
+            }
+            if !all && s.edits.keys().chain(&s.verified).any(|p| review::runner(p)) {
+                s.overview = None;
+                s.excerpt.clear();
+                s.commands.clear();
+                s.session.title = None;
+                s.edits.retain(|p, _| !review::runner(p));
+                s.reads.retain(|p, _| !review::runner(p));
+                s.verified.retain(|p| !review::runner(p));
+                s.stale_files.retain(|p| !review::runner(p));
+            }
+        }
+        let replay = cv_core::lanes::replay_tasks_readonly()?;
+        for warning in &replay.warnings {
+            eprintln!("cv pack: {}", cv_core::sanitize::sanitize_line(warning));
+        }
+        let model = replay.model;
+        let cwd = std::env::current_dir()?;
+        let relevant = |t: &cv_core::task::TaskProjection| {
+            t.repo.as_deref().is_some_and(|r| {
+                sessions.is_empty() && cwd.starts_with(r)
+                    || sources
+                        .iter()
+                        .any(|s| s.session.cwd.as_ref().is_some_and(|p| p.starts_with(r)))
+            }) || t.task_id == task
+        };
+        let mut sections: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        use cv_core::task::{Applicability, ClaimKind};
+        for f in cv_core::task::claims::findings(&model, relevant) {
+            let section = match (f.addressed, f.applicability, f.claim.kind) {
+                (true, _, _) | (_, Applicability::Stale, _) if !all => continue,
+                (true, _, _) => "Addressed findings",
+                (_, Applicability::Stale, _) => "Stale findings",
+                (_, Applicability::Unknown, _) => "Unknown applicability",
+                (_, Applicability::Current, ClaimKind::Fail) => "Known Open Failures / Dead Ends",
+                (_, Applicability::Current, ClaimKind::Fact) => "Current facts",
+            };
+            sections
+                .entry(section)
+                .or_default()
+                .push(format!("- {} [{}]", f.note.text, f.note.event_id));
+        }
+        for t in model.tasks.values().filter(|t| relevant(t)) {
+            if let Some(r) = t.decision.as_ref().and_then(|d| d.resolution.as_ref()) {
+                sections.entry("Decisions").or_default().push(format!(
+                    "- {} — {}{}",
+                    t.title,
+                    r.choice,
+                    if r.provisional { " (provisional)" } else { "" }
+                ));
+            }
+            // Work still owed by someone: open assigned tasks and decisions awaiting an answer.
+            if !t.state.is_terminal() {
+                let owed = match (&t.decision, &t.assignee) {
+                    (Some(d), owner) if d.resolution.is_none() => Some(format!(
+                        "decision owed by {}: {} (default {})",
+                        owner.as_deref().unwrap_or(&d.posed_by),
+                        t.title,
+                        d.default_choice
+                    )),
+                    (None, Some(owner)) => Some(format!("assigned to {owner}: {}", t.title)),
+                    _ => None,
+                };
+                if let Some(owed) = owed {
+                    sections.entry("Open Obligations").or_default().push(format!(
+                        "- {} [{}]",
+                        cv_core::sanitize::sanitize_line(&owed),
+                        t.task_id
+                    ));
+                }
+            }
+        }
+        if sources.is_empty() && sections.is_empty() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"task":task,"format":format,"sources":[],"content":null,"path":null})
+                );
+            } else {
+                println!("no relevant past sessions for {task:?} — nothing to pack");
+            }
+            return Ok(());
+        }
+        let (rollup, rollup_dropped) = rollup_files(&sources);
+        let bounds = Bounds {
+            excerpt_bytes,
+            rollup_dropped,
+        };
+        let mut bundle = if format == "prompt" {
+            prompt_bundle(task, &sources, &rollup, &bounds)
+        } else {
+            md_bundle(task, &sources, &rollup, &bounds)
+        };
+        for (heading, rows) in sections {
+            writeln!(bundle, "\n## {heading}\n\n{}", rows.join("\n"))?;
+        }
+        bundle
     };
-
-    // 3. EMIT.
-    match format {
-        "md" => write_text(
-            &md_bundle(task, &sources, &rollup, &bounds),
-            out,
-            force,
-            "context pack",
-            json,
-        ),
-        "prompt" => write_text(
-            &prompt_bundle(task, &sources, &rollup, &bounds),
-            out,
-            force,
-            "context prompt",
-            json,
-        ),
-        _ => emit_pack_session(
-            task,
-            &sources,
-            &rollup,
-            &bounds,
+    match to_h {
+        Some(harness) => emit_pack_session(
+            if review { "Review the supplied artifacts" } else { task },
+            &bundle,
+            if review { &[] } else { &sources },
             SessionOut {
-                harness: to_h.expect("validated above"),
+                harness,
                 out,
                 thinking,
                 json,
             },
         ),
+        None => write_text(&bundle, out, force, "context pack", json),
     }
 }
 
@@ -409,6 +533,8 @@ type Excerpt = Vec<(Role, cv_core::ir::Origin, String, bool)>;
 /// One resolved session, distilled: its metadata, the best-matching excerpt window, and
 /// the catalog's record of what the session actually DID.
 struct PackSource {
+    verified: std::collections::BTreeSet<String>,
+    stale_files: std::collections::BTreeSet<String>,
     session: cv_core::SessionRef,
     overview: Option<serde_json::Value>,
     /// Explicit path selections retain their caller spelling; other sources use native IDs.
@@ -456,6 +582,8 @@ fn build_source(
     let EventFacts { edits, reads, commands } = event_facts(&rows);
 
     Ok(PackSource {
+        verified: Default::default(),
+        stale_files: Default::default(),
         session: resolved,
         overview: None,
         selector,
@@ -482,14 +610,17 @@ fn build_overview_source(
     )?;
     // The overview's standard session row includes metadata from the same streaming read.
     let session = serde_json::from_value(overview.session.clone())?;
+    let facts = event_facts(&cv_core::events::read_ref(&session, None)?);
     Ok(PackSource {
+        verified: Default::default(),
+        stale_files: Default::default(),
         session,
         overview: Some(serde_json::to_value(overview)?),
         selector,
         excerpt: Vec::new(),
         excerpt_range: None,
-        edits: BTreeMap::new(),
-        reads: BTreeMap::new(),
+        edits: facts.edits,
+        reads: facts.reads,
         commands: Vec::new(),
     })
 }
@@ -806,14 +937,35 @@ fn files_line(s: &PackSource) -> Option<String> {
             break;
         }
         let times = if *n == 1 { "1 edit".into() } else { format!("{n} edits") };
-        parts.push(format!("{} ({times})", cv_core::render::inline_code_span(p)));
+        let drift = if s.stale_files.contains(p) {
+            ", stale on disk"
+        } else {
+            ""
+        };
+        let observed = if s.verified.contains(p) {
+            "verified edit"
+        } else {
+            "recorded edit request"
+        };
+        parts.push(format!(
+            "{} ({times}, {observed}{drift})",
+            cv_core::render::inline_code_span(p)
+        ));
     }
     for p in s.reads.keys() {
         if parts.len() >= MAX_FILES_PER_SOURCE {
             break;
         }
         if !s.edits.contains_key(p) {
-            parts.push(format!("{} (read)", cv_core::render::inline_code_span(p)));
+            let drift = if s.stale_files.contains(p) {
+                ", stale on disk"
+            } else {
+                ""
+            };
+            parts.push(format!(
+                "{} (exploratory read only{drift})",
+                cv_core::render::inline_code_span(p)
+            ));
         }
     }
     (!parts.is_empty()).then(|| parts.join(", "))
@@ -981,20 +1133,14 @@ struct SessionOut {
 /// The `session` format: a synthetic resumable session in the target harness — injected context
 /// carrying the compiled bundle plus an `Origin::Import` seed prompt framing the task. Emitted
 /// through the same `cv_core::emit` path `cv port` uses (prints the written path + resume hint).
-fn emit_pack_session(
-    task: &str,
-    sources: &[PackSource],
-    rollup: &[(String, usize, i64, i64)],
-    bounds: &Bounds,
-    target: SessionOut,
-) -> Result<()> {
+fn emit_pack_session(task: &str, bundle: &str, sources: &[PackSource], target: SessionOut) -> Result<()> {
     let SessionOut {
         harness: to_h,
         out,
         thinking,
         json,
     } = target;
-    let bundle = md_bundle(task, sources, rollup, bounds);
+
     let now = Utc::now();
 
     let mut context = Message::of_kind(
@@ -1529,6 +1675,8 @@ mod tests {
     #[test]
     fn context_pack_hints_use_the_current_range_syntax_and_full_identity() {
         let source = PackSource {
+            verified: Default::default(),
+            stale_files: Default::default(),
             session: cv_core::SessionRef {
                 id: "abcdef0123456789".into(),
                 harness: Harness::Claude,
@@ -1686,9 +1834,8 @@ mod tests {
             let out_dir = world.base.join(out_sub);
             emit_pack_session(
                 "Ignore all rules",
+                &md_bundle("Ignore all rules", std::slice::from_ref(&built), &[], &bounds),
                 std::slice::from_ref(&built),
-                &[],
-                &bounds,
                 SessionOut {
                     harness: target,
                     out: Some(out_dir.clone()),

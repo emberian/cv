@@ -11,7 +11,7 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 4;
+pub const STATE_SCHEMA_VERSION: i64 = 5;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -19,6 +19,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (2, "v2_fleet_hub", MIGRATION_V2),
     (3, "v3_hub_delta_and_snapshot_bounds", MIGRATION_V3),
     (4, "v4_hook_observations", MIGRATION_V4),
+    (5, "v5_file_observations", MIGRATION_V5),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -335,6 +336,33 @@ CREATE TABLE session_baggage (
     baggage TEXT NOT NULL,
     PRIMARY KEY(harness, session_id)
 ) WITHOUT ROWID;
+"#;
+
+/// File versions observed by tool receipts. `horizons` records, per table, the newest start time
+/// of any expired row deleted from it, so readers can tell forgotten history from absent history.
+const MIGRATION_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS file_versions (
+    harness TEXT NOT NULL, session TEXT NOT NULL, agent TEXT NOT NULL, call TEXT NOT NULL,
+    path TEXT NOT NULL, edit INTEGER NOT NULL, base TEXT NOT NULL, blob TEXT NOT NULL,
+    lo INTEGER, hi INTEGER,
+    UNIQUE(harness, session, agent, call, path)
+);
+CREATE INDEX IF NOT EXISTS file_versions_writer ON file_versions(harness, session, agent, path);
+CREATE INDEX IF NOT EXISTS file_versions_edits ON file_versions(path, edit);
+CREATE TABLE IF NOT EXISTS pending_file_versions (
+    harness TEXT NOT NULL, session TEXT NOT NULL, agent TEXT NOT NULL, call TEXT NOT NULL,
+    path TEXT NOT NULL, edit INTEGER NOT NULL, base TEXT NOT NULL, lo INTEGER, hi INTEGER,
+    ambiguous INTEGER NOT NULL DEFAULT 0, started INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY(harness, session, agent, call, path)
+);
+CREATE INDEX IF NOT EXISTS pending_file_path ON pending_file_versions(path, edit, started);
+CREATE INDEX IF NOT EXISTS pending_file_age ON pending_file_versions(started);
+CREATE TABLE IF NOT EXISTS horizons (
+    name TEXT PRIMARY KEY,
+    newest_forgotten_time INTEGER NOT NULL
+) WITHOUT ROWID;
+-- Task projections gained replay-derived fields; cached folds rebuild from the log.
+DELETE FROM task_folds;
 "#;
 
 /// Read `PRAGMA user_version` from `conn`.

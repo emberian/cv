@@ -20,6 +20,26 @@ use crate::ir::{Block, Message, MessageKind, Role, SessionRef, Usage};
 use crate::stream::{Demand, Flow};
 use crate::AgentRef;
 
+/// Resolve a selected source to the seat named by tool receipts.
+#[cfg(feature = "sqlite")]
+pub fn session_stale_reads(
+    session: &crate::Session,
+    source: &SessionRef,
+) -> Result<Vec<crate::events::workspace::StaleRead>> {
+    let agent = source
+        .path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("agent-"));
+    // Receipts from a sub-agent with a session of its own are keyed by its parent and agent seat.
+    let own_session = |agent: &str| crate::harness::rootless(source.harness).and_then(|a| a.agent_session_id(agent));
+    let (parent, seat) = match (session.lineage.parent.as_deref(), agent) {
+        (Some(parent), Some(agent)) if own_session(agent).is_some() => (parent, Some(agent)),
+        _ => (session.id.as_str(), None),
+    };
+    crate::events::workspace::stale_reads(source.harness.as_str(), parent, seat, None)
+}
+
 /// Token totals for one lane, following [`Usage`]'s disjoint convention.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LaneTokens {

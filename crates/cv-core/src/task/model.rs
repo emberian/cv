@@ -59,6 +59,8 @@ pub enum TaskEventKind {
     Released {},
     /// Progress note; never changes state.
     Noted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim: Option<super::Claim>,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_ref: Option<String>,
@@ -66,6 +68,10 @@ pub enum TaskEventKind {
     /// Completion, self-reported and labeled so, with an optional pointer to the evidence the
     /// agent offers. cv records the word; it never claims to have checked it.
     Done {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence: Vec<super::EvidenceRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disclosure: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         observed: Option<String>,
         /// Retired in 0.15.0 (the `--check-*` completion checks). Read through as raw JSON so a
@@ -90,6 +96,10 @@ pub enum TaskEventKind {
     /// task is blocked *now* is computed at read time from the blocker's current state, never
     /// stored — so a blocker finishing or being abandoned unblocks without another event.
     BlockedBy {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        require_success: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        final_only: bool,
         task: String,
     },
     /// Pose a decision on this task: from here on the task is of kind `decision` — something an
@@ -321,14 +331,19 @@ mod tests {
             TaskEventKind::Claimed { assignee: "a".into() },
             TaskEventKind::Released {},
             TaskEventKind::Noted {
+                claim: None,
                 text: "n".into(),
                 session_ref: Some("s".into()),
             },
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: Some("exit 0".into()),
                 check: None,
             },
@@ -337,7 +352,11 @@ mod tests {
             TaskEventKind::Tagged {
                 tags: vec!["decision".into()],
             },
-            TaskEventKind::BlockedBy { task: "t3".into() },
+            TaskEventKind::BlockedBy {
+                require_success: false,
+                final_only: false,
+                task: "t3".into(),
+            },
             TaskEventKind::Posed {
                 options: vec!["keep".into(), "delete".into()],
                 default_choice: "keep".into(),
@@ -424,6 +443,7 @@ mod tests {
             (TaskEventKind::Released {}, "released"),
             (
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "n".into(),
                     session_ref: None,
                 },
@@ -431,6 +451,8 @@ mod tests {
             ),
             (
                 TaskEventKind::Done {
+                    evidence: Vec::new(),
+                    disclosure: None,
                     observed: None,
                     check: None,
                 },
@@ -439,7 +461,14 @@ mod tests {
             (TaskEventKind::Abandoned { reason: "r".into() }, "abandoned"),
             (TaskEventKind::Superseded { by_task: "b".into() }, "superseded"),
             (TaskEventKind::Tagged { tags: vec![] }, "tagged"),
-            (TaskEventKind::BlockedBy { task: "b".into() }, "blocked_by"),
+            (
+                TaskEventKind::BlockedBy {
+                    require_success: false,
+                    final_only: false,
+                    task: "b".into(),
+                },
+                "blocked_by",
+            ),
             (
                 TaskEventKind::Posed {
                     options: vec!["a".into()],

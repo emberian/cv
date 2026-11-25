@@ -18,6 +18,10 @@
 - Doctor reports five-tool-turn follow-up counts by whisper kind.
 - Lane and event JSON expose validated causal identifiers supplied through `CV_BAGGAGE`.
 - Harden Markdown fences, neutralize forged role and section headers, preserve non-human seed provenance across distills and ports, and omit titles from SessionStart hooks.
+- Task notes support conditional facts and failures that go stale when pinned files, sessions, or tasks move. Stall ordering exposes waiting work.
+- Task completion shows cited command outcomes, local receipt-chain anchors, red/green contrast, and discrepancies with reported validation.
+- Pack includes current findings, decisions, and open obligations, separates observed edits from reads, quarantines test-runner changes, and supports blind checkout review.
+- Related writers receive advisory edit pointers. Tool receipts capture file versions for stale-read diagnostics in hooks, adoption, and splice.
 
 - CLI, API, and reader overviews collect initial and recent requests, worker replies, referenced files, and commands with links to their messages.
 - Pack accepts explicit sessions or transcript paths, with bounded overviews or task-focused excerpts, without searching other conversations or requiring an index.

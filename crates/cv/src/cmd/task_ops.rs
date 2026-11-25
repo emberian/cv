@@ -32,6 +32,8 @@ pub(crate) struct DecisionSpec {
     pub source: Option<String>,
     /// Tasks (full ids) this decision blocks.
     pub blocks: Vec<String>,
+    pub require_success: bool,
+    pub final_only: bool,
     /// Resolve it on its default at once, by the poser, with a veto window: a `resolved`
     /// (`provisional: true`) lands in the same unit as the pose.
     pub provisional: bool,
@@ -102,7 +104,11 @@ pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEven
         candidates.push(task::new_event(
             Some(other),
             from,
-            TaskEventKind::BlockedBy { task: id.clone() },
+            TaskEventKind::BlockedBy {
+                require_success: spec.require_success,
+                final_only: spec.final_only,
+                task: id.clone(),
+            },
         ));
     }
     if spec.provisional {
@@ -196,6 +202,25 @@ pub(crate) fn resolve(
     )
 }
 
+/// Build a structured [`task::Claim`] from ergonomic CLI/HTTP inputs (`"fact"` / `"fail"` or JSON,
+/// optional `--scope` / `--resolves`) and automatically populate `FileAt` + provisional decision
+/// conditions when `any_of` was not manually provided.
+pub(crate) fn build_note_claim(
+    model: &TaskReadModel,
+    task_id: &str,
+    raw_claim: Option<&str>,
+    scopes: &[String],
+    resolves: &[String],
+    session_ref: Option<&str>,
+    from: &str,
+) -> Result<Option<task::Claim>> {
+    let Some((mut claim, explicit_any_of)) = task::Claim::parse_spec(raw_claim, scopes, resolves)? else {
+        return Ok(None);
+    };
+    task::claims::populate_auto_conditions(&mut claim, explicit_any_of, model, task_id, session_ref, Some(from))?;
+    Ok(Some(claim))
+}
+
 // ───────────────────────────── the event feed ─────────────────────────────
 
 /// A `--since` argument, resolved: an instant, or an event id (exclusive cursor).
@@ -263,6 +288,7 @@ impl Since {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventFilter {
+    pub scope: Option<std::path::PathBuf>,
     pub since: Since,
     /// Wire tags (already canonicalized by [`kind_tag`]).
     pub kinds: Vec<String>,
@@ -336,6 +362,7 @@ pub(crate) fn select_events<'a>(outcome: &'a ReplayOutcome, f: &EventFilter) -> 
         .iter()
         .skip(start)
         .filter(|ev| f.since.admits_time(ev))
+        .filter(|ev| f.scope.as_deref().is_none_or(|path|matches!(&ev.kind,TaskEventKind::Noted{claim:Some(c),..} if c.covers(path,outcome.model.tasks.get(&ev.task_id).and_then(|t|t.repo.as_deref())))))
         .filter(|ev| f.kinds.is_empty() || f.kinds.iter().any(|k| k == ev.kind.tag()))
         .filter(|ev| f.by.as_deref().is_none_or(|b| task::same_actor(&ev.by, b)))
         .filter(|ev| !f.not_by.as_deref().is_some_and(|b| task::same_actor(&ev.by, b)))
@@ -812,6 +839,7 @@ mod tests {
                 Some(&action_id),
                 "orchestrator",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: body.clone(),
                     session_ref: None,
                 },
@@ -984,6 +1012,7 @@ mod tests {
                 }
             } else {
                 TaskEventKind::Noted {
+                    claim: None,
                     text: format!("note {index}"),
                     session_ref: None,
                 }

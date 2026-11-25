@@ -1,7 +1,7 @@
 //! Bounded orientation over the existing message stream, event classifier and worker forest.
 //! Excerpts are pointers into evidence, not a summary or a claim that reported work was integrated.
 mod episodes;
-pub use episodes::{Episode, RepairEpisodes};
+pub use episodes::{validation as validation_command, Episode, RepairEpisodes};
 
 use crate::events::EventExtractor;
 use crate::ir::{Block, Message, MessageKind, Origin, Role, Session, SessionRef};

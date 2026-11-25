@@ -102,6 +102,8 @@ pub struct Note {
     pub by: String,
     pub ts: DateTime<Utc>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<super::Claim>,
     pub session_ref: Option<String>,
     /// Appended after the task reached a terminal state. Terminal is about STATE, not the record:
     /// a lane that marks `done` and then writes its evidence keeps the evidence, and the note
@@ -179,6 +181,12 @@ pub struct PinnedStatus {
     pub revisions: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Prerequisite {
+    pub require_success: bool,
+    pub final_only: bool,
+}
+
 /// Read model for one task.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskProjection {
@@ -198,6 +206,19 @@ pub struct TaskProjection {
     pub abandoned_reason: Option<String>,
     /// The evidence the agent offered with its `done` — self-reported free text, never checked.
     pub done_observed: Option<String>,
+    /// Who appended the `done`: the claimant whose own validation runs its report is read against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_by: Option<String>,
+    /// Events applied to this task, its `opened` included: a note's cursor on a peer task.
+    #[serde(default)]
+    pub event_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<super::EvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<String>,
+    /// Only strengthened edges. Unqualified prerequisites retain their original wire representation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prerequisites: BTreeMap<String, Prerequisite>,
     /// The union of every `tagged` event's labels, in first-seen order. Omitted from the wire when
     /// empty, so a log that never tagged anything serializes exactly as it did before tags existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -261,6 +282,11 @@ impl TaskProjection {
             superseded_by: None,
             abandoned_reason: None,
             done_observed: None,
+            done_by: None,
+            event_count: 1,
+            evidence: vec![],
+            disclosure: None,
+            prerequisites: Default::default(),
             tags: Vec::new(),
             blocked_by: Vec::new(),
             decision: None,
@@ -269,6 +295,7 @@ impl TaskProjection {
     }
 
     fn touch(&mut self, event: &TaskEvent) {
+        self.event_count += 1;
         self.last_event_id = event.id.clone();
         self.last_ts = event.ts;
     }
@@ -356,6 +383,21 @@ impl TaskReducer {
                 field: "channel",
                 value: "removed in 0.15.0 (read-through only)".into(),
             }),
+            TaskEventKind::Noted { claim: Some(c), .. } if !c.admissible() => Err(ReduceError::InvalidField {
+                field: "claim",
+                value: "invalid scope, condition, or claim size".into(),
+            }),
+            TaskEventKind::Done {
+                evidence, disclosure, ..
+            } if evidence.len() > 64
+                || disclosure.as_ref().is_some_and(|s| s.len() > 8192)
+                || serde_json::to_vec(evidence).is_ok_and(|v| v.len() > 65536) =>
+            {
+                Err(ReduceError::InvalidField {
+                    field: "evidence",
+                    value: "completion evidence exceeds admission limit".into(),
+                })
+            }
             TaskEventKind::Done { check: Some(_), .. } => Err(ReduceError::InvalidField {
                 field: "check",
                 value: "removed in 0.15.0 (read-through only)".into(),
@@ -450,7 +492,11 @@ impl TaskReducer {
                 task.assignee = None;
                 task.state = TaskState::Open;
             }
-            TaskEventKind::Noted { text, session_ref } => {
+            TaskEventKind::Noted {
+                text,
+                session_ref,
+                claim,
+            } => {
                 // The one event a terminal task accepts unconditionally: a note never changes
                 // state, so refusing it only lost evidence (four lanes wrote `done` before their
                 // note and lost the note). It is marked `post_close` so every surface can say so.
@@ -460,17 +506,26 @@ impl TaskReducer {
                     ts: event.ts,
                     text: text.clone(),
                     session_ref: session_ref.clone(),
+                    claim: claim.clone(),
                     post_close: task.state.is_terminal(),
                 });
             }
-            TaskEventKind::Done { observed, .. } => {
+            TaskEventKind::Done {
+                observed,
+                evidence,
+                disclosure,
+                ..
+            } => {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
                 if task.decision.is_some() {
                     return Err(ReduceError::DecisionNeedsResolve {
                         task_id: task.task_id.clone(),
                     });
                 }
+                task.evidence = evidence.clone();
+                task.disclosure = disclosure.clone();
                 task.done_observed = observed.clone();
+                task.done_by = Some(event.by.clone());
                 task.state = TaskState::Done;
             }
             TaskEventKind::Abandoned { reason } => {
@@ -494,8 +549,20 @@ impl TaskReducer {
                     }
                 }
             }
-            TaskEventKind::BlockedBy { task: blocker } => {
+            TaskEventKind::BlockedBy {
+                task: blocker,
+                require_success,
+                final_only,
+            } => {
                 require_base(task, kind, &[TaskState::Open, TaskState::Claimed])?;
+                if *require_success || *final_only {
+                    let edge = task.prerequisites.entry(blocker.clone()).or_insert(Prerequisite {
+                        require_success: false,
+                        final_only: false,
+                    });
+                    edge.require_success |= *require_success;
+                    edge.final_only |= *final_only;
+                }
                 if !task.blocked_by.iter().any(|have| have == blocker) {
                     task.blocked_by.push(blocker.clone());
                 }
@@ -688,7 +755,7 @@ fn validate_event_shape(event: &TaskEvent) -> Result<(), ReduceError> {
             }
             Ok(())
         }
-        TaskEventKind::BlockedBy { task } => {
+        TaskEventKind::BlockedBy { task, .. } => {
             require_nonempty("task", task)?;
             if task == &event.task_id {
                 return Err(ReduceError::InvalidField {
@@ -816,6 +883,8 @@ mod tests {
             ts: historical_open.ts,
             by: AUTHOR.into(),
             kind: TaskEventKind::Done {
+                evidence: vec![],
+                disclosure: None,
                 observed: None,
                 check: Some(serde_json::json!({"cmd":"old check"})),
             },
@@ -929,6 +998,7 @@ mod tests {
             &task,
             OTHER,
             TaskEventKind::Noted {
+                claim: None,
                 text: "halfway".into(),
                 session_ref: None,
             },
@@ -937,6 +1007,8 @@ mod tests {
             &task,
             OTHER,
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: Some("screenshot.png".into()),
                 check: None,
             },
@@ -996,6 +1068,8 @@ mod tests {
             &task,
             OTHER,
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },
@@ -1120,6 +1194,8 @@ mod tests {
             (
                 "done",
                 vec![TaskEventKind::Done {
+                    evidence: Vec::new(),
+                    disclosure: None,
                     observed: None,
                     check: None,
                 }],
@@ -1150,6 +1226,7 @@ mod tests {
                 &task,
                 AUTHOR,
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "before".into(),
                     session_ref: None,
                 },
@@ -1163,6 +1240,7 @@ mod tests {
                 &task,
                 OTHER,
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "the evidence, after the close".into(),
                     session_ref: None,
                 },
@@ -1194,6 +1272,7 @@ mod tests {
     #[test]
     fn post_close_is_wire_additive() {
         let n = Note {
+            claim: None,
             event_id: "e".into(),
             by: "b".into(),
             ts: "2026-07-16T12:00:00Z".parse().unwrap(),
@@ -1342,6 +1421,8 @@ mod tests {
             &task,
             OTHER,
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },
@@ -1378,6 +1459,8 @@ mod tests {
             &task,
             AUTHOR,
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: Some("my word".into()),
                 check: None,
             },

@@ -176,6 +176,13 @@ pub(crate) enum TaskCmd {
         /// Another task waits on this one (writes a `blocked_by` on THAT task). Repeatable.
         #[arg(long = "blocks", value_name = "ID")]
         blocks: Vec<String>,
+        /// Require successful completion or a final decision on the specified edges.
+        #[arg(long)]
+        require_success: bool,
+        /// Wait for a final outcome on the specified edges.
+        #[arg(long)]
+        final_only: bool,
+
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -267,6 +274,16 @@ pub(crate) enum TaskCmd {
         file: Option<PathBuf>,
         #[arg(long = "session-ref")]
         session_ref: Option<String>,
+        /// Typed finding: `fact`, `fail`, or a JSON claim object. Omit `any_of` to auto-pin
+        /// touched/scoped files and active provisional decisions.
+        #[arg(long, value_name = "KIND_OR_JSON")]
+        claim: Option<String>,
+        /// Relative file or directory paths scoped by a typed finding (repeatable or comma-separated).
+        #[arg(long, value_name = "PATH", value_delimiter = ',')]
+        scope: Vec<String>,
+        /// Prior finding note event IDs this note addresses (repeatable or comma-separated).
+        #[arg(long, value_name = "EVENT_ID", value_delimiter = ',')]
+        resolves: Vec<String>,
         /// Acting endpoint recorded in `by`. Default: $CV_ENDPOINT.
         #[arg(long)]
         from: Option<String>,
@@ -279,6 +296,12 @@ pub(crate) enum TaskCmd {
         /// Pointer to observable evidence (URL, path, session id).
         #[arg(long)]
         observed: Option<String>,
+        /// Cite a typed evidence reference (JSON object). Repeatable.
+        #[arg(long, value_name = "JSON")]
+        evidence: Vec<String>,
+        /// Record limits on what the completion discloses.
+        #[arg(long)]
+        disclosure: Option<String>,
         /// A closing note (`-` = stdin), validated with the `done` before appending: the note,
         /// then the done.
         #[arg(long, conflicts_with = "note_file")]
@@ -340,6 +363,12 @@ pub(crate) enum TaskCmd {
     },
     /// Record that a task waits on another: `cv task block <id> --by <blocker>`.
     Block {
+        /// Wait for successful completion or a final decision.
+        #[arg(long)]
+        require_success: bool,
+        /// Require a final successful outcome, including human confirmation of provisional decisions.
+        #[arg(long)]
+        final_only: bool,
         id: String,
         /// The task that must finish first (id or unique prefix).
         #[arg(long = "by", value_name = "ID")]
@@ -379,6 +408,13 @@ pub(crate) enum TaskCmd {
         /// This decision blocks another task (writes a `blocked_by` on THAT task). Repeatable.
         #[arg(long = "blocks", value_name = "ID")]
         blocks: Vec<String>,
+        /// Require successful completion or a final decision on the specified edges.
+        #[arg(long)]
+        require_success: bool,
+        /// Wait for a final outcome on the specified edges.
+        #[arg(long)]
+        final_only: bool,
+
         /// Resolve it on its default NOW, on the decider's behalf (by you, the poser), with a veto
         /// window: work proceeds, and their inbox shows it under "made for you (veto?)" until they
         /// `--confirm` or choose otherwise. Validated in the same batch as the pose.
@@ -417,6 +453,9 @@ pub(crate) enum TaskCmd {
     /// New task events since a point in time, one JSON line each (the poll surface: hand the
     /// last event id back as the next `--since`). `--text` renders one human line per event.
     Events {
+        /// Claim events covering this file or directory.
+        #[arg(long)]
+        scope: Option<PathBuf>,
         /// A duration (`2h`), a date, a datetime, an RFC 3339 timestamp, or an event id (exclusive).
         #[arg(long, value_name = "WHEN")]
         since: Option<String>,
@@ -456,6 +495,9 @@ pub(crate) enum TaskCmd {
     /// What needs `<who>`: decisions owed (default + options on one line each), decisions made
     /// for them provisionally, then assigned actions and claimed work. Same 14-day window as `list`.
     Inbox {
+        /// Rank by distinct waiting lanes times observed stall duration.
+        #[arg(long,value_parser=["stall"])]
+        sort: Option<String>,
         /// Endpoint to compute the inbox for. Default: $CV_ENDPOINT, else "cv".
         who: Option<String>,
         #[arg(long)]
@@ -600,6 +642,7 @@ fn close_with_note(id: &str, from: &str, note: Option<String>, close: TaskEventK
         Some(id),
         from,
         TaskEventKind::Noted {
+            claim: None,
             text,
             session_ref: None,
         },
@@ -661,6 +704,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             tags,
             blocked_by,
             blocks,
+            require_success,
+            final_only,
             from,
         } => {
             let repo = canonical_repo(repo)?;
@@ -717,13 +762,25 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 batch.push(task::new_event(Some(&id), &from, TaskEventKind::Tagged { tags }));
             }
             for b in blocked_by {
-                batch.push(task::new_event(Some(&id), &from, TaskEventKind::BlockedBy { task: b }));
+                batch.push(task::new_event(
+                    Some(&id),
+                    &from,
+                    TaskEventKind::BlockedBy {
+                        require_success,
+                        final_only,
+                        task: b,
+                    },
+                ));
             }
             for other in blocks {
                 batch.push(task::new_event(
                     Some(&other),
                     &from,
-                    TaskEventKind::BlockedBy { task: id.clone() },
+                    TaskEventKind::BlockedBy {
+                        require_success,
+                        final_only,
+                        task: id.clone(),
+                    },
                 ));
             }
             append_batch(batch)?;
@@ -853,18 +910,46 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 ),
                 None => None,
             };
+            let witness = task::witness::completion(t);
+            let stall = task::stall::projection(&outcome, Utc::now())
+                .remove(&id)
+                .unwrap_or_default();
+            let mut files = task::FileDigests::default();
+            let mut drift = std::collections::BTreeMap::new();
+            let applicability: std::collections::BTreeMap<_, _> = t
+                .notes
+                .iter()
+                .filter_map(|n| {
+                    let claim = n.claim.as_ref()?;
+                    let moved = claim.drift(&outcome.model, &mut files);
+                    if !moved.is_empty() {
+                        drift.insert(&n.event_id, moved);
+                    }
+                    Some((
+                        &n.event_id,
+                        claim.evaluate(&outcome.model, t.repo.as_deref(), &mut files),
+                    ))
+                })
+                .collect();
             if json {
+                let mut detail = serde_json::to_value(t)?;
+                detail["completion"] = serde_json::to_value(&witness)?;
+                detail["cycle"] = serde_json::to_value(&stall.cycle)?;
+                detail["applicability"] = serde_json::to_value(&applicability)?;
+                if !drift.is_empty() {
+                    detail["drift"] = serde_json::to_value(&drift)?;
+                }
                 if events {
                     let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
                     let doc = serde_json::json!({
-                        "task": t,
+                        "task": detail,
                         "effective_state": cv_core::task::effective_display(t),
                         "warnings": outcome.warnings,
                         "events": history,
                     });
                     println!("{}", serde_json::to_string_pretty(&doc)?);
                 } else {
-                    println!("{}", serde_json::to_string_pretty(t)?);
+                    println!("{}", serde_json::to_string_pretty(&detail)?);
                 }
             } else {
                 print!(
@@ -878,6 +963,24 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                         Utc::now()
                     )
                 );
+                if !brief {
+                    if witness.self_reported
+                        || !witness.chain_anchored.is_empty()
+                        || !witness.observed_outcome.is_empty()
+                    {
+                        println!("  completion: {}", serde_json::to_string(&witness)?);
+                    }
+                    if !stall.cycle.is_empty() {
+                        println!("  cycle: {}", serde_json::to_string(&stall.cycle)?);
+                    }
+                    for (note, state) in applicability {
+                        let moved = drift
+                            .get(note)
+                            .map(|d| format!(" ({})", d.join(", ")))
+                            .unwrap_or_default();
+                        println!("  claim {}: {:?}{}", sanitize_line(note), state, sanitize_line(&moved));
+                    }
+                }
                 if events {
                     let history: Vec<_> = outcome.events.iter().filter(|e| e.task_id == id).collect();
                     println!("{}", serde_json::to_string_pretty(&history)?);
@@ -900,15 +1003,40 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             text,
             file,
             session_ref,
+            claim,
+            scope,
+            resolves,
             from,
         } => {
-            let id = resolve_target(&id)?;
+            let outcome = fold_loud()?;
+            let id = resolve(&outcome.model, &id)?.to_string();
             let text = text_arg(text, file)?.expect("clap requires text or --file");
-            append_event(Some(&id), &from_or_cv(from), TaskEventKind::Noted { text, session_ref }).map(|_| ())
+            let from = from_or_cv(from);
+            let claim = task_ops::build_note_claim(
+                &outcome.model,
+                &id,
+                claim.as_deref(),
+                &scope,
+                &resolves,
+                session_ref.as_deref(),
+                &from,
+            )?;
+            append_event(
+                Some(&id),
+                &from,
+                TaskEventKind::Noted {
+                    claim,
+                    text,
+                    session_ref,
+                },
+            )
+            .map(|_| ())
         }
         TaskCmd::Done {
             id,
             observed,
+            evidence,
+            disclosure,
             note,
             note_file,
             from,
@@ -919,7 +1047,15 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 &id,
                 &from_or_cv(from),
                 note,
-                TaskEventKind::Done { observed, check: None },
+                TaskEventKind::Done {
+                    evidence: evidence
+                        .iter()
+                        .map(|s| serde_json::from_str(s))
+                        .collect::<serde_json::Result<_>>()?,
+                    disclosure,
+                    observed,
+                    check: None,
+                },
             )
         }
         TaskCmd::Status { id, text, file, from } => {
@@ -952,12 +1088,28 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             }
             append_event(Some(&id), &from_or_cv(from), TaskEventKind::Tagged { tags }).map(|_| ())
         }
-        TaskCmd::Block { id, by_task, from } => {
+        TaskCmd::Block {
+            id,
+            by_task,
+            from,
+            require_success,
+            final_only,
+        } => {
             let (id, by_task) = resolve_target_and(&id, &by_task)?;
-            append_event(Some(&id), &from_or_cv(from), TaskEventKind::BlockedBy { task: by_task }).map(|_| ())
+            append_event(
+                Some(&id),
+                &from_or_cv(from),
+                TaskEventKind::BlockedBy {
+                    require_success,
+                    final_only,
+                    task: by_task,
+                },
+            )
+            .map(|_| ())
         }
         TaskCmd::Sweep { repo, main, json } => cmd_sweep(&repo, main, json),
         TaskCmd::Inbox {
+            sort,
             who,
             json,
             md,
@@ -971,11 +1123,44 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             let now = Utc::now();
             let window = scope_window(all, since.as_deref(), now)?;
             let caller = task::default_endpoint();
-            let page = if json || md {
+            let mut page = if json || md {
                 task::inbox_page(&outcome, &who, caller.as_deref(), window, unread, now)
             } else {
                 task::inbox_page_brief(&outcome, &who, caller.as_deref(), window, unread, now)
             };
+            if sort.is_some() {
+                let ranks = task::stall::projection(&outcome, now);
+                let mut seen = std::collections::HashSet::new();
+                page.items.retain_mut(|i| {
+                    let s = &ranks[&i.id];
+                    if s.cycle.first().is_some_and(|id| !seen.insert(id.clone())) {
+                        return false;
+                    }
+                    i.stall = Some(s.as_ref().clone());
+                    true
+                });
+                page.items.sort_by_key(|i| std::cmp::Reverse(ranks[&i.id].score));
+                if !json {
+                    for i in &page.items {
+                        let s = &ranks[&i.id];
+                        let cycle = if s.cycle.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · cycle [{}]", s.cycle.join(", "))
+                        };
+                        println!(
+                            "{}{}  {} · {} blocked lanes × {}s{}",
+                            if md { "- " } else { "" },
+                            sanitize_line(&i.id),
+                            sanitize_line(&i.title),
+                            s.blocked_lanes,
+                            s.seconds,
+                            sanitize_line(&cycle)
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             if json {
                 // The page the text and Markdown render from — the shape `cv serve`'s `/api/inbox`
                 // serves, and whose `items` are the `/api/tasks/inbox` rows.
@@ -999,6 +1184,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             issue,
             tags,
             blocks,
+            require_success,
+            final_only,
             provisional,
             from,
         } => {
@@ -1031,6 +1218,8 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 tags: tags.as_deref().map(parse_tags).unwrap_or_default(),
                 source: None,
                 blocks,
+                require_success,
+                final_only,
                 provisional,
             };
             // Validate the pose and (with --provisional) resolution before writing; candidate
@@ -1120,6 +1309,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
             Ok(())
         }
         TaskCmd::Events {
+            scope,
             since,
             kind,
             by,
@@ -1145,6 +1335,7 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 not_by,
                 assignee,
                 task: task_id,
+                scope,
             };
             print_events(&outcome, &f, text)
         }
@@ -1254,7 +1445,7 @@ fn render_show(
         }
     }
     if task::is_blocked(model, t) {
-        out.push_str("  ⊘ BLOCKED — a blocker above has not finished\n");
+        out.push_str("  ⊘ BLOCKED — a prerequisite above is waiting\n");
     }
     for other in task::blocks(model, &t.task_id) {
         out.push_str(&format!(
@@ -1414,6 +1605,11 @@ mod tests {
             superseded_by: None,
             abandoned_reason: None,
             done_observed: None,
+            done_by: None,
+            event_count: 1,
+            evidence: vec![],
+            disclosure: None,
+            prerequisites: Default::default(),
             tags: Vec::new(),
             blocked_by: Vec::new(),
             decision: None,
@@ -1451,6 +1647,7 @@ mod tests {
             superseded_provisional: Some(res("keep /tank", "orchestrator:demo", "2026-07-16T12:31:00Z", true)),
         });
         t.notes.push(Note {
+            claim: None,
             event_id: "n".into(),
             by: "orchestrator:demo".into(),
             ts: at("2026-07-16T12:34:00Z"),
@@ -1504,6 +1701,7 @@ mod tests {
         let mut task = proj("notes", "2026-07-16T00:00:00Z");
         for index in 0..10 {
             task.notes.push(cv_core::task::Note {
+                claim: None,
                 event_id: format!("note-{index}"),
                 by: "author".into(),
                 ts: now,

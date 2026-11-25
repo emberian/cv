@@ -738,6 +738,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
     let mut composition = cv_core::splice::Composition::default();
     let mut first_path = None;
     let mut agent_sources: Vec<PathBuf> = Vec::new();
+    let mut stale_reads = Vec::new();
     for sp in &parsed {
         let (reference, adapter) = crate::cmd::distill::resolve_source(&sp.id, None)?;
         first_path.get_or_insert_with(|| reference.path.clone());
@@ -767,6 +768,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
             p.apply(&mut session);
             plans.push(p);
         }
+        stale_reads.extend(cv_core::lanes::session_stale_reads(&session, &reference)?);
         composition.push(session, total, sp.start, sp.end);
     }
     let first_h = composition
@@ -788,6 +790,11 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         spliced
             .cv_extra_mut()
             .insert("recovery".into(), serde_json::json!(plans));
+    }
+    if !stale_reads.is_empty() {
+        let values = serde_json::to_value(&stale_reads)?;
+        eprintln!("stale_reads: {values}");
+        spliced.cv_extra_mut().insert("stale_reads".into(), values);
     }
     if let Some(target) = resumable {
         // `--session` / `--agent-of`: a resumable Claude transcript, the way `distill` writes one.
@@ -813,6 +820,7 @@ pub(crate) fn cmd_splice(args: SpliceArgs<'_>) -> Result<()> {
         if !plans.is_empty() {
             v["recovery"] = serde_json::json!(plans);
         }
+        v["stale_reads"] = serde_json::to_value(&stale_reads)?;
         if let (Some(mode), Some(path), Some(id), None) = (carry_agents, &e.path, &e.session_id, &e.agent_id) {
             v["carried_agents"] = carry(mode, &agent_sources, path, id, (false, false), &mut h)?;
         }

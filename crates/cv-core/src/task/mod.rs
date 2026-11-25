@@ -21,12 +21,16 @@
 //! Storage is a single append-only event log (`$CLUSTERVISION_HOME/tasks/events.jsonl`) under a
 //! crash-safe flock.
 
+pub mod claims;
+pub use claims::{AllOf, Applicability, Claim, ClaimKind, Condition, EvidenceRef, FileDigests};
 pub mod inbox;
 pub mod model;
 pub mod project;
 pub mod reduce;
+pub mod stall;
 pub mod store;
 pub mod views;
+pub mod witness;
 
 pub use inbox::{
     deadline_phrase, decisions_from_notes, inbox_page, inbox_page_brief, DecisionView, InboxCounts, InboxItem,
@@ -214,6 +218,8 @@ mod tests {
             Some(&first.task_id),
             "agent:worker",
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: Some("completed".into()),
                 check: None,
             },
@@ -246,6 +252,8 @@ mod tests {
             Some(&second.task_id),
             "agent:author",
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },

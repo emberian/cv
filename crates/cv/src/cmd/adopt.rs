@@ -87,6 +87,10 @@ fn join(a: &AdoptArgs) -> Result<()> {
     let (from, into) = (session(from)?, session(into)?);
     let sources = std::slice::from_ref(&from.path);
     let only = resolve_agent_specs(sources, &a.agents).or_else(|e| usage(e.to_string()))?;
+    let stale_reads = cv_core::events::workspace::stale_reads("claude", &from.session_id, None, None)?
+        .into_iter()
+        .filter(|s| !s.reader_agent.is_empty() && (only.is_empty() || only.contains(&s.reader_agent)))
+        .collect::<Vec<_>>();
     let carried = carry_agents(
         sources,
         &into.path,
@@ -106,12 +110,15 @@ fn join(a: &AdoptArgs) -> Result<()> {
             crate::cmd::reshape::carried_line(&carried)
         )
     };
+    if !stale_reads.is_empty() {
+        let _ = writeln!(h, "  stale_reads: {}", serde_json::to_string(&stale_reads)?);
+    }
     let refused = carried.refused.len();
     crate::cmd::reshape::refused_lines(&mut h, &carried);
     report(
         a.json,
         &h,
-        &json!({"from": from.session_id, "into": into.session_id, "carried_agents": carried, "written": !a.dry_run}),
+        &json!({"from": from.session_id, "into": into.session_id, "carried_agents": carried, "stale_reads":stale_reads,"written": !a.dry_run}),
     )?;
     if refused > 0 {
         anyhow::bail!("{refused} transcript(s) were refused; every other agent was carried");
@@ -217,6 +224,8 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
     let mut h = String::new();
     for p in &plans {
         let g = &p.agent;
+        let stale_reads = cv_core::events::workspace::stale_reads("claude", &g.session_id, Some(&g.agent_id), None)?;
+
         // A dry run still restamps in memory, so its line counts are the real ones.
         let r = adopt::execute(p, !a.dry_run, a.force || a.dry_run)?;
         let meta_dest = p
@@ -319,7 +328,10 @@ fn run(roots: &[PathBuf], a: &AdoptArgs) -> Result<()> {
             short_id(&into.session_id),
             g.agent_id
         );
-        done.push(json!({"plan": p, "result": r, "written": !a.dry_run}));
+        if !stale_reads.is_empty() {
+            let _ = writeln!(h, "  stale_reads: {}", serde_json::to_string(&stale_reads)?);
+        }
+        done.push(json!({"plan": p, "result": r, "written": !a.dry_run,"stale_reads":stale_reads}));
     }
     let mut retargeted = Vec::new();
     for g in &retargets {

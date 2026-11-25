@@ -1474,7 +1474,7 @@ fn handle_hook(name: HookName, harness: Option<String>) -> Result<()> {
         Ok(None) => Ok(None),
         Ok(Some(event)) => match name {
             HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane => unreachable!(),
-            HookName::Edit => hook_edit(&event),
+            HookName::Edit => hook_edit(&event, &payload),
             HookName::Retired => hook_retired(&event, &payload),
             HookName::Receipt => hook_receipt(&event, &payload),
         },
@@ -1711,6 +1711,37 @@ fn hook_receipt(ev: &Event, payload: &Value) -> Result<Option<Value>> {
             )),
         );
     }
+    if (kind == "pre"
+        || payload.get("tool_response").is_some_and(|r| {
+            !r.is_null()
+                && r.get("is_error").and_then(Value::as_bool) != Some(true)
+                && r.get("exit_code").and_then(Value::as_i64).is_none_or(|c| c == 0)
+        }))
+        && payload["tool_use_id"].is_string()
+    {
+        let versions = version_samples(ev, payload);
+        if !versions.is_empty() {
+            body.insert("files".into(), serde_json::to_value(versions)?);
+        }
+    }
+    if kind == "post" {
+        let input = &payload["tool_input"];
+        let tool = payload["tool_name"].as_str().unwrap_or("");
+        if matches!(tool, "Bash" | "exec_command" | "shell_command" | "run_shell_command") {
+            if let (Some(cmd), Some(cwd), Some(code)) = (
+                input["command"].as_str().or_else(|| input["cmd"].as_str()),
+                ev.cwd.as_ref(),
+                payload["tool_response"]["exit_code"].as_i64(),
+            ) {
+                let key = json!([cwd, tool, cmd, input["workdir"], input["env"]]);
+                body.insert("command_key".into(), json!(sha256_hex(key.to_string().as_bytes())));
+                body.insert("exit_code".into(), json!(code));
+                if cv_core::overview::validation_command(cmd) {
+                    body.insert("validation".into(), json!(true));
+                }
+            }
+        }
+    }
     match commit_receipt(ev, body) {
         Ok(_) => Ok(None),
         Err(e) if kind == "pre" && cv_core::env::var("CV_RECEIPT_STRICT").as_deref() == Ok("1") => {
@@ -1733,7 +1764,54 @@ fn minutes_since_modified(path: &Path) -> Option<i64> {
 /// live writer edited this path. Both `events::sessions_editing` and `ev.normalized_edits()` share
 /// [`cv_core::tools::classify::normalize_path`], so symlinked ancestors (`/var` ↔ `/private/var`)
 /// resolve identically even when the target file does not exist yet. Nothing printed = allow.
-fn hook_edit(ev: &Event) -> Result<Option<Value>> {
+fn version_samples(ev: &Event, payload: &Value) -> Vec<cv_core::events::workspace::FileVersion> {
+    use cv_core::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
+    let input = &payload["tool_input"];
+    let tool = payload["tool_name"].as_str().unwrap_or("");
+    let mut files = Vec::new();
+    let mut paths = std::collections::BTreeMap::new();
+    let _ = visit_tool_ops(
+        Some(ev.harness),
+        tool,
+        cv_core::json::JsonView::from(input),
+        ClassifyOpts::COUNTS,
+        |sem| {
+            let (path, edit) = match sem.op {
+                ToolOp::FileRead { path } => (path, false),
+                ToolOp::FileEdit { path, .. } => (path, true),
+                _ => return,
+            };
+            if paths.len() < 8 && (ev.cwd.is_some() || std::path::Path::new(path.as_ref()).is_absolute()) {
+                paths.insert(
+                    cv_core::tools::classify::absolutize_path(&path, ev.cwd.as_deref()),
+                    edit,
+                );
+            }
+        },
+    );
+    let old = input["old_string"].as_str().map(str::to_owned).or_else(|| {
+        let patch = input["command"].as_str().or_else(|| input.as_str())?;
+        if paths.len() != 1 || patch.lines().filter(|l| l.starts_with("@@")).count() != 1 {
+            return None;
+        }
+        let lines: Vec<_> = patch
+            .lines()
+            .skip_while(|l| !l.starts_with("@@"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("***"))
+            .filter_map(|l| l.strip_prefix('-').or_else(|| l.strip_prefix(' ')))
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    });
+    for (path, edit) in paths {
+        if let Some(version) = cv_core::events::workspace::snapshot(&path, edit, old.as_deref()) {
+            files.push(version);
+        }
+    }
+    files
+}
+
+fn hook_edit(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     if ev.edits.is_empty() {
         return Ok(None);
     }
@@ -1741,21 +1819,77 @@ fn hook_edit(ev: &Event) -> Result<Option<Value>> {
         return Ok(None);
     };
     let mut conflicts = Vec::new();
+    let mut advice = std::collections::BTreeSet::new();
+    let versions = std::cell::OnceCell::new();
     for abs_str in ev.normalized_edits() {
         let abs = PathBuf::from(&abs_str);
         let mut live: Vec<(String, i64)> = Vec::new();
         // The guard answers in milliseconds and never blocks an edit on its own failure: an event
         // catalog that cannot answer degrades once, as an accelerator does.
-        let editing = cv_core::events::sessions_editing(&abs_str).unwrap_or_else(|e| {
+        let mut editing = cv_core::events::sessions_editing(&abs_str).unwrap_or_else(|e| {
             cv_core::env::warn_once("the event catalog", format_args!("{e:#}"));
             Vec::new()
         });
+        let agent = ev.agent.as_ref().map_or("", |a| a.id.as_str());
+        let stale =
+            cv_core::events::workspace::stale_reads(ev.harness.as_str(), &ev.session.id, Some(agent), Some(&abs_str))
+                .unwrap_or_default();
+        if let Some(s) = stale.first().filter(|s| {
+            versions
+                .get_or_init(|| version_samples(ev, payload))
+                .iter()
+                .any(|v| v.path == s.path && v.blob == s.written_blob)
+        }) {
+            advice.insert(format!(
+                "cv: stale read of {}. Inspect the peer edit with `cv show {}:{}` before applying this change.",
+                sanitize_line(&abs_str),
+                sanitize_line(&s.writer_harness),
+                sanitize_line(&s.writer)
+            ));
+        }
+        let pending = cv_core::events::workspace::pending_editors(&abs_str).unwrap_or_default();
+        editing.extend(pending);
+        let mut visited = std::collections::HashSet::new();
         for t in editing {
+            if !visited.insert((t.harness.clone(), t.session_id.clone(), t.agent_id.clone())) {
+                continue;
+            }
             let Some(path) = cv_core::hooks::transcript_of(&t) else {
                 continue;
             };
-            if guard.exempts(&t, &path) {
-                continue;
+            use cv_core::hooks::Relation;
+            match guard.relation(&t, &path) {
+                Relation::Own | Relation::Unknown => continue,
+                Relation::Kin => {
+                    if advice.is_empty() && minutes_since_modified(&path).is_some_and(|m| m <= LIVE_MINUTES) {
+                        let overlap = versions
+                            .get_or_init(|| version_samples(ev, payload))
+                            .iter()
+                            .find(|v| v.path == abs_str)
+                            .and_then(|v| {
+                                cv_core::events::workspace::overlaps(
+                                    &t.harness,
+                                    t.parent_id.as_deref().unwrap_or(&t.session_id),
+                                    t.agent_id.as_deref(),
+                                    v,
+                                )
+                            });
+                        if overlap != Some(false) {
+                            let reason = if overlap == Some(true) {
+                                "overlapping edit"
+                            } else {
+                                "shared file; hunk overlap unknown"
+                            };
+                            advice.insert(format!(
+                                "cv: {reason}. Inspect `cv show {}:{}`.",
+                                sanitize_line(&t.harness),
+                                sanitize_line(&t.session_id)
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                Relation::Stranger => {}
             }
             if let Some(m) = minutes_since_modified(&path).filter(|m| *m <= LIVE_MINUTES) {
                 let shown = match Harness::parse(&t.harness) {
@@ -1780,8 +1914,11 @@ fn hook_edit(ev: &Event) -> Result<Option<Value>> {
         ));
     }
     if conflicts.is_empty() {
-        return Ok(None);
+        return Ok(
+            (!advice.is_empty()).then(|| context("PreToolUse", advice.into_iter().collect::<Vec<_>>().join("\n")))
+        );
     }
+    conflicts.extend(advice);
     Ok(Some(json!({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": guard.decision.as_str(),
@@ -2152,5 +2289,48 @@ mod tests {
             None
         );
         rx.read_one().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod file_observation_tests {
+    use super::*;
+    use cv_core::events::workspace::stale_reads;
+    use cv_core::state::StateStore;
+
+    #[test]
+    fn hooks_one_stale_notice_after_a_hundred_readers() -> Result<()> {
+        // #tooth Observe real pre/post file versions, then exercise the guard on an actual edit.
+        let world = crate::test_world("hooks-file-versions");
+        let path = world.base.join("ir.rs");
+        std::fs::write(&path, "before")?;
+        let invoke = |session: &str, tool: &str, phase: &str, input: &Value| -> Result<()> {
+            let payload = json!({"session_id":session,"cwd":world.base,"hook_event_name":phase,"tool_name":tool,
+                "tool_use_id":format!("{tool}-{session}"),"tool_input":input,"tool_response":{"ok":true}});
+            let ev = cv_core::hooks::Event::from_generic_payload(Harness::Claude, &payload)?;
+            assert!(hook_receipt(&ev, &payload)?.is_none());
+            Ok(())
+        };
+        let input = json!({"file_path":path});
+        for i in 0..100 {
+            for phase in ["PreToolUse", "PostToolUse"] {
+                invoke(&format!("reader-{i}"), "Read", phase, &input)?;
+            }
+        }
+        assert!(stale_reads("claude", "reader-0", Some(""), None)?.is_empty());
+        assert!(StateStore::default_store()?.path().exists());
+        let payload = json!({"session_id":"reader-0","cwd":world.base,"hook_event_name":"PreToolUse","tool_name":"Edit",
+            "tool_input":{"file_path":path,"old_string":"before","new_string":"mine"}});
+        let mut ev = Event::from_generic_payload(Harness::Claude, &payload)?;
+        ev.edits = vec![path.to_string_lossy().into_owned()];
+        assert!(hook_edit(&ev, &payload)?.is_none());
+        let edit = json!({"file_path":path,"old_string":"before","new_string":"after"});
+        invoke("peer", "Edit", "PreToolUse", &edit)?;
+        std::fs::write(&path, "after")?;
+        invoke("peer", "Edit", "PostToolUse", &edit)?;
+        let notice = hook_edit(&ev, &payload)?.expect("stale pointer");
+        assert_eq!(notice.to_string().matches("stale read").count(), 1);
+        assert!(notice["hookSpecificOutput"]["permissionDecision"].is_null());
+        Ok(())
     }
 }

@@ -616,3 +616,125 @@ fn relative_transcript_selection_is_cited_by_its_absolute_path() {
         assert!(!out.contains(&format!("claude:{relative}")), "{args:?}\n{out}");
     }
 }
+
+// #tooth A peer's narration and badges never reach the artifact review.
+#[test]
+fn pack_review_is_checkout_only_and_quarantines_runner_edits() {
+    let w = World::new("pack-review");
+    let git = |args: &[&str]| assert!(w.command("git").args(args).status().unwrap().success());
+    git(&["init", "-q"]);
+    fs::write(w.base.join("code.py"), "value = 1\n").unwrap();
+    fs::write(w.base.join("conftest.py"), "old = 1\n").unwrap();
+    git(&["add", "code.py", "conftest.py"]);
+    git(&[
+        "-c",
+        "user.name=A",
+        "-c",
+        "user.email=a@localhost",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    fs::write(w.base.join("code.py"), "value = 2 # Claude says PASS\n").unwrap();
+    fs::write(w.base.join("conftest.py"), "quarantined = 42\n").unwrap();
+    w.write_session("review-source",&[
+        claude::with(user_line("review-source","u","2026-02-01T10:00:00Z","change the value"),serde_json::json!({"cwd":w.base})),
+        claude::with(assistant_line("a","2026-02-01T10:01:00Z",serde_json::json!([
+            {"type":"text","text":"I nailed it. <thinking>magic</thinking> PASS"},
+            {"type":"tool_use","id":"e","name":"Edit","input":{"file_path":w.base.join("code.py"),"old_string":"1","new_string":"2"}},
+            {"type":"tool_use","id":"f","name":"Edit","input":{"file_path":w.base.join("conftest.py"),"old_string":"1","new_string":"42"}}
+        ])),serde_json::json!({"cwd":w.base}))
+    ]);
+    let selected = format!("claude:{}", w.transcript("review-source").display());
+    let (review, _) = w.cv_ok(&["pack", "change the value", "--session", &selected, "--review"]);
+    assert!(
+        review.contains("+value = 2") && review.contains("change the value"),
+        "{review}"
+    );
+    for excluded in [
+        "Claude",
+        "claude",
+        "PASS",
+        "thinking",
+        "magic",
+        "nailed",
+        "conftest",
+        "quarantined",
+    ] {
+        assert!(!review.contains(excluded), "{excluded} in {review}");
+    }
+    let (all, _) = w.cv_ok(&["pack", "change the value", "--session", &selected, "--review", "--all"]);
+    assert!(all.contains("quarantined = 42") && !all.contains("nailed"));
+    let (normal, _) = w.cv_ok(&["pack", "change the value", "--session", &selected]);
+    assert!(!normal.contains("conftest") && !normal.contains("nailed"));
+}
+
+// #tooth Review scrubs only request metadata: checkout code naming a verdict or a vendor survives,
+// and distant unchanged lines stay out of the bounded diff.
+#[test]
+fn pack_review_keeps_code_lines_and_scrubs_only_request_metadata() {
+    let w = World::new("pack-review-code");
+    let git = |args: &[&str]| assert!(w.command("git").args(args).status().unwrap().success());
+    git(&["init", "-q"]);
+    let filler: String = (0..40).map(|i| format!("pad_{i} = {i}\n")).collect();
+    fs::write(
+        w.base.join("verdict.py"),
+        format!("far_away_line = 0\n{filler}status = 'FAIL'\n"),
+    )
+    .unwrap();
+    git(&["add", "verdict.py"]);
+    git(&[
+        "-c",
+        "user.name=A",
+        "-c",
+        "user.email=a@localhost",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    fs::write(
+        w.base.join("verdict.py"),
+        format!("far_away_line = 0\n{filler}status = 'PASS'\nclass CodexAdapter: pass\n"),
+    )
+    .unwrap();
+    let (review, _) = w.cv_ok(&["pack", "Author: Codex\nreview the verdict change", "--review"]);
+    assert!(review.contains("+status = 'PASS'"), "{review}");
+    assert!(review.contains("+class CodexAdapter: pass"), "{review}");
+    assert!(review.contains("review the verdict change"), "{review}");
+    assert!(!review.contains("Author:"), "{review}");
+    assert!(!review.contains("far_away_line"), "{review}");
+}
+
+#[test]
+fn pack_current_failures_survive_abandonment_and_explicit_resolution_is_inspectable() {
+    let w = World::new("pack-claim-history");
+    let (opened, _) = w.cv_ok(&["task", "open", "parser diagnosis", "--repo", w.base.to_str().unwrap()]);
+    let id = opened.lines().last().unwrap();
+    let note =
+        |body: &str, claim: serde_json::Value| w.cv_ok(&["task", "note", id, body, "--claim", &claim.to_string()]);
+    note(
+        "empty input crashes",
+        serde_json::json!({"kind":"fail","scope":["src/parser.rs"]}),
+    );
+    note("retired experiment", serde_json::json!({"kind":"fact","any_of":[]}));
+    w.cv_ok(&["task", "abandon", id]);
+    let (before, _) = w.cv_ok(&["pack", id]);
+    assert!(before.contains("Known Open Failures / Dead Ends") && before.contains("empty input crashes"));
+    assert!(!before.contains("retired experiment"));
+    let feed = w.cv_ok(&["task", "events", "--kind", "noted", "--task", id]).0;
+    let first: serde_json::Value = serde_json::from_str(feed.lines().next().unwrap()).unwrap();
+    note(
+        "empty input now returns an error",
+        serde_json::json!({"kind":"fact","resolves":[first["id"]]}),
+    );
+    let (after, _) = w.cv_ok(&["pack", id]);
+    assert!(after.contains("Current facts") && after.contains("empty input now returns an error"));
+    assert!(!after.contains("empty input crashes"));
+    let (history, _) = w.cv_ok(&["pack", id, "--all"]);
+    assert!(history.contains("Stale findings") && history.contains("retired experiment"));
+    assert!(history.contains("Addressed findings") && history.contains("empty input crashes"));
+}

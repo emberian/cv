@@ -186,6 +186,7 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         "agent:author",
         2,
         TaskEventKind::Noted {
+            claim: None,
             text: "gate wired; tests running".into(),
             session_ref: Some("sess-alpha-001".into()),
         },
@@ -259,6 +260,8 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         "agent:author",
         11,
         TaskEventKind::Done {
+            evidence: vec![],
+            disclosure: None,
             observed: Some("observed on origin/main by cv-verify".into()),
             // The retired `check` field (0.15.0): kept on the wire as the bytes a pre-0.15.0 cv
             // wrote, read through, never derived from.
@@ -358,7 +361,11 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         &c,
         "agent:owner",
         21,
-        TaskEventKind::BlockedBy { task: a.clone() },
+        TaskEventKind::BlockedBy {
+            require_success: false,
+            final_only: false,
+            task: a.clone(),
+        },
     );
     push(
         &mut events,
@@ -482,6 +489,7 @@ fn regenerate(log_path: &std::path::Path, snap_path: &std::path::Path) {
         "orchestrator:demo",
         32,
         TaskEventKind::Noted {
+            claim: None,
             text: "the measurement is in the report".into(),
             session_ref: None,
         },

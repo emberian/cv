@@ -75,7 +75,8 @@ impl Replacement {
     }
 }
 
-fn validation(command: &str) -> bool {
+/// A plain test, check, lint, or build invocation (no shell composition).
+pub fn validation(command: &str) -> bool {
     if command.len() > 4096 || command.contains(['\n', ';', '|', '&', '`', '>', '<', '$']) {
         return false;
     }

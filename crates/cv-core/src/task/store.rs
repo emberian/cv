@@ -874,7 +874,7 @@ pub struct Folded {
 /// as a `task-fold` record keyed by the log's path, and admitted only while the log is the same
 /// file, at least `offset` long, its prefix sampling as it did ([`crate::source::Prefix`]: an
 /// edit outside the samples is not seen, the limit every resume mark has).
-const STATE_FOLD_VERSION: u32 = 1;
+const STATE_FOLD_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Fold {
@@ -1044,6 +1044,8 @@ mod tests {
                 Some(&id),
                 "author",
                 TaskEventKind::Done {
+                    evidence: vec![],
+                    disclosure: None,
                     observed: None,
                     check: Some(serde_json::json!({"cmd":"old check"})),
                 },
@@ -1089,6 +1091,8 @@ mod tests {
                 Some(&task),
                 "agent:a",
                 TaskEventKind::Done {
+                    evidence: Vec::new(),
+                    disclosure: None,
                     observed: None,
                     check: None,
                 },
@@ -1121,6 +1125,7 @@ mod tests {
                 Some(&task),
                 "agent:a",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: t.into(),
                     session_ref: None,
                 },
@@ -1139,6 +1144,8 @@ mod tests {
             Some(&task),
             "agent:a",
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },
@@ -1225,6 +1232,7 @@ mod tests {
                 Some(&task),
                 "agent:a",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "hi".into(),
                     session_ref: None,
                 },
@@ -1260,6 +1268,7 @@ mod tests {
             Some(&task),
             "agent:a",
             TaskEventKind::Noted {
+                claim: None,
                 text: "completed evidence 🌙".into(),
                 session_ref: None,
             },
@@ -1279,6 +1288,8 @@ mod tests {
             Some(&task),
             "agent:a",
             TaskEventKind::Done {
+                evidence: Vec::new(),
+                disclosure: None,
                 observed: None,
                 check: None,
             },
@@ -1320,6 +1331,7 @@ mod tests {
                 Some(&opened.task_id),
                 "agent:a",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "still separate".into(),
                     session_ref: None,
                 },
@@ -1369,6 +1381,7 @@ mod tests {
                 Some(&task),
                 "agent:a",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "must not land".into(),
                     session_ref: None,
                 },
@@ -1394,6 +1407,7 @@ mod tests {
             Some(&task),
             "agent:a",
             TaskEventKind::Noted {
+                claim: None,
                 text: "recovered".into(),
                 session_ref: None,
             },
@@ -1439,6 +1453,7 @@ mod tests {
                     Some(&task),
                     "agent:a",
                     TaskEventKind::Noted {
+                        claim: None,
                         text: "must not erase unknown history".into(),
                         session_ref: None,
                     },
@@ -1507,6 +1522,7 @@ mod tests {
                 Some(&task),
                 "agent:a",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: text.into(),
                     session_ref: None,
                 },
@@ -1588,6 +1604,7 @@ mod tests {
             Some(&task),
             "agent:a",
             TaskEventKind::Noted {
+                claim: None,
                 text: "still here".into(),
                 session_ref: None,
             },
@@ -1905,6 +1922,7 @@ mod tests {
                 Some(&task_id),
                 "agent:seed",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: format!("note-{i}"),
                     session_ref: None,
                 },
@@ -1926,6 +1944,7 @@ mod tests {
                 Some(&task_id),
                 "agent:seed",
                 TaskEventKind::Noted {
+                    claim: None,
                     text: "note-51".into(),
                     session_ref: None,
                 },

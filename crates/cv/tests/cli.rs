@@ -5277,3 +5277,205 @@ fn cli_port_strict_stages_before_publish_and_runs_skills_in_stage() {
         "Hermes transaction & FTS5 triggers must roll back on --strict failure"
     );
 }
+
+// #tooth A veto only changes how a later read evaluates support.
+#[test]
+fn task_claim_veto_and_stronger_prerequisites_have_no_cascade() {
+    let w = World::new("task-conditional");
+    let open = |title: &str| {
+        w.cv_ok(&["task", "open", title, "--assignee", "worker"]);
+        task_id_titled(&w, title)
+    };
+    let work = open("consumer");
+    let abandoned = open("unsuccessful prerequisite");
+    w.cv_ok(&[
+        "task",
+        "decide",
+        "choose format",
+        "--for",
+        "owner",
+        "--default",
+        "old",
+        "--option",
+        "new",
+        "--provisional",
+        "--from",
+        "poser",
+    ]);
+    let d = task_id_titled(&w, "choose format");
+    w.cv_ok(&["task", "block", &work, "--by", &d, "--require-success"]);
+    assert!(w.cv_ok(&["task", "show", &work]).0.contains("⊘ BLOCKED"));
+    let claim =
+        serde_json::json!({"kind":"fail","scope":["src"],"any_of":[[{"kind":"choice_is","task":d,"choice":"old"}]]});
+    w.cv_ok(&["task", "note", &work, "old format fails", "--claim", &claim.to_string()]);
+    let feed = |scope: &str| w.cv_ok(&["task", "events", "--scope", scope]).0;
+    assert!(feed("src/ir.rs").contains("old format fails"));
+    assert!(feed("tests").is_empty());
+    let show = || serde_json::from_str::<serde_json::Value>(&w.cv_ok(&["task", "show", &work, "--json"]).0).unwrap();
+    let state = || {
+        show()["applicability"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(state(), "current");
+    let log = w.cv_home.join("tasks/events.jsonl");
+    let before = std::fs::read_to_string(&log).unwrap();
+    w.cv_ok(&["task", "resolve", &d, "--choice", "new", "--from", "owner"]);
+    let after = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(after.strip_prefix(&before).unwrap().lines().count(), 1);
+    assert_eq!(state(), "stale");
+    assert_eq!(std::fs::read_to_string(log).unwrap(), after);
+    assert!(!w.cv_ok(&["task", "show", &work]).0.contains("⊘ BLOCKED"));
+    w.cv_ok(&["task", "block", &work, "--by", &abandoned, "--require-success"]);
+    w.cv_ok(&["task", "abandon", &abandoned, "--reason", "withdrawn"]);
+    assert!(w.cv_ok(&["task", "show", &work]).0.contains("⊘ BLOCKED"));
+}
+
+#[test]
+fn task_stall_collapses_cycle_and_counts_a_lane_once() {
+    let w = World::new("task-stall");
+    let open = |title: &str| {
+        w.cv_ok(&["task", "open", title, "--assignee", "worker"]);
+        task_id_titled(&w, title)
+    };
+    let a = open("first");
+    let b = open("second");
+    w.cv_ok(&["task", "block", &a, "--by", &b]);
+    w.cv_ok(&["task", "block", &b, "--by", &a]);
+    let (out, _) = w.cv_ok(&["task", "inbox", "worker", "--sort", "stall", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    let mut ids = vec![a, b];
+    ids.sort();
+    assert_eq!(v["items"][0]["stall"]["cycle"], serde_json::json!(ids));
+    assert_eq!(v["items"][0]["stall"]["blocked_lanes"], 1);
+}
+
+// #tooth Agents post `--claim fail --scope ... --from claude:<session>` with zero DNF JSON, and
+// edits to the session's read files or vetoes of active provisional decisions flip it stale.
+#[test]
+fn task_note_ergonomic_claim_infers_session_files_and_provisional_decisions() {
+    let w = World::new("task-ergonomic-claim");
+    fs::create_dir_all(w.base.join("src")).unwrap();
+    let target = w.base.join("src/parser.rs");
+    let untouched = w.base.join("src/other.rs");
+    fs::write(&target, "pub fn parse() -> usize { 0 }\n").unwrap();
+    fs::write(&untouched, "pub fn helper() {}\n").unwrap();
+
+    // Session reads `src/parser.rs` (not `src/other.rs`).
+    w.write_session(
+        "investigator",
+        &[
+            claude::with(
+                user_line("investigator", "u1", "2026-03-01T10:00:00Z", "inspect parser"),
+                serde_json::json!({"cwd": w.base}),
+            ),
+            claude::with(
+                assistant_line(
+                    "a1",
+                    "2026-03-01T10:00:05Z",
+                    serde_json::json!([
+                        {"type":"tool_use","id":"r1","name":"Read","input":{"file_path": target}}
+                    ]),
+                ),
+                serde_json::json!({"cwd": w.base}),
+            ),
+        ],
+    );
+
+    w.cv_ok(&[
+        "task",
+        "open",
+        "investigate parser",
+        "--repo",
+        w.base.to_str().unwrap(),
+        "--assignee",
+        "worker",
+    ]);
+    let work = task_id_titled(&w, "investigate parser");
+    w.cv_ok(&[
+        "task",
+        "decide",
+        "error recovery policy",
+        "--repo",
+        w.base.to_str().unwrap(),
+        "--for",
+        "owner",
+        "--default",
+        "abort",
+        "--option",
+        "recover",
+        "--provisional",
+        "--from",
+        "poser",
+    ]);
+    let dec = task_id_titled(&w, "error recovery policy");
+
+    // Post a scoped failure using ergonomic flags — no JSON or blake3 digest typed by hand.
+    w.cv_ok(&[
+        "task",
+        "note",
+        &work,
+        "parser returns 0 on malformed header",
+        "--claim",
+        "fail",
+        "--scope",
+        "src",
+        "--from",
+        "claude:investigator",
+    ]);
+
+    let status = || {
+        let out = w.cv_ok(&["task", "show", &work, "--json"]).0;
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let claim = &doc["notes"][0]["claim"];
+        let atoms = claim["any_of"][0].as_array().expect("auto-populated conjunction");
+        assert!(
+            atoms
+                .iter()
+                .any(|a| a["kind"] == "file_at" && a["path"] == "src/parser.rs"),
+            "expected src/parser.rs FileAt in {claim}"
+        );
+        assert!(
+            !atoms.iter().any(|a| a["path"] == "src/other.rs"),
+            "unvisited sibling file must not be pinned: {claim}"
+        );
+        assert!(
+            atoms
+                .iter()
+                .any(|a| a["kind"] == "choice_is" && a["task"] == dec && a["choice"] == "abort"),
+            "expected provisional ChoiceIs in {claim}"
+        );
+        doc["applicability"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    assert_eq!(status(), "current");
+    assert!(w.cv_ok(&["pack", &work]).0.contains("Known Open Failures / Dead Ends"));
+
+    // Editing the untouched sibling file keeps the finding Current.
+    fs::write(&untouched, "pub fn helper() { /* changed */ }\n").unwrap();
+    assert_eq!(status(), "current");
+
+    // Editing `src/parser.rs` flips the finding Stale automatically.
+    fs::write(&target, "pub fn parse() -> Result<usize, ()> { Err(()) }\n").unwrap();
+    assert_eq!(status(), "stale");
+    assert!(!w.cv_ok(&["pack", &work]).0.contains("Known Open Failures / Dead Ends"));
+
+    // Restore `src/parser.rs`, then veto the provisional decision: also flips Stale.
+    fs::write(&target, "pub fn parse() -> usize { 0 }\n").unwrap();
+    assert_eq!(status(), "current");
+    w.cv_ok(&["task", "resolve", &dec, "--choice", "recover", "--from", "owner"]);
+    assert_eq!(status(), "stale");
+}

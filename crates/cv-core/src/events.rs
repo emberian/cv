@@ -22,6 +22,8 @@
 //! Like [`crate::catalog`], the persistence side is best-effort: SQLite errors degrade to empty
 //! results / no-ops with a named diagnostic, never silently failing the caller.
 
+#[path = "events_workspace.rs"]
+pub mod workspace;
 use crate::ir::{Block, Message, Session, SessionRef};
 use crate::json::{Json, JsonView};
 use crate::stream::{Checkpoint, Flow, MessageSink};

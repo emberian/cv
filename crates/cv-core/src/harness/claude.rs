@@ -425,6 +425,10 @@ impl Adapter for Claude {
         hook::hook_event(payload)
     }
 
+    fn agent_session_id(&self, agent: &str) -> Option<String> {
+        Some(format!("agent-{}", agent.strip_prefix("agent-").unwrap_or(agent)))
+    }
+
     fn agent_transcript(&self, parent: &SessionRef, agent_session: &str, workflow: Option<&str>) -> Option<PathBuf> {
         hook::agent_transcript(&parent.path, agent_session, workflow)
     }

@@ -1172,34 +1172,7 @@ impl StateStore {
     /// Returns the number of verified links, or an error naming the exact broken link.
     pub fn verify_receipt_chain(&self, session_id: &str) -> Result<usize, StateError> {
         let chain = self.receipts_for_session(session_id)?;
-        let mut expected_prev = String::new();
-        for (expected_seq, rec) in (1u64..).zip(chain.iter()) {
-            if rec.seq != expected_seq {
-                return Err(StateError::InvalidArgument(format!(
-                    "receipt chain gap in session `{session_id}`: expected seq {expected_seq}, found {}",
-                    rec.seq
-                )));
-            }
-            if rec.prev_hash != expected_prev {
-                return Err(StateError::InvalidArgument(format!(
-                    "receipt chain prev_hash mismatch at seq {}: expected `{expected_prev}`, found `{}`",
-                    rec.seq, rec.prev_hash
-                )));
-            }
-            let mut without_h = rec.body.clone();
-            if let Some(obj) = without_h.as_object_mut() {
-                obj.remove("h");
-            }
-            let computed = compute_receipt_hash(&expected_prev, &without_h);
-            if computed != rec.receipt_hash {
-                return Err(StateError::InvalidArgument(format!(
-                    "receipt chain tampered at seq {}: computed `{computed}` != stored `{}`",
-                    rec.seq, rec.receipt_hash
-                )));
-            }
-            expected_prev = rec.receipt_hash.clone();
-        }
-        Ok(chain.len())
+        verify_receipt_records(session_id, &chain)
     }
 
     // ───────────────────────── Lineage Edges ─────────────────────────
@@ -1460,6 +1433,37 @@ pub fn is_lane_run_alive(run: &LaneRun) -> bool {
     }
 }
 
+pub(crate) fn verify_receipt_records(session_id: &str, chain: &[ReceiptRecord]) -> Result<usize, StateError> {
+    let mut expected_prev = String::new();
+    for (expected_seq, rec) in (1u64..).zip(chain.iter()) {
+        if rec.seq != expected_seq {
+            return Err(StateError::InvalidArgument(format!(
+                "receipt chain gap in session `{session_id}`: expected seq {expected_seq}, found {}",
+                rec.seq
+            )));
+        }
+        if rec.prev_hash != expected_prev {
+            return Err(StateError::InvalidArgument(format!(
+                "receipt chain prev_hash mismatch at seq {}: expected `{expected_prev}`, found `{}`",
+                rec.seq, rec.prev_hash
+            )));
+        }
+        let mut without_h = rec.body.clone();
+        if let Some(obj) = without_h.as_object_mut() {
+            obj.remove("h");
+        }
+        let computed = compute_receipt_hash(&expected_prev, &without_h);
+        if computed != rec.receipt_hash {
+            return Err(StateError::InvalidArgument(format!(
+                "receipt chain tampered at seq {}: computed `{computed}` != stored `{}`",
+                rec.seq, rec.receipt_hash
+            )));
+        }
+        expected_prev = rec.receipt_hash.clone();
+    }
+    Ok(chain.len())
+}
+
 fn insert_receipt_in_tx(
     tx: &rusqlite::Connection,
     session_id: &str,
@@ -1529,6 +1533,16 @@ fn insert_receipt_in_tx(
         ],
     )?;
 
+    if let Some(call) = tool_use_id.as_deref() {
+        crate::events::workspace::record(
+            tx,
+            harness,
+            session_id,
+            agent_id.as_deref().unwrap_or(""),
+            call,
+            &full_body,
+        )?;
+    }
     Ok(ReceiptRecord {
         session_id: session_id.to_string(),
         seq,

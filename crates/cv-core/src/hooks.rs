@@ -206,15 +206,20 @@ impl EditGuard {
     }
 }
 
-/// The edit guard for the session an [`Event`] speaks for, and its one lineage rule: an edit the
-/// same writer already made is never a conflict. Where the guard can ask, the writer is the
-/// session's own agent (a sibling, the parent or a child gets the question); where it can only
-/// deny, the writer is the whole lineage tree, every session the `Session::lineage` parents lead
-/// to the same root (a swarm shares its files on purpose, and a deny would stop it).
+/// Writer identity relative to this hook call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    Own,
+    Kin,
+    Stranger,
+    Unknown,
+}
+
 pub struct Guard {
     pub decision: EditGuard,
     adapter: &'static dyn crate::harness::Adapter,
-    root: String,
+    root: Option<String>,
+    session: String,
     agent: Option<String>,
     ledger: std::sync::Arc<crate::lanes::LedgerIndex>,
 }
@@ -225,7 +230,7 @@ impl Guard {
         let adapter = crate::harness::rootless(ev.harness)?;
         let decision = adapter.capabilities().edit_guard?;
         let (root, ledger) = match decision {
-            EditGuard::Ask => (ev.session.id.clone(), Default::default()),
+            EditGuard::Ask => (Some(ev.session.id.clone()), Default::default()),
             EditGuard::Deny => {
                 let ledger = crate::lanes::ledger_index();
                 (lineage_root(adapter, &ev.session.id, ev.transcript(), &ledger), ledger)
@@ -235,19 +240,33 @@ impl Guard {
             decision,
             adapter,
             root,
+            session: ev.session.id.clone(),
             agent: ev.agent.as_ref().map(|a| a.id.clone()),
             ledger,
         })
     }
 
-    /// Whether `t`'s edits (its transcript at `transcript`) are this writer's own.
-    pub fn exempts(&self, t: &crate::events::TouchedSession, transcript: &Path) -> bool {
-        if t.harness != self.adapter.harness().as_str() {
-            return false;
+    pub fn relation(&self, t: &crate::events::TouchedSession, transcript: &Path) -> Relation {
+        if self.session.is_empty() || t.session_id.is_empty() || Harness::parse(&t.harness).is_none() {
+            return Relation::Unknown;
         }
+        if t.harness != self.adapter.harness().as_str() {
+            return Relation::Stranger;
+        }
+        let parent = t.parent_id.as_deref().unwrap_or(&t.session_id);
         match self.decision {
-            EditGuard::Ask => t.parent_id.as_deref().unwrap_or(&t.session_id) == self.root && t.agent_id == self.agent,
-            EditGuard::Deny => lineage_root(self.adapter, &t.session_id, Some(transcript), &self.ledger) == self.root,
+            EditGuard::Ask if parent == self.session && t.agent_id == self.agent => Relation::Own,
+            EditGuard::Ask if parent == self.session => Relation::Kin,
+            EditGuard::Ask => Relation::Stranger,
+            EditGuard::Deny if self.session == t.session_id => Relation::Own,
+            EditGuard::Deny => match (
+                &self.root,
+                lineage_root(self.adapter, &t.session_id, Some(transcript), &self.ledger),
+            ) {
+                (Some(a), Some(b)) if *a == b => Relation::Kin,
+                (Some(_), Some(_)) => Relation::Stranger,
+                _ => Relation::Unknown,
+            },
         }
     }
 }
@@ -261,18 +280,23 @@ fn lineage_root(
     id: &str,
     path: Option<&Path>,
     ledger: &crate::lanes::LedgerIndex,
-) -> String {
+) -> Option<String> {
     let mut id = id.to_string();
     let mut path = path.map(Path::to_path_buf);
+    let mut seen = std::collections::HashSet::new();
     for _ in 0..16 {
+        if !seen.insert(id.clone()) {
+            return None;
+        }
         let registered = ledger.latest_start(&id);
-        let parent = path
-            .as_deref()
-            // An unreadable header falls back to the ledger's registration.
-            .and_then(|p| adapter.hook_lineage(p).ok().flatten())
+        let header = path.as_deref().and_then(|p| adapter.hook_lineage(p).ok().flatten());
+        let known = header.is_some();
+        let parent = header
             .and_then(|l| l.parent)
-            .or_else(|| registered.map(|row| row.session_id.clone()));
-        let Some(parent) = parent else { return id };
+            .or_else(|| registered.map(|r| r.session_id.clone()));
+        let Some(parent) = parent else {
+            return known.then_some(id);
+        };
         path = crate::catalog::lookup(&parent, Some(adapter.harness()))
             .into_iter()
             .find(|r| r.id == parent)
@@ -280,7 +304,7 @@ fn lineage_root(
             .or_else(|| registered.and_then(|row| row.transcript_path.clone()));
         id = parent;
     }
-    id
+    None
 }
 
 /// The transcript behind a session the edit index names, without a scan: the parent's own store
@@ -322,7 +346,7 @@ mod tests {
         let exempts = |agent: Option<&str>, t: &crate::events::TouchedSession| {
             let guard = Guard::of(&event(agent)).unwrap();
             assert_eq!(guard.decision, EditGuard::Ask);
-            guard.exempts(t, Path::new("/t.jsonl"))
+            guard.relation(t, Path::new("/t.jsonl")) == Relation::Own
         };
         let mut touched = crate::events::TouchedSession {
             harness: "claude".into(),

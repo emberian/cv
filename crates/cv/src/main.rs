@@ -1003,6 +1003,12 @@ enum Cmd {
     },
     /// Compile a context bundle from selected sessions or sessions recalled for a task.
     Pack {
+        /// Produce a blind review from the task and tracked checkout changes.
+        #[arg(long)]
+        review: bool,
+        /// Include retired support and quarantined test-runner changes.
+        #[arg(long)]
+        all: bool,
         /// What you're about to work on — recall finds relevant spans, or focuses the selected sessions.
         #[arg(required_unless_present = "sessions")]
         task: Option<String>,
@@ -1529,6 +1535,8 @@ fn run() -> Result<()> {
             no_redact,
         } => share::cmd_share(&id, harness, out, force, no_redact),
         Cmd::Pack {
+            review,
+            all,
             task,
             sessions,
             format,
@@ -1540,6 +1548,8 @@ fn run() -> Result<()> {
             json,
             excerpt_bytes,
         } => pack::cmd_pack(pack::PackArgs {
+            review,
+            all,
             task: task.as_deref(),
             sessions: &sessions,
             format: &format,

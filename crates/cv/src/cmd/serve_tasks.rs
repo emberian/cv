@@ -158,6 +158,7 @@ fn api_events(q: &Query) -> Result<String> {
         None => None,
     };
     let f = EventFilter {
+        scope: q.get("scope").map(Into::into),
         since: Since::parse(q.get("since").as_deref(), now)?,
         kinds: q
             .get("kind")
@@ -231,6 +232,13 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                 Some(&id),
                 &by,
                 TaskEventKind::Done {
+                    evidence: body
+                        .get("evidence")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    disclosure: text("disclosure"),
                     observed: text("observed"),
                     check: None,
                 },
@@ -242,13 +250,41 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
             let Some(t) = text("text") else {
                 bail!("a note needs text")
             };
+            let sref = text("session_ref");
+            let scopes: Vec<String> = body
+                .get("scope")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let resolves: Vec<String> = body
+                .get("resolves")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let raw_claim = match body.get("claim") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(other) => Some(serde_json::to_string(other)?),
+            };
+            let claim = task_ops::build_note_claim(
+                &outcome.model,
+                &id,
+                raw_claim.as_deref(),
+                &scopes,
+                &resolves,
+                sref.as_deref(),
+                who,
+            )?;
             let out = task::append(
                 store,
                 Some(&id),
                 &by,
                 TaskEventKind::Noted {
+                    claim,
                     text: t,
-                    session_ref: None,
+                    session_ref: sref,
                 },
                 Vec::new(),
             )?;
@@ -264,6 +300,7 @@ fn act_in(store: &TaskStore, id: &str, verb: &str, who: &str, body: &Value) -> R
                         Some(&id),
                         &by,
                         TaskEventKind::Noted {
+                            claim: None,
                             text: format!("NEEDS DISCUSSION: {detail}"),
                             session_ref: None,
                         },
