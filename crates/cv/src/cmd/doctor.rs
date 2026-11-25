@@ -408,10 +408,78 @@ fn print_report(
         }
     }
 
+    for line in trajectory_lines(rep) {
+        println!("{line}");
+    }
+
     println!("\nVerdict: {}", verdict(rep));
     if n_targets == 1 && rep.sessions == 1 {
         println!("  (analyze your whole project: `cv doctor --recent 20`)");
     }
+}
+
+/// The trajectory sensors, only where they found something: lossy seams, summary tokens nobody
+/// said before the compaction, and read/search spins.
+fn trajectory_lines(rep: &Report) -> Vec<String> {
+    use cv_core::sanitize::sanitize_line;
+    let at = |session: &Option<String>, index: usize| match session {
+        Some(id) if rep.sessions > 1 => format!("{} @msg {index}", crate::util::short_id(id)),
+        _ => format!("@msg {index}"),
+    };
+    let mut out = Vec::new();
+    let lossy: Vec<_> = rep.post_compaction_churn.iter().filter(|s| s.lossy).collect();
+    if !lossy.is_empty() {
+        out.push(format!(
+            "\nLossy compactions ({} of {} seams; re-reads + errors in the next {} turns):",
+            lossy.len(),
+            rep.post_compaction_churn.len(),
+            cv_core::doctor::CHURN_TURNS_AFTER
+        ));
+        for s in lossy {
+            out.push(format!(
+                "  {:<24} {} re-read(s) · {} error(s) / {} call(s)  churn {:.2}  {}",
+                at(&s.session, s.index),
+                s.rereads,
+                s.tool_errors,
+                s.tool_calls,
+                s.churn_rate,
+                sanitize_line(&s.reread_paths.join(" "))
+            ));
+        }
+    }
+    let flagged: Vec<_> = rep
+        .summary_provenance_contrast
+        .iter()
+        .filter(|s| s.unwitnessed_count > 0)
+        .collect();
+    if !flagged.is_empty() {
+        out.push("\nCompaction summaries naming URLs, commands or paths nobody said before them:".into());
+        for s in flagged {
+            out.push(format!(
+                "  {:<24} {} of {}: {}",
+                at(&s.session, s.index),
+                s.unwitnessed_count,
+                s.candidates,
+                sanitize_line(&s.unwitnessed.join(" · "))
+            ));
+        }
+    }
+    if !rep.spin_episodes.is_empty() {
+        out.push(format!(
+            "\nSpin episodes ({}; identical read/search calls in a row):",
+            rep.spin_episodes.len()
+        ));
+        for s in rep.spin_episodes.iter().take(8) {
+            out.push(format!(
+                "  {:<24} {}× {}  {}",
+                at(&s.session, s.index),
+                s.calls,
+                sanitize_line(&s.tool),
+                cv_core::ir::truncate(&sanitize_line(&s.input), 100)
+            ));
+        }
+    }
+    out
 }
 
 fn store_health_summary_line(h: &StoreHealthReport) -> String {

@@ -26,6 +26,7 @@
 - Antigravity fills truncated export fields from matching native steps while retaining exported bodies for cleared rows.
 - Observational hooks use bounded input and a nonblocking recorder queue. Quiet starts emit zero bytes, and actionable pointers are deduplicated per condition revision.
 - Doctor reports five-tool-turn follow-up counts by whisper kind.
+- Doctor reports post-compaction re-read churn, compaction-summary URLs, commands and paths nobody said earlier, and repeated identical read/search spins.
 - Lane and event JSON expose validated causal identifiers supplied through `CV_BAGGAGE`.
 - Harden Markdown fences, neutralize forged role and section headers, preserve non-human seed provenance across distills and ports, and omit titles from SessionStart hooks.
 - Task notes support conditional facts and failures that go stale when pinned files, sessions, or tasks move. Stall ordering exposes waiting work.

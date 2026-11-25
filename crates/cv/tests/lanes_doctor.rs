@@ -399,6 +399,12 @@ fn doctor_separates_post_compaction_active_window_from_history_and_reports_store
     let (doc_json, _) = w.cv_ok(&["doctor", sid, "--json"]);
     let doc: Value = serde_json::from_str(&doc_json).unwrap();
 
+    // The trajectory sensors ride the same pass: one seam, one summary, no spins.
+    assert_eq!(doc["post_compaction_churn"].as_array().unwrap().len(), 1, "{doc}");
+    assert_eq!(doc["post_compaction_churn"][0]["session"], sid);
+    assert_eq!(doc["summary_provenance_contrast"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["spin_episodes"], serde_json::json!([]));
+
     // Active window vs lifetime history checks.
     let aw = &doc["active_window"];
     let hist = &doc["history"];
