@@ -4351,8 +4351,9 @@ mod tests {
             }
             expected = body_hash(expected, &x[..input_bytes % x.len()]);
             expected = body_hash(expected, suffix);
-            for n in 0..copies {
-                let body = &result.observed.bodies[&format!("large{n}")];
+            // Documents are keyed by the composite session selector.
+            for large in refs.iter().take(copies) {
+                let body = &result.observed.bodies[&large.session_selector()];
                 assert_eq!(body.bytes, prefix.len() + input_bytes + suffix.len());
                 assert_eq!(body.hash, expected);
             }

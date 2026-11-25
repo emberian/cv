@@ -218,6 +218,7 @@ SHELL_DOCTOR_EXPECTED = {
         "by_attachment": {"injected_context": 13421804},
         "tool_results_mcp": 0, "tool_results_builtin": 0, "by_tool": [],
     },
+    "whisper_uptake": {},
 }
 
 
