@@ -35,6 +35,7 @@
 //! that order and marks the compaction boundary, so a consumer can see which entries the
 //! compaction kept without re-deriving it.
 
+pub mod branch;
 pub(crate) mod record;
 
 use super::{parse_ts, ts_from_value, Adapter, Discovered, ResumeEnv};

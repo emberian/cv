@@ -52,12 +52,15 @@ kept reply whose turn's tool results were all dropped or pointered "rests on not
 (`plan.rests_on_nothing` in `--json`).
 
 **Other harnesses.** Claude Code sessions are rewound and pruned record by record. Codex, Gemini,
-OpenCode, Qwen and OpenSession sessions (any harness with a verified emitter, and OpenSession
+OpenCode, Qwen, Pi and OpenSession sessions (any harness with a verified emitter, and OpenSession
 documents) are rewound and pruned by selection: cv reads the session into the IR, selects the
 prefix through `--at` (a message index or a commit sha, as for Claude) or replaces each tool output
 over `--min-size` before the last `--keep-last` messages with a `[PRUNED …]` marker, and emits the
 result under a fresh id to the same harness (`--out <dir>`, else its store), reading it back to
-report what the target did not keep. A prune writes the originals to `<new_id>.flat.jsonl` beside
+report what the target did not keep. Pi has no emitter: its selection is written as a native
+branch of the source file, beside it as `<created>_<new-id>.jsonl` (or under `--out`), holding the
+header under the new id and every entry on the chain from the root to the cut, bytes unchanged
+except each pruned result's text; abandoned sibling branches are left out. A prune writes the originals to `<new_id>.flat.jsonl` beside
 the new session, so `cv cat <new-id> <tool_use_id>` answers every marker. Flags that edit Claude
 records (`--plan`, `--window`, `--range`, `--declassify`, `--drop-thinking`, `--carry-agents`,
 `--skills`, `--uncompact`) refuse there with exit 2. Pass `--harness` with a transcript path whose

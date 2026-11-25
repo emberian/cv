@@ -5525,16 +5525,40 @@ fn reshape_lane(w: &World) -> PathBuf {
     )
 }
 
-// #tooth Codex, Gemini and OpenSession sessions rewind and prune by IR selection and verified
-// emission: a rewind at a commit ends at its result; a prune's markers name the new id and its
-// `<new_id>.flat.jsonl` sidecar answers `cv cat` with the original output.
+/// The reshape lane as a Pi v3 tree, written by hand (Pi is read, not a port target), with an
+/// abandoned sibling branch after the build output.
+fn reshape_lane_pi(dir: &std::path::Path) -> PathBuf {
+    use serde_json::json;
+    let big = "build line\n".repeat(400);
+    let rows = [
+        json!({"type":"session","version":3,"id":"pi-reshape","cwd":"/work","timestamp":"2026-01-01T10:00:00Z"}),
+        json!({"type":"message","id":"u1","parentId":"pi-reshape","timestamp":"2026-01-01T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Ship the parser fix."}]}}),
+        json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T10:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"toolu_big","name":"bash","arguments":{"command":"make all"}}]}}),
+        json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T10:00:02Z","message":{"role":"toolResult","toolCallId":"toolu_big","toolName":"bash","content":[{"type":"text","text":big}],"isError":false}}),
+        json!({"type":"message","id":"dead","parentId":"r1","timestamp":"2026-01-01T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"An abandoned branch."}]}}),
+        json!({"type":"message","id":"a2","parentId":"r1","timestamp":"2026-01-01T10:00:03Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"toolu_commit","name":"bash","arguments":{"command":"git commit -am fix"}}]}}),
+        json!({"type":"message","id":"r2","parentId":"a2","timestamp":"2026-01-01T10:00:04Z","message":{"role":"toolResult","toolCallId":"toolu_commit","toolName":"bash","content":[{"type":"text","text":"[main 4f2a9c1] fix the parser\n 1 file changed"}],"isError":false}}),
+        json!({"type":"message","id":"a3","parentId":"r2","timestamp":"2026-01-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"Later work after the commit."}]}}),
+    ];
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("2026-01-01T10-00-00-000Z_pi-reshape.jsonl");
+    fs::write(&path, rows.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+    path
+}
+
+// #tooth Codex, Gemini, OpenSession and Pi sessions rewind and prune by IR selection and verified
+// emission (Pi's as a native branch of its own file): a rewind at a commit ends at its result; a
+// prune's markers name the new id and its `<new_id>.flat.jsonl` sidecar answers `cv cat` with
+// the original output.
 #[test]
 fn rewind_and_prune_reshape_codex_gemini_and_opensession_by_selection() {
     let w = World::new("reshape-ir");
     reshape_lane(&w);
-    for harness in ["codex", "gemini", "opensession"] {
+    for harness in ["codex", "gemini", "opensession", "pi"] {
         let ported = w.base.join(format!("port-{harness}"));
-        let source = if harness == "opensession" {
+        let source = if harness == "pi" {
+            reshape_lane_pi(&ported).to_str().unwrap().to_string()
+        } else if harness == "opensession" {
             // OpenSession is a document format: `export --format json` writes it.
             let (doc, _) = w.cv_ok(&["export", "claude:reshape-lane", "--format", "json"]);
             fs::create_dir_all(&ported).unwrap();
@@ -5576,6 +5600,14 @@ fn rewind_and_prune_reshape_codex_gemini_and_opensession_by_selection() {
         assert!(shown.contains("Ship the parser fix."), "{harness}: {shown}");
         assert!(shown.contains("fix the parser"), "{harness}: {shown}");
         assert!(!shown.contains("Later work after the commit."), "{harness}: {shown}");
+        if harness == "pi" {
+            let written = fs::read_to_string(new_path).unwrap();
+            assert!(!written.contains("An abandoned branch."), "{written}");
+            assert!(new_path.ends_with(&format!(
+                "2026-01-01T10-00-00-000Z_{}.jsonl",
+                rw["new_id"].as_str().unwrap()
+            )));
+        }
 
         let pruned = w.base.join(format!("prune-{harness}"));
         let (out, err) = w.cv_ok(&[

@@ -451,11 +451,12 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
 }
 
 /// Harnesses rewound and pruned by IR selection and verified emission: every target with an
-/// emitter that is not Claude (record derivation) or native Antigravity (cold rewind).
+/// emitter that is not Claude (record derivation) or native Antigravity (cold rewind), and Pi,
+/// whose selection is written as a native branch of its own file.
 fn ir_reshapeable(h: Harness) -> bool {
     !cv_core::harness::has_derived_copies(h)
         && !cv_core::harness::has_cold_rewind(h)
-        && (h == Harness::OpenSession || cv_core::emit::supported_targets().contains(&h))
+        && (matches!(h, Harness::OpenSession | Harness::Pi) || cv_core::emit::supported_targets().contains(&h))
 }
 
 /// Where a selected session is written: `--out`, else the harness's own store.
@@ -468,9 +469,20 @@ fn ir_out_dir(h: Harness, out: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-/// Emit an IR selection under `new_id` to its own harness with read-back verification. Returns
-/// the written path and the conversion losses the target's reader reported.
-fn emit_ir(session: &Session, target: Harness, out: Option<PathBuf>, new_id: &str) -> Result<(PathBuf, Vec<String>)> {
+/// Emit an IR selection of `source` under `new_id` to its own harness with read-back
+/// verification. Returns the written path and the conversion losses the target's reader reported.
+fn emit_ir(
+    session: &Session,
+    source: &std::path::Path,
+    target: Harness,
+    out: Option<PathBuf>,
+    new_id: &str,
+) -> Result<(PathBuf, Vec<String>)> {
+    if target == Harness::Pi {
+        // A branch of the source file, written beside it unless `--out` says otherwise.
+        let dir = out.unwrap_or_else(|| source.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+        return cv_core::harness::pi::branch::write(source, session, &dir, new_id);
+    }
     let out_dir = ir_out_dir(target, out)?;
     if target == Harness::OpenSession {
         // An OpenSession document is the IR's own serialization: written whole, then read back.
@@ -582,7 +594,7 @@ fn prune_ir(r: &cv_core::ir::SessionRef, args: IrPruneArgs) -> Result<()> {
         "lost": [],
     });
     if !dry_run {
-        let (path, lost) = emit_ir(&pruned.session, r.harness, out, &new_id)?;
+        let (path, lost) = emit_ir(&pruned.session, &r.path, r.harness, out, &new_id)?;
         let sidecar = (!pruned.stashed.is_empty()).then(|| ir_sidecar_path(&path, &new_id));
         if let Some(sc) = &sidecar {
             cv_core::distill::write_sidecar(sc, &pruned.stashed, cv_core::publish::Claim::New)
@@ -670,7 +682,7 @@ fn rewind_ir(
         "lost": [],
     });
     if !dry_run {
-        let (path, lost) = emit_ir(&session, r.harness, out, &new_id)?;
+        let (path, lost) = emit_ir(&session, &r.path, r.harness, out, &new_id)?;
         let _ = writeln!(h, "  new session: {}", path.display());
         for line in &lost {
             let _ = writeln!(h, "  ⚠ lost {line}");
