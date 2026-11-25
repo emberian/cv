@@ -419,7 +419,7 @@ fn print_report(
 }
 
 /// The trajectory sensors, only where they found something: lossy seams, summary tokens nobody
-/// said before the compaction, and read/search spins.
+/// said before the compaction, read/search spins, and oversized instruction files.
 fn trajectory_lines(rep: &Report) -> Vec<String> {
     use cv_core::sanitize::sanitize_line;
     let at = |session: &Option<String>, index: usize| match session {
@@ -430,19 +430,24 @@ fn trajectory_lines(rep: &Report) -> Vec<String> {
     let lossy: Vec<_> = rep.post_compaction_churn.iter().filter(|s| s.lossy).collect();
     if !lossy.is_empty() {
         out.push(format!(
-            "\nLossy compactions ({} of {} seams; re-reads + errors in the next {} turns):",
+            "\nLossy compactions ({} of {} seams; errors + corrections in the next {} turns, re-reads are expected):",
             lossy.len(),
             rep.post_compaction_churn.len(),
             cv_core::doctor::CHURN_TURNS_AFTER
         ));
         for s in lossy {
+            let [near, full] = &s.windows;
             out.push(format!(
-                "  {:<24} {} re-read(s) · {} error(s) / {} call(s)  churn {:.2}  {}",
+                "  {:<24} {} error(s) ({} repeated) · {} correction(s) / {} call(s)  churn {:.2}  first {} turns: {}  · {} re-read(s) {}",
                 at(&s.session, s.index),
-                s.rereads,
-                s.tool_errors,
-                s.tool_calls,
+                full.tool_errors,
+                full.repeated_failures,
+                full.corrections,
+                full.tool_calls,
                 s.churn_rate,
+                near.k,
+                near.repeated_failures_and_corrections,
+                full.eviction_rereads,
                 sanitize_line(&s.reread_paths.join(" "))
             ));
         }
@@ -476,6 +481,22 @@ fn trajectory_lines(rep: &Report) -> Vec<String> {
                 s.calls,
                 sanitize_line(&s.tool),
                 cv_core::ir::truncate(&sanitize_line(&s.input), 100)
+            ));
+        }
+    }
+    if !rep.instruction_bloat.is_empty() {
+        out.push(format!(
+            "\nInstruction files over {} words (carried every turn; estimates):",
+            cv_core::doctor::INSTRUCTION_BLOAT_WORDS
+        ));
+        for b in rep.instruction_bloat.iter().take(8) {
+            out.push(format!(
+                "  {:<24} {} words · ~{} tokens · loaded {}×  {}",
+                at(&b.session, b.index),
+                b.words,
+                b.tokens_est,
+                b.loads,
+                sanitize_line(&b.path)
             ));
         }
     }

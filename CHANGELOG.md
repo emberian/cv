@@ -28,7 +28,8 @@
 - Observational hooks use bounded input and a nonblocking recorder queue. Quiet starts emit zero bytes, and actionable pointers are deduplicated per condition revision.
 - Doctor reports five-tool-turn follow-up counts by whisper kind.
 - `show --kind files` and `/api/session/{harness}/{id}/files` list reads, writes and edits, each verified against later commits, the checkout, or the transcript.
-- Doctor reports post-compaction re-read churn, compaction-summary URLs, commands and paths nobody said earlier, and repeated identical read/search spins.
+- Doctor reports post-compaction eviction re-reads apart from errors and corrections, unwitnessed compaction-summary URLs, commands and paths, and read/search spins.
+- Doctor flags loaded instruction files (CLAUDE.md, AGENTS.md, memory indexes) over 600 words, with word and token estimates.
 - Lane and event JSON expose validated causal identifiers supplied through `CV_BAGGAGE`.
 - Lanes carry an `attention` state (needs_you, working, stale, idle, done), sorted most urgent first, and report hook/transcript `witness_divergence`.
 - `/api/stream` announces `lanes` and `files` changes and, given `lanes=` or `files=`, pushes that session's compact lane rows or latest file touch.

@@ -1,31 +1,56 @@
 //! Trajectory sensors folded in the same streamed doctor pass: what happened right after each
 //! compaction (`post_compaction_churn`), what a compaction summary says that nobody said before
-//! it (`summary_provenance_contrast`), and repeated identical reads (`spin_episodes`).
+//! it (`summary_provenance_contrast`), repeated identical reads (`spin_episodes`), and loaded
+//! instruction files long enough to crowd every turn (`instruction_bloat`).
 //!
-//! All three are deterministic counts over message order. A turn is one assistant response:
+//! All four are deterministic counts over message order. A turn is one assistant response:
 //! consecutive assistant records sharing a response key ([`crate::stats::usage_key`]) are one turn.
 
 use crate::ir::{Block, Message, MessageKind, Origin, Role};
 use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
 /// Turns inspected after each compaction seam.
 pub const CHURN_TURNS_AFTER: usize = 6;
+/// The windows each seam is counted over: the first 3 turns and all [`CHURN_TURNS_AFTER`].
+pub const CHURN_WINDOWS: [usize; 2] = [3, CHURN_TURNS_AFTER];
 /// Pre-compaction turns whose reads count as already known.
 pub const CHURN_TURNS_BEFORE: usize = 12;
-/// A seam is lossy when at least this many re-reads and errors follow it…
+/// A seam is lossy when at least this many tool errors and human corrections follow it in the
+/// full window…
 pub const LOSSY_MIN_EVENTS: u64 = 2;
-/// …and they make up at least this share of the window's tool calls.
-pub const LOSSY_MIN_RATE: f64 = 0.5;
+/// …at a rate of at least this many per tool call.
+pub const LOSSY_MIN_RATE: f64 = 0.25;
+/// A loaded instruction file longer than this many words is reported.
+pub const INSTRUCTION_BLOAT_WORDS: usize = 600;
 /// Identical consecutive read/search calls that make a spin.
 pub const SPIN_MIN_CALLS: usize = 4;
 /// Unwitnessed tokens listed per summary (the count is exact).
 const UNWITNESSED_SHOWN: usize = 12;
 /// Witness vocabulary cap; past it, further tokens are not recorded (biasing toward flagging).
 const WITNESS_CAP: usize = 500_000;
+
+/// What followed one compaction seam within its first `k` turns. Records re-emitted under an
+/// already-counted message id or tool call id count once.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ChurnWindow {
+    pub k: usize,
+    pub tool_calls: u64,
+    /// The expected cost of compaction: reads of files already read in the
+    /// [`CHURN_TURNS_BEFORE`] turns before the seam, whose contents it evicted.
+    pub eviction_rereads: u64,
+    pub tool_errors: u64,
+    /// Failed calls whose tool and input already failed in this window (a subset of
+    /// `tool_errors`).
+    pub repeated_failures: u64,
+    /// Human prompts that read as a correction ("no, …", "I already said …").
+    pub corrections: u64,
+    /// The suspect regressions: `tool_errors + corrections`.
+    pub repeated_failures_and_corrections: u64,
+}
 
 /// What followed one compaction seam.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -36,15 +61,33 @@ pub struct ChurnSeam {
     pub index: usize,
     /// Turns inspected (at most [`CHURN_TURNS_AFTER`]; fewer when the session ends).
     pub turns: usize,
-    pub tool_calls: u64,
-    /// Reads of files already read in the [`CHURN_TURNS_BEFORE`] turns before the seam.
-    pub rereads: u64,
-    pub tool_errors: u64,
-    /// `(rereads + tool_errors) / max(tool_calls, 1)`.
+    /// One window per [`CHURN_WINDOWS`] entry, shortest first.
+    pub windows: [ChurnWindow; 2],
+    /// The full window's `repeated_failures_and_corrections / max(tool_calls, 1)`.
     pub churn_rate: f64,
+    /// Suspect regressions, not eviction re-reads, cross [`LOSSY_MIN_EVENTS`] and
+    /// [`LOSSY_MIN_RATE`] in the full window.
     pub lossy: bool,
     /// The re-read paths, first occurrence order.
     pub reread_paths: Vec<String>,
+}
+
+/// One loaded instruction file (`CLAUDE.md`, `AGENTS.md`, a memory index, …) over
+/// [`INSTRUCTION_BLOAT_WORDS`]. Every turn after the load carries it, so its size is paid per turn.
+/// The word and token counts are estimates of the injected text, an advisory heuristic.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct InstructionBloat {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Message index of the first load.
+    pub index: usize,
+    /// The file as the harness named it.
+    pub path: String,
+    /// Whitespace-separated words in the largest load.
+    pub words: usize,
+    pub tokens_est: u64,
+    /// Times the file was injected in this session (re-injected after compactions, for one).
+    pub loads: usize,
 }
 
 /// Imperative, path and URL tokens in one compaction summary, against what was said before it.
@@ -79,11 +122,29 @@ pub(super) struct Findings {
     pub churn: Vec<ChurnSeam>,
     pub contrast: Vec<SummaryContrast>,
     pub spins: Vec<SpinEpisode>,
+    pub bloat: Vec<InstructionBloat>,
 }
 
 struct OpenSeam {
     seam: ChurnSeam,
     known: HashSet<String>,
+    /// Message ids (`m:`), calls (`c:`) and failed results (`e:`) already counted.
+    seen: HashSet<String>,
+    /// The current message repeats one already counted.
+    dup: bool,
+    /// Call id → tool and canonical input, for calls made in the window.
+    calls: HashMap<String, String>,
+    failed: HashSet<String>,
+}
+
+impl OpenSeam {
+    /// Apply `f` to every window the seam's current turn still falls in.
+    fn bump(&mut self, f: impl Fn(&mut ChurnWindow)) {
+        let turns = self.seam.turns;
+        for w in self.seam.windows.iter_mut().filter(|w| turns <= w.k) {
+            f(w);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -99,6 +160,8 @@ pub(super) struct Trajectory {
     witness_tokens: HashSet<String>,
     witness_spans: HashSet<String>,
     spin: Option<(String, String, usize, usize)>,
+    /// Instruction files seen, by path, in first-load order.
+    instructions: Vec<InstructionBloat>,
     found: Findings,
 }
 
@@ -110,6 +173,43 @@ static PATHLIKE: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
+
+/// A human prompt that pushes back on what the agent just did.
+static CORRECTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)^\W*(?:no\b|nope\b|stop\b|wrong\b|undo\b|revert\b|don'?t\b|do not\b|that'?s not\b|not that\b)",
+        r"|(?i)\b(?:i (?:already )?(?:said|told you)|as i said|you forgot|we already|already (?:did|done|fixed|told)|not what i)\b"
+    ))
+    .unwrap()
+});
+/// Claude Code's instruction-file header inside a system reminder.
+static CONTENTS_OF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^Contents of (\S+) \(").unwrap());
+/// Codex's AGENTS.md dump.
+static AGENTS_FOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\A\s*# AGENTS\.md instructions for (\S+)").unwrap());
+
+/// `(path, body)` for each instruction file injected in `text`.
+fn instruction_files(text: &str) -> Vec<(&str, &str)> {
+    if let Some(caps) = AGENTS_FOR.captures(text) {
+        let path = caps.get(1).map_or("AGENTS.md", |m| m.as_str());
+        return vec![(path, &text[caps.get(0).map_or(0, |m| m.end())..])];
+    }
+    let heads: Vec<_> = CONTENTS_OF.captures_iter(text).collect();
+    let mut out = Vec::with_capacity(heads.len());
+    for (i, caps) in heads.iter().enumerate() {
+        let (Some(whole), Some(path)) = (caps.get(0), caps.get(1)) else {
+            continue;
+        };
+        let start = text[whole.end()..].find('\n').map_or(text.len(), |n| whole.end() + n);
+        let end = heads
+            .get(i + 1)
+            .and_then(|c| c.get(0))
+            .map_or(text.len(), |m| m.start());
+        let body = &text[start..end];
+        let body = body.find("</system-reminder>").map_or(body, |n| &body[..n]);
+        out.push((path.as_str(), body));
+    }
+    out
+}
 
 fn trim_token(t: &str) -> &str {
     t.trim_matches(|c: char| "\"'()[]{}<>,;:!?`*".contains(c))
@@ -179,21 +279,30 @@ impl Trajectory {
                 session: None,
                 index: self.idx,
                 turns: 0,
-                tool_calls: 0,
-                rereads: 0,
-                tool_errors: 0,
+                windows: CHURN_WINDOWS.map(|k| ChurnWindow {
+                    k,
+                    ..Default::default()
+                }),
                 churn_rate: 0.0,
                 lossy: false,
                 reread_paths: Vec::new(),
             },
             known,
+            seen: HashSet::new(),
+            dup: false,
+            calls: HashMap::new(),
+            failed: HashSet::new(),
         });
     }
 
     fn close(seam: OpenSeam) -> ChurnSeam {
         let mut s = seam.seam;
-        let events = s.rereads + s.tool_errors;
-        s.churn_rate = events as f64 / s.tool_calls.max(1) as f64;
+        for w in &mut s.windows {
+            w.repeated_failures_and_corrections = w.tool_errors + w.corrections;
+        }
+        let full = &s.windows[1];
+        let events = full.repeated_failures_and_corrections;
+        s.churn_rate = events as f64 / full.tool_calls.max(1) as f64;
         s.lossy = events >= LOSSY_MIN_EVENTS && s.churn_rate >= LOSSY_MIN_RATE;
         s
     }
@@ -215,6 +324,29 @@ impl Trajectory {
             }
         }
         self.open = still;
+    }
+
+    fn note_instructions(&mut self, text: &str, index: usize) {
+        for (path, body) in instruction_files(text) {
+            let words = body.split_whitespace().count();
+            let tokens_est = crate::ir::est_str_tokens(body, crate::ir::TokenKind::Text);
+            match self.instructions.iter_mut().find(|b| b.path == path) {
+                Some(seen) => {
+                    seen.loads += 1;
+                    if words > seen.words {
+                        (seen.words, seen.tokens_est) = (words, tokens_est);
+                    }
+                }
+                None => self.instructions.push(InstructionBloat {
+                    session: None,
+                    index,
+                    path: path.to_string(),
+                    words,
+                    tokens_est,
+                    loads: 1,
+                }),
+            }
+        }
     }
 
     fn end_spin(&mut self) {
@@ -254,6 +386,17 @@ impl Trajectory {
     ) -> anyhow::Result<()> {
         let index = self.idx;
         let visible = m.is_model_visible();
+        for seam in &mut self.open {
+            seam.dup = m.id.as_ref().is_some_and(|id| !seam.seen.insert(format!("m:{id}")));
+        }
+        if visible && matches!(m.kind, MessageKind::InjectedContext | MessageKind::SystemPrompt) {
+            for b in &m.content {
+                if let Block::Text { text, .. } = b {
+                    let text = text.try_resolve(resolver)?;
+                    self.note_instructions(&text, index);
+                }
+            }
+        }
         match m.kind {
             MessageKind::CompactionBoundary => {
                 self.open_seam();
@@ -289,10 +432,17 @@ impl Trajectory {
         }
         if visible && m.role == Role::User && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
             self.end_spin();
+            let mut corrects = false;
             for b in &m.content {
                 if let Block::Text { text, .. } = b {
                     let text = text.try_resolve(resolver)?;
+                    corrects |= CORRECTION.is_match(&text);
                     self.witness(&text);
+                }
+            }
+            if corrects {
+                for seam in self.open.iter_mut().filter(|s| !s.dup) {
+                    seam.bump(|w| w.corrections += 1);
                 }
             }
         }
@@ -308,9 +458,22 @@ impl Trajectory {
                         let text = text.try_resolve(resolver)?;
                         self.witness(&text);
                     }
-                    Block::ToolUse { name, input, .. } => {
+                    Block::ToolUse { id, name, input, .. } => {
+                        let call_key = format!("c:{id}");
+                        let mut counting = Vec::with_capacity(self.open.len());
                         for seam in &mut self.open {
-                            seam.seam.tool_calls += 1;
+                            let fresh = !seam.dup && seam.seen.insert(call_key.clone());
+                            if fresh {
+                                seam.bump(|w| w.tool_calls += 1);
+                            }
+                            counting.push(fresh);
+                        }
+                        if counting.iter().any(|&c| c) {
+                            let (canonical, _) = input.canonical_prefix(512)?;
+                            let key = format!("{name}\0{canonical}");
+                            for (seam, _) in self.open.iter_mut().zip(&counting).filter(|(_, c)| **c) {
+                                seam.calls.insert(id.clone(), key.clone());
+                            }
                         }
                         let mut reads = Vec::new();
                         let mut said = Vec::new();
@@ -349,9 +512,10 @@ impl Trajectory {
                                 self.witness_spans.insert(s.trim().to_string());
                             }
                         }
-                        for seam in &mut self.open {
-                            for p in reads.iter().filter(|p| seam.known.contains(*p)) {
-                                seam.seam.rereads += 1;
+                        for (seam, _) in self.open.iter_mut().zip(&counting).filter(|(_, c)| **c) {
+                            let evicted: Vec<&String> = reads.iter().filter(|p| seam.known.contains(*p)).collect();
+                            for p in evicted {
+                                seam.bump(|w| w.eviction_rereads += 1);
                                 if !seam.seam.reread_paths.contains(p) {
                                     seam.seam.reread_paths.push(p.clone());
                                 }
@@ -375,9 +539,25 @@ impl Trajectory {
         }
         if visible {
             for b in &m.content {
-                if let Block::ToolResult { is_error: true, .. } = b {
-                    for seam in &mut self.open {
-                        seam.seam.tool_errors += 1;
+                if let Block::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                } = b
+                {
+                    let err_key = format!("e:{tool_use_id}");
+                    for seam in self.open.iter_mut().filter(|s| !s.dup) {
+                        if !seam.seen.insert(err_key.clone()) {
+                            continue;
+                        }
+                        let repeated = seam
+                            .calls
+                            .get(tool_use_id)
+                            .is_some_and(|key| !seam.failed.insert(key.clone()));
+                        seam.bump(|w| {
+                            w.tool_errors += 1;
+                            w.repeated_failures += u64::from(repeated);
+                        });
                     }
                 }
             }
@@ -401,6 +581,14 @@ impl Trajectory {
         for s in &mut self.found.spins {
             s.session.clone_from(&session);
         }
+        self.found.bloat = std::mem::take(&mut self.instructions)
+            .into_iter()
+            .filter(|b| b.words > INSTRUCTION_BLOAT_WORDS)
+            .map(|b| InstructionBloat {
+                session: session.clone(),
+                ..b
+            })
+            .collect();
         self.found
     }
 }

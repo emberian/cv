@@ -23,7 +23,9 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod trajectory;
-pub use trajectory::{ChurnSeam, SpinEpisode, SummaryContrast, CHURN_TURNS_AFTER};
+pub use trajectory::{
+    ChurnSeam, ChurnWindow, InstructionBloat, SpinEpisode, SummaryContrast, CHURN_TURNS_AFTER, INSTRUCTION_BLOAT_WORDS,
+};
 
 /// The bucket name for an injected-context turn: the harness's own attachment kind when it recorded
 /// one ([`crate::harness::Adapter::attachment_kind`], e.g. Claude's `hook_success`), else the IR
@@ -202,13 +204,16 @@ pub struct Report {
     pub peak_ctx: u64,    // maximum recorded prompt usage across turns
     /// Active post-compaction window slice (active branch from latest compaction to tip).
     pub active_window: ActiveWindowReport,
-    /// Re-reads and tool errors in the turns after each compaction seam.
+    /// Eviction re-reads, and the tool errors and human corrections that suggest a lossy
+    /// compaction, in the turns after each compaction seam.
     pub post_compaction_churn: Vec<ChurnSeam>,
     /// URL, command and path tokens in compaction summaries that no earlier human prompt or
     /// assistant-authored text or call contains.
     pub summary_provenance_contrast: Vec<SummaryContrast>,
     /// Runs of identical consecutive read/search calls with no edit or human prompt between.
     pub spin_episodes: Vec<SpinEpisode>,
+    /// Loaded instruction files over [`INSTRUCTION_BLOAT_WORDS`] words.
+    pub instruction_bloat: Vec<InstructionBloat>,
 }
 
 impl Report {
@@ -321,6 +326,7 @@ impl Report {
             "post_compaction_churn": self.post_compaction_churn,
             "summary_provenance_contrast": self.summary_provenance_contrast,
             "spin_episodes": self.spin_episodes,
+            "instruction_bloat": self.instruction_bloat,
         })
     }
 }
@@ -563,6 +569,7 @@ impl SessionPass<'_> {
         rep.post_compaction_churn.extend(found.churn);
         rep.summary_provenance_contrast.extend(found.contrast);
         rep.spin_episodes.extend(found.spins);
+        rep.instruction_bloat.extend(found.bloat);
         Ok(())
     }
 
@@ -1495,11 +1502,32 @@ mod tests {
         let mut pass = rep.session(None);
         let read = |id: &str, path: &str| tool(id, "Read", json!({"file_path": path}));
         let grep = |id: &str| tool(id, "Grep", json!({"pattern": "fn main", "path": "/r"}));
-        let mut failed = result("p2", "no such file");
-        if let Some(Block::ToolResult { is_error, .. }) = failed.content.first_mut() {
-            *is_error = true;
-        }
+        let failed_result = |id: &str| {
+            let mut m = result(id, "failed");
+            if let Some(Block::ToolResult { is_error, .. }) = m.content.first_mut() {
+                *is_error = true;
+            }
+            m
+        };
+        let failed = failed_result("p2");
         let human = crate::Origin::Human;
+        let mut correction = said(
+            Role::User,
+            MessageKind::Prompt,
+            human,
+            "No, I already said run the tests first.",
+        );
+        correction.id = Some("u-correct".into());
+        let bash = |id: &str| tool(id, "Bash", json!({"command": "cargo test"}));
+        let claude_md = said(
+            Role::User,
+            MessageKind::InjectedContext,
+            crate::Origin::Harness,
+            &format!(
+                "<system-reminder>\nContents of /r/CLAUDE.md (project instructions):\n\n{}\nContents of /r/small.md (notes):\n\nkeep it short\n</system-reminder>",
+                "word ".repeat(700)
+            ),
+        );
         let msgs = vec![
             said(Role::User, MessageKind::Prompt, human, "please fix src/lib.rs today"),
             said(
@@ -1537,6 +1565,18 @@ mod tests {
             read("p2", "/r/b.rs"),
             failed,
             read("p3", "/r/new.rs"),
+            // Turn 3 ends: the correction counts in both windows; its re-emission in neither.
+            correction.clone(),
+            correction,
+            bash("b1"),
+            failed_result("b1"),
+            bash("b2"),
+            failed_result("b2"),
+            failed_result("b2"),
+            // A re-emitted call: no new call, no new re-read.
+            read("p1", "/r/a.rs"),
+            claude_md.clone(),
+            claude_md,
         ];
         for m in msgs {
             assert!(matches!(pass.message(m), Flow::Continue));
@@ -1546,11 +1586,20 @@ mod tests {
         let [seam] = rep.post_compaction_churn.as_slice() else {
             panic!("{:?}", rep.post_compaction_churn)
         };
-        assert_eq!(seam.index, 14);
-        assert_eq!(
-            (seam.rereads, seam.tool_errors, seam.tool_calls, seam.turns),
-            (2, 1, 3, 3)
-        );
+        assert_eq!((seam.index, seam.turns), (14, 6));
+        let counts = |w: &ChurnWindow| {
+            (
+                w.k,
+                w.tool_calls,
+                w.eviction_rereads,
+                w.tool_errors,
+                w.repeated_failures,
+                w.corrections,
+                w.repeated_failures_and_corrections,
+            )
+        };
+        assert_eq!(counts(&seam.windows[0]), (3, 3, 2, 1, 0, 1, 2), "{seam:?}");
+        assert_eq!(counts(&seam.windows[1]), (6, 5, 2, 3, 1, 1, 4), "{seam:?}");
         assert!(seam.lossy, "{seam:?}");
         assert_eq!(seam.reread_paths, ["/r/a.rs", "/r/b.rs"]);
 
@@ -1575,7 +1624,44 @@ mod tests {
         let json = rep.to_json();
         assert_eq!(json["spin_episodes"][0]["calls"], 5);
         assert_eq!(json["post_compaction_churn"][0]["lossy"], true);
+        assert_eq!(json["post_compaction_churn"][0]["windows"][1]["eviction_rereads"], 2);
+
+        let [bloat] = rep.instruction_bloat.as_slice() else {
+            panic!("{:?}", rep.instruction_bloat)
+        };
+        assert_eq!(
+            (bloat.path.as_str(), bloat.words, bloat.loads),
+            ("/r/CLAUDE.md", 700, 2)
+        );
+        assert!(bloat.tokens_est > 700, "{bloat:?}");
+        assert_eq!(json["instruction_bloat"][0]["words"], 700);
         assert_eq!(json["summary_provenance_contrast"][0]["unwitnessed_count"], 3);
+    }
+
+    #[test]
+    fn eviction_rereads_alone_never_make_a_seam_lossy() {
+        // #tooth Every post-compaction call re-reads an evicted file: expected cost, not a regression.
+        let mut rep = Report::default();
+        let mut pass = rep.session(None);
+        let read = |id: &str, path: &str| tool(id, "Read", json!({"file_path": path}));
+        let msgs = vec![
+            read("r1", "/r/a.rs"),
+            read("r2", "/r/b.rs"),
+            Message::of_kind(Role::System, MessageKind::CompactionBoundary, crate::Origin::Harness),
+            read("p1", "/r/a.rs"),
+            read("p2", "/r/b.rs"),
+            read("p3", "/r/a.rs"),
+        ];
+        for m in msgs {
+            assert!(matches!(pass.message(m), Flow::Continue));
+        }
+        pass.finish().unwrap();
+        let [seam] = rep.post_compaction_churn.as_slice() else {
+            panic!("{:?}", rep.post_compaction_churn)
+        };
+        assert_eq!(seam.windows[1].eviction_rereads, 3);
+        assert_eq!(seam.windows[1].repeated_failures_and_corrections, 0);
+        assert!(!seam.lossy, "{seam:?}");
     }
 
     #[test]
