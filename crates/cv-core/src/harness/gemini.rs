@@ -225,6 +225,8 @@ fn type_user_turn_from(m: &mut Message, text: &str) {
     // whitespace-only turn stays a human prompt.
     } else if !t.is_empty() && is_ignored_user_content(t) {
         (MessageKind::InjectedContext, Origin::Harness)
+    } else if crate::distill::is_cv_seed_text(t) {
+        (MessageKind::Prompt, Origin::Import)
     } else {
         (MessageKind::Prompt, Origin::Human)
     };

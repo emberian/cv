@@ -573,6 +573,9 @@ fn record<'a>(
                 "user"
             }),
         );
+        if message.role == Role::User && message.origin == crate::ir::Origin::Import {
+            base.insert("origin".into(), json!({"kind": "import"}));
+        }
         let mut inner = Map::new();
         inner.insert(
             "role".into(),

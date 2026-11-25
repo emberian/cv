@@ -648,6 +648,21 @@ impl Origin {
         }
     }
 
+    /// Parse a canonical snake_case [`Origin`] name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(Origin::Human),
+            "model" => Some(Origin::Model),
+            "harness" => Some(Origin::Harness),
+            "hook" => Some(Origin::Hook),
+            "scheduler" => Some(Origin::Scheduler),
+            "subagent" => Some(Origin::Subagent),
+            "import" => Some(Origin::Import),
+            "unknown" => Some(Origin::Unknown),
+            _ => None,
+        }
+    }
+
     /// The origin a bare role implies: User→Human, Assistant→Model, Tool→Harness (the harness ran
     /// the tool), System→Harness. Adapters override when the store says otherwise.
     pub fn for_role(role: Role) -> Self {
@@ -864,6 +879,16 @@ impl Message {
             .get(CV_NAMESPACE)
             .and_then(|bag| bag.get("synthesized"))
             .is_some()
+    }
+
+    /// cv's own per-message fact bag (`extra["cv"]`), created on demand.
+    pub fn cv_extra_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+        bag_mut(&mut self.extra, CV_NAMESPACE)
+    }
+
+    /// cv's own per-message fact bag, if anything was recorded in it.
+    pub fn cv_extra(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.extra.get(CV_NAMESPACE).and_then(serde_json::Value::as_object)
     }
 
     /// The harness-specific fact bag for `h` — `extra[h.as_str()]` as an object, created on demand.

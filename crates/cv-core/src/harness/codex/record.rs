@@ -151,6 +151,19 @@ fn injected(v: Option<JsonView<'_>>) -> Result<bool> {
     Ok(is_injected_text(&head))
 }
 
+/// Is `text_parts(v)` a `cv`-synthesized seed prompt (`[cv distill] …`, `[cv pack] …`, or
+/// standalone `# Distilled context — …`)? Reads only the head in O(1) memory.
+fn cv_seed(v: Option<JsonView<'_>>) -> Result<bool> {
+    let mut head = String::new();
+    for_each_joined_char(v, |c| {
+        if !(head.is_empty() && c.is_whitespace()) {
+            head.push(c);
+        }
+        head.len() < 512
+    })?;
+    Ok(crate::distill::is_cv_seed_text(&head))
+}
+
 /// `text_parts(v) == expected`, decoded in place.
 fn joined_eq(v: Option<JsonView<'_>>, expected: &str) -> Result<bool> {
     let mut rest = expected.chars();
@@ -486,6 +499,8 @@ impl Reader<'_> {
                 if let Some(text) = body.map(|b| self.demand.text(b)).transpose()?.flatten() {
                     let mut m = if injected(body)? {
                         Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness)
+                    } else if cv_seed(body)? {
+                        Message::of_kind(Role::User, MessageKind::Prompt, Origin::Import)
                     } else if self.session.lineage.parent.is_some() && !inherited {
                         Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent)
                     } else {
@@ -1002,6 +1017,7 @@ impl Reader<'_> {
                         _ if injected(content)? => {
                             Message::of_kind(Role::User, MessageKind::InjectedContext, Origin::Harness)
                         }
+                        _ if cv_seed(content)? => Message::of_kind(Role::User, MessageKind::Prompt, Origin::Import),
                         _ if self.session.lineage.parent.is_some() && !inherited => {
                             Message::of_kind(Role::User, MessageKind::Prompt, Origin::Subagent)
                         }

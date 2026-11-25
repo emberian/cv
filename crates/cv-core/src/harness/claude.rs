@@ -1021,6 +1021,9 @@ fn user_origin_from(scheduled: bool, is_meta: bool, kind: Option<&str>) -> Origi
     if matches!(kind, Some("coordinator" | "peer" | "agent")) {
         return Origin::Subagent;
     }
+    if kind == Some("import") {
+        return Origin::Import;
+    }
     if is_meta {
         return Origin::Harness;
     }

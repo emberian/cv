@@ -189,6 +189,22 @@ fn emit(
                     _ => m.content.push(block),
                 }
             }
+            if m.origin == Origin::Human {
+                let is_seed = m
+                    .content
+                    .iter()
+                    .find_map(|b| match b {
+                        Block::Text { text } => text_head(text, &Resolver::new(None), 512, true)
+                            .ok()
+                            .map(|(head, _)| head)
+                            .filter(|h| !h.is_empty()),
+                        _ => None,
+                    })
+                    .is_some_and(|head| crate::distill::is_cv_seed_text(&head));
+                if is_seed {
+                    m.origin = Origin::Import;
+                }
+            }
             if st.first_prompt.is_none() {
                 st.first_prompt = text_summary(
                     m.content

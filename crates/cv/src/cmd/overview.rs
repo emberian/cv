@@ -20,8 +20,14 @@ fn text(value: &Value, key: &str) -> String {
     sanitize_line(value.get(key).and_then(Value::as_str).unwrap_or("")).into_owned()
 }
 
-fn excerpt(out: &mut String, row: &Value, key: &str) {
-    for line in row.get(key).and_then(Value::as_str).unwrap_or("").lines() {
+fn excerpt(out: &mut String, row: &Value, key: &str, human: bool) {
+    let raw = row.get(key).and_then(Value::as_str).unwrap_or("");
+    let body = if human {
+        std::borrow::Cow::Borrowed(raw)
+    } else {
+        cv_core::render::neutralize_forged_headers(raw)
+    };
+    for line in body.lines() {
         out.push_str("    ");
         out.push_str(&sanitize_line(line));
         out.push('\n');
@@ -72,14 +78,17 @@ pub(crate) fn render(value: &Value, source: Option<&str>, agent: Option<&str>) -
                         "  [{}]\n",
                         index.map_or_else(|| "?".into(), |i| i.to_string())
                     ));
-                    excerpt(&mut out, row, "text");
+                    excerpt(&mut out, row, "text", true);
                 }
                 "workers" => {
                     out.push_str(&format!("  {} · {}\n", text(row, "agent_id"), text(row, "status")));
                     if let Some(description) = row.get("description").and_then(Value::as_str) {
-                        out.push_str(&format!("    {}\n", sanitize_line(description)));
+                        out.push_str(&format!(
+                            "    {}\n",
+                            sanitize_line(&cv_core::render::neutralize_forged_headers(description))
+                        ));
                     }
-                    excerpt(&mut out, row, "last_text");
+                    excerpt(&mut out, row, "last_text", false);
                     out.push_str(&format!(
                         "    cv show {worker_parent} --agent {}\n",
                         cv_core::harness::shell_quote(&text(row, "agent_id"))
@@ -104,7 +113,7 @@ pub(crate) fn render(value: &Value, source: Option<&str>, agent: Option<&str>) -
                         index.map_or_else(|| "?".into(), |i| i.to_string())
                     ));
                     if row.get("command").is_some_and(Value::is_string) {
-                        excerpt(&mut out, row, "command");
+                        excerpt(&mut out, row, "command", false);
                     } else {
                         out.push_str("    Dynamic command; open the tool call for its arguments.\n");
                     }

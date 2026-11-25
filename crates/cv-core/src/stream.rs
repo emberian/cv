@@ -364,9 +364,15 @@ impl MessageSink for Guard<'_> {
         self.latch.capture(self.inner);
         self.latch.take("stream consumer")
     }
-    fn message(&mut self, m: Message) -> Flow {
+    fn message(&mut self, mut m: Message) -> Flow {
         if self.latch.failed() {
             return Flow::Stop;
+        }
+        if m.role == crate::ir::Role::User
+            && m.origin == crate::ir::Origin::Human
+            && crate::distill::message_has_inline_cv_seed(&m)
+        {
+            m.origin = crate::ir::Origin::Import;
         }
         let started = self.start();
         let flow = self.inner.try_message(m).unwrap_or_else(|error| {

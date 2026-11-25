@@ -15,7 +15,7 @@ use anyhow::Context;
 /// Re-parse a just-emitted session back into the IR using `target`'s adapter, so we can diff it
 /// against the source. Mirrors how each adapter's `parse` keys off a [`SessionRef`].
 #[cfg(test)]
-pub(super) fn reparse_emitted(target: Harness, result: &EmitResult, opts: &Demand) -> Result<Session> {
+pub(crate) fn reparse_emitted(target: Harness, result: &EmitResult, opts: &Demand) -> Result<Session> {
     let opts = reparse_options(target, opts);
     reparse_with(target, result, &|adapter, reference| {
         crate::stream::collect_with(adapter, reference, &opts)

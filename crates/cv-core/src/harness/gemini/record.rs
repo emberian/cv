@@ -733,7 +733,7 @@ impl Default for TextInfo {
 
 impl TextInfo {
     fn complete(&self) -> bool {
-        self.head.done() && self.trimmed_chars == 64
+        self.head.done() && self.trimmed_chars == 512
     }
 
     fn feed(&mut self, s: &str) {
@@ -743,7 +743,7 @@ impl TextInfo {
             if !self.nonwhite && !c.is_whitespace() {
                 self.nonwhite = true;
             }
-            if self.nonwhite && self.trimmed_chars < 64 {
+            if self.nonwhite && self.trimmed_chars < 512 {
                 self.trimmed.push(c);
                 self.trimmed_chars += 1;
             }
