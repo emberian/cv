@@ -35,6 +35,8 @@ pub(super) enum KindView {
     /// with its summary (`compaction::print_compactions`).
     Compactions,
     Context,
+    /// `files`: every read, write and edit, with its verification (`cv_core::files`).
+    Files,
     /// `plan`, `schedule`, `background_job`, … (or `affordances`, all of them): the affordance rows
     /// (`cv_core::affordance`, `docs/design/AFFORDANCES.md`).
     Affordances(std::collections::HashSet<cv_core::affordance::Kind>),
@@ -47,6 +49,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
         Overview,
         Compactions,
         Context,
+        Files,
         Affordances,
     }
     const SAID: [&str; 2] = ["prompt", "answer"];
@@ -55,7 +58,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
     let words: Vec<&str> = cv_core::affordance::Kind::ALL.iter().map(|k| k.as_str()).collect();
     let accepted = format!(
         "`--kind` takes `overview`, `prompt,answer` (what the person said), \
-         `compaction_boundary,compaction_summary` (the compaction seams), `context` (recorded usage), or affordances: {} (`affordances` is all of them)",
+         `compaction_boundary,compaction_summary` (the compaction seams), `context` (recorded usage), `files` (reads, writes and edits), or affordances: {} (`affordances` is all of them)",
         words.join(",")
     );
     let family = |k: &str| {
@@ -65,6 +68,8 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
             Some(Family::Said)
         } else if k == "context" {
             Some(Family::Context)
+        } else if k == "files" {
+            Some(Family::Files)
         } else if SEAMS.contains(&k) {
             Some(Family::Compactions)
         } else if k == "affordances" || cv_core::affordance::Kind::parse(k).is_some() {
@@ -86,6 +91,7 @@ pub(super) fn parse_kinds(spec: &str) -> Result<KindView> {
         [Family::Overview] => Ok(KindView::Overview),
         [Family::Compactions] => Ok(KindView::Compactions),
         [Family::Context] => Ok(KindView::Context),
+        [Family::Files] => Ok(KindView::Files),
         [Family::Affordances] => Ok(KindView::Affordances(
             cv_core::affordance::parse_kinds(&kinds).expect("every word checked above"),
         )),
@@ -243,6 +249,80 @@ fn print_context(r: &SessionRef, adapter: &dyn Adapter, win: KindWindow, json: b
     Ok(())
 }
 
+fn file_line(t: &cv_core::files::FileTouch) -> String {
+    use cv_core::files::{FileOp, FileVerification};
+    use cv_core::sanitize::sanitize_line;
+    let ts = t
+        .timestamp
+        .map(|t| crate::util::fmt_local(t, "%m-%d %H:%M"))
+        .unwrap_or_else(|| "-----------".into());
+    let op = match t.op {
+        FileOp::Read => "read ",
+        FileOp::Write => "write",
+        FileOp::Edit => "edit ",
+    };
+    let ok = match t.succeeded {
+        Some(true) => "ok ",
+        Some(false) => "ERR",
+        None => " ? ",
+    };
+    let lines = t.lines_changed.map(|(a, r)| format!("  +{a} -{r}")).unwrap_or_default();
+    let verified = match &t.verification {
+        FileVerification::VerifiedGit { commit, .. } => format!("git {}", commit.get(..9).unwrap_or(commit)),
+        FileVerification::VerifiedDisk { .. } => "disk".into(),
+        FileVerification::Reconstructed => "reconstructed".into(),
+        FileVerification::Unverified if t.op == FileOp::Read => String::new(),
+        FileVerification::Unverified => "unverified".into(),
+    };
+    format!(
+        "[{}] {ts}  {op} {ok} {}{lines}  {}\n",
+        t.msg_idx,
+        sanitize_line(&t.path),
+        verified
+    )
+}
+
+/// `show --kind files`: the session's file touches in message order, sliced like other kinds.
+fn print_files(r: &SessionRef, adapter: &dyn Adapter, win: KindWindow, json: bool) -> Result<()> {
+    let mut rows = cv_core::files::read(adapter, r)?;
+    if let Some((start, end)) = win.pre_compaction {
+        rows.retain(|t| t.msg_idx >= start && end.is_none_or(|end| t.msg_idx < end));
+    }
+    let (rows, next) = slice_and_budget(
+        rows,
+        win.selector,
+        win.max_bytes,
+        if json { 5 } else { 100 },
+        |t| Some(t.msg_idx),
+        |t| {
+            if json {
+                let pretty = serde_json::to_string_pretty(t)?;
+                Ok(pretty.len() + 2 * pretty.lines().count() + 2)
+            } else {
+                Ok(file_line(t).len())
+            }
+        },
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        if let Some(next) = next {
+            eprintln!("{}", continue_hint(next));
+        }
+        return Ok(());
+    }
+    println!("# files of {} — {} touch(es)\n", short_id(&r.id), rows.len());
+    if rows.is_empty() {
+        println!("No file reads, writes or edits in this selection.");
+    }
+    for t in &rows {
+        print!("{}", file_line(t));
+    }
+    if let Some(next) = next {
+        println!("{}", continue_hint(next));
+    }
+    Ok(())
+}
+
 /// `show --kind plan,schedule,…`: the affordance rows of one session, transcript rows in message
 /// order then the side store's, sliced by `selector` and `max_bytes` after projection.
 fn print_affordances(
@@ -355,6 +435,14 @@ pub(crate) fn cmd_show(
                     max_bytes: window.max_bytes,
                 };
                 print_context(&r, adapter.as_ref(), win, json)
+            }
+            KindView::Files => {
+                let win = KindWindow {
+                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    selector: window.message_selector_in(adapter.as_ref(), &r)?,
+                    max_bytes: window.max_bytes,
+                };
+                print_files(&r, adapter.as_ref(), win, json)
             }
             KindView::Compactions => {
                 if selector || window.max_bytes.is_some() || pre_compaction.is_some() {
@@ -2939,6 +3027,8 @@ mod tests {
         assert!(matches!(parse_kinds("compaction_summary"), Ok(KindView::Compactions)));
         assert!(matches!(parse_kinds("context"), Ok(KindView::Context)));
         assert!(parse_kinds("context,prompt").is_err());
+        assert!(matches!(parse_kinds("files"), Ok(KindView::Files)));
+        assert!(parse_kinds("files,context").is_err());
         match parse_kinds("plan,schedule") {
             Ok(KindView::Affordances(k)) => assert_eq!(k, [Kind::Plan, Kind::Schedule].into_iter().collect()),
             _ => panic!("plan,schedule is the affordance view"),

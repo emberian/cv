@@ -39,10 +39,11 @@ pub struct ContextWindow {
     pub around: Option<(usize, usize)>,
 }
 
-pub fn window(rows: Vec<ContextRow>, selection: ContextWindow) -> Vec<ContextRow> {
-    let (start, end) = if let Some((index, context)) = selection.around {
-        let first = rows.partition_point(|row| row.index < index);
-        let after = rows.partition_point(|row| row.index <= index);
+/// Select `rows` (ordered by their original transcript index, `index`) by `selection`.
+pub fn window<T>(rows: Vec<T>, selection: ContextWindow, index: impl Fn(&T) -> usize) -> Vec<T> {
+    let (start, end) = if let Some((at, context)) = selection.around {
+        let first = rows.partition_point(|row| index(row) < at);
+        let after = rows.partition_point(|row| index(row) <= at);
         (
             first.saturating_sub(context),
             after.saturating_add(context).min(rows.len()),

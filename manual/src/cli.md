@@ -222,7 +222,7 @@ on a terminal or a pipe; a window or `--max-bytes` bounds it.
 `--kind` takes one view family: `prompt,answer`; `compaction_boundary,compaction_summary`; affordances
 (`plan`, `goal`, `schedule`, `background_job`, `skill`, `hook`, `question`, `approval`,
 `checkpoint`, `branch`, `fork`, `model_change`, `subagent_spawn`, `subagent_return`, or all as
-`affordances`); or `context`. Unknown or mixed exits 2. Compaction views cover the whole session
+`affordances`); `context`; or `files`. Unknown or mixed exits 2. Compaction views cover the whole session
 and reject window flags. A slash-loaded Claude skill counts once per activation.
 
 #### The threading: `--tree`
@@ -290,6 +290,21 @@ Compaction rows include the trigger and pre-compaction size when recorded.
 `--first`, `--last`, and `--range` select context rows; `--around` locates an original message
 index or ID, with `--context` rows on each side. `--pre-compaction` filters by the discarded
 message span. `--max-bytes` keeps whole rows and prints a continuation hint.
+
+#### File touches: `--kind files`
+
+```sh
+cv show da9174f4 --kind files --last 20
+cv show da9174f4 --kind files --around 125 --json
+```
+
+Every read, write and edit a tool call made, in message order: the path (relative to the
+session's git root when inside it), whether the call succeeded, lines added and removed, and how
+far the result is verified. `verified_git` names a commit at or after the touch that holds the
+reconstructed file, or, for an edit with no known base, its replacement text. `verified_disk`
+means the checkout's file equals the reconstruction now (the last touch of a path only; never
+under `--frozen`). `reconstructed` follows from a `Write` and exact `Edit` replacements in the
+transcript; everything else is `unverified`. Window flags select rows as for `--kind context`.
 
 ### `cv cat`
 

@@ -228,6 +228,8 @@ enum Cmd {
         /// index, timestamp, tool, tool_use_id, summary, items, source` rows).
         /// `context`: saved per-call usage, context limits and compaction boundaries; window
         /// flags select context rows, retaining original message indices for --around.
+        /// `files`: every file read, write and edit with its result and how far it is verified
+        /// (a later git commit, the checkout, or reconstruction from the transcript).
         #[arg(long, value_name = "KIND,…", conflicts_with = "subagents")]
         kind: Option<String>,
         /// With the compaction kinds: print each summary in full, not just its head.

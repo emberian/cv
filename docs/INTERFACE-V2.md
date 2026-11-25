@@ -165,7 +165,7 @@ every command of the clap tree on a pipe under this contract.
   (+ `display_title`, `git` under `--enrich`; + `score`, `snippet`, `agent_id`, `parent_id`,
   `workflow` from `search`). `cv schema --json` publishes this list as `session_row`, with
   `subagent_row` (a forest member: the session row + its sidecar facts), `task_row`, `session`,
-  `message`, `block`, `prompt_row`, `context_row`, `overview`, `lane` and `query`; the manual's architecture
+  `message`, `block`, `prompt_row`, `context_row`, `file_touch`, `overview`, `lane` and `query`; the manual's architecture
   chapter is the prose.
 - A **message** is the IR `Message`. A **block** is the IR `Block`, tagged by `type`.
 - A **context row** (`show --kind context --json`, `GET /api/session/{harness}/{id}/context`)
@@ -182,6 +182,10 @@ every command of the clap tree on a pipe under this contract.
   `--first/--last/--range` and API `first/last/start-end` select projected rows; `--around` / API
   `around` anchors to an original message index or ID, with `context` rows on each side (default
   five). API `[start,end)` is half-open and mixed selector families are rejected.
+- A **file touch** (`show --kind files --json`, `GET /api/session/{harness}/{id}/files`) is
+  `{ msg_idx, timestamp, op, path, tool, tool_use_id, succeeded, lines_changed, verification }`,
+  in transcript order and selected like context rows. `verification.kind` is `verified_git`
+  (`commit`, `blob`), `verified_disk` (`blake3`), `reconstructed` or `unverified`.
 
 ### Session overview
 

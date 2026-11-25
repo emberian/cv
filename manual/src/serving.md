@@ -212,6 +212,11 @@ each side (default `5`). Mixed selectors, malformed numbers and unknown message 
 Missing row values remain `null` and absent `usage` components are omitted; `usage_basis`
 distinguishes recorded usage from saved prune estimates.
 
+#### `GET /api/session/{harness}/{id}/files`
+
+The same array as `cv show --kind files --json`: `msg_idx, timestamp, op, path, tool,
+tool_use_id, succeeded, lines_changed, verification`, selected like `/context`.
+
 #### `GET /api/session/{harness}/{id}/compactions`
 
 `cv show --kind compaction_boundary --json` rows (`boundary_msg_idx, summary_msg_idx, trigger,

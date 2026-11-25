@@ -123,6 +123,16 @@ pub(crate) fn data_schema_json() -> Value {
             "nulls": "all keys remain present: unknown or inapplicable values are null; index and kind are always present. Empty selection or no usable records returns []",
             "windows": "CLI first/last/range and API first/last/start-end select projected rows; around=N|ID selects an original message index or ID with context rows on either side (default 5). API start/end is half-open; mixed selectors are rejected",
         },
+        "file_touch": {
+            "description": "one row of `show --kind files --json` or GET /api/session/{harness}/{id}/files; both return arrays in transcript order",
+            "keys": ["msg_idx", "timestamp", "op", "path", "tool", "tool_use_id", "succeeded", "lines_changed", "verification"],
+            "op": ["read", "write", "edit"],
+            "path": "repository-relative inside the session's git root, else cwd-relative, else as the call named it",
+            "succeeded": "from the call's result: false when it errored, null when no result was recorded",
+            "lines_changed": "[added, removed] for writes and edits; null for reads and patches",
+            "verification": "{kind: verified_git, commit, blob} a later commit holds the reconstructed content or the edit's replacement · {kind: verified_disk, blake3} the checkout's file equals it now (last touch of a path only; skipped under --frozen) · {kind: reconstructed} it follows from a Write and exact Edits in the transcript · {kind: unverified}",
+            "windows": "as context_row",
+        },
         "resume": {
             "description": "native launch plan from `resume --json`; inspecting it never launches the harness",
             "keys": ["id", "harness", "path", "program", "args", "cwd", "env", "unset_env", "hint", "warning"],

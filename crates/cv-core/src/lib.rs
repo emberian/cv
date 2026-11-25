@@ -36,6 +36,9 @@ pub mod emit;
 pub mod env;
 
 pub mod events;
+// Verifies touches against git and the checkout: native only, like `blame`.
+#[cfg(feature = "sqlite")]
+pub mod files;
 pub mod formats;
 pub mod harness;
 pub mod hooks;
