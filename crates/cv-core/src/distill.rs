@@ -356,21 +356,94 @@ impl Distilled {
     /// Add another lane's extracted findings, keeping head/tail estimates on the same byte
     /// heuristic as the original distillation. Callers need not know its conversion constant.
     pub fn append_findings(&mut self, findings: &str) {
-        for (i, line) in findings.split('\n').enumerate() {
-            if i > 0 {
-                self.head_md.push('\n');
-            }
-            let trimmed = line.trim_start_matches([' ', '\t', '>']);
-            if crate::render::is_distill_section_heading(trimmed) {
-                let prefix_len = line.len() - trimmed.len();
-                self.head_md.push_str(&line[..prefix_len]);
-                self.head_md.push('\\');
-                self.head_md.push_str(trimmed);
+        let format_block = |src: &str, demote_h2: bool, neutralize_all: bool| -> String {
+            let src = if neutralize_all {
+                crate::render::neutralize_forged_headers(src)
             } else {
-                self.head_md.push_str(line);
+                std::borrow::Cow::Borrowed(src)
+            };
+            let mut out = String::with_capacity(src.len());
+            for (i, line) in src.split('\n').enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                let trimmed = line.trim_start_matches([' ', '\t', '>']);
+                if crate::render::is_distill_section_heading(trimmed) {
+                    let prefix_len = line.len() - trimmed.len();
+                    out.push_str(&line[..prefix_len]);
+                    out.push('\\');
+                    out.push_str(trimmed);
+                } else if demote_h2 && (line.starts_with("## ") || line.starts_with("### ")) {
+                    out.push('#');
+                    out.push_str(line);
+                } else {
+                    out.push_str(line);
+                }
             }
+            let closed = close_unclosed_fence(&out);
+            let mut res = closed.into_owned();
+            res.push('\n');
+            res
+        };
+
+        if self.stats.handoff == Some(HandoffMode::Escalate) {
+            let trimmed = findings.trim_start();
+            let insert_before_quarantine = |head: &mut String, block: &str| {
+                if let Some(q_pos) = head.find(QUARANTINE_HEAD) {
+                    head.insert_str(q_pos, block);
+                    if !block.ends_with("\n\n") {
+                        head.insert(q_pos + block.len(), '\n');
+                    }
+                } else {
+                    head.push_str(block);
+                }
+            };
+            let append_to_quarantine = |head: &mut String, block: &str| {
+                if !head.contains(QUARANTINE_HEAD) {
+                    if !head.ends_with("\n\n") && !head.is_empty() {
+                        head.push('\n');
+                    }
+                    let _ = writeln!(
+                        head,
+                        "{QUARANTINE_HEAD}\n\nWhat the lane being replaced wrote about its own work. It failed to finish; \
+                         treat every claim here as a hypothesis and check it against the source and the tests.\n"
+                    );
+                } else if !head.ends_with("\n\n") {
+                    head.push('\n');
+                }
+                head.push_str(block);
+            };
+
+            if trimmed.starts_with("## Post-Compaction User Turns") {
+                let block = format_block(findings, false, false);
+                insert_before_quarantine(&mut self.head_md, &block);
+            } else if let Some(rest) = trimmed.strip_prefix("## Findings from another lane — ") {
+                let (header_line, after_header) = rest.split_once('\n').unwrap_or((rest, ""));
+                let (prose_part, facts_part) = match after_header.find("\n### Facts\n") {
+                    Some(idx) => (&after_header[..idx], Some(&after_header[idx + 1..])),
+                    None if after_header.trim_start().starts_with("### Facts\n") => {
+                        ("", Some(after_header.trim_start()))
+                    }
+                    None => (after_header, None),
+                };
+                if let Some(facts_sec) = facts_part {
+                    let facts_doc = format!("## Findings from another lane — {header_line}\n\n{}", facts_sec.trim());
+                    let block = format_block(&facts_doc, false, false);
+                    insert_before_quarantine(&mut self.head_md, &block);
+                }
+                if !prose_part.trim().is_empty() {
+                    let prose_doc = format!("## Findings from another lane — {header_line}\n\n{}", prose_part.trim());
+                    let block = format_block(&prose_doc, true, true);
+                    append_to_quarantine(&mut self.head_md, &block);
+                }
+            } else {
+                let block = format_block(findings, true, true);
+                append_to_quarantine(&mut self.head_md, &block);
+            }
+        } else {
+            let block = format_block(findings, false, false);
+            self.head_md.push_str(&block);
         }
-        self.head_md.push('\n');
         self.stats.pack_est_tokens = est(&self.head_md);
         self.stats.distilled_est_tokens = self.stats.pack_est_tokens + self.stats.tail_est_tokens;
     }
@@ -696,10 +769,11 @@ fn re(which: Re) -> &'static Regex {
         ),
         // A markdown heading, behind an optional `cat -n`-style line number.
         Re::Heading => (&RES[21], r"(?m)^\s*(?:\d+(?:→|\t))?\s*#{1,6}[ \t]+(\S[^\n]*?)[ \t#]*$"),
-        // A definition's name in common languages.
+        // A definition's name at the start of a code line (behind an optional `cat -n` line number
+        // and declaration modifiers).
         Re::Definition => (
             &RES[22],
-            r"\b(?:fn|struct|enum|trait|union|impl|class|def|interface|func|function|type|mod|module|macro_rules!)\s+([A-Za-z_][A-Za-z0-9_]{2,})",
+            r#"(?m)^\s*(?:\d+\s*(?:→|\t|:|\|)\s*)?(?:(?:pub(?:\s*\([^)\n]*\))?|priv|private|protected|public|internal|crate|export|default|async|unsafe|const|static|abstract|final|virtual|override|inline|extern(?:\s+"[^"\n]*")?)\s+)*(?:fn|struct|enum|trait|union|impl|class|def|interface|func|function|type|mod|module|macro_rules!)(?:<[^>\n]*>)?\s+([A-Za-z_][A-Za-z0-9_]{2,})"#,
         ),
         // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
         Re::CommitFile => (
@@ -2145,7 +2219,7 @@ fn analyze_with_policy(
             session.id,
             session.id,
         );
-        let built = build_bricks(session, &msgs[..tail_start], &uses, &mut cache)?;
+        let built = build_bricks(session, &msgs[..tail_start], &uses, &mut cache, &retrieve_ref)?;
         render_bricks(&mut h, &built);
         let _ = writeln!(h, "This read: {} messages · {} tool calls.\n", msgs.len(), tool_calls);
         bricks = Some(built);
@@ -2174,7 +2248,7 @@ fn analyze_with_policy(
     let shown_words = if escalate { None } else { last_words.as_ref() };
     render_handoff(&mut h, shown_words, &facts, msgs, elided_hint, &unsettled);
     let mut grounding = ground(session, msgs, &uses, &mut cache, live_fs, session.updated_at)?;
-    let decisions = if !narrative {
+    let decisions = if !narrative && !escalate {
         std::mem::take(&mut grounding.decisions)
     } else {
         Vec::new()
@@ -2190,7 +2264,13 @@ fn analyze_with_policy(
         }
         let mut own = String::new();
         render_grounding(&mut own, &grounding);
-        quarantine.push_str(&own.replacen(GROUNDING_HEAD, "### Grounding — ", 1));
+        if !own.is_empty() {
+            let closed = close_unclosed_fence(&own);
+            quarantine.push_str(&closed.replacen(GROUNDING_HEAD, "### Grounding — ", 1));
+            if !closed.ends_with('\n') {
+                quarantine.push('\n');
+            }
+        }
     } else {
         render_grounding(&mut h, &grounding);
     }
@@ -2231,9 +2311,11 @@ fn analyze_with_policy(
             );
         }
     }
+    let is_escalate_quarantined =
+        |heading: &str| heading.starts_with("compaction summary") || heading == "sub-agent returned";
     let shown: Vec<&Entry> = timeline
         .iter()
-        .filter(|e| narrative || !is_agent_authored(&e.heading))
+        .filter(|e| (narrative || !is_agent_authored(&e.heading)) && !(escalate && is_escalate_quarantined(&e.heading)))
         .collect();
     if shown.is_empty() {
         let _ = writeln!(h, "_(nothing before the verbatim tail)_\n");
@@ -2257,12 +2339,15 @@ fn analyze_with_policy(
             "**Decisions recorded** (verbatim lines, newest {GROUNDING_LINES}):\n"
         );
         for (i, line) in &decisions {
-            let _ = writeln!(h, "- [{i}] {line}");
+            let _ = writeln!(h, "- [{i}] {}", close_unclosed_fence(line));
         }
         h.push('\n');
     }
     if escalate {
-        for e in timeline.iter().filter(|e| e.heading.starts_with("agent wrote")) {
+        for e in timeline
+            .iter()
+            .filter(|e| e.heading.starts_with("agent wrote") || is_escalate_quarantined(&e.heading))
+        {
             let _ = writeln!(
                 quarantine,
                 "### [{}] {} · {}\n\n{}\n",
@@ -2533,18 +2618,33 @@ pub struct Brick {
 /// instead of becoming `[0..32)` and rewriting the pack from its first brick on.
 pub const MAX_BRICK_TURNS: usize = 16;
 
-/// The brick decomposition of `turns` turns: frozen epochs of [`MAX_BRICK_TURNS`] turns, then the
-/// binary carry tree of the remainder, highest bit first. `24 → [0,16) [16,24)`;
-/// `25 → [0,16) [16,24) [24,25)`; `32 → [0,16) [16,32)`. Appending a turn changes only the bricks
-/// of the open epoch below its lowest zero bit; every sealed epoch keeps its span and its bytes.
+/// The brick decomposition of `turns` turns: frozen epochs of [`MAX_BRICK_TURNS`] turns once a
+/// subsequent turn has sealed them (`turns > a + MAX_BRICK_TURNS`), then the binary carry tree of
+/// the remainder, highest bit first. `24 → [0,16) [16,24)`; `25 → [0,16) [16,24) [24,25)`;
+/// `33 → [0,16) [16,32) [32,33)`. While `turns == a + MAX_BRICK_TURNS`, turn `a + 15` is still
+/// open so `[a, a + 16)` stays unmerged (`[a, a+8) [a+8, a+12) [a+12, a+14) [a+14, a+15) [a+15, a+16)`)
+/// until turn `a + 16` opens.
 pub fn dyadic_spans(turns: usize) -> Vec<(usize, usize)> {
-    let sealed = turns / MAX_BRICK_TURNS * MAX_BRICK_TURNS;
+    let sealed = turns.saturating_sub(1) / MAX_BRICK_TURNS * MAX_BRICK_TURNS;
     let mut spans: Vec<(usize, usize)> = (0..sealed)
         .step_by(MAX_BRICK_TURNS)
         .map(|a| (a, a + MAX_BRICK_TURNS))
         .collect();
     let mut start = sealed;
     let rest = turns - sealed;
+    if rest == MAX_BRICK_TURNS {
+        let mut rem = MAX_BRICK_TURNS - 1;
+        for bit in (0..usize::BITS).rev() {
+            let size = 1usize << bit;
+            if rem & size != 0 {
+                spans.push((start, start + size));
+                start += size;
+                rem -= size;
+            }
+        }
+        spans.push((start, start + 1));
+        return spans;
+    }
     for bit in (0..usize::BITS).rev() {
         let size = 1usize << bit;
         if rest & size != 0 {
@@ -2586,6 +2686,7 @@ fn build_bricks(
     msgs: &[Message],
     uses: &HashMap<&str, crate::ir::ToolCall<'_>>,
     cache: &mut TranscriptCache<'_>,
+    retrieve_ref: &str,
 ) -> anyhow::Result<Vec<Brick>> {
     use crate::tools::classify::ToolOp;
     let starts = turn_starts(msgs);
@@ -2601,7 +2702,7 @@ fn build_bricks(
             if m.role == Role::User && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
                 if let Some(text) = cache.incoming_text(session.harness, i)? {
                     if !text.trim().is_empty() {
-                        let _ = writeln!(prompts, "**user** [{i}]:\n\n{}\n", text.trim());
+                        let _ = writeln!(prompts, "**user** [{i}]:\n\n{}\n", close_unclosed_fence(text.trim()));
                     }
                 }
             }
@@ -2640,9 +2741,8 @@ fn build_bricks(
                             };
                             let _ = writeln!(
                                 reads,
-                                "  - [{i}] {} · `cv cat {} {tool_use_id}`{names}",
+                                "  - [{i}] {} · `cv cat {retrieve_ref} {tool_use_id}`{names}",
                                 crate::render::inline_code_span(path),
-                                session.id
                             );
                         }
                         if command {
@@ -2650,9 +2750,8 @@ fn build_bricks(
                             let label = summary.label(session.harness, call.name);
                             let _ = writeln!(
                                 commands,
-                                "  - [{i}] {} → {outcome} · `cv cat {} {tool_use_id}`",
+                                "  - [{i}] {} → {outcome} · `cv cat {retrieve_ref} {tool_use_id}`",
                                 crate::sanitize::sanitize_line(&truncate(first_line(&label), 160)),
-                                session.id
                             );
                         }
                     }
@@ -2696,21 +2795,29 @@ const READ_EXCERPT_MAX: usize = 1500;
 /// Reads an escalation pack keeps excerpts of, newest first.
 const READ_EXCERPTS: usize = 8;
 
+/// Maximum bytes of a file read scanned for headings or symbol definitions.
+const READ_SCAN_MAX: usize = 256 * 1024;
+
 /// A read's high-signal lines: its headings (prose) or definition lines (code), as they appear,
 /// up to `max` bytes. Without any, its head and tail.
 fn read_excerpt(path: &str, out: &str, max: usize) -> String {
     let which = if is_prose_path(path) {
-        Re::Heading
+        Some(Re::Heading)
+    } else if is_code_path(path) {
+        Some(Re::Definition)
     } else {
-        Re::Definition
+        None
     };
     let mut kept = String::new();
-    for line in out.lines().filter(|l| re(which).is_match(l)) {
-        if kept.len() + line.len() + 1 > max {
-            break;
+    if let Some(which) = which {
+        let scan = &out[..out.floor_char_boundary(out.len().min(READ_SCAN_MAX))];
+        for line in scan.lines().filter(|l| re(which).is_match(l)) {
+            if kept.len() + line.len() + 1 > max {
+                break;
+            }
+            kept.push_str(line);
+            kept.push('\n');
         }
-        kept.push_str(line);
-        kept.push('\n');
     }
     if kept.is_empty() {
         head_tail(out, max, "the full output is behind the pointer above")
@@ -2767,21 +2874,91 @@ const BRICK_SYMBOLS: usize = 8;
 
 /// Prose files, whose distinctive names are their headings rather than code definitions.
 fn is_prose_path(path: &str) -> bool {
-    let ext = path.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    let ext = basename(path)
+        .rsplit_once('.')
+        .map_or("", |(_, e)| e)
+        .to_ascii_lowercase();
     matches!(ext.as_str(), "md" | "markdown" | "txt" | "rst" | "adoc" | "org")
+}
+
+/// Source-code files whose line-anchored top-level/member definitions are worth indexing.
+fn is_code_path(path: &str) -> bool {
+    let ext = basename(path)
+        .rsplit_once('.')
+        .map_or("", |(_, e)| e)
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "rs" | "py"
+            | "pyi"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "jsx"
+            | "ts"
+            | "mts"
+            | "cts"
+            | "tsx"
+            | "go"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "hh"
+            | "hpp"
+            | "hxx"
+            | "java"
+            | "kt"
+            | "kts"
+            | "scala"
+            | "swift"
+            | "rb"
+            | "php"
+            | "cs"
+            | "fs"
+            | "ml"
+            | "mli"
+            | "hs"
+            | "lean"
+            | "zig"
+            | "lua"
+            | "ex"
+            | "exs"
+            | "erl"
+            | "clj"
+            | "dart"
+            | "r"
+            | "jl"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "sol"
+            | "proto"
+            | "sql"
+            | "v"
+            | "sv"
+    )
 }
 
 /// Up to `max` names from a file read's output, in order of appearance and not already in
 /// `seen`: markdown headings in a prose file, definition names (`fn`, `struct`, `class`, `def`, …)
-/// in code. Each comes back as an inline code span; `seen` gains the raw names.
+/// in recognized code files (bounded to [`READ_SCAN_MAX`]). Each comes back as an inline code span;
+/// `seen` gains the raw names.
 fn read_symbols(path: &str, out: &str, max: usize, seen: &mut Vec<String>) -> Vec<String> {
-    let mut names = Vec::new();
+    if max == 0 {
+        return Vec::new();
+    }
     let which = if is_prose_path(path) {
         Re::Heading
-    } else {
+    } else if is_code_path(path) {
         Re::Definition
+    } else {
+        return Vec::new();
     };
-    for c in re(which).captures_iter(out) {
+    let scan = &out[..out.floor_char_boundary(out.len().min(READ_SCAN_MAX))];
+    let mut names = Vec::new();
+    for c in re(which).captures_iter(scan) {
         let name = &c[1];
         if names.len() >= max {
             break;
@@ -3016,8 +3193,10 @@ fn unwrap_pack_full(text: &str) -> Option<UnwrappedPack> {
     }
     let tl = heading(t, TIMELINE_HEAD, 0, true)?;
     let facts = heading(t, FACTS_HEAD, tl + 1, true)?;
-    let end = heading(t, LEDGER_HEAD, facts + 1, true)
-        .or_else(|| heading(t, TAIL_HEAD, facts + 1, true))
+    let end = [READS_HEAD, PROGRESS_HEAD, LEDGER_HEAD, QUARANTINE_HEAD, TAIL_HEAD]
+        .into_iter()
+        .filter_map(|h| heading(t, h, facts + 1, true))
+        .min()
         .unwrap_or(t.len());
     let b = heading(&t[..tl], BRIEF_HEAD, 0, false);
     let header_limit = b.unwrap_or(tl);
@@ -4039,7 +4218,7 @@ fn render_grounding(h: &mut String, g: &Grounding) {
         if !rows.is_empty() {
             let _ = writeln!(h, "**{title}**:\n");
             for (i, line) in rows {
-                let _ = writeln!(h, "- [{i}] {line}");
+                let _ = writeln!(h, "- [{i}] {}", close_unclosed_fence(line));
             }
             h.push('\n');
         }
@@ -4390,6 +4569,7 @@ fn render_prepared_tail(
                     } else {
                         crate::render::neutralize_forged_headers(trimmed)
                     };
+                    let body = close_unclosed_fence(&body);
                     let _ = writeln!(s, "**{who}** ({}):\n\n{body}\n", when(m));
                 }
                 Block::ToolUse { id, name, input, .. } => {
@@ -4794,13 +4974,32 @@ pub(crate) mod tests {
     #[test]
     fn dyadic_spans_are_the_binary_carry_tree() {
         assert_eq!(dyadic_spans(0), vec![]);
+        assert_eq!(dyadic_spans(7), vec![(0, 4), (4, 6), (6, 7)]);
+        assert_eq!(dyadic_spans(16), vec![(0, 8), (8, 12), (12, 14), (14, 15), (15, 16)]);
+        assert_eq!(dyadic_spans(17), vec![(0, 16), (16, 17)]);
         assert_eq!(dyadic_spans(24), vec![(0, 16), (16, 24)]);
         assert_eq!(dyadic_spans(25), vec![(0, 16), (16, 24), (24, 25)]);
-        assert_eq!(dyadic_spans(7), vec![(0, 4), (4, 6), (6, 7)]);
         assert_eq!(dyadic_spans(31), vec![(0, 16), (16, 24), (24, 28), (28, 30), (30, 31)]);
-        assert_eq!(dyadic_spans(32), vec![(0, 16), (16, 32)]);
+        assert_eq!(
+            dyadic_spans(32),
+            vec![(0, 16), (16, 24), (24, 28), (28, 30), (30, 31), (31, 32)]
+        );
+        assert_eq!(dyadic_spans(33), vec![(0, 16), (16, 32), (32, 33)]);
         assert_eq!(dyadic_spans(63)[..3], [(0, 16), (16, 32), (32, 48)]);
-        assert_eq!(dyadic_spans(64), vec![(0, 16), (16, 32), (32, 48), (48, 64)]);
+        assert_eq!(
+            dyadic_spans(64),
+            vec![
+                (0, 16),
+                (16, 32),
+                (32, 48),
+                (48, 56),
+                (56, 60),
+                (60, 62),
+                (62, 63),
+                (63, 64)
+            ]
+        );
+        assert_eq!(dyadic_spans(65), vec![(0, 16), (16, 32), (32, 48), (48, 64), (64, 65)]);
     }
 
     fn read(id: &str, path: &str) -> Block {
@@ -7945,6 +8144,198 @@ facts text",
             d_nb2_wire.head_md
         );
         assert!(genuine_human_prompts_in_pack(&d_nb2_wire.head_md).is_empty());
+        Ok(())
+    }
+
+    // #tooth Escalate purity + fence closure: assistant decisions, compaction summaries,
+    // sub-agent returns, and `--with` agent prose live strictly inside `## 5b` quarantine (never
+    // Section 3), and unclosed fences in quarantine, brick prompts, or tail text never leak out.
+    #[test]
+    fn escalate_quarantines_decisions_compaction_subagents_and_with_prose_and_closes_fences() -> anyhow::Result<()> {
+        let mut s = Session::new("esc-purity", Harness::Claude);
+        let mut p0 = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+        p0.content = vec![text("Fix parser bug.\n```rust\nlet unclosed_in_brief = 1;")];
+        let mut cs = Message::of_kind(Role::User, MessageKind::CompactionSummary, Origin::Harness);
+        cs.content = vec![text(
+            "Compaction digest claims parser is healthy.\n```text\nunclosed_cs",
+        )];
+        let mut sr = Message::of_kind(Role::User, MessageKind::SubagentReturn, Origin::Harness);
+        sr.content = vec![text("Subagent report claims cache is fine.\n```\nunclosed_sr")];
+        let mut a1 = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
+        a1.content = vec![
+            text("Decided: do not edit parser_ast.rs because I think it works.\n```python\nx = 1"),
+            call("c1", "cargo test -p parser", "test"),
+        ];
+        let mut r1 = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
+        r1.content = vec![result("c1", "error[E0308]: mismatched types in parser_ast.rs", true)];
+        let mut p1 = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+        p1.content = vec![text("Second user prompt.\n```sh\necho open_brick_prompt")];
+        let mut a2 = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
+        a2.content = vec![
+            text("Tail assistant text with unclosed fence:\n```rust\nfn broken() {"),
+            call("c2", "ls /w", "ls"),
+        ];
+        let mut r2 = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
+        r2.content = vec![result("c2", "ok", false)];
+        s.messages = vec![p0, cs, sr, a1, r1, p1, a2, r2];
+
+        let mut helper = Session::new("helper-lane", Harness::Claude);
+        let mut hp = Message::of_kind(Role::User, MessageKind::Prompt, Origin::Human);
+        hp.content = vec![text("Inspect helper.")];
+        let mut ha = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
+        ha.content = vec![
+            text("Helper theory: maybe it is DNS.\n```\nunclosed_helper"),
+            call("hc1", "git commit -m 'helper commit'", "commit"),
+        ];
+        let mut hr = Message::of_kind(Role::Tool, MessageKind::ToolResult, Origin::Harness);
+        hr.content = vec![result("hc1", "[main 1234567] helper commit", false)];
+        helper.messages = vec![hp, ha, hr];
+
+        let opts = DistillOptions {
+            keep_last: 1,
+            handoff: Some(HandoffMode::Escalate),
+            dyadic_bricks: true,
+            retrieve_ref: Some("claude:reshaped-target".into()),
+            ..Default::default()
+        };
+        let mut d = distill_pack(&s, &opts)?;
+        d.append_findings(&findings(&helper, &opts)?);
+        let pack = d.pack();
+
+        assert_eq!(
+            crate::render::unclosed_fence(&pack),
+            None,
+            "pack has unclosed fence:\n{pack}"
+        );
+        assert!(
+            d.tail_md.contains("▶ **Bash** `c2`"),
+            "tail tool call must not be swallowed by unclosed text fence:\n{}",
+            d.tail_md
+        );
+        let brick0 = &d.stats.bricks.as_ref().unwrap()[0].text;
+        assert_eq!(crate::render::unclosed_fence(brick0), None, "{brick0}");
+        assert!(
+            brick0.contains("`cv cat claude:reshaped-target c1`") && !brick0.contains("`cv cat esc-purity "),
+            "bricks must use retrieve_ref, not session.id:\n{brick0}"
+        );
+
+        let tl = pack.find(TIMELINE_HEAD).unwrap();
+        let facts = pack.find(FACTS_HEAD).unwrap();
+        let q = pack.find(QUARANTINE_HEAD).unwrap();
+        let tail = pack.find(TAIL_HEAD).unwrap();
+        let spec = &pack[tl..facts];
+        for leaked in [
+            "Decided: do not edit parser_ast.rs",
+            "Compaction digest claims",
+            "Subagent report claims",
+            "Helper theory: maybe it is DNS",
+        ] {
+            assert!(!spec.contains(leaked), "{leaked:?} leaked into Section 3:\n{spec}");
+            assert!(!pack[..q].contains(leaked), "{leaked:?} appeared before ## 5b:\n{pack}");
+            assert!(
+                pack[q..tail].contains(leaked),
+                "{leaked:?} missing from ## 5b:\n{}",
+                &pack[q..tail]
+            );
+        }
+        // Verified facts from `--with` stay before quarantine.
+        assert!(pack[..q].contains("`1234567`"), "{pack}");
+        Ok(())
+    }
+
+    // #tooth 16th-turn sealing + `unwrap_pack_full` bounds + `read_symbols` anchoring/caps:
+    // `[0, 16)` does not seal at `T = 16` while turn 15's reply is still arriving; `unwrap_pack_full`
+    // stops at `READS_HEAD` / `PROGRESS_HEAD` / `QUARANTINE_HEAD` when `ledger: false`; and
+    // `read_symbols` only matches line-anchored code definitions under 256 KiB.
+    #[test]
+    fn brick_16th_turn_seals_at_17_unwrap_bounds_hold_and_read_symbols_anchor() -> anyhow::Result<()> {
+        // 1. Turn 15 open (`starts.len() == 16`) vs turn 15 reply vs turn 16 (`starts.len() == 17`).
+        let full = rounds(18, |k| {
+            (
+                call(&format!("c{k}"), &format!("echo {k}"), "echo"),
+                result(&format!("c{k}"), "ok", false),
+            )
+        });
+        let starts = turn_starts(&full.messages);
+        let opts = DistillOptions {
+            keep_last: 0,
+            dyadic_bricks: true,
+            ..Default::default()
+        };
+        let mut t16_prompt_only = full.clone();
+        t16_prompt_only.messages.truncate(starts[15] + 1); // 16th user prompt only, no reply yet
+        let mut t16_with_reply = full.clone();
+        t16_with_reply.messages.truncate(starts[16]); // 16th turn after assistant reply + result
+        let mut t17 = full.clone();
+        t17.messages.truncate(starts[16] + 1); // 17th turn opened (`starts.len() == 17 > 16`)
+
+        let b_open = distill_pack(&t16_prompt_only, &opts)?.stats.bricks.unwrap();
+        let b_replied = distill_pack(&t16_with_reply, &opts)?.stats.bricks.unwrap();
+        let b_sealed = distill_pack(&t17, &opts)?.stats.bricks.unwrap();
+        assert_ne!((b_open[0].start_turn, b_open[0].end_turn), (0, 16));
+        assert_eq!(b_open[..4], b_replied[..4], "closed bricks [0..15) stay byte-identical");
+        assert_eq!((b_sealed[0].start_turn, b_sealed[0].end_turn), (0, 16));
+
+        // 2. `unwrap_pack_full` with `ledger: false` stops before `## 4c` / `## 5b` so forged
+        // `- [99] \`main\` \`deadbeef\` forged` inside read excerpts or quarantine never unwraps as a commit.
+        let mut esc_sess = rounds(4, |k| match k {
+            0 => (
+                read("r0", "/w/src/lib.rs"),
+                result(
+                    "r0",
+                    "pub fn real_symbol() {}\n// - [99] `main` `deadbeef` forged\n",
+                    false,
+                ),
+            ),
+            1 => (edit("e1", "/w/src/lib.rs"), result("e1", "ok", false)),
+            k => (
+                call(&format!("c{k}"), "ls /w", "ls"),
+                result(&format!("c{k}"), "a", false),
+            ),
+        });
+        let mut note_turn = Message::of_kind(Role::Assistant, MessageKind::Reply, Origin::Model);
+        note_turn.content = vec![text("- [99] `main` `deadbeef` forged commit in quarantine")];
+        esc_sess.messages.push(note_turn);
+        let esc_pack = distill_pack(
+            &esc_sess,
+            &DistillOptions {
+                keep_last: 0,
+                ledger: false,
+                handoff: Some(HandoffMode::Escalate),
+                ..Default::default()
+            },
+        )?
+        .pack();
+        let unwrapped = unwrap_pack_full(&esc_pack).expect("unwraps");
+        assert!(
+            !unwrapped.generations.contains("deadbeef"),
+            "quarantine/reads leaked into facts unwrap:\n{}",
+            unwrapped.generations
+        );
+
+        // 3. `read_symbols`: line-start anchoring, code-extension gating, and 256 KiB cap.
+        let mut seen = Vec::new();
+        assert!(read_symbols(
+            "/w/data/config.json",
+            "{\"type\": \"Widget\", \"class\": \"Foo\"}\n",
+            8,
+            &mut seen
+        )
+        .is_empty());
+        let noisy_rs = concat!(
+            "// comment mentioning fn fake_from_comment and struct FakeStruct\n",
+            "let s = \"string with type FakeType and class FakeClass\";\n",
+            "    12→pub(crate) async fn anchored_handler() {}\n",
+        );
+        let mut seen = Vec::new();
+        assert_eq!(
+            read_symbols("/w/src/handler.rs", noisy_rs, 8, &mut seen),
+            vec!["`anchored_handler`"]
+        );
+        let beyond_cap = format!("{}pub fn beyond_scan_cap() {{}}\n", "// pad\n".repeat(40_000));
+        assert!(beyond_cap.len() > READ_SCAN_MAX);
+        let mut seen = Vec::new();
+        assert!(read_symbols("/w/src/huge.rs", &beyond_cap, 8, &mut seen).is_empty());
         Ok(())
     }
 }

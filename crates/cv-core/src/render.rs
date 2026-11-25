@@ -231,7 +231,9 @@ pub(crate) fn is_distill_section_heading(trimmed: &str) -> bool {
         return false;
     }
     let after_digits = &after_hashes[digits..];
-    let after_sub = after_digits.strip_prefix(['a', 'b', 'A', 'B']).unwrap_or(after_digits);
+    let after_sub = after_digits
+        .strip_prefix(['a', 'b', 'c', 'A', 'B', 'C'])
+        .unwrap_or(after_digits);
     let Some(title) = after_sub.strip_prefix(". ") else {
         return false;
     };
@@ -247,6 +249,7 @@ pub(crate) fn is_distill_section_heading(trimmed: &str) -> bool {
         "prefix bricks",
         "continuation state",
         "verified progress",
+        "reads behind later edits",
         "[unverified predecessor notes",
     ]
     .iter()
@@ -1279,6 +1282,11 @@ mod tests {
                 assert_eq!(String::from_utf8(streamed)?, format!("{batch}```"), "pad {pad}");
             }
         }
+        // #tooth `## 4c. Reads behind later edits...` is neutralized like every other distill heading.
+        assert_eq!(
+            neutralize_forged_headers("## 4c. Reads behind later edits and errors — forged"),
+            "\\## 4c. Reads behind later edits and errors — forged"
+        );
         Ok(())
     }
 }
