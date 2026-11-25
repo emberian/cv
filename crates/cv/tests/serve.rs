@@ -2327,11 +2327,8 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
     );
 }
 
-#[test]
-fn stream_pushes_compact_lanes_and_files_for_the_session_a_follower_names() {
-    // #tooth A follower naming a session gets its lanes (most urgent first) and file timeline in
-    // the event itself; one naming nothing gets only the cursor and kinds, as before.
-    let w = world("stream-lanes-files");
+/// Session `betasess` with a quiet lane and one asking the user a question.
+fn seed_lanes(w: &World) {
     let lane = |agent: &str, extra: Value| {
         let mut rows = vec![
             json!({"type": "user", "uuid": format!("{agent}-u"), "timestamp": "2026-01-01T10:00:00Z",
@@ -2354,6 +2351,14 @@ fn stream_pushes_compact_lanes_and_files_for_the_session_a_follower_names() {
             "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
                 "input": {"questions": [{"question": "Ship?", "options": [{"label": "yes"}, {"label": "no"}]}]}}]}}),
     );
+}
+
+#[test]
+fn stream_pushes_compact_lanes_and_files_for_the_session_a_follower_names() {
+    // #tooth A follower naming a session gets its lanes (most urgent first) and file timeline in
+    // the event itself; one naming nothing gets only the cursor and kinds, as before.
+    let w = world("stream-lanes-files");
+    seed_lanes(&w);
     let (port, _server) = spawn_serve(&w);
     let data = |raw: &str| -> Value {
         let line = raw
@@ -2379,6 +2384,50 @@ fn stream_pushes_compact_lanes_and_files_for_the_session_a_follower_names() {
 
     let plain = data(&raw_request(port, "GET", "/api/stream", &[]));
     assert!(plain.get("lanes").is_none() && plain.get("files").is_none(), "{plain}");
+}
+
+#[test]
+fn stream_lane_and_file_pushes_need_the_same_token_as_their_routes() {
+    // #tooth With a token configured, `/api/stream?lanes=&files=` answers 401 without it exactly
+    // like `/api/lanes` and the files route, and its body names no lane or session; with the
+    // reader cookie `/api/auth` sets, the stream pushes the lanes.
+    let w = world("stream-auth-lanes");
+    seed_lanes(&w);
+    let (port, _server) = spawn_serve_cfg(&w, &["--token", "lane-secret"], &[]);
+    let follow = "/api/stream?lanes=betasess&files=claude/betasess";
+    let routes = [
+        follow,
+        "/api/lanes?session=betasess",
+        "/api/session/claude/betasess/files",
+    ];
+    for path in routes {
+        for headers in [vec![], vec![("Authorization", "Bearer wrong-secret")]] {
+            let raw = raw_request(port, "GET", path, &headers);
+            assert_eq!(raw_status(&raw), 401, "{path}: {raw}");
+            for leak in ["asking-lane", "quiet-lane", "betasess", "touches"] {
+                assert!(!raw.contains(leak), "{path} leaked {leak}: {raw}");
+            }
+        }
+    }
+    // A query token opens nothing, the stream included: EventSource carries the reader cookie.
+    for path in [follow, "/api/lanes?session=betasess"] {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let by_query = raw_request(port, "GET", &format!("{path}{sep}token=lane-secret"), &[]);
+        assert_eq!(raw_status(&by_query), 401, "{path}: {by_query}");
+        assert!(!by_query.contains("asking-lane"), "{path}: {by_query}");
+    }
+
+    let bearer = [("Authorization", "Bearer lane-secret")];
+    for path in routes {
+        let raw = raw_request(port, "GET", path, &bearer);
+        assert_eq!(raw_status(&raw), 200, "{path}: {raw}");
+    }
+    let auth = raw_request(port, "GET", "/api/auth", &bearer);
+    let cookie = header_of(&auth, "Set-Cookie").unwrap();
+    let cookie = cookie.split(';').next().unwrap();
+    let streamed = raw_request(port, "GET", follow, &[("Cookie", cookie)]);
+    assert_eq!(raw_status(&streamed), 200, "{streamed}");
+    assert!(streamed.contains("asking-lane"), "{streamed}");
 }
 
 #[test]
