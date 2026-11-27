@@ -132,38 +132,39 @@ pub(crate) fn record(
 /// Editors whose pre-call observation is still live. Reads never enter this lookup.
 #[cfg(feature = "sqlite")]
 pub fn pending_editors(path: &str) -> anyhow::Result<Vec<super::TouchedSession>> {
-    let Some(conn) = crate::state::StateStore::default_store()?.open_readonly()? else {
-        return Ok(vec![]);
-    };
-    if crate::state::current_schema_version(&conn)? < 5 {
-        return Ok(vec![]);
-    }
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT harness,session,agent FROM pending_file_versions
-        WHERE path=?1 AND edit=1 AND started >= unixepoch()-300 ORDER BY harness,session,agent LIMIT 128",
-    )?;
-    let rows = stmt.query_map([path], |r| {
-        let harness: String = r.get(0)?;
-        let session: String = r.get(1)?;
-        let agent: String = r.get(2)?;
-        let child = (!agent.is_empty())
-            .then(|| crate::Harness::parse(&harness).and_then(crate::harness::rootless))
-            .flatten()
-            .and_then(|adapter| adapter.agent_session_id(&agent));
-        let parent_id = child.is_some().then(|| session.clone());
-        Ok(super::TouchedSession {
-            harness,
-            session_id: child.unwrap_or(session),
-            parent_id,
-            agent_id: (!agent.is_empty()).then_some(agent),
-            title: None,
-            workflow: None,
-            edits: 1,
-            reads: 0,
-            last_ts: None,
-        })
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    Ok(crate::state::StateStore::default_store()?
+        .read_in(|conn| {
+            if crate::state::current_schema_version(conn)? < 5 {
+                return Ok(vec![]);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT harness,session,agent FROM pending_file_versions
+                WHERE path=?1 AND edit=1 AND started >= unixepoch()-300 ORDER BY harness,session,agent LIMIT 128",
+            )?;
+            let rows = stmt.query_map([path], |r| {
+                let harness: String = r.get(0)?;
+                let session: String = r.get(1)?;
+                let agent: String = r.get(2)?;
+                let child = (!agent.is_empty())
+                    .then(|| crate::Harness::parse(&harness).and_then(crate::harness::rootless))
+                    .flatten()
+                    .and_then(|adapter| adapter.agent_session_id(&agent));
+                let parent_id = child.is_some().then(|| session.clone());
+                Ok(super::TouchedSession {
+                    harness,
+                    session_id: child.unwrap_or(session),
+                    parent_id,
+                    agent_id: (!agent.is_empty()).then_some(agent),
+                    title: None,
+                    workflow: None,
+                    edits: 1,
+                    reads: 0,
+                    last_ts: None,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,82 +186,88 @@ pub fn stale_reads(
     agent: Option<&str>,
     path: Option<&str>,
 ) -> anyhow::Result<Vec<StaleRead>> {
-    let Some(conn) = crate::state::StateStore::default_store()?.open_readonly()? else {
-        return Ok(vec![]);
-    };
-    if crate::state::current_schema_version(&conn)? < 5 {
-        return Ok(vec![]);
-    }
-    let mut stmt=conn.prepare("SELECT r.path,r.blob,w.blob,w.session,w.harness,r.session,r.agent,w.agent FROM file_versions r
-        JOIN file_versions w ON w.path=r.path AND w.edit=1 AND w.rowid>r.rowid
-        WHERE r.harness=?1 AND r.session=?2 AND (?3 IS NULL OR r.agent=?3) AND (?4 IS NULL OR r.path=?4)
-        AND r.edit=0 AND w.base!=w.blob AND w.blob!=r.blob
-        AND (w.harness!=r.harness OR w.session!=r.session OR w.agent!=r.agent)
-        AND NOT EXISTS (SELECT 1 FROM file_versions newer WHERE newer.path=r.path AND newer.harness=r.harness AND newer.session=r.session AND newer.agent=r.agent AND newer.rowid>r.rowid)
-        AND NOT EXISTS (SELECT 1 FROM file_versions newer WHERE newer.path=w.path AND newer.edit=1 AND newer.rowid>w.rowid)
-        ORDER BY r.path,r.rowid")?;
-    let rows = stmt.query_map(rusqlite::params![harness, session, agent, path], |r| {
-        Ok(StaleRead {
-            path: r.get(0)?,
-            read_blob: r.get(1)?,
-            written_blob: r.get(2)?,
-            writer: r.get(3)?,
-            writer_harness: r.get(4)?,
-            reader: r.get(5)?,
-            reader_agent: r.get(6)?,
-            writer_agent: r.get(7)?,
-        })
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    Ok(crate::state::StateStore::default_store()?
+        .read_in(|conn| {
+            if crate::state::current_schema_version(conn)? < 5 {
+                return Ok(vec![]);
+            }
+            let mut stmt = conn.prepare(
+                "SELECT r.path,r.blob,w.blob,w.session,w.harness,r.session,r.agent,w.agent FROM file_versions r
+                JOIN file_versions w ON w.path=r.path AND w.edit=1 AND w.rowid>r.rowid
+                WHERE r.harness=?1 AND r.session=?2 AND (?3 IS NULL OR r.agent=?3) AND (?4 IS NULL OR r.path=?4)
+                AND r.edit=0 AND w.base!=w.blob AND w.blob!=r.blob
+                AND (w.harness!=r.harness OR w.session!=r.session OR w.agent!=r.agent)
+                AND NOT EXISTS (SELECT 1 FROM file_versions newer WHERE newer.path=r.path AND newer.harness=r.harness AND newer.session=r.session AND newer.agent=r.agent AND newer.rowid>r.rowid)
+                AND NOT EXISTS (SELECT 1 FROM file_versions newer WHERE newer.path=w.path AND newer.edit=1 AND newer.rowid>w.rowid)
+                ORDER BY r.path,r.rowid",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![harness, session, agent, path], |r| {
+                Ok(StaleRead {
+                    path: r.get(0)?,
+                    read_blob: r.get(1)?,
+                    written_blob: r.get(2)?,
+                    writer: r.get(3)?,
+                    writer_harness: r.get(4)?,
+                    reader: r.get(5)?,
+                    reader_agent: r.get(6)?,
+                    writer_agent: r.get(7)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?
+        .unwrap_or_default())
 }
 
 #[cfg(feature = "sqlite")]
 pub fn overlaps(harness: &str, session: &str, agent: Option<&str>, v: &FileVersion) -> Option<bool> {
     let span = v.span?;
-    let conn = crate::state::StateStore::default_store().ok()?.open_readonly().ok()??;
-    let mut stmt = conn
-        .prepare(
-            "SELECT base,lo,hi FROM pending_file_versions
-        WHERE harness=?1 AND session=?2 AND agent=?3 AND path=?4 AND edit=1 AND started>=unixepoch()-300
-        UNION ALL SELECT base,lo,hi FROM (SELECT base,lo,hi FROM file_versions WHERE harness=?1 AND session=?2
-        AND agent=?3 AND path=?4 AND edit=1 ORDER BY rowid DESC LIMIT 1)",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map(rusqlite::params![harness, session, agent.unwrap_or(""), v.path], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<usize>>(1)?,
-                r.get::<_, Option<usize>>(2)?,
-            ))
-        })
-        .ok()?;
-    let mut same_base = false;
-    for row in rows {
-        let (base, lo, hi) = row.ok()?;
-        if base == v.blob {
-            let (lo, hi) = (lo?, hi?);
-            if lo < span.1 && span.0 < hi {
-                return Some(true);
+    crate::state::StateStore::default_store()
+        .ok()?
+        .read_in(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT base,lo,hi FROM pending_file_versions
+                WHERE harness=?1 AND session=?2 AND agent=?3 AND path=?4 AND edit=1 AND started>=unixepoch()-300
+                UNION ALL SELECT base,lo,hi FROM (SELECT base,lo,hi FROM file_versions WHERE harness=?1 AND session=?2
+                AND agent=?3 AND path=?4 AND edit=1 ORDER BY rowid DESC LIMIT 1)",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![harness, session, agent.unwrap_or(""), v.path], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<usize>>(1)?,
+                    r.get::<_, Option<usize>>(2)?,
+                ))
+            })?;
+            let mut same_base = false;
+            for row in rows {
+                let (base, lo, hi) = row?;
+                if base == v.blob {
+                    let (Some(lo), Some(hi)) = (lo, hi) else {
+                        return Ok(None);
+                    };
+                    if lo < span.1 && span.0 < hi {
+                        return Ok(Some(true));
+                    }
+                    same_base = true;
+                }
             }
-            same_base = true;
-        }
-    }
-    same_base.then_some(false)
+            Ok(same_base.then_some(false))
+        })
+        .ok()??
 }
 
 #[cfg(feature = "sqlite")]
 pub fn observed_edits(harness: &str, session: &str) -> anyhow::Result<std::collections::BTreeSet<String>> {
-    let Some(conn) = crate::state::StateStore::default_store()?.open_readonly()? else {
-        return Ok(Default::default());
-    };
-    if crate::state::current_schema_version(&conn)? < 5 {
-        return Ok(Default::default());
-    }
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT path FROM file_versions WHERE harness=?1 AND session=?2 AND edit=1")?;
-    let rows = stmt.query_map([harness, session], |r| r.get(0))?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    Ok(crate::state::StateStore::default_store()?
+        .read_in(|conn| {
+            if crate::state::current_schema_version(conn)? < 5 {
+                return Ok(Default::default());
+            }
+            let mut stmt =
+                conn.prepare("SELECT DISTINCT path FROM file_versions WHERE harness=?1 AND session=?2 AND edit=1")?;
+            let rows = stmt.query_map([harness, session], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?
+        .unwrap_or_default())
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -271,23 +278,24 @@ pub fn observed_edits(_harness: &str, _session: &str) -> anyhow::Result<std::col
 /// Latest recorded file blob per path observed or produced by `(harness, session)` via receipts.
 #[cfg(feature = "sqlite")]
 pub fn observed_file_blobs(harness: &str, session: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-    let Some(conn) = crate::state::StateStore::default_store()?.open_readonly()? else {
-        return Ok(Default::default());
-    };
-    if crate::state::current_schema_version(&conn)? < 5 {
-        return Ok(Default::default());
-    }
-    let mut stmt =
-        conn.prepare("SELECT path, blob FROM file_versions WHERE harness=?1 AND session=?2 ORDER BY rowid ASC")?;
-    let mut out = std::collections::BTreeMap::new();
-    let rows = stmt.query_map([harness, session], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (path, blob) = row?;
-        out.insert(path, blob);
-    }
-    Ok(out)
+    Ok(crate::state::StateStore::default_store()?
+        .read_in(|conn| {
+            if crate::state::current_schema_version(conn)? < 5 {
+                return Ok(Default::default());
+            }
+            let mut stmt = conn
+                .prepare("SELECT path, blob FROM file_versions WHERE harness=?1 AND session=?2 ORDER BY rowid ASC")?;
+            let mut out = std::collections::BTreeMap::new();
+            let rows = stmt.query_map([harness, session], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (path, blob) = row?;
+                out.insert(path, blob);
+            }
+            Ok(out)
+        })?
+        .unwrap_or_default())
 }
 
 #[cfg(not(feature = "sqlite"))]

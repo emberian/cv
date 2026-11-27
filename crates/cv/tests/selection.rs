@@ -202,10 +202,18 @@ fn splice_into_a_claude_session_carries_system_records_as_they_were() {
     // A typed prompt stays a person's typed prompt.
     assert_eq!(by["u1"]["origin"]["kind"], "human", "{}", by["u1"]);
     assert_eq!(by["u1"]["promptSource"], "typed");
-    // One session: every spelling of the id is the new one, and the chain is whole.
-    let text = fs::read_to_string(&path).unwrap();
-    assert!(!text.contains(SRC), "a record still names the source session");
+    // One session: every spelling of the session id is the new one (only the continuation
+    // provenance `fork-context-ref` names `parentSessionId: SRC`), and the chain is whole.
     for r in &written {
+        if r.get("type").and_then(Value::as_str) == Some("fork-context-ref") {
+            assert_eq!(r["parentSessionId"], SRC, "{r}");
+            assert_eq!(r["sessionId"], new_id, "{r}");
+        } else {
+            assert!(
+                !r.to_string().contains(SRC),
+                "a record still names the source session: {r}"
+            );
+        }
         for key in ["sessionId", "session_id"] {
             if let Some(id) = r.get(key) {
                 assert_eq!(id, new_id, "{r}");

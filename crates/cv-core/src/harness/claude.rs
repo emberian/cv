@@ -685,31 +685,24 @@ impl Adapter for Claude {
                 _ => TranscriptState {
                     session: new_session_for(&r.id, Some(r.path.clone()), opts),
                     skipped_parents: std::collections::BTreeMap::new(),
+                    opening_turns_seen: 0,
                 },
             };
-            let mut lineage_sink = OpeningLineageSink::new(sink, r.id.clone(), Some(r.path.clone()));
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, &mut lineage_sink);
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
             let mut before_skipped = 0u64;
             if !matches!(from, Start::Checkpoint(_)) {
                 let (flow, skipped) = join(&mut state, &prefix_runs, opts, &mut spawns)?;
                 before_skipped = skipped;
                 if flow == Flow::Stop {
                     super::note_skipped_lines(&mut state.session, before_skipped);
-                    if state.session.lineage.continues.is_none() {
-                        state.session.lineage.continues = lineage_sink.detected.take();
-                    }
                     return Ok(Some(state.session));
                 }
             }
             let read = jsonl::Read::open(&r.path)?;
             let codec = Transcript { state, opts };
-            let Some(mut s) = jsonl::drive_from(&read, from, tail_start, before_skipped, codec, &mut spawns)? else {
+            let Some(s) = jsonl::drive_from(&read, from, tail_start, before_skipped, codec, &mut spawns)? else {
                 return Ok(None);
             };
-            drop(spawns);
-            if s.lineage.continues.is_none() {
-                s.lineage.continues = lineage_sink.detected.take();
-            }
             Ok(Some(match from {
                 Start::Prefix(_) => s,
                 _ => with_fork_source(s, &r.path, sink),
@@ -753,7 +746,15 @@ fn join(
         jsonl::Read::open(&slice.path)?.snapshot(slice.start, slice.end, |line| {
             match line.view {
                 Some(view) => {
-                    flow = record::record(&mut state.session, view, None, opts, &mut state.skipped_parents, sink)?
+                    flow = record::record(
+                        &mut state.session,
+                        view,
+                        None,
+                        opts,
+                        &mut state.skipped_parents,
+                        &mut state.opening_turns_seen,
+                        sink,
+                    )?
                 }
                 None => skipped += u64::from(!line.blank),
             }
@@ -778,55 +779,6 @@ fn with_fork_source(mut s: Session, path: &Path, sink: &mut dyn MessageSink) -> 
     s
 }
 
-/// Inspects at most the opening two non-carrier messages (`seen < 2`) for explicit continuation /
-/// fold / distill / splice parent provenance without touching deep transcript messages.
-struct OpeningLineageSink<'a> {
-    inner: &'a mut dyn MessageSink,
-    own_id: String,
-    resolver: crate::lazy::Resolver,
-    seen: usize,
-    detected: Option<String>,
-}
-
-impl<'a> OpeningLineageSink<'a> {
-    fn new(inner: &'a mut dyn MessageSink, own_id: String, source: Option<PathBuf>) -> Self {
-        Self {
-            inner,
-            own_id,
-            resolver: crate::lazy::Resolver::new(source),
-            seen: 0,
-            detected: None,
-        }
-    }
-}
-
-impl MessageSink for OpeningLineageSink<'_> {
-    fn meta(&mut self, s: &Session) {
-        self.inner.meta(s);
-    }
-    fn dependency(&mut self, path: &Path) {
-        self.inner.dependency(path);
-    }
-    fn take_error(&mut self) -> Option<anyhow::Error> {
-        self.inner.take_error()
-    }
-    fn message(&mut self, m: Message) -> Flow {
-        if self.seen < 2
-            && m.kind != crate::ir::MessageKind::Carrier
-            && matches!(
-                m.role,
-                crate::ir::Role::User | crate::ir::Role::Assistant | crate::ir::Role::System
-            )
-        {
-            if self.detected.is_none() {
-                self.detected = crate::lineage::detect_opening_message(&m, &self.resolver, Some(&self.own_id));
-            }
-            self.seen += 1;
-        }
-        self.inner.message(m)
-    }
-}
-
 /// Fully parse a Claude `.jsonl` transcript from its text contents into a [`Session`] (full
 /// fidelity, including `extra` sidecars).
 ///
@@ -849,14 +801,22 @@ pub fn stream_str(
     opts: &Demand,
     sink: &mut dyn MessageSink,
 ) -> Session {
-    let mut session = new_session_for(id, source_path.clone(), opts);
-    let mut lineage_sink = OpeningLineageSink::new(sink, id.to_owned(), source_path);
-    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, &mut lineage_sink);
+    let mut session = new_session_for(id, source_path, opts);
+    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
     // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
     let mut skipped = super::Unparsed::default();
     let mut skipped_parents = std::collections::BTreeMap::new();
+    let mut opening_turns_seen = 0u8;
     let result = jsonl::slice(text.as_bytes(), |line| match line.view {
-        Some(view) => record::record(&mut session, view, None, opts, &mut skipped_parents, &mut spawns),
+        Some(view) => record::record(
+            &mut session,
+            view,
+            None,
+            opts,
+            &mut skipped_parents,
+            &mut opening_turns_seen,
+            &mut spawns,
+        ),
         None => {
             skipped.0 += u64::from(!line.blank);
             Ok(Flow::Continue)
@@ -867,11 +827,11 @@ pub fn stream_str(
     if let Some(error) = spawns.take_error() {
         super::note_read_error(&mut session, Err(error));
     }
-    drop(spawns);
-    if session.lineage.continues.is_none() {
-        session.lineage.continues = lineage_sink.detected.take();
-    }
     session
+}
+
+fn is_zero_u8(&n: &u8) -> bool {
+    n == 0
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -880,6 +840,8 @@ struct TranscriptState {
     session: Session,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     skipped_parents: std::collections::BTreeMap<String, Option<String>>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    opening_turns_seen: u8,
 }
 
 /// The Claude record codec over one captured transcript: each record accumulates into the session
@@ -898,6 +860,7 @@ impl jsonl::Codec for Transcript<'_> {
             Some(at),
             self.opts,
             &mut self.state.skipped_parents,
+            &mut self.state.opening_turns_seen,
             sink,
         )
     }

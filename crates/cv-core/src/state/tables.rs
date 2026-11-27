@@ -743,32 +743,33 @@ impl StateStore {
 
     /// Look up a single published pack manifest by `pack_id`.
     pub fn get_pack_manifest(&self, pack_id: &str) -> Result<Option<PackManifest>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        conn.query_row(
-            "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
-                    digest, pack_path, index_meta_json, published_at
-             FROM pack_manifests
-             WHERE pack_id = ?1",
-            [pack_id],
-            |r| {
-                let meta_str: String = r.get(7)?;
-                Ok(PackManifest {
-                    pack_id: r.get(0)?,
-                    min_commit_pos: r.get(1)?,
-                    max_commit_pos: r.get(2)?,
-                    record_count: r.get::<_, i64>(3)? as u64,
-                    byte_len: r.get::<_, i64>(4)? as u64,
-                    digest: r.get(5)?,
-                    pack_path: r.get(6)?,
-                    index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                    published_at: r.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(StateError::from)
+        Ok(self
+            .read_in(|conn| {
+                conn.query_row(
+                    "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
+                            digest, pack_path, index_meta_json, published_at
+                     FROM pack_manifests
+                     WHERE pack_id = ?1",
+                    [pack_id],
+                    |r| {
+                        let meta_str: String = r.get(7)?;
+                        Ok(PackManifest {
+                            pack_id: r.get(0)?,
+                            min_commit_pos: r.get(1)?,
+                            max_commit_pos: r.get(2)?,
+                            record_count: r.get::<_, i64>(3)? as u64,
+                            byte_len: r.get::<_, i64>(4)? as u64,
+                            digest: r.get(5)?,
+                            pack_path: r.get(6)?,
+                            index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+                            published_at: r.get(8)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StateError::from)
+            })?
+            .flatten())
     }
 
     /// Record a monotonic custody acknowledgement watermark for `(target_hub, producer_id, epoch)`.

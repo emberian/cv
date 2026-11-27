@@ -658,6 +658,7 @@ pub(super) fn record(
     at: Option<u64>,
     opts: &crate::stream::Demand,
     skipped_parents: &mut std::collections::BTreeMap<String, Option<String>>,
+    opening_turns_seen: &mut u8,
     sink: &mut dyn MessageSink,
 ) -> Result<Flow> {
     // A record that is not an object carries nothing (Value's lookups all miss).
@@ -742,9 +743,8 @@ pub(super) fn record(
             let is_continues = r.value("continues")?.and_then(|v| v.as_bool()) == Some(true);
             if let Some(id) = r.top.string("parentSessionId")? {
                 if is_continues {
-                    session.lineage.continues = Some(id.clone());
-                }
-                if session.lineage.forked_from.is_none() || !is_continues {
+                    session.lineage.continues = Some(id);
+                } else {
                     session.lineage.forked_from = Some(id);
                 }
             }
@@ -857,6 +857,13 @@ pub(super) fn record(
     // model encountered in this read, so a window can have a different session default.
     if session.model.is_none() && msg.model.as_deref() != Some(SYNTHETIC_MODEL) {
         session.model = msg.model.clone();
+    }
+    if *opening_turns_seen < 2 && msg.kind != crate::ir::MessageKind::Carrier {
+        if session.lineage.continues.is_none() {
+            session.lineage.continues =
+                crate::lineage::detect_opening_message(&msg, &session.resolver(), Some(&session.id));
+        }
+        *opening_turns_seen += 1;
     }
     Ok(sink.message(msg))
 }

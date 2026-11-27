@@ -4015,7 +4015,30 @@ fn is_state(path: &str, named: &[String], session_cwd: Option<&std::path::Path>)
 /// True only for native local sessions anchored to an explicit checkout `cwd` — never imported,
 /// portable, custody/pack-backed, or remotely replicated transcripts.
 fn session_allows_live_fs(session: &Session) -> bool {
-    if session.cwd.is_none() || session.harness == Harness::OpenSession {
+    let local_checkout_harness = match session.harness {
+        Harness::OpenSession | Harness::ChatGptExport | Harness::ClaudeExport => false,
+        Harness::Claude
+        | Harness::Codex
+        | Harness::Grok
+        | Harness::OpenCode
+        | Harness::Gemini
+        | Harness::Antigravity
+        | Harness::OpenClaw
+        | Harness::Pi
+        | Harness::Kimi
+        | Harness::KimiCode
+        | Harness::Qwen
+        | Harness::LmStudio
+        | Harness::Cline
+        | Harness::Roo
+        | Harness::Continue
+        | Harness::Hermes
+        | Harness::Cursor
+        | Harness::Goose
+        | Harness::Zed
+        | Harness::Devin => true,
+    };
+    if session.cwd.is_none() || !local_checkout_harness {
         return false;
     }
     if session.messages.iter().any(|m| m.origin == Origin::Import) {

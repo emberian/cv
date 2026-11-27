@@ -294,10 +294,20 @@ fn ancestor_canonicalizing_path_normalizer_catches_symlinked_edit_conflicts_befo
 fn hooks_show_reports_seven_hooks_codex_post_tool_use_start_over_2000_msgs_and_cross_harness_retired() {
     let w = World::new("hooks-seven-and-retired");
 
-    // 1) `cv hooks show claude` (human & `--json`) reports all 7 hooks (`compact`, `start`, `lane`,
-    //    `decisions`, `edit`, `retired`, `receipt`).
+    // 1) `cv hooks show claude` (human & `--json`) reports all 9 hooks (`compact`, `start`, `hint`,
+    //    `lane`, `decisions`, `edit`, `retired`, `receipt`, `nudge`).
     let (human_show, _) = w.cv_ok(&["hooks", "show", "claude"]);
-    for name in ["compact", "start", "lane", "decisions", "edit", "retired", "receipt"] {
+    for name in [
+        "compact",
+        "start",
+        "hint",
+        "lane",
+        "decisions",
+        "edit",
+        "retired",
+        "receipt",
+        "nudge",
+    ] {
         assert!(
             human_show.contains(&format!("hook {name}")),
             "human `hooks show` missing {name}:\n{human_show}"
@@ -313,10 +323,20 @@ fn hooks_show_reports_seven_hooks_codex_post_tool_use_start_over_2000_msgs_and_c
         .collect();
     assert_eq!(
         hook_names,
-        vec!["compact", "start", "lane", "decisions", "edit", "retired", "receipt"]
+        vec![
+            "compact",
+            "start",
+            "hint",
+            "lane",
+            "decisions",
+            "edit",
+            "retired",
+            "receipt",
+            "nudge"
+        ]
     );
 
-    // 2) `cv hooks install codex` + `--retired` + `--receipts` installs all 9 entries including `PostToolUse` (`receipt`),
+    // 2) `cv hooks install codex` + `--retired` + `--receipts` installs all 10 entries including `PostToolUse` (`receipt`),
     //    and `hooks show codex --json` computes `post_tool_use` trust keys cleanly.
     w.cv_ok(&["hooks", "install", "codex"]);
     w.cv_ok(&["hooks", "install", "codex", "--retired"]);
@@ -324,7 +344,7 @@ fn hooks_show_reports_seven_hooks_codex_post_tool_use_start_over_2000_msgs_and_c
     let (codex_json, _) = w.cv_ok(&["hooks", "show", "codex", "--json"]);
     let codex_val: Value = serde_json::from_str(&codex_json).unwrap();
     let installed = codex_val["installed"].as_array().unwrap();
-    assert_eq!(installed.len(), 9, "{codex_val}");
+    assert_eq!(installed.len(), 10, "{codex_val}");
     assert!(
         installed.iter().any(|r| {
             r["event"] == "PostToolUse"
