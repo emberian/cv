@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Shared multi-session SQLite stores report `size_bytes: null` and optional `store_bytes` on session rows so listing never multiplies database sizes.
+- OpenCode strips leading UTF-8 BOMs and trailing NUL padding in tree-layout files, skipping empty or NUL-only crash stubs cleanly.
+- Prune drops multi-record pre-compaction carry after boundaries, warns on high uncompacted overhead, and adds `--revive-estimate` for spliced or folded sessions.
+- `cv hooks install` enables the zero-read SessionStart verb-map `hint` hook by default (`--no-hint` omits it), adds `--nudge` and `schema --hint`, and sharpens `SKILL.md`.
+- Claude requires outer `<system-reminder>` delivery framing before marking prompts queued, and `CV_BAGGAGE` accepts four full 128-byte identifiers.
+- Devin CLI supports session emission into `sessions.db` across `port`, `pack --format session`, and `resume` (`devin -r`), with transactional `--strict` verification.
+- `cv pack` elides shell heredoc bodies and caps command byte length and per-source command counts, reporting cuts in `Bounds`.
+- `cv pack` redacts credential-shaped tokens, headers, keys, and secret assignments by default (`--no-redact` retains raw text), preserving author emails.
+- Distill, splice, and adopt record continuation lineage; `cv search` and `cv pack` collapse derived chains to their fullest session unless `--all`.
+- Distill confines live state-file reads to canonical `O_NOFOLLOW` paths inside local `session.cwd`, disabling disk reads for imported or custody sessions.
+- `cv index --subagents` isolates unreadable child transcripts across full-text, trigram, and event passes, naming failing paths and erroring only under `--strict`.
+- `cv index` bounds discovery, sweep, and Tantivy writer pools via `--threads` and `CV_THREADS`, defaulting to at most eight workers.
+- Frozen and batch search bound logical read work without live transcript opens, expose `--stats` accounting, and eliminate shared-store staleness and admission contention.
 - Search hits carry profile-qualified session selectors; list, search, show, pack, and port fall back to archived packs and hub snapshots.
 - Serve enforces scoped disclosure tiers, separates reader, producer, and inbox credentials, and accepts HttpOnly reader cookies on browser streams and downloads.
 - Archive keeps single-file Claude, Codex, Qwen, and OpenSession sessions as their native bytes, packing only appended lines; rewritten files start fresh.
