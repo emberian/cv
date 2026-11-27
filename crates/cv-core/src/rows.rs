@@ -16,23 +16,43 @@ use crate::events::{EventRow, TouchedSession};
 use crate::ir::{Harness, SessionRef};
 use serde_json::{json, Value};
 
-/// THE session row (§3): the same nine keys `cv ls --json`, `cv search --json`, `cv serve`'s
+/// `(size_bytes, store_bytes)` for `r`: per-session files carry `(probe.ref_size(r), None)`, while
+/// shared multi-session stores (`!path_selects_session(r)`) carry `(None, probe.size(&r.path))` so
+/// callers never sum one database across N rows while still reporting the shared store's size.
+pub fn ref_sizes(probe: &mut crate::source::Probe, r: &SessionRef) -> (Option<u64>, Option<u64>) {
+    if crate::harness::path_selects_session(r) {
+        (probe.ref_size(r), None)
+    } else {
+        (None, probe.size(&r.path))
+    }
+}
+
+/// THE session row (§3): the same keys `cv ls --json`, `cv search --json`, `cv serve`'s
 /// `/api/sessions` and the desktop app's `api` command emit. `size_bytes` is passed in because
 /// only the caller knows whether it already has the `stat` in hand. `message_count` is `null`
 /// for a session no full read or index has counted yet; `0` is a session with no turns.
 pub fn session_row(r: &SessionRef, size_bytes: Option<u64>) -> Value {
-    json!({
-        "id": r.id,
-        "harness": r.harness.as_str(),
-        "path": r.path.to_string_lossy(),
-        "cwd": r.cwd.as_ref().map(|p| p.to_string_lossy()),
-        "title": r.title,
-        "created_at": r.created_at.map(|t| t.to_rfc3339()),
-        "updated_at": r.updated_at.map(|t| t.to_rfc3339()),
-        "message_count": r.message_count,
-        "size_bytes": size_bytes,
-        "session_key": r.session_selector(),
-    })
+    session_row_with_store(r, size_bytes, None)
+}
+
+/// [`session_row`] plus optional `store_bytes` (emitted only for shared multi-session stores where
+/// per-session `size_bytes` is `null`).
+pub fn session_row_with_store(r: &SessionRef, size_bytes: Option<u64>, store_bytes: Option<u64>) -> Value {
+    let mut map = serde_json::Map::with_capacity(11);
+    map.insert("id".into(), json!(r.id));
+    map.insert("harness".into(), json!(r.harness.as_str()));
+    map.insert("path".into(), json!(r.path.to_string_lossy()));
+    map.insert("cwd".into(), json!(r.cwd.as_ref().map(|p| p.to_string_lossy())));
+    map.insert("title".into(), json!(r.title));
+    map.insert("created_at".into(), json!(r.created_at.map(|t| t.to_rfc3339())));
+    map.insert("updated_at".into(), json!(r.updated_at.map(|t| t.to_rfc3339())));
+    map.insert("message_count".into(), json!(r.message_count));
+    map.insert("size_bytes".into(), json!(size_bytes));
+    if let Some(sb) = store_bytes {
+        map.insert("store_bytes".into(), json!(sb));
+    }
+    map.insert("session_key".into(), json!(r.session_selector()));
+    Value::Object(map)
 }
 
 /// Unix seconds (how the search index dates a hit) → the RFC 3339 string §3 promises.
@@ -92,9 +112,10 @@ impl Default for SearchRowContext {
 
 impl SearchRow<'_> {
     /// The §3 search row: the session row (filled from the catalog, so `path`, `message_count` and
-    /// `size_bytes` are the same values `ls --json` gives — all null for a sub-agent lane, which
-    /// the catalog does not list) with the hit's own title/cwd/dates laid over it, plus `score`,
-    /// `snippet`, and the sub-agent provenance trio — always present, null for a top-level hit.
+    /// `size_bytes` are the same values `ls --json` gives — `size_bytes` is null when the session
+    /// shares a multi-session store, and all three are null for an uncataloged sub-agent lane)
+    /// with the hit's own title/cwd/dates laid over it, plus `score`, `snippet`, and the sub-agent
+    /// provenance trio — always present, null for a top-level hit.
     /// A response's hits share one operation-owned exact catalog reader (`context`).
     pub fn to_json_with(&self, context: &SearchRowContext) -> Value {
         let cataloged = context
@@ -127,30 +148,55 @@ impl SearchRow<'_> {
         // plus canonical identity, path and count. Out-of-range index dates use the catalog too.
         let created = rfc3339(self.created_at).or_else(|| reference.and_then(|r| r.created_at).map(|t| t.to_rfc3339()));
         let updated = rfc3339(self.updated_at).or_else(|| reference.and_then(|r| r.updated_at).map(|t| t.to_rfc3339()));
-        json!({
-            "id": reference.map_or(self.id, |r| r.id.as_str()),
-            "harness": reference.map_or(self.harness, |r| r.harness.as_str()),
-            "path": reference.map(|r| r.path.to_string_lossy()),
-            "cwd": self.cwd.map(std::borrow::Cow::Borrowed).or_else(|| reference.and_then(|r| r.cwd.as_ref()).map(|p| p.to_string_lossy())),
-            "title": self.title.or_else(|| reference.and_then(|r| r.title.as_deref())),
-            "created_at": created,
-            "updated_at": updated,
-            "message_count": reference.map(|r| r.message_count),
-            "size_bytes": reference.and_then(|r| context.probe.borrow_mut().ref_size(r)),
-            "session_key": crate::SessionKey::split_selector(self.id).map(|_| self.id.to_owned()).or_else(|| reference.map(SessionRef::session_selector)),
-            "score": self.score,
-            "snippet": self.snippet,
-            "agent_id": self.agent_id,
-            "parent_id": self.parent_id,
-            "workflow": self.workflow,
-        })
+        let (size_bytes, store_bytes) = reference
+            .map(|r| ref_sizes(&mut context.probe.borrow_mut(), r))
+            .unwrap_or((None, None));
+        let mut map = serde_json::Map::with_capacity(16);
+        map.insert("id".into(), json!(reference.map_or(self.id, |r| r.id.as_str())));
+        map.insert(
+            "harness".into(),
+            json!(reference.map_or(self.harness, |r| r.harness.as_str())),
+        );
+        map.insert("path".into(), json!(reference.map(|r| r.path.to_string_lossy())));
+        map.insert(
+            "cwd".into(),
+            json!(self
+                .cwd
+                .map(std::borrow::Cow::Borrowed)
+                .or_else(|| reference.and_then(|r| r.cwd.as_ref()).map(|p| p.to_string_lossy()))),
+        );
+        map.insert(
+            "title".into(),
+            json!(self.title.or_else(|| reference.and_then(|r| r.title.as_deref()))),
+        );
+        map.insert("created_at".into(), json!(created));
+        map.insert("updated_at".into(), json!(updated));
+        map.insert("message_count".into(), json!(reference.map(|r| r.message_count)));
+        map.insert("size_bytes".into(), json!(size_bytes));
+        if let Some(sb) = store_bytes {
+            map.insert("store_bytes".into(), json!(sb));
+        }
+        map.insert(
+            "session_key".into(),
+            json!(crate::SessionKey::split_selector(self.id)
+                .map(|_| self.id.to_owned())
+                .or_else(|| reference.map(SessionRef::session_selector))),
+        );
+        map.insert("score".into(), json!(self.score));
+        map.insert("snippet".into(), json!(self.snippet));
+        map.insert("agent_id".into(), json!(self.agent_id));
+        map.insert("parent_id".into(), json!(self.parent_id));
+        map.insert("workflow".into(), json!(self.workflow));
+        Value::Object(map)
     }
 }
 
 /// The live-scan twin of [`SearchRow::to_json`]: the ref is in hand, so the row is exact; a live
 /// scan has no score and never walks sub-agents (provenance is null).
 pub fn live_search_row(r: &SessionRef, title: &str, snippet: &str) -> Value {
-    let mut row = session_row(r, crate::source::ref_size(r));
+    let mut probe = crate::source::Probe::default();
+    let (size, store) = ref_sizes(&mut probe, r);
+    let mut row = session_row_with_store(r, size, store);
     let obj = row.as_object_mut().expect("json object");
     obj.insert("title".into(), json!(title));
     obj.insert("score".into(), Value::Null);
@@ -302,6 +348,25 @@ mod tests {
             session_row(&uncounted, None)["message_count"].is_null(),
             "not counted yet is null, never 0"
         );
+        assert!(v.get("store_bytes").is_none());
+
+        let world = crate::test_world("rows-shared-store-bytes");
+        let db = world.base.join("state.db");
+        std::fs::write(&db, b"0123456789abcdef").unwrap();
+        let single = world.base.join("s.jsonl");
+        std::fs::write(&single, b"012345").unwrap();
+        let mut probe = crate::source::Probe::default();
+        let shared_ref = SessionRef::new("h1", Harness::Hermes, db);
+        let (sz, sb) = ref_sizes(&mut probe, &shared_ref);
+        let shared_row = session_row_with_store(&shared_ref, sz, sb);
+        assert!(shared_row["size_bytes"].is_null());
+        assert_eq!(shared_row["store_bytes"], 16);
+
+        let single_ref = SessionRef::new("c1", Harness::Claude, single);
+        let (sz, sb) = ref_sizes(&mut probe, &single_ref);
+        let single_row = session_row_with_store(&single_ref, sz, sb);
+        assert_eq!(single_row["size_bytes"], 6);
+        assert!(single_row.get("store_bytes").is_none());
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub(crate) fn data_schema_json() -> Value {
         "session_row": {
             "description": "one session in a list — identical across `ls --json` and `search --json`",
             "keys": cv_core::rows::SESSION_ROW_KEYS,
+            "shared_store_keys": ["store_bytes"],
             "enrich_keys": ["display_title", "git", "enrich_error"],
             "search_extra_keys": &cv_core::rows::SEARCH_ROW_KEYS[cv_core::rows::SESSION_ROW_KEYS.len()..],
             "timestamps": "RFC 3339 strings, null when unknown",

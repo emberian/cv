@@ -309,15 +309,11 @@ fn sessions(query: &str) -> (u16, Value) {
                 if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
                     probe = crate::source::Probe::default();
                 }
-                crate::rows::session_row(r, probe.ref_size(r))
+                let (size, store) = crate::rows::ref_sizes(&mut probe, r);
+                crate::rows::session_row_with_store(r, size, store)
             })
             .collect(),
     ))
-}
-
-/// The transcript's on-disk size, or `None` when it has been deleted since discovery.
-fn size_of(r: &SessionRef) -> Option<u64> {
-    crate::source::ref_size(r)
 }
 
 /// Look up one session by harness name + id (or unique prefix), with each failure already a reply.
@@ -397,7 +393,9 @@ fn session_head(harness: &str, id: &str) -> (u16, Value) {
         Ok(head) => head,
         Err(e) => return err(500, &format!("stream failed: {e:#}")),
     };
-    let mut row = crate::rows::session_row(&r, size_of(&r));
+    let mut probe = crate::source::Probe::default();
+    let (size, store) = crate::rows::ref_sizes(&mut probe, &r);
+    let mut row = crate::rows::session_row_with_store(&r, size, store);
     let map = row.as_object_mut().expect("session_row is an object");
     let Value::Object(head) = head else {
         unreachable!("head metadata is an object")

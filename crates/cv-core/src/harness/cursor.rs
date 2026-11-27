@@ -217,6 +217,13 @@ impl Adapter for Cursor {
 
     /// Every composer's and legacy tab's certificate in a `state.vscdb` ([`rows_conn`]); a CLI
     /// chat's `store.db` holds one session and certifies none.
+    fn rows_store(&self, r: &SessionRef) -> Option<PathBuf> {
+        if r.id.starts_with("cli:") || r.path.file_name().and_then(|n| n.to_str()) == Some("store.db") {
+            return None;
+        }
+        (self.sqlite_source(r) == Some(true)).then(|| r.path.clone())
+    }
+
     fn rows(&self, store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
         open_ro(store).ok()?.read(|conn, _| rows_conn(conn)).ok()
     }
@@ -1672,5 +1679,19 @@ mod tests {
             Some(PathBuf::from("/Users/x/Application Support"))
         );
         assert_eq!(file_uri_to_path("vscode-remote://foo/bar"), None);
+    }
+
+    #[test]
+    fn path_selects_session_distinguishes_shared_vscdb_and_per_chat_cli_store() {
+        let global = SessionRef::new("comp-1", Harness::Cursor, "/u/Cursor/User/globalStorage/state.vscdb");
+        let legacy = SessionRef::new(
+            "legacy:tab-1",
+            Harness::Cursor,
+            "/u/Cursor/User/workspaceStorage/abc/state.vscdb",
+        );
+        let cli = SessionRef::new("cli:agent-1", Harness::Cursor, "/u/.cursor/chats/c1/store.db");
+        assert!(!ROOTLESS.path_selects_session(&global));
+        assert!(!ROOTLESS.path_selects_session(&legacy));
+        assert!(ROOTLESS.path_selects_session(&cli));
     }
 }

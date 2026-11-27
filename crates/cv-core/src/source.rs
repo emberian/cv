@@ -991,10 +991,24 @@ impl Probe {
         }
     }
 
+    /// Whether `r`'s primary or store path is present on disk, reusing this probe's path cache.
+    /// Readable files whose mtime cannot form a [`FileId`] (e.g. pre-epoch timestamps) still exist.
+    pub fn ref_exists(&mut self, r: &SessionRef) -> bool {
+        let primary = self.primary_path(r);
+        if primary == r.path {
+            return self.size(&r.path).is_some();
+        }
+        self.size(&primary).is_some() || self.size(&r.path).is_some()
+    }
+
     /// Transcript byte size of `r`, resolving directory-backed session keys (`kimi`, `kimi-code`,
     /// `grok`) to their underlying transcript file rather than the directory inode's metadata size.
-    /// Returns `None` when the session's source has been deleted since discovery.
+    /// Returns `None` when `r` lives in a shared multi-session store or when its source has been
+    /// deleted since discovery.
     pub fn ref_size(&mut self, r: &SessionRef) -> Option<u64> {
+        if !crate::harness::path_selects_session(r) {
+            return None;
+        }
         let primary = self.primary_path(r);
         if primary == r.path {
             return self.size(&r.path);
@@ -2513,6 +2527,60 @@ mod tests {
 
         std::fs::remove_dir_all(&grok_dir).unwrap();
         assert_eq!(super::ref_size(&r_grok), None);
+    }
+
+    #[test]
+    fn ref_size_omits_shared_stores_while_ref_exists_tracks_presence() {
+        let world = crate::test_world("probe-shared-store-ref-size");
+        let shared_db = world.base.join("state.db");
+        let shared_vscdb = world.base.join("state.vscdb");
+        let shared_sqlite = world.base.join("agent.sqlite");
+        let cli_store = world.base.join("store.db");
+        let agy_db = world.base.join("conv.db");
+        let claude_jsonl = world.base.join("s1.jsonl");
+        let opencode_json = world.base.join("ses_1.json");
+        for path in [
+            &shared_db,
+            &shared_vscdb,
+            &shared_sqlite,
+            &cli_store,
+            &agy_db,
+            &claude_jsonl,
+            &opencode_json,
+        ] {
+            std::fs::write(path, "0123456789").unwrap();
+        }
+
+        let mut probe = Probe::default();
+        for shared in [
+            SessionRef::new("h1", Harness::Hermes, &shared_db),
+            SessionRef::new("d1", Harness::Devin, &shared_db),
+            SessionRef::new("z1", Harness::Zed, &shared_db),
+            SessionRef::new("o1", Harness::OpenCode, &shared_db),
+            SessionRef::new("g1", Harness::Goose, &shared_db),
+            SessionRef::new("oc1", Harness::OpenClaw, &shared_sqlite),
+            SessionRef::new("c1", Harness::Cursor, &shared_vscdb),
+            SessionRef::new("legacy:t1", Harness::Cursor, &shared_vscdb),
+        ] {
+            assert!(!crate::harness::path_selects_session(&shared), "{shared:?}");
+            assert!(probe.ref_exists(&shared), "{shared:?}");
+            assert_eq!(probe.ref_size(&shared), None, "{shared:?}");
+        }
+
+        for single in [
+            SessionRef::new("cli:a1", Harness::Cursor, &cli_store),
+            SessionRef::new("agy1", Harness::Antigravity, &agy_db),
+            SessionRef::new("s1", Harness::Claude, &claude_jsonl),
+            SessionRef::new("ses_1", Harness::OpenCode, &opencode_json),
+        ] {
+            assert!(crate::harness::path_selects_session(&single), "{single:?}");
+            assert!(probe.ref_exists(&single), "{single:?}");
+            assert_eq!(probe.ref_size(&single), Some(10), "{single:?}");
+        }
+
+        std::fs::remove_file(&shared_db).unwrap();
+        let mut fresh_probe = Probe::default();
+        assert!(!fresh_probe.ref_exists(&SessionRef::new("h1", Harness::Hermes, &shared_db)));
     }
 
     #[cfg(unix)]

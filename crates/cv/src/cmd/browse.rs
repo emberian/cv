@@ -21,7 +21,8 @@ fn apply_query(refs: &mut Vec<SessionRef>, query: &Option<cv_core::SessionQuery>
 }
 
 /// Session rows for `--json` listings, capped at `limit`. Fresh render-phase metadata supplies
-/// both presence and `size_bytes`; rows sharing a path reuse that observation within each batch.
+/// presence and per-session `size_bytes` (`null` plus `store_bytes` for shared multi-session
+/// stores); rows sharing a path reuse that observation within each batch.
 fn json_rows<'a>(refs: impl Iterator<Item = &'a SessionRef>, limit: usize) -> Vec<(&'a SessionRef, serde_json::Value)> {
     // Several logical sessions can share one database. Recheck at this rendering boundary,
     // then reuse metadata in small batches: a missing tail must not grow another fleet-sized map.
@@ -31,10 +32,15 @@ fn json_rows<'a>(refs: impl Iterator<Item = &'a SessionRef>, limit: usize) -> Ve
             if index % METADATA_BATCH_SIZE == 0 {
                 probe = cv_core::source::Probe::default();
             }
-            probe.ref_size(r).map(|size| (r, size))
+            probe
+                .ref_exists(r)
+                .then(|| (r, cv_core::rows::ref_sizes(&mut probe, r)))
         })
         .take(limit)
-        .map(|(r, size)| (r, session_row(r, Some(size))))
+        .map(|(r, (size, store))| match store {
+            Some(_) => (r, cv_core::rows::session_row_with_store(r, size, store)),
+            None => (r, session_row(r, size)),
+        })
         .collect()
 }
 
@@ -326,9 +332,20 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
     } else {
         println!("{total} session(s)\n");
     }
-    // The exists() check guards the catalog read path's one residual lie — a session deleted since
-    // the probe last looked — and is bounded by `limit`, not the fleet (it stats only listed rows).
-    let shown: Vec<&SessionRef> = refs.iter().filter(|r| r.path.exists()).take(limit).collect();
+    // The ref_exists() check guards the catalog read path's one residual lie — a session deleted
+    // since the probe last looked — and reuses shared-store observations within small batches.
+    let mut probe = cv_core::source::Probe::default();
+    let shown: Vec<&SessionRef> = refs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, r)| {
+            if index % METADATA_BATCH_SIZE == 0 {
+                probe = cv_core::source::Probe::default();
+            }
+            probe.ref_exists(r).then_some(r)
+        })
+        .take(limit)
+        .collect();
     let plen = cv_core::task::unique_prefix_len(shown.iter().map(|r| r.id.strip_prefix("agent-").unwrap_or(&r.id)), 8);
     let id_col = shown
         .iter()
@@ -497,26 +514,39 @@ mod window_tests {
     fn machine_windows_recheck_shared_paths_and_keep_readable_old_timestamps() {
         let world = crate::test_world("shared_window_metadata");
         let path = world.base.join("shared.db");
+        let single_path = world.base.join("single.jsonl");
         let refs: Vec<_> = ["first", "second"]
             .into_iter()
             .map(|id| SessionRef::new(id, cv_core::Harness::OpenCode, path.clone()))
             .collect();
+        let single_ref = SessionRef::new("single", cv_core::Harness::Claude, single_path.clone());
         let query = cv_core::SessionQuery::parse("text:hit").unwrap();
         let texts = cv_core::query::TextSets::resolve(&query, |_| refs.iter().map(|r| r.id.clone()).collect());
         for content in ["one", "longer"] {
             std::fs::write(&path, content).unwrap();
-            std::fs::File::open(&path)
-                .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
-                )
-                .unwrap();
-            assert!(cv_core::source::FileId::at(&path).is_none());
+            std::fs::write(&single_path, content).unwrap();
+            for p in [&path, &single_path] {
+                std::fs::File::open(p)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+                    )
+                    .unwrap();
+                assert!(cv_core::source::FileId::at(p).is_none());
+            }
             let mut selected = refs.clone();
             cv_core::query::filter_refs_limited(&mut selected, &query, &texts, 2).unwrap();
             let rows = json_rows(selected.iter(), 2);
             assert_eq!(rows.len(), 2);
-            assert!(rows.iter().all(|(_, row)| row["size_bytes"] == content.len()));
+            assert!(rows
+                .iter()
+                .all(|(_, row)| row["size_bytes"].is_null() && row["store_bytes"] == content.len()));
+
+            let single_rows = json_rows(std::iter::once(&single_ref), 1);
+            assert_eq!(single_rows.len(), 1);
+            assert_eq!(single_rows[0].1["size_bytes"], content.len());
+            assert!(single_rows[0].1.get("store_bytes").is_none());
         }
         // The rendering phase must not retain the query's earlier presence observation.
         let mut selected = refs;

@@ -1269,6 +1269,29 @@ pub fn writes_selection(h: Harness) -> bool {
     rootless(h).is_some_and(|a| a.writes_selection())
 }
 
+/// Whether `r`'s path alone names one session ([`Adapter::path_selects_session`]), including
+/// SQLite-gated harnesses in `--no-default-features` builds.
+pub fn path_selects_session(r: &SessionRef) -> bool {
+    if let Some(adapter) = rootless(r.harness) {
+        return adapter.path_selects_session(r);
+    }
+    #[cfg(not(feature = "sqlite"))]
+    match r.harness {
+        Harness::Cursor => {
+            if r.id.starts_with("cli:") || r.path.file_name().and_then(|n| n.to_str()) == Some("store.db") {
+                true
+            } else {
+                !crate::source::has_sqlite_extension(&r.path)
+            }
+        }
+        Harness::Goose => !crate::source::has_sqlite_extension(&r.path),
+        Harness::Hermes | Harness::Zed | Harness::Devin => false,
+        _ => !crate::source::has_sqlite_extension(&r.path),
+    }
+    #[cfg(feature = "sqlite")]
+    unreachable!("every harness has a rootless adapter when sqlite is enabled")
+}
+
 /// Resolve an explicit file path via [`Adapter::resolve_path`], restricted to `want` when given.
 pub fn resolve_file_source(path: &Path, want: Option<Harness>) -> Option<(SessionRef, Box<dyn Adapter>)> {
     match want {
