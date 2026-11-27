@@ -525,7 +525,9 @@ fn round_trip_all_supported_targets() {
     for &target in targets {
         let parsed = emit_and_reparse(target);
 
-        // Two faithful-format quirks among the newer targets:
+        // Faithful-format quirks among the newer targets:
+        //  - Antigravity's cold emitter writes one USER_INPUT seed step containing the rendered
+        //    Markdown conversation (turns and tool calls flattened into the seed prompt);
         //  - LM Studio has no tool structures on disk → tool turns flatten to text (lossy on tools);
         //  - Cline/Roo embed cwd + a `<task>` title inside the first user message's text (that's how
         //    those harnesses really store it), so the user text comes back wrapped, not bare;
@@ -536,9 +538,17 @@ fn round_trip_all_supported_targets() {
             target,
             Harness::LmStudio | Harness::Cline | Harness::Roo | Harness::Continue
         );
-        let flattens_tools = matches!(target, Harness::LmStudio);
+        let flattens_tools = matches!(target, Harness::LmStudio | Harness::Antigravity);
 
-        if wraps_text {
+        if target == Harness::Antigravity {
+            let texts = user_texts(&parsed);
+            assert!(
+                texts.iter().any(|t| t.contains("list the files please")
+                    && t.contains("Sure, listing now.")
+                    && t.contains("run_shell")),
+                "{target}: seed prompt did not preserve conversation text (got {texts:?})"
+            );
+        } else if wraps_text {
             assert!(
                 user_texts(&parsed).iter().any(|t| t.contains("list the files please")),
                 "{target}: user text did not survive round-trip (got {:?})",

@@ -42,9 +42,10 @@ pub fn write_with_sidecar(
         set.add(staged_sc, sc_path, crate::publish::Claim::New);
     }
     set.stage(&path, "pi", bytes.as_bytes(), crate::publish::Claim::New)?;
-    set.publish()?;
     let back = super::parse_str(new_id, &bytes)?;
-    Ok((path, sidecar_path, verify(selected, &back, new_id)))
+    let lost = verify(selected, &back, new_id);
+    set.publish()?;
+    Ok((path, sidecar_path, lost))
 }
 
 /// Pi names a file `<created>_<id>.jsonl`; the branch keeps the source's prefix under its own id.

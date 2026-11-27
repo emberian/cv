@@ -146,6 +146,10 @@ fn json_consumers_unreadable_sources_return_errors_before_emit_writes() {
         (Harness::Qwen, cv_core::harness::qwen::emit),
         #[cfg(feature = "sqlite")]
         (Harness::Hermes, cv_core::harness::hermes::emit),
+        #[cfg(feature = "sqlite")]
+        (Harness::Antigravity, cv_core::harness::antigravity::emit),
+        #[cfg(feature = "sqlite")]
+        (Harness::Devin, cv_core::harness::devin::emit),
     ];
     let declared: std::collections::HashSet<_> = direct.iter().map(|(target, _)| *target).collect();
     assert_eq!(declared.len(), direct.len(), "duplicate direct emitter");
