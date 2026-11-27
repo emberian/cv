@@ -385,6 +385,7 @@ impl Adapter for OpenCode {
                         .map(|fields| fields.string("id").map(Option::unwrap_or_default))
                         .transpose()
                 })?
+                .into_option()
                 .flatten();
                 let bytes = id.as_ref().map_or(0, String::capacity) + std::mem::size_of_val(&id);
                 Ok((id, reads.clone(), bytes))
@@ -435,10 +436,18 @@ impl Adapter for OpenCode {
             if !name.starts_with("ses_") || !name.ends_with(".json") {
                 continue;
             }
-            let Some(text) = out.keep(path, fs::read_to_string(path).map_err(Into::into)) else {
+            let Some(bytes) = out.keep(path, fs::read(path).map_err(Into::into)) else {
                 continue;
             };
-            let Some(v) = out.keep(path, serde_json::from_str::<Value>(&text).map_err(Into::into)) else {
+            let Some((start, end)) = trim_tree_json_bytes(&bytes) else {
+                // Empty, whitespace-only, or NUL-filled preallocated crash stubs on Windows are not
+                // sessions and not corrupt JSON diagnostics.
+                continue;
+            };
+            let Some(v) = out.keep(
+                path,
+                serde_json::from_slice::<Value>(&bytes[start..end]).map_err(Into::into),
+            ) else {
                 continue;
             };
             let id = v
@@ -485,13 +494,17 @@ impl Adapter for OpenCode {
             //   2. view each message file once: its header record and its `time/created` key,
             //   3. in that order, view each header's part files one at a time, emit its IR
             //      message(s) to `sink`, and drop it before touching the next.
-            let text = fs::read_to_string(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
-            // A document that does not decode is a counted record, read as no facts.
+            let bytes = fs::read(&r.path).with_context(|| format!("reading {}", r.path.display()))?;
+            // A document that does not decode is a counted record, read as no facts; an empty or
+            // NUL-padded crash stub is simply empty metadata.
             let mut unparsed = super::Unparsed::default();
-            let meta: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
-                unparsed.count();
-                Value::Null
-            });
+            let meta: Value = match trim_tree_json_bytes(&bytes) {
+                None => Value::Null,
+                Some((start, end)) => serde_json::from_slice(&bytes[start..end]).unwrap_or_else(|_| {
+                    unparsed.count();
+                    Value::Null
+                }),
+            };
 
             let mut s = Session {
                 cwd: meta.get("directory").and_then(Value::as_str).map(PathBuf::from),
@@ -526,8 +539,9 @@ impl Adapter for OpenCode {
                         Ok((when, header))
                     })?;
                     match header {
-                        Some((when, header)) => order.push((when, path, header)),
-                        None => unparsed.count(),
+                        TreeDoc::Value((when, header)) => order.push((when, path, header)),
+                        TreeDoc::Empty => {}
+                        TreeDoc::Invalid => unparsed.count(),
                     }
                 }
             }
@@ -551,7 +565,7 @@ impl Adapter for OpenCode {
                         let part = document(&path, |view, source| {
                             record.part(view, None, record::Ctx::new(opts.spans, source, &arena))
                         })?;
-                        if part.is_none() {
+                        if matches!(part, TreeDoc::Invalid) {
                             unparsed.count();
                         }
                     }
@@ -615,21 +629,77 @@ fn listing(dir: &Path) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// One JSON document of the tree, validated and viewed once; None for a file that is not exactly
-/// one JSON value. A file that cannot be read is an error.
+/// Strip an optional leading UTF-8 BOM (`0xEF 0xBB 0xBF`) and trailing `\0` bytes (NTFS crash
+/// padding). Returns `None` when nothing non-whitespace remains.
+fn trim_tree_json_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
+    let start = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    let end = bytes[start..]
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(start, |i| start + i + 1);
+    (!bytes[start..end].trim_ascii().is_empty()).then_some((start, end))
+}
+
+enum TreeDoc<T> {
+    Value(T),
+    Empty,
+    Invalid,
+}
+
+impl<T> TreeDoc<T> {
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Value(v) => Some(v),
+            Self::Empty | Self::Invalid => None,
+        }
+    }
+}
+
+/// One JSON document of the tree, validated and viewed once; `Empty` for 0-byte / whitespace /
+/// NUL-padded crash stubs, `Invalid` for non-empty bytes that do not form one JSON value, and
+/// `Value` for valid JSON (tolerating a leading UTF-8 BOM or trailing `\0` padding).
 fn document<T>(
     path: &Path,
     f: impl for<'a> FnOnce(crate::json::JsonView<'a>, &crate::json::JsonSource) -> Result<T>,
-) -> Result<Option<T>> {
+) -> Result<TreeDoc<T>> {
     let source = crate::json::JsonSource::capture(path)?;
+    if source.len() == 0 {
+        return Ok(TreeDoc::Empty);
+    }
+    let mut f = Some(f);
     match source.read(ReadInput::Document, Validation::Syntax, |view| {
         if view.accepts_value()? {
-            f(view, &source).map(Some)
+            let cb = f.take().expect("document callback runs once");
+            cb(view, &source).map(TreeDoc::Value)
         } else {
-            Ok(None)
+            Ok(TreeDoc::Invalid)
         }
     }) {
-        Err(error) if error.is::<crate::json::InvalidJson>() => Ok(None),
+        Err(error) if error.is::<crate::json::InvalidJson>() => {
+            let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            source.check()?;
+            let Some((start, end)) = trim_tree_json_bytes(&raw) else {
+                return Ok(TreeDoc::Empty);
+            };
+            if start == 0 && end == raw.len() {
+                return Ok(TreeDoc::Invalid);
+            }
+            match source.read(
+                ReadInput::Range(start as u64, (end - start) as u64),
+                Validation::Syntax,
+                |view| {
+                    if view.accepts_value()? {
+                        let cb = f.take().expect("document callback runs once");
+                        cb(view, &source).map(TreeDoc::Value)
+                    } else {
+                        Ok(TreeDoc::Invalid)
+                    }
+                },
+            ) {
+                Err(error) if error.is::<crate::json::InvalidJson>() => Ok(TreeDoc::Invalid),
+                result => result,
+            }
+        }
         result => result,
     }
 }
@@ -2584,5 +2654,79 @@ mod tests {
             build_messages(&mv, &empty).is_empty(),
             "a contentless part adds no turn"
         );
+    }
+
+    #[test]
+    fn windows_utf8_bom_and_nul_padded_or_empty_crash_files_discover_and_stream_cleanly() {
+        let world = cv_testkit::World::new("opencode-bom-nul");
+        let storage = world.base.join("storage");
+        let sdir = storage.join("session/proj");
+        let mdir = storage.join("message/ses_bom01");
+        let pdir = storage.join("part/msg_01");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&pdir).unwrap();
+
+        let with_bom_and_nuls = |v: serde_json::Value| -> Vec<u8> {
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            out.extend_from_slice(v.to_string().as_bytes());
+            out.extend_from_slice(&[0u8; 16]);
+            out
+        };
+
+        fs::write(
+            sdir.join("ses_bom01.json"),
+            with_bom_and_nuls(serde_json::json!({
+                "id": "ses_bom01",
+                "directory": "/work/win",
+                "title": "BOM session",
+                "time": {"created": 1_760_000_000_000i64, "updated": 1_760_000_005_000i64}
+            })),
+        )
+        .unwrap();
+        fs::write(
+            mdir.join("msg_01.json"),
+            with_bom_and_nuls(serde_json::json!({
+                "id": "msg_01",
+                "sessionID": "ses_bom01",
+                "role": "user",
+                "time": {"created": 1_760_000_001_000i64}
+            })),
+        )
+        .unwrap();
+        fs::write(
+            pdir.join("prt_01.json"),
+            with_bom_and_nuls(serde_json::json!({
+                "id": "prt_01",
+                "sessionID": "ses_bom01",
+                "messageID": "msg_01",
+                "type": "text",
+                "text": "hello from windows"
+            })),
+        )
+        .unwrap();
+
+        // Unclean exit stubs: 0-byte, whitespace-only, and NUL-filled preallocated files.
+        fs::write(sdir.join("ses_empty.json"), b"").unwrap();
+        fs::write(sdir.join("ses_ws.json"), b"  \r\n\t ").unwrap();
+        fs::write(sdir.join("ses_crash.json"), vec![0u8; 128]).unwrap();
+        fs::write(mdir.join("msg_crash.json"), vec![0u8; 128]).unwrap();
+        fs::write(pdir.join("prt_crash.json"), b"").unwrap();
+
+        let adapter = OpenCode::with_root(storage);
+        let discovered = adapter.discover().unwrap();
+        assert!(discovered.skipped.is_empty(), "skipped: {:?}", discovered.skipped);
+        assert_eq!(discovered.refs.len(), 1, "refs: {:?}", discovered.refs);
+        assert_eq!(discovered.refs[0].id, "ses_bom01");
+        assert_eq!(discovered.refs[0].title.as_deref(), Some("BOM session"));
+
+        let session = adapter.parse(&discovered.refs[0]).unwrap();
+        assert!(
+            session.extra.get("cv").and_then(|v| v.get("skipped_lines")).is_none(),
+            "unexpected skipped_lines: {:?}",
+            session.extra
+        );
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].text().as_deref(), Some("hello from windows"));
     }
 }
