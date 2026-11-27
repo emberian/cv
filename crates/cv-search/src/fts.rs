@@ -397,18 +397,21 @@ pub fn index_all(
     subagents: bool,
     strict: bool,
 ) -> Result<(Indexed, Vec<cv_core::SessionRef>)> {
-    let (swept, refs) = if let Some(migration) = migration::Migration::prepare(dir, rebuild)? {
-        // Migration requires authoritative discovery before ingest. The ordinary compatible
-        // path keeps its decode-once handoff and partial-success behavior.
-        let _sources = cv_core::source::read_scope();
-        let refs = cv_core::discover_all_checked()?;
-        let swept = sweep_refs(migration.path(), &refs, true, subagents)?;
-        migration.publish(&swept)?;
-        (swept, refs)
-    } else {
-        sweep_all(dir, rebuild, subagents)?
-    };
-    Ok((report(swept, rebuild, strict)?, refs))
+    let threads = cv_core::resolve_worker_threads(None)?;
+    cv_core::with_worker_threads(threads, || {
+        let (swept, refs) = if let Some(migration) = migration::Migration::prepare(dir, rebuild)? {
+            // Migration requires authoritative discovery before ingest. The ordinary compatible
+            // path keeps its decode-once handoff and partial-success behavior.
+            let _sources = cv_core::source::read_scope();
+            let refs = cv_core::discover_all_checked()?;
+            let swept = sweep_refs(migration.path(), &refs, true, subagents)?;
+            migration.publish(&swept)?;
+            (swept, refs)
+        } else {
+            sweep_all(dir, rebuild, subagents)?
+        };
+        Ok((report(swept, rebuild, strict)?, refs))
+    })
 }
 
 /// Discovery beside [`sweep_decoded`], then the full sweep over what discovery found.
@@ -464,7 +467,7 @@ fn sweep_decoded(dir: &Path, rebuild: bool, decoded: cv_core::codex_handoff::Rec
         return Ok(None);
     };
     let (index, f) = open_or_create(dir)?;
-    let mut writer = open_writer(&index, 50_000_000)?;
+    let mut writer = open_writer(&index, 60_000_000)?;
     let mut state = PlanState::load(&index, &f, dir)?;
     let consumer = state.consumer.clone();
     let mut ran = run_fed(&mut writer, &f, &consumer, available_workers(), move |feed| {
@@ -668,6 +671,8 @@ struct Job {
     prov: cv_core::events::Provenance,
     /// Where the last pass over this file left off, if it left a mark.
     mark: Option<cv_core::resume::MarkHead>,
+    /// `Feed::push` already queried `resume_marks` on its single catalog connection.
+    mark_loaded: bool,
     /// The bytes discovery already decoded for it, read instead of decoding again.
     decoded: Option<cv_core::codex_handoff::Decoded>,
     /// Set by the pass when it left a mark: the primary's prefix as [`Self::source`] captured
@@ -897,7 +902,7 @@ fn sweep_refs_after(
         }
         break (plan, before);
     };
-    let mut writer = open_writer(&index, 50_000_000)?;
+    let mut writer = open_writer(&index, 60_000_000)?;
     // The mutation plan must describe the metadata protected by the writer lock, rather than
     // a previously observed index. Ordinary single-writer refreshes need no second plan.
     let plan = planner.under_writer(plan, &planned_meta, &writer)?;
@@ -1212,6 +1217,7 @@ impl PlanState {
                 && (!col_events_needed || col_events.as_ref().is_some_and(|cs| cs.can_resume(r, prov))),
             prov: prov.clone(),
             mark: None,
+            mark_loaded: false,
             source,
             dependencies_fresh,
             decoded: None,
@@ -1292,7 +1298,12 @@ fn resumed_docs(f: &Fields, id: &str, n: usize) -> tantivy::query::BooleanQuery 
 }
 
 /// Read one job and send what it found; `false` when the writer hung up.
-fn run_job(mut job: Job, f: &Fields, tx: &std::sync::mpsc::SyncSender<Out>, marks: &cv_core::resume::Reader) -> bool {
+fn run_job(
+    mut job: Job,
+    f: &Fields,
+    tx: &std::sync::mpsc::SyncSender<Out>,
+    marks: &std::cell::OnceCell<cv_core::resume::Reader>,
+) -> bool {
     let adapter = match cv_core::custody::backing_for(&job.r) {
         Ok(Some(backing)) => backing,
         Ok(None) => match cv_core::harness::for_harness(job.r.harness) {
@@ -1314,12 +1325,24 @@ fn run_job(mut job: Job, f: &Fields, tx: &std::sync::mpsc::SyncSender<Out>, mark
 }
 
 /// Stage one validated source revision before the writer replaces its previous documents.
-fn job_out(mut job: Job, f: &Fields, marks: &cv_core::resume::Reader, adapter: &dyn cv_core::Adapter) -> Out {
+fn job_out(
+    mut job: Job,
+    f: &Fields,
+    marks: &std::cell::OnceCell<cv_core::resume::Reader>,
+    adapter: &dyn cv_core::Adapter,
+) -> Out {
     let version = cv_core::resume::version(adapter, RESUME_TAG);
-    // Workers run only after writer admission and the publication recheck. Even a whole-pass
-    // job needs its prior head so failure cleanup can invalidate an obsolete checkpoint.
-    job.mark = marks.head(&job.r);
-    let from = resumable_from(&job, &version, marks);
+    // `Feed::push` resolves `job.mark` on the feeder's single connection; workers only open a
+    // catalog reader if a grown session actually demands its stored checkpoint state.
+    if !job.mark_loaded {
+        job.mark = marks.get_or_init(cv_core::resume::Reader::default).head(&job.r);
+        job.mark_loaded = true;
+    }
+    let from = if job.grew && job.dependencies_fresh && job.mark.is_some() {
+        resumable_from(&job, &version, marks.get_or_init(cv_core::resume::Reader::default))
+    } else {
+        None
+    };
     // A resume the adapter declines touched nothing: read the session whole instead.
     let resumed = match &from {
         Some(cp) => job_pass(&job, f, adapter, Some(cp)).transpose(),
@@ -3181,7 +3204,7 @@ fn pass_needed_with_catalog(
 #[cfg(test)]
 pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool) -> Result<usize> {
     let (index, f) = open_or_create(dir)?;
-    let mut writer = open_writer(&index, 50_000_000)?;
+    let mut writer = open_writer(&index, 60_000_000)?;
     let consumer = source_consumer(dir)?;
     cv_core::source::invalidate(&consumer, refs).context("invalidating old search dependency baselines")?;
     writer.delete_all_documents().context("clearing index")?;
@@ -4631,6 +4654,7 @@ mod tests {
             dependencies_fresh: true,
             prov: Default::default(),
             mark: None,
+            mark_loaded: false,
             decoded: None,
             appended: None,
         }
@@ -11610,5 +11634,40 @@ mod tests {
         assert_eq!(ans_degraded.suffix.failed, 1, "{:?}", ans_degraded.suffix);
         assert_eq!(ans_degraded.suffix.read, 1, "{:?}", ans_degraded.suffix);
         assert_eq!(ans_degraded.total, 1);
+    }
+
+    #[test]
+    fn worker_and_tantivy_threads_honor_default_cap_and_cv_threads_override() {
+        let home = IsolatedHome::new();
+        home._scope.remove(cv_core::THREADS_VAR);
+        let default_n = cv_core::default_worker_threads();
+        assert!((1..=8).contains(&default_n), "default worker cap <= 8: {default_n}");
+        assert_eq!(available_workers(), default_n);
+
+        let index = Index::create_in_ram(build_schema());
+        let w_default = open_writer(&index, 60_000_000).unwrap();
+        assert_eq!(w_default.num_threads(), default_n.min(4).max(1));
+        drop(w_default);
+
+        // `--threads 1` / `CV_THREADS=1` bounds sweep workers AND Tantivy writer threads to 1.
+        cv_core::with_worker_threads(1, || {
+            assert_eq!(available_workers(), 1);
+            let w1 = open_writer(&index, 60_000_000).unwrap();
+            assert_eq!(w1.num_threads(), 1);
+        });
+
+        // `CV_THREADS=2` bounds sweep workers AND Tantivy writer threads to 2.
+        home._scope.set(cv_core::THREADS_VAR, "2");
+        assert_eq!(cv_core::resolve_worker_threads(None).unwrap(), 2);
+        assert_eq!(available_workers(), 2);
+        let w2 = open_writer(&index, 60_000_000).unwrap();
+        assert_eq!(w2.num_threads(), 2);
+        drop(w2);
+
+        // Explicit `--threads` overrides even a malformed `$CV_THREADS`, while bare resolution rejects 0/bad.
+        home._scope.set(cv_core::THREADS_VAR, "not-a-number");
+        assert!(cv_core::resolve_worker_threads(None).unwrap_err().is::<cv_core::BadThreads>());
+        assert_eq!(cv_core::resolve_worker_threads(Some(3)).unwrap(), 3);
+        assert!(cv_core::resolve_worker_threads(Some(0)).unwrap_err().is::<cv_core::BadThreads>());
     }
 }

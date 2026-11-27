@@ -1202,6 +1202,10 @@ enum Cmd {
         /// the index commits the rest and a later pass retries them.
         #[arg(long)]
         strict: bool,
+        /// Worker threads for discovery, parsing and indexing (default: min(cores, 8); overrides
+        /// $CV_THREADS). Must be at least 1.
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
         /// Print the result as JSON: `{indexed, changed, removed, errors, path, unreadable:
         /// [{id, harness, reason}]}`.
         #[arg(long)]
@@ -1564,8 +1568,9 @@ fn run() -> Result<()> {
             subagents,
             if_changed,
             strict,
+            threads,
             json,
-        } => search::cmd_index(rebuild, subagents, if_changed, strict, json, exact),
+        } => search::cmd_index(rebuild, subagents, if_changed, strict, threads, json, exact),
         Cmd::Events {
             id,
             harness,

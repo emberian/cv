@@ -588,3 +588,46 @@ fn subagent_dangling_symlink_warns_with_path_and_indexes_siblings_unless_strict(
         "strict stderr must name agent-adead.jsonl:\n{strict_err}"
     );
 }
+
+/// #tooth Issue #42: `cv index` bounds worker pools (`--threads 1`, `CV_THREADS=2`), `--threads`
+/// overrides `CV_THREADS`, and `--threads 0` or invalid `CV_THREADS` exit 2 clearly.
+#[test]
+fn index_threads_flag_and_cv_threads_bound_workers_and_reject_zero_or_invalid() {
+    let w = World::new("index-threads");
+    for i in 0..6 {
+        let id = format!("th{i}");
+        w.write_session(&id, &[claude::user(&id, "u1", TS, &format!("zqthreadpool42 session {i}"))]);
+    }
+
+    // `--threads 0` exits 2 as a usage error.
+    let (ok0, code0, _, err0) = w.cv(&["index", "--threads", "0"]);
+    assert!(!ok0 && code0 == 2, "expected exit 2 for --threads 0, got {code0}: {err0}");
+    assert!(err0.contains("--threads"), "{err0}");
+
+    // Invalid `CV_THREADS` exits 2 clearly.
+    for bad in ["0", "bogus"] {
+        let (ok_bad, code_bad, _, err_bad) = w.cv_env(&["index"], &[("CV_THREADS", bad)]);
+        assert!(!ok_bad && code_bad == 2, "CV_THREADS={bad} expected exit 2, got {code_bad}: {err_bad}");
+        assert!(err_bad.contains("CV_THREADS"), "{err_bad}");
+    }
+
+    // `--threads 1` succeeds and indexes all sessions, even if `CV_THREADS` is invalid (`--threads` overrides).
+    let (ok1, code1, out1, err1) = w.cv_env(
+        &["index", "--threads", "1", "--exact", "--json"],
+        &[("CV_THREADS", "bogus")],
+    );
+    assert!(ok1 && code1 == 0, "expected exit 0, got {code1}: {out1}\n{err1}");
+    let parsed1: serde_json::Value = serde_json::from_str(&out1).unwrap();
+    assert_eq!(parsed1["indexed"].as_u64(), Some(6));
+    assert_eq!(frozen_total(&w, "zqthreadpool42"), 6);
+
+    // `CV_THREADS=2` succeeds on incremental + rebuild passes.
+    let (ok2, code2, out2, err2) = w.cv_env(
+        &["index", "--rebuild", "--exact", "--json"],
+        &[("CV_THREADS", "2")],
+    );
+    assert!(ok2 && code2 == 0, "expected exit 0, got {code2}: {out2}\n{err2}");
+    let parsed2: serde_json::Value = serde_json::from_str(&out2).unwrap();
+    assert_eq!(parsed2["indexed"].as_u64(), Some(6));
+    assert_eq!(parsed2["changed"].as_u64(), Some(6));
+}

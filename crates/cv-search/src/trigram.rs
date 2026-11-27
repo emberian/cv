@@ -1693,21 +1693,24 @@ pub fn sync_all(
     subagents: bool,
     strict: bool,
 ) -> Result<(TrigramSynced, Vec<cv_core::SessionRef>)> {
-    let _sources = cv_core::source::read_scope();
-    let refs = cv_core::sessions();
-    let synced = sync_sessions(dir, &refs, rebuild, subagents)?;
-    if strict {
-        if let Some(first) = synced.unreadable.first() {
-            anyhow::bail!(
-                "{} unreadable session(s) during trigram sync (first: {} ({}): {})",
-                synced.unreadable.len(),
-                first.id,
-                first.harness,
-                first.reason
-            );
+    let threads = cv_core::resolve_worker_threads(None)?;
+    cv_core::with_worker_threads(threads, || {
+        let _sources = cv_core::source::read_scope();
+        let refs = cv_core::sessions();
+        let synced = sync_sessions(dir, &refs, rebuild, subagents)?;
+        if strict {
+            if let Some(first) = synced.unreadable.first() {
+                anyhow::bail!(
+                    "{} unreadable session(s) during trigram sync (first: {} ({}): {})",
+                    synced.unreadable.len(),
+                    first.id,
+                    first.harness,
+                    first.reason
+                );
+            }
         }
-    }
-    Ok((synced, refs))
+        Ok((synced, refs))
+    })
 }
 
 /// Incrementally synchronize `refs` into the trigram segment store at `dir`.
@@ -2630,7 +2633,7 @@ mod tests {
         if query.is_empty() {
             return HashSet::new();
         }
-        let expanded = expand_sessions(refs, subagents).unwrap();
+        let (expanded, _) = expand_sessions(refs, subagents);
         let mut out = HashSet::new();
         for (r, _prov) in expanded {
             if !r.path.exists() {

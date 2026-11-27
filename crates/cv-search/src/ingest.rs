@@ -10,6 +10,12 @@ use tantivy::schema::Document;
 use tantivy::{Index, IndexWriter, Opstamp, TantivyDocument};
 
 pub(super) const DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+const TANTIVY_MIN_HEAP_PER_THREAD: usize = 15_000_000;
+
+pub(super) fn writer_threads_for(workers: usize, heap: usize) -> usize {
+    let max_by_heap = (heap / TANTIVY_MIN_HEAP_PER_THREAD).max(1);
+    workers.min(4).min(max_by_heap).max(1)
+}
 
 #[derive(Default)]
 struct State {
@@ -17,6 +23,7 @@ struct State {
     peak: usize,
     largest: usize,
     waits: usize,
+    waiters: usize,
     closed: bool,
 }
 
@@ -51,7 +58,10 @@ impl Admission {
         // charging its actual allocation preserves semantics and prevents concurrent oversize.
         while !state.closed && state.bytes != 0 && bytes > self.limit.saturating_sub(state.bytes) {
             state.waits += 1;
-            state = self.wake.wait(state).unwrap();
+            state.waiters += 1;
+            let waited = self.wake.wait(state);
+            state = waited.unwrap();
+            state.waiters -= 1;
         }
         anyhow::ensure!(!state.closed, "index document admission closed");
         state.bytes = state
@@ -114,8 +124,14 @@ struct Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.admission.state.lock().unwrap().bytes -= self.bytes;
-        self.admission.wake.notify_all();
+        let notify = {
+            let mut state = self.admission.state.lock().unwrap();
+            state.bytes -= self.bytes;
+            state.waiters > 0
+        };
+        if notify {
+            self.admission.wake.notify_all();
+        }
     }
 }
 
@@ -143,14 +159,21 @@ pub(super) struct Writer {
     /// `None` only while [`Drop`] closes it.
     inner: Option<IndexWriter<AdmittedDocument>>,
     pub(super) admission: Arc<Admission>,
+    #[cfg(test)]
+    threads: usize,
     fault: Fault,
 }
 impl Writer {
     pub(super) fn new(index: &Index, heap: usize) -> Result<Self> {
-        let inner = index.writer(heap).context("creating tantivy index writer")?;
+        let threads = writer_threads_for(cv_core::configured_worker_threads(), heap);
+        let inner = index
+            .writer_with_num_threads(threads, heap)
+            .context("creating tantivy index writer")?;
         Ok(Self {
             inner: Some(inner),
             admission: Admission::new(document_limit()),
+            #[cfg(test)]
+            threads,
             fault: Fault::default(),
         })
     }
@@ -196,6 +219,9 @@ impl Fault {
 }
 #[cfg(test)]
 impl Writer {
+    pub(super) fn num_threads(&self) -> usize {
+        self.threads
+    }
     pub(super) fn add_document(&self, document: TantivyDocument) -> Result<Opstamp> {
         self.add_admitted(self.admission.document(document)?)
     }

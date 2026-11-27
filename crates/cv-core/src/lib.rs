@@ -297,6 +297,123 @@ pub fn replay_tasks_frozen_safe() -> anyhow::Result<task::ReplayOutcome> {
 
 use anyhow::Result;
 
+/// Environment variable bounding worker threads across discovery and `cv index`.
+pub const THREADS_VAR: &str = "CV_THREADS";
+
+/// Default upper bound on worker threads when neither `--threads` nor `$CV_THREADS` is set,
+/// avoiding futex and SQLite contention storms on many-core hosts.
+pub const DEFAULT_MAX_WORKER_THREADS: usize = 8;
+
+/// Invalid `--threads` or `$CV_THREADS` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadThreads {
+    FlagZero,
+    Env(String),
+}
+
+impl std::fmt::Display for BadThreads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlagZero => f.write_str("--threads must be at least 1"),
+            Self::Env(raw) => write!(f, "{THREADS_VAR}={raw:?}: expected a positive integer (>= 1)"),
+        }
+    }
+}
+
+impl std::error::Error for BadThreads {}
+
+/// Default worker count (`min(available_parallelism, 8)`, fallback `4`).
+pub fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(DEFAULT_MAX_WORKER_THREADS))
+        .unwrap_or(4)
+}
+
+/// Resolve an explicit `--threads` flag (which overrides `$CV_THREADS`), else `$CV_THREADS`,
+/// else [`default_worker_threads`].
+pub fn resolve_worker_threads(explicit: Option<usize>) -> Result<usize> {
+    if let Some(n) = explicit {
+        if n == 0 {
+            return Err(BadThreads::FlagZero.into());
+        }
+        return Ok(n);
+    }
+    let var = env::var_os(THREADS_VAR).filter(|v| !v.is_empty());
+    if let Some(raw) = var {
+        let raw = raw.to_string_lossy();
+        return match raw.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(BadThreads::Env(raw.into_owned()).into()),
+        };
+    }
+    Ok(default_worker_threads())
+}
+
+/// Resolved worker count in the active environment (falling back to [`default_worker_threads`] if
+/// `$CV_THREADS` is unset or malformed).
+pub fn configured_worker_threads() -> usize {
+    resolve_worker_threads(None).unwrap_or_else(|_| default_worker_threads())
+}
+
+#[cfg(feature = "parallel")]
+fn bounded_rayon_pool(threads: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
+    let mut pools = POOLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = pools.get(&threads) {
+        return Some(Arc::clone(pool));
+    }
+    let built = rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok()?;
+    let arc = Arc::new(built);
+    if pools.len() >= 8 {
+        pools.clear();
+    }
+    pools.insert(threads, Arc::clone(&arc));
+    Some(arc)
+}
+
+#[cfg(feature = "parallel")]
+fn in_bounded_rayon<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+    thread_local! {
+        static ACTIVE_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    let already_in_pool =
+        ACTIVE_THREADS.with(|c| c.get() == Some(threads)) || rayon::current_thread_index().is_some() && rayon::current_num_threads() <= threads;
+    if already_in_pool {
+        return f();
+    }
+    let Some(pool) = bounded_rayon_pool(threads) else {
+        return f();
+    };
+    struct Reset(Option<usize>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ACTIVE_THREADS.with(|c| c.set(self.0));
+        }
+    }
+    let prev = ACTIVE_THREADS.with(|c| c.replace(Some(threads)));
+    let _reset = Reset(prev);
+    let env = env::Env::scoped();
+    pool.install(|| env::within(&env, f))
+}
+
+/// Run `f` with `threads` (`>= 1`) carried through [`env::Env`] and any Rayon fan-outs bounded to
+/// `threads` without initializing or depending on Rayon's global thread pool.
+pub fn with_worker_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+    let threads = threads.max(1);
+    let scope = (*env::Env::current()).clone().enter();
+    scope.set(THREADS_VAR, threads.to_string());
+    #[cfg(feature = "parallel")]
+    if threads >= 2 {
+        return in_bounded_rayon(threads, f);
+    }
+    f()
+}
+
 /// Discover every session from every registered harness on this machine — the **full scan**, and
 /// the slow path. Adapters are queried in parallel (each is independent and `Send + Sync`), so the
 /// cost is the slowest single adapter rather than the sum. Disable the `parallel` feature (e.g. on
@@ -410,8 +527,13 @@ fn discover_all_with_catalog(mut catalog: Option<catalog::Reader>) -> DiscoveryI
 
     #[cfg(feature = "parallel")]
     let mut results: Vec<_> = {
-        use rayon::prelude::*;
-        jobs.into_par_iter().map(run_job).collect()
+        let threads = configured_worker_threads();
+        if threads <= 1 || jobs.len() <= 1 {
+            jobs.into_iter().map(run_job).collect()
+        } else {
+            use rayon::prelude::*;
+            in_bounded_rayon(threads, || jobs.into_par_iter().map(run_job).collect())
+        }
     };
     #[cfg(not(feature = "parallel"))]
     let mut results: Vec<_> = jobs.into_iter().map(run_job).collect();
@@ -735,8 +857,13 @@ where
     };
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        items.into_par_iter().filter_map(f).collect()
+        let threads = configured_worker_threads();
+        if threads <= 1 || items.len() <= 1 {
+            items.into_iter().filter_map(f).collect()
+        } else {
+            use rayon::prelude::*;
+            in_bounded_rayon(threads, || items.into_par_iter().filter_map(f).collect())
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -789,8 +916,13 @@ where
     };
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        items.into_par_iter().flat_map_iter(f).collect()
+        let threads = configured_worker_threads();
+        if threads <= 1 || items.len() <= 1 {
+            items.into_iter().flat_map(f).collect()
+        } else {
+            use rayon::prelude::*;
+            in_bounded_rayon(threads, || items.into_par_iter().flat_map_iter(f).collect())
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {

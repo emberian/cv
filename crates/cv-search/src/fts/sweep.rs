@@ -83,8 +83,14 @@ pub(super) struct GroupReservation<'a> {
 }
 impl Drop for GroupReservation<'_> {
     fn drop(&mut self) {
-        self.queue.lock().unwrap().in_flight -= self.bytes;
-        self.wake.notify_all();
+        let notify = {
+            let mut q = self.queue.lock().unwrap();
+            q.in_flight -= self.bytes;
+            q.next_fitting().is_some()
+        };
+        if notify {
+            self.wake.notify_all();
+        }
     }
 }
 
@@ -167,7 +173,7 @@ pub(super) fn publish_dependencies(ran: &mut Ran, consumer: &str) {
 }
 
 pub(super) fn available_workers() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    cv_core::configured_worker_threads()
 }
 
 /// Run every job on a pool of workers, writing on this thread.
@@ -184,6 +190,7 @@ pub(super) struct Feed<'a> {
     pub(super) queue: &'a std::sync::Mutex<Queue>,
     pub(super) wake: &'a std::sync::Condvar,
     pub(super) consumer: &'a str,
+    pub(super) marks: &'a cv_core::resume::Reader,
 }
 
 impl Feed<'_> {
@@ -207,6 +214,14 @@ impl Feed<'_> {
                 });
             }
         }
+        // Resolve prior resume heads sequentially on this single feeder connection so worker
+        // threads never contend opening or querying `catalog.db` per job.
+        for j in &mut jobs {
+            if !j.mark_loaded {
+                j.mark = self.marks.head(&j.r);
+                j.mark_loaded = true;
+            }
+        }
         let mut by_id: HashMap<String, usize> = HashMap::new();
         let mut groups: Vec<Vec<Job>> = Vec::new();
         for j in jobs {
@@ -218,13 +233,16 @@ impl Feed<'_> {
                 }
             }
         }
+        let pushed = groups.len();
         let mut q = self.queue.lock().unwrap();
         anyhow::ensure!(!q.stopped, "index sweep stopped");
         for group in groups {
             q.push(group);
         }
         drop(q);
-        self.wake.notify_all();
+        for _ in 0..pushed {
+            self.wake.notify_one();
+        }
         Ok(())
     }
 }
@@ -256,7 +274,15 @@ pub(super) fn run_fed(
         let (queue, wake) = (&queue, &wake);
         let sources = &sources;
         let fed = scope.spawn(cv_core::env::carry(move || {
-            let fed = sources.run(|| feed(&Feed { queue, wake, consumer }));
+            let marks = cv_core::resume::Reader::default();
+            let fed = sources.run(|| {
+                feed(&Feed {
+                    queue,
+                    wake,
+                    consumer,
+                    marks: &marks,
+                })
+            });
             queue.lock().unwrap().closed = true;
             wake.notify_all();
             fed
@@ -264,7 +290,7 @@ pub(super) fn run_fed(
         for _ in 0..workers {
             let tx = tx.clone();
             scope.spawn(cv_core::env::carry(move || {
-                let marks = cv_core::resume::Reader::default();
+                let marks = std::cell::OnceCell::new();
                 sources.run(|| loop {
                     let group = {
                         let mut q = queue.lock().unwrap();

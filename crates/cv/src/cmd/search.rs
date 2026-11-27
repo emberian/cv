@@ -360,85 +360,90 @@ pub(crate) fn cmd_index(
     subagents: bool,
     if_changed: bool,
     strict: bool,
+    threads: Option<usize>,
     json: bool,
     exact: bool,
 ) -> Result<()> {
-    let dir = cv_search::default_tantivy_dir();
-    let trigram_dir = cv_search::default_trigram_dir();
-    let mut trigram_need = Some(true);
-    if if_changed && !rebuild {
-        // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
-        // index's own stamps) answers whether a pass would find work at all.
-        let fts_need = cv_search::fts::pass_needed(&dir, subagents);
-        trigram_need = if exact {
-            cv_search::trigram::pass_needed(&trigram_dir, subagents)
-        } else {
-            Some(false)
-        };
-        match (fts_need, trigram_need) {
-            (Some(false), Some(false)) => {
-                if json {
-                    let indexed = cv_search::fts::indexed_top_level_count(&dir).unwrap_or(0);
-                    let out = serde_json::json!({
-                        "indexed": indexed,
-                        "changed": 0,
-                        "removed": 0,
-                        "errors": 0,
-                        "path": dir,
-                        "unreadable": [],
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out)?);
-                } else {
-                    println!("index already current — nothing changed since the last pass (skipped)");
-                }
-                return Ok(());
-            }
-            (None, _) | (_, None) => eprintln!("  ↳ index unreadable — running the pass"),
-            _ => eprintln!("  ↳ corpus moved since the last pass — indexing"),
-        }
-    }
-    if exact && (!if_changed || rebuild || trigram_need != Some(false)) {
-        let (synced, _) = cv_search::trigram::sync_all(&trigram_dir, rebuild, subagents, strict)?;
-        eprintln!(
-            "trigram: {} indexed, {} unchanged, {} unreadable",
-            synced.indexed,
-            synced.unchanged,
-            synced.unreadable.len()
-        );
-    }
-
-    eprintln!(
-        "✦ {} full-text index{}…",
-        if rebuild { "rebuilding" } else { "updating" },
-        if subagents { " (+ sub-agent forest)" } else { "" }
-    );
-    let (indexed, _refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
-    if !json {
-        println!(
-            "indexed {} top-level session(s) → {}{}",
-            indexed.total,
-            dir.display(),
-            if subagents {
-                " (sub-agent transcripts folded in)"
+    let threads = cv_core::resolve_worker_threads(threads)
+        .map_err(|e| crate::util::UsageError(format!("{e:#}")))?;
+    cv_core::with_worker_threads(threads, || {
+        let dir = cv_search::default_tantivy_dir();
+        let trigram_dir = cv_search::default_trigram_dir();
+        let mut trigram_need = Some(true);
+        if if_changed && !rebuild {
+            // The timer gate: a stat-only probe (catalog inventory + one stat per session + the
+            // index's own stamps) answers whether a pass would find work at all.
+            let fts_need = cv_search::fts::pass_needed(&dir, subagents);
+            trigram_need = if exact {
+                cv_search::trigram::pass_needed(&trigram_dir, subagents)
             } else {
-                ""
+                Some(false)
+            };
+            match (fts_need, trigram_need) {
+                (Some(false), Some(false)) => {
+                    if json {
+                        let indexed = cv_search::fts::indexed_top_level_count(&dir).unwrap_or(0);
+                        let out = serde_json::json!({
+                            "indexed": indexed,
+                            "changed": 0,
+                            "removed": 0,
+                            "errors": 0,
+                            "path": dir,
+                            "unreadable": [],
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        println!("index already current — nothing changed since the last pass (skipped)");
+                    }
+                    return Ok(());
+                }
+                (None, _) | (_, None) => eprintln!("  ↳ index unreadable — running the pass"),
+                _ => eprintln!("  ↳ corpus moved since the last pass — indexing"),
             }
+        }
+        if exact && (!if_changed || rebuild || trigram_need != Some(false)) {
+            let (synced, _) = cv_search::trigram::sync_all(&trigram_dir, rebuild, subagents, strict)?;
+            eprintln!(
+                "trigram: {} indexed, {} unchanged, {} unreadable",
+                synced.indexed,
+                synced.unchanged,
+                synced.unreadable.len()
+            );
+        }
+
+        eprintln!(
+            "✦ {} full-text index{}…",
+            if rebuild { "rebuilding" } else { "updating" },
+            if subagents { " (+ sub-agent forest)" } else { "" }
         );
-    }
-    if json {
-        let out = serde_json::json!({
-            "indexed": indexed.total,
-            "changed": indexed.changed,
-            "removed": indexed.removed,
-            "errors": indexed.errors,
-            "path": dir,
-            "unreadable": indexed.unreadable,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
-        println!("events: extracted on the same pass → try `cv events <id>` / `cv touched <path>`");
-    }
-    Ok(())
+        let (indexed, _refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
+        if !json {
+            println!(
+                "indexed {} top-level session(s) → {}{}",
+                indexed.total,
+                dir.display(),
+                if subagents {
+                    " (sub-agent transcripts folded in)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if json {
+            let out = serde_json::json!({
+                "indexed": indexed.total,
+                "changed": indexed.changed,
+                "removed": indexed.removed,
+                "errors": indexed.errors,
+                "path": dir,
+                "unreadable": indexed.unreadable,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!("events: extracted on the same pass → try `cv events <id>` / `cv touched <path>`");
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

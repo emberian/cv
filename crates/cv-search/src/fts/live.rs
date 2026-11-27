@@ -560,6 +560,7 @@ fn plan(
             dependencies_fresh: fresh.dependencies_fresh,
             prov: prov.clone(),
             mark: reader.head(r),
+            mark_loaded: true,
             decoded: None,
             appended: None,
         };

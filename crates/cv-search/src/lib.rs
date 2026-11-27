@@ -541,6 +541,7 @@ impl Scope {
     }
 }
 
+pub use cv_core::{BadThreads, THREADS_VAR};
 pub use fts::{BadLiveBytes, Budget, Indexed, LiveRead, Suffix, Unreadable, LIVE_BYTES_VAR};
 
 #[cfg(all(test, feature = "probe-heap"))]
