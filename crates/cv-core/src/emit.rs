@@ -243,6 +243,8 @@ fn emitter_for(target: Harness) -> Result<StagedEmitFn, &'static str> {
         Harness::Hermes => crate::harness::hermes::emit_staged,
         #[cfg(feature = "sqlite")]
         Harness::Antigravity => crate::harness::antigravity::emit_staged,
+        #[cfg(feature = "sqlite")]
+        Harness::Devin => crate::harness::devin::emit_staged,
         Harness::LmStudio => crate::harness::lmstudio::emit_staged,
         Harness::Cline => crate::harness::cline::emit_staged,
         Harness::Roo => crate::harness::roo::emit_staged,
@@ -251,7 +253,7 @@ fn emitter_for(target: Harness) -> Result<StagedEmitFn, &'static str> {
         // gemini-cli recording it no longer reads.
         Harness::Qwen => crate::harness::qwen::emit_staged,
         #[cfg(not(feature = "sqlite"))]
-        Harness::Hermes | Harness::Antigravity => return Err("requires the `sqlite` feature"),
+        Harness::Hermes | Harness::Antigravity | Harness::Devin => return Err("requires the `sqlite` feature"),
         // Parse-only harnesses (Cursor, Goose, desktop apps, …) aren't conversion targets. Kimi
         // (`~/.kimi`) is not one either: kimi-cli froze that store in 2026-06 and migrates it to
         // `~/.kimi-code` on open, so a session written there was a port to nowhere.
@@ -259,7 +261,6 @@ fn emitter_for(target: Harness) -> Result<StagedEmitFn, &'static str> {
         | Harness::Pi
         | Harness::Goose
         | Harness::Zed
-        | Harness::Devin
         | Harness::Kimi
         | Harness::KimiCode
         | Harness::ChatGptExport
@@ -721,6 +722,11 @@ pub fn retract_emitted(
                 let tx = conn.transaction()?;
                 for (table, col) in [
                     ("messages", "session_id"),
+                    ("message_nodes", "session_id"),
+                    ("subagent_heads", "session_id"),
+                    ("tool_call_state", "session_id"),
+                    ("prompt_history", "session_id"),
+                    ("rendered_commits", "session_id"),
                     ("transcript_events", "session_id"),
                     ("session_message", "session_id"),
                     ("part", "session_id"),
@@ -3746,7 +3752,7 @@ mod tests {
     #[test]
     fn a_taken_session_name_is_refused_unless_forced_for_every_emitter() {
         for &target in supported_targets() {
-            if matches!(target, Harness::Hermes | Harness::OpenCode) {
+            if matches!(target, Harness::Hermes | Harness::OpenCode | Harness::Devin) {
                 continue; // SQLite rows, not staged files
             }
             // A file, or a session directory of files (Grok, Cline, Roo).

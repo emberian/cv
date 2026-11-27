@@ -492,7 +492,7 @@ pub(crate) fn resume_target(h: Harness, id: &str) -> ResumeTarget {
         },
         Harness::Devin => ResumeTarget::Cli {
             program: "devin",
-            args: vec!["--resume".into(), id.into()],
+            args: vec!["-r".into(), id.into()],
         },
         Harness::Pi => ResumeTarget::Cli {
             program: "pi",

@@ -52,7 +52,7 @@ kept reply whose turn's tool results were all dropped or pointered "rests on not
 (`plan.rests_on_nothing` in `--json`).
 
 **Other harnesses.** Claude Code sessions are rewound and pruned record by record. Codex, Gemini,
-OpenCode, Qwen, Pi and OpenSession sessions (any harness with a verified emitter, and OpenSession
+OpenCode, Qwen, Devin, Pi and OpenSession sessions (any harness with a verified emitter, and OpenSession
 documents) are rewound and pruned by selection: cv reads the session into the IR, selects the
 prefix through `--at` (a message index or a commit sha, as for Claude) or replaces each tool output
 over `--min-size` before the last `--keep-last` messages with a `[PRUNED …]` marker, and emits the

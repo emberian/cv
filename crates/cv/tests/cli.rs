@@ -5814,3 +5814,119 @@ fn export_bundle_survives_source_deletion_and_reports_uncaptured() {
     let parsed_in: serde_json::Value = serde_json::from_str(&cat_in).unwrap();
     assert_eq!(parsed_in, big_input);
 }
+
+#[test]
+fn port_and_pack_session_emit_resumable_devin_store_and_rediscover() {
+    let w = World::new("port-and-pack-devin");
+    let src_id = "claude-for-devin";
+    w.write_session(
+        src_id,
+        &[
+            claude::with(
+                claude::user(src_id, "u1", "2026-11-20T10:00:00Z", "Inspect parser edge case"),
+                serde_json::json!({"cwd": "/work/devin-demo"}),
+            ),
+            claude::with(
+                claude::assistant(
+                    "a1",
+                    "2026-11-20T10:00:02Z",
+                    "claude-sonnet-4-6",
+                    serde_json::json!([
+                        {"type": "thinking", "thinking": "Checking record.rs", "signature": "sealed.sig.1"},
+                        claude::tool_use("toolu_1", "Read", serde_json::json!({"file_path": "/work/devin-demo/src/lib.rs"}))
+                    ]),
+                ),
+                serde_json::json!({"cwd": "/work/devin-demo"}),
+            ),
+            claude::with(
+                claude::tool_result("r1", "2026-11-20T10:00:03Z", "toolu_1", "pub fn parse() {}"),
+                serde_json::json!({"cwd": "/work/devin-demo"}),
+            ),
+            claude::with(
+                claude::assistant(
+                    "a2",
+                    "2026-11-20T10:00:05Z",
+                    "claude-sonnet-4-6",
+                    serde_json::json!([{"type": "text", "text": "Found the parser entry point."}]),
+                ),
+                serde_json::json!({"cwd": "/work/devin-demo"}),
+            ),
+        ],
+    );
+    let src_path = w.transcript(src_id);
+
+    // 1. `cv port --harness devin --out <dir> <claude_session.jsonl>` writes `sessions.db` and prints `devin -r <id>`.
+    let xdg_alt = w.base.join("alt-xdg");
+    let devin_out = xdg_alt.join("devin/cli");
+    let (port_stdout, _) = w.cv_ok(&[
+        "port",
+        src_path.to_str().unwrap(),
+        "--harness",
+        "devin",
+        "--out",
+        devin_out.to_str().unwrap(),
+    ]);
+    assert!(
+        port_stdout.contains("sessions.db") && port_stdout.contains("devin -r "),
+        "unexpected port output:\n{port_stdout}"
+    );
+    assert!(
+        port_stdout.contains("XDG_DATA_HOME="),
+        "alternate XDG store hint must include XDG_DATA_HOME:\n{port_stdout}"
+    );
+
+    // 2. `cv pack --format session --harness devin --out <dir>` appends to the same `sessions.db` and prints `devin -r <id>`.
+    let (pack_json_str, _) = w.cv_ok(&[
+        "pack",
+        "continue parser refactor",
+        "--session",
+        &format!("claude:{src_id}"),
+        "--format",
+        "session",
+        "--harness",
+        "devin",
+        "--out",
+        devin_out.to_str().unwrap(),
+        "--json",
+    ]);
+    let pack_json: serde_json::Value = serde_json::from_str(pack_json_str.trim()).unwrap();
+    let pack_id = pack_json["id"].as_str().unwrap();
+    let pack_hint = pack_json["resume_hint"].as_str().unwrap();
+    assert!(
+        pack_hint.contains(&format!("devin -r {pack_id}")),
+        "pack resume_hint: {pack_hint}"
+    );
+
+    // 3. Re-discoverable via `cv ls` and readable via `cv show` and `cv resume` under `XDG_DATA_HOME`!
+    let env = [("XDG_DATA_HOME", xdg_alt.to_str().unwrap())];
+    let (ok, _, ls_out, ls_err) = w.cv_env(&["ls", "--harness", "devin", "--json"], &env);
+    assert!(ok, "{ls_err}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(ls_out.trim()).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected both ported and packed sessions in devin store: {ls_out}"
+    );
+
+    let ported_id = rows
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .find(|&id| id != pack_id)
+        .unwrap();
+
+    let (ok, _, show_out, show_err) = w.cv_env(&["show", &format!("devin:{ported_id}")], &env);
+    assert!(ok, "{show_err}");
+    assert!(show_out.contains("Inspect parser edge case"), "{show_out}");
+    assert!(show_out.contains("Found the parser entry point."), "{show_out}");
+
+    let (ok, _, show_pack, show_pack_err) = w.cv_env(&["show", &format!("devin:{pack_id}")], &env);
+    assert!(ok, "{show_pack_err}");
+    assert!(show_pack.contains("continue parser refactor"), "{show_pack}");
+
+    let (ok, _, resume_out, resume_err) = w.cv_env(&["resume", &format!("devin:{ported_id}")], &env);
+    assert!(ok, "{resume_err}");
+    assert!(
+        resume_out.contains(&format!("devin -r {ported_id}")),
+        "cv resume output:\n{resume_out}"
+    );
+}

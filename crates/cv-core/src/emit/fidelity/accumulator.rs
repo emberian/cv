@@ -570,8 +570,11 @@ struct TargetProfile {
     files_after_tool_calls: bool,
     drops_empty_turn: EmptyTurnDrop,
     omits_system_prompt_rows: bool,
+    prepends_session_system_prompt: bool,
+    devin_compaction_boundary: bool,
     empty_assistant_default_turn: bool,
     reroles_non_prompt_user: bool,
+    reroles_injected_user: bool,
     orphan_result_shell: OrphanShell,
     native_thinking_as_text: bool,
     drops_foreign_encrypted: bool,
@@ -642,6 +645,14 @@ fn target_profile(h: Harness) -> TargetProfile {
             reroles_non_prompt_user: true,
             ..base
         },
+        Harness::Devin => TargetProfile {
+            separated_assistant: true,
+            join_thinking: true,
+            prepends_session_system_prompt: true,
+            devin_compaction_boundary: true,
+            reroles_injected_user: true,
+            ..base
+        },
         Harness::OpenClaw
         | Harness::Cline
         | Harness::Roo
@@ -652,7 +663,6 @@ fn target_profile(h: Harness) -> TargetProfile {
         | Harness::KimiCode
         | Harness::Goose
         | Harness::Zed
-        | Harness::Devin
         | Harness::ChatGptExport
         | Harness::ClaudeExport
         | Harness::OpenSession => base,
@@ -1041,6 +1051,8 @@ struct ScannedMessage {
     carrier: bool,
     claude_raw_content: bool,
     skills_stripped: bool,
+    id: Option<String>,
+    parent_id: Option<String>,
     has_id: bool,
     timestamp: Option<DateTime<Utc>>,
     has_model: bool,
@@ -1260,6 +1272,8 @@ impl Accumulator {
             carrier: message.is_carrier(),
             claude_raw_content,
             skills_stripped,
+            id: message.id.clone(),
+            parent_id: message.parent_id.clone(),
             has_id: message.id.is_some(),
             timestamp: message.timestamp,
             has_model: message.model.is_some(),
@@ -1325,7 +1339,13 @@ impl Accumulator {
             if bookkeeping || unrepresentable || (!msg.blocks.is_empty() && msg.blocks.iter().all(&is_orphan_call)) {
                 continue;
             }
-            let (role, kind) = if rules.reroles_client_commands && scanned_is_client_command(msg) {
+            let prof = target_profile(self.target);
+            let (role, kind) = if (rules.reroles_client_commands && scanned_is_client_command(msg))
+                || (msg.written_from.is_some()
+                    && prof.reroles_injected_user
+                    && msg.role == Role::User
+                    && !matches!(msg.kind, MessageKind::Prompt | MessageKind::CompactionSummary))
+            {
                 ("system", MessageKind::InjectedContext.as_str())
             } else if fate == Some(SystemFate::Special(MessageKind::CompactionSummary)) {
                 ("user", msg.kind.as_str())
@@ -1413,6 +1433,7 @@ impl Accumulator {
         let units = build_canonical_units(
             self.target,
             self.thinking,
+            metadata.system_prompt.as_deref(),
             &self.messages,
             &answered,
             &called,
@@ -1603,6 +1624,7 @@ fn turn_text_join_separator(target: Harness, written_from: Option<Harness>, mess
                 .is_some_and(|fate| matches!(fate, SystemFate::Special(_)));
             special.then_some("")
         }
+        Harness::Devin => matches!(message.role, Role::System | Role::User | Role::Assistant).then_some("\n"),
         Harness::Qwen => matches!(message.kind, MessageKind::Error | MessageKind::Notice).then_some(""),
         Harness::OpenClaw
         | Harness::Gemini
@@ -1617,7 +1639,6 @@ fn turn_text_join_separator(target: Harness, written_from: Option<Harness>, mess
         | Harness::KimiCode
         | Harness::Goose
         | Harness::Zed
-        | Harness::Devin
         | Harness::ChatGptExport
         | Harness::ClaudeExport
         | Harness::OpenSession => None,
@@ -1759,9 +1780,11 @@ fn opencode_attachment_unavailable(label: &str, mime: Option<&str>, reference: O
 /// Build the canonical ordered unit stream `π_B` for either the source (`written_from.is_some()`)
 /// or the reparsed session (`written_from.is_none()`), covering `System`, `User`, `Assistant`, and
 /// `Tool` turns plus `Text`, `Thinking`, `ToolUse`, `ToolResult`, `Image`, and `File` blocks.
+#[allow(clippy::too_many_arguments)]
 fn build_canonical_units(
     target: Harness,
     thinking: ThinkingMode,
+    system_prompt: Option<&str>,
     messages: &[ScannedMessage],
     answered: &HashSet<&str>,
     called: &HashSet<&str>,
@@ -1774,11 +1797,57 @@ fn build_canonical_units(
     let mut rho = RhoMap::default();
     let mut out = Vec::new();
 
-    for msg in messages {
+    let source_side = messages.first().is_some_and(|m| m.written_from.is_some());
+    if source_side
+        && prof.prepends_session_system_prompt
+        && !messages.iter().any(|m| m.kind == MessageKind::SystemPrompt)
+    {
+        if let Some(sp) = system_prompt.filter(|s| !s.is_empty()) {
+            let mut preview = String::new();
+            append_preview(&mut preview, sp);
+            let loc = UnitLoc { turn: 0, block: 0 };
+            out.push(Unit {
+                loc,
+                kind: UnitKind::Turn { role: UnitRole::System },
+            });
+            out.push(Unit {
+                loc,
+                kind: UnitKind::Text {
+                    hash: hash_bytes(sp.as_bytes()),
+                    byte_len: sp.len() as u64,
+                    preview,
+                },
+            });
+        }
+    }
+
+    let summary_parents: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::CompactionSummary)
+        .filter_map(|m| m.parent_id.as_deref())
+        .collect();
+    let mut in_devin_summary_run = false;
+
+    for (msg_idx, msg) in messages.iter().enumerate() {
         if msg.skills_stripped || msg.lmstudio_non_selected_variant {
             continue;
         }
         let is_source = msg.written_from.is_some();
+        if is_source && prof.devin_compaction_boundary && msg.kind == MessageKind::CompactionBoundary {
+            let paired = msg.synthesized
+                || msg
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| id.ends_with("#boundary") || summary_parents.contains(id))
+                || messages[msg_idx + 1..]
+                    .iter()
+                    .find(|m| m.kind != MessageKind::Carrier)
+                    .is_some_and(|next| next.kind == MessageKind::CompactionSummary);
+            if paired {
+                in_devin_summary_run = false;
+                continue;
+            }
+        }
         let fate = msg
             .written_from
             .zip(rules.system_fate)
@@ -1826,6 +1895,33 @@ fn build_canonical_units(
             continue;
         }
 
+        if is_source && prof.devin_compaction_boundary {
+            if msg.kind == MessageKind::CompactionSummary {
+                if !in_devin_summary_run {
+                    in_devin_summary_run = true;
+                    const COMPACT_MARKER: &str = "context compacted";
+                    let loc = UnitLoc {
+                        turn: msg.turn_idx,
+                        block: 0,
+                    };
+                    out.push(Unit {
+                        loc,
+                        kind: UnitKind::Turn { role: UnitRole::System },
+                    });
+                    out.push(Unit {
+                        loc,
+                        kind: UnitKind::Text {
+                            hash: hash_bytes(COMPACT_MARKER.as_bytes()),
+                            byte_len: COMPACT_MARKER.len() as u64,
+                            preview: COMPACT_MARKER.into(),
+                        },
+                    });
+                }
+            } else {
+                in_devin_summary_run = false;
+            }
+        }
+
         match msg.role {
             Role::System => {
                 // Claude `CompactionSummary` writes as a `user` record (`isCompactSummary: true`).
@@ -1848,10 +1944,13 @@ fn build_canonical_units(
             Role::User => {
                 // Gemini & Qwen re-role client commands / context preambles to `System`/`InjectedContext`;
                 // Qwen also writes non-`Prompt` User turns (`InjectedContext`, `SubagentReturn`,
-                // `CompactionSummary`) as `system`-provenance rows that re-parse as `Role::System`.
+                // `CompactionSummary`) as `system`-provenance rows that re-parse as `Role::System`;
+                // Devin writes non-`Prompt`, non-`CompactionSummary` User turns with `is_user_input: false`.
                 let unit_role = if is_source
                     && ((rules.reroles_client_commands && scanned_is_gemini_ignored_user(msg))
-                        || (prof.reroles_non_prompt_user && msg.kind != MessageKind::Prompt))
+                        || (prof.reroles_non_prompt_user && msg.kind != MessageKind::Prompt)
+                        || (prof.reroles_injected_user
+                            && !matches!(msg.kind, MessageKind::Prompt | MessageKind::CompactionSummary)))
                 {
                     UnitRole::System
                 } else {

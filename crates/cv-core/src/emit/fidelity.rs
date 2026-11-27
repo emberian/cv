@@ -82,6 +82,11 @@ fn reparse_with(
         Harness::Hermes => reparse_hermes(result, collect),
         #[cfg(feature = "sqlite")]
         Harness::Antigravity => reparse_antigravity(result, collect),
+        #[cfg(feature = "sqlite")]
+        Harness::Devin => collect(
+            &crate::harness::devin::Devin::detect(),
+            &sref(result.new_id.clone(), result.path.clone()),
+        ),
         // The emitters whose output is parseable directly from the EmitResult path.
         Harness::LmStudio => collect(
             &crate::harness::lmstudio::LmStudio::detect(),
@@ -104,12 +109,11 @@ fn reparse_with(
             &sref(result.new_id.clone(), result.path.clone()),
         ),
         #[cfg(not(feature = "sqlite"))]
-        Harness::Hermes | Harness::Antigravity => anyhow::bail!("re-parse for {target} not supported"),
+        Harness::Hermes | Harness::Antigravity | Harness::Devin => anyhow::bail!("re-parse for {target} not supported"),
         Harness::Cursor
         | Harness::Pi
         | Harness::Goose
         | Harness::Zed
-        | Harness::Devin
         | Harness::Kimi
         | Harness::KimiCode
         | Harness::ChatGptExport
@@ -436,6 +440,7 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
         Harness::Continue => &[Text, Image, ToolUse, ToolResult, IsError, Usage, Cost, Timestamp, TimestampToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::Qwen => &[Text, ThinkingText, Image, File, ToolUse, ToolResult, ToolName, IsError, Usage, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, CompleteReparse],
         Harness::Antigravity => &[Text, ToolUse, ToolResult, Title, Cwd, CompleteReparse],
+        Harness::Devin => &[Text, ThinkingText, ThinkingSignature, ToolUse, ToolResult, IsError, Usage, UsageCacheCreation, Timestamp, TimestampToolTurn, Id, IdToolTurn, Title, Cwd, SessionModel, SystemPrompt, CompleteReparse],
         Harness::OpenSession => &[Principal, Opaque],
         Harness::Cursor
         | Harness::Pi
@@ -443,7 +448,6 @@ pub(crate) fn holds_fields(h: Harness) -> &'static [Field] {
         | Harness::KimiCode
         | Harness::Goose
         | Harness::Zed
-        | Harness::Devin
         | Harness::ChatGptExport
         | Harness::ClaudeExport => &[],
     }
@@ -1164,6 +1168,7 @@ fn reparse_sqlite_projected(
         Harness::OpenCode => crate::harness::opencode::stream_conn(conn, &r, &opts, &mut sink)?,
         Harness::Hermes => crate::harness::hermes::stream_conn_verified(conn, &r, &opts, &mut sink)?,
         Harness::OpenClaw => crate::harness::openclaw::stream_sqlite_conn(conn, &r, &opts, &mut sink)?,
+        Harness::Devin => crate::harness::devin::stream_conn_verified(conn, &r, &opts, &mut sink)?,
         Harness::Claude
         | Harness::Codex
         | Harness::Grok
@@ -1180,7 +1185,6 @@ fn reparse_sqlite_projected(
         | Harness::KimiCode
         | Harness::Goose
         | Harness::Zed
-        | Harness::Devin
         | Harness::ChatGptExport
         | Harness::ClaudeExport
         | Harness::OpenSession => anyhow::bail!("same-transaction SQLite reparse is not supported for {target}"),

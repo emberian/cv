@@ -142,7 +142,10 @@
 //! "" falls back to the last chain assistant's `generation_model` (observed on a real session). `hidden = 1` sessions are
 //! still discovered, flagged in `extra["devin"]["hidden"]`.
 
+mod emit;
 mod record;
+pub(crate) use emit::emit_staged;
+pub use emit::{emit, resolve_db_path};
 
 use super::store::sqlite::{open_ro, table_exists, Cell, Cells, Select};
 use super::store::xdg_data_dir;
@@ -215,7 +218,58 @@ impl Adapter for Devin {
     }
 
     fn roots(&self) -> Vec<PathBuf> {
-        self.db_path().map(|_| self.root.clone()).into_iter().collect()
+        let installed = !self.root.as_os_str().is_empty()
+            && (self.root.is_dir()
+                || self.db_path().is_some()
+                || self.root.parent().is_some_and(|p| p.ends_with("devin") && p.is_dir()));
+        installed.then(|| self.root.clone()).into_iter().collect()
+    }
+
+    fn resume_env(&self, r: &SessionRef) -> Option<std::result::Result<super::ResumeEnv, String>> {
+        const NO_STORE: &str = "no native store can be selected for this source; use the original harness/profile or port it into a supported native store";
+        if r.id.contains('/') {
+            return Some(Err(NO_STORE.into()));
+        }
+        let Ok(canonical) = r.path.canonicalize() else {
+            return Some(Err(format!("{} cannot be read", r.path.display())));
+        };
+        let spelled = std::path::absolute(&r.path).ok();
+        let target_xdg = [spelled.as_deref(), Some(canonical.as_path())]
+            .into_iter()
+            .flatten()
+            .find_map(xdg_root_for_db)
+            .filter(|xdg| {
+                xdg.join("devin")
+                    .join("cli")
+                    .join("sessions.db")
+                    .canonicalize()
+                    .is_ok_and(|p| p == canonical)
+            });
+        let Some(target_xdg) = target_xdg else {
+            return Some(Err(NO_STORE.into()));
+        };
+        let home_default = crate::env::home_dir().map(|h| h.join(".local").join("share"));
+        let active = xdg_data_dir();
+        let same = |a: &Path, b: &Path| {
+            a == b
+                || a.canonicalize()
+                    .ok()
+                    .zip(b.canonicalize().ok())
+                    .is_some_and(|(x, y)| x == y)
+        };
+        let mut env = super::ResumeEnv::default();
+        if active.as_deref().is_some_and(|act| same(act, &target_xdg)) {
+            return Some(Ok(env));
+        }
+        if crate::env::var_os("XDG_DATA_HOME").is_some_and(|v| !v.is_empty())
+            && home_default.as_deref().is_some_and(|def| same(def, &target_xdg))
+        {
+            env.unset.push("XDG_DATA_HOME");
+            return Some(Ok(env));
+        }
+        env.set
+            .insert("XDG_DATA_HOME".into(), target_xdg.to_string_lossy().into_owned());
+        Some(Ok(env))
     }
 
     fn discover(&self) -> Result<crate::Discovered> {
@@ -703,6 +757,44 @@ struct NodeFacts {
     is_system_prefix: bool,
 }
 
+/// When `db_path` sits at `<xdg>/devin/cli/sessions.db`, return `<xdg>`.
+pub(super) fn xdg_root_for_db(db_path: &Path) -> Option<PathBuf> {
+    let cli = db_path.parent().filter(|_| db_path.ends_with("sessions.db"))?;
+    let devin = cli.parent().filter(|_| cli.ends_with("cli"))?;
+    devin
+        .parent()
+        .filter(|_| devin.ends_with("devin"))
+        .map(Path::to_path_buf)
+}
+
+pub(crate) fn stream_conn_verified(
+    conn: &Connection,
+    r: &SessionRef,
+    opts: &Demand,
+    sink: &mut dyn MessageSink,
+) -> Result<Session> {
+    let guard = crate::json::SqliteSessionGuard::new(|| false);
+    let result = crate::stream::checked(sink, |sink| {
+        let mut spawns = crate::affordance::AffordanceSink::new(Harness::Devin, sink);
+        let (session_id, agent_id) = match r.id.split_once('/') {
+            Some((s, a)) => (s, Some(a)),
+            None => (r.id.as_str(), None),
+        };
+        stream_session_with_guard(
+            conn,
+            session_id,
+            agent_id,
+            r,
+            &mut spawns,
+            &crate::source::ReadSet::default(),
+            opts.spans,
+            Some(&guard),
+        )
+    });
+    guard.end_pass();
+    result
+}
+
 fn stream_conn(
     conn: &Connection,
     r: &SessionRef,
@@ -715,14 +807,15 @@ fn stream_conn(
         Some((s, a)) => (s, Some(a)),
         None => (r.id.as_str(), None),
     };
-    stream_session(conn, session_id, agent_id, r, sink, reads, spans)
+    stream_session_with_guard(conn, session_id, agent_id, r, sink, reads, spans, None)
 }
 
 /// The one chain walk / node map / meta path behind [`Adapter::stream`] for both a session and
 /// each of its sub-agent children: same forest, same [`sessions`] row — `agent` only changes which
 /// head is walked (`subagent_heads.chain_node_id` instead of `main_chain_id`) and what lineage /
 /// extra the emitted session carries.
-fn stream_session(
+#[allow(clippy::too_many_arguments)]
+fn stream_session_with_guard(
     conn: &Connection,
     session_id: &str,
     agent: Option<&str>,
@@ -730,8 +823,13 @@ fn stream_session(
     sink: &mut dyn MessageSink,
     reads: &crate::source::ReadSet,
     spans: bool,
+    in_tx_guard: Option<&std::sync::Arc<crate::json::SqliteSessionGuard>>,
 ) -> Result<Session> {
-    let _snapshot = super::store::sqlite::snapshot(conn)?;
+    let _snapshot = if in_tx_guard.is_none() {
+        super::store::sqlite::snapshot(conn)?
+    } else {
+        None
+    };
     let select = Select::of(conn, "sessions")
         .always(&[
             "working_directory",
@@ -772,7 +870,14 @@ fn stream_session(
     // The chosen chain (see the module doc): head → root, reversed. For a child the head comes
     // from `subagent_heads.chain_node_id` — a head naming no live node leaves the chain empty
     // (counted as dangling rather than falling back, which would pick some other chain's tail).
-    let loaded = loaded_forest(conn, &r.path, session_id, reads)?;
+    let loaded = match in_tx_guard {
+        None => loaded_forest(conn, &r.path, session_id, reads)?,
+        Some(guard) => {
+            let cells = Cells::for_session(conn, &r.path, reads, guard, "message_nodes")?;
+            let forest = load_forest(conn, session_id, &cells)?;
+            std::sync::Arc::new((cells, forest))
+        }
+    };
     let (cells, forest) = (&loaded.0, &loaded.1);
     let heads = subagent_head_rows(conn, session_id, forest)?;
     let (head, fell_back, dangling_head) = match agent {
