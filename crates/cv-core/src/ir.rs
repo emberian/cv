@@ -1438,6 +1438,11 @@ impl SessionRef {
             .to_string();
         SessionRef::new(id, harness, path)
     }
+
+    /// Explicit fold, splice, distill, rewind, or continuation parent session ID, if recorded.
+    pub fn derived_from(&self) -> Option<String> {
+        crate::lineage::derived_from_ref(self)
+    }
 }
 
 /// One member of a session's sub-agent forest, in any harness: the agent's transcript as a

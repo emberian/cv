@@ -56,6 +56,7 @@ mod derive;
 pub mod json;
 pub mod lanes;
 pub mod lazy;
+pub mod lineage;
 pub(crate) mod lockfile;
 pub mod offsets;
 pub mod overview;

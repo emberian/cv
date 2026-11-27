@@ -679,21 +679,29 @@ impl Adapter for Claude {
                     skipped_parents: std::collections::BTreeMap::new(),
                 },
             };
-            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
+            let mut lineage_sink = OpeningLineageSink::new(sink, r.id.clone(), Some(r.path.clone()));
+            let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, &mut lineage_sink);
             let mut before_skipped = 0u64;
             if !matches!(from, Start::Checkpoint(_)) {
                 let (flow, skipped) = join(&mut state, &prefix_runs, opts, &mut spawns)?;
                 before_skipped = skipped;
                 if flow == Flow::Stop {
                     super::note_skipped_lines(&mut state.session, before_skipped);
+                    if state.session.lineage.continues.is_none() {
+                        state.session.lineage.continues = lineage_sink.detected.take();
+                    }
                     return Ok(Some(state.session));
                 }
             }
             let read = jsonl::Read::open(&r.path)?;
             let codec = Transcript { state, opts };
-            let Some(s) = jsonl::drive_from(&read, from, tail_start, before_skipped, codec, &mut spawns)? else {
+            let Some(mut s) = jsonl::drive_from(&read, from, tail_start, before_skipped, codec, &mut spawns)? else {
                 return Ok(None);
             };
+            drop(spawns);
+            if s.lineage.continues.is_none() {
+                s.lineage.continues = lineage_sink.detected.take();
+            }
             Ok(Some(match from {
                 Start::Prefix(_) => s,
                 _ => with_fork_source(s, &r.path, sink),
@@ -753,10 +761,62 @@ fn join(
 /// A `--fork-session` copy names no source; the records it shares with one do ([`fork`]). Runs
 /// after every stream, whole or resumed, since it reads other files.
 fn with_fork_source(mut s: Session, path: &Path, sink: &mut dyn MessageSink) -> Session {
+    if s.lineage.continues.is_none() {
+        s.lineage.continues = crate::lineage::derived_from_rewind_sidecar(path, Some(&s.id));
+    }
     if s.lineage.parent.is_none() && s.lineage.forked_from.is_none() {
         s.lineage.forked_from = fork::source_tracked(path, sink).map(|(id, _)| id);
     }
     s
+}
+
+/// Inspects at most the opening two non-carrier messages (`seen < 2`) for explicit continuation /
+/// fold / distill / splice parent provenance without touching deep transcript messages.
+struct OpeningLineageSink<'a> {
+    inner: &'a mut dyn MessageSink,
+    own_id: String,
+    resolver: crate::lazy::Resolver,
+    seen: usize,
+    detected: Option<String>,
+}
+
+impl<'a> OpeningLineageSink<'a> {
+    fn new(inner: &'a mut dyn MessageSink, own_id: String, source: Option<PathBuf>) -> Self {
+        Self {
+            inner,
+            own_id,
+            resolver: crate::lazy::Resolver::new(source),
+            seen: 0,
+            detected: None,
+        }
+    }
+}
+
+impl MessageSink for OpeningLineageSink<'_> {
+    fn meta(&mut self, s: &Session) {
+        self.inner.meta(s);
+    }
+    fn dependency(&mut self, path: &Path) {
+        self.inner.dependency(path);
+    }
+    fn take_error(&mut self) -> Option<anyhow::Error> {
+        self.inner.take_error()
+    }
+    fn message(&mut self, m: Message) -> Flow {
+        if self.seen < 2
+            && m.kind != crate::ir::MessageKind::Carrier
+            && matches!(
+                m.role,
+                crate::ir::Role::User | crate::ir::Role::Assistant | crate::ir::Role::System
+            )
+        {
+            if self.detected.is_none() {
+                self.detected = crate::lineage::detect_opening_message(&m, &self.resolver, Some(&self.own_id));
+            }
+            self.seen += 1;
+        }
+        self.inner.message(m)
+    }
 }
 
 /// Fully parse a Claude `.jsonl` transcript from its text contents into a [`Session`] (full
@@ -781,8 +841,9 @@ pub fn stream_str(
     opts: &Demand,
     sink: &mut dyn MessageSink,
 ) -> Session {
-    let mut session = new_session_for(id, source_path, opts);
-    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, sink);
+    let mut session = new_session_for(id, source_path.clone(), opts);
+    let mut lineage_sink = OpeningLineageSink::new(sink, id.to_owned(), source_path);
+    let mut spawns = crate::affordance::AffordanceSink::new(Harness::Claude, &mut lineage_sink);
     // Pure-string path (parse_str, tests): no file offsets, so all content stays inline.
     let mut skipped = super::Unparsed::default();
     let mut skipped_parents = std::collections::BTreeMap::new();
@@ -797,6 +858,10 @@ pub fn stream_str(
     super::note_read_error(&mut session, result);
     if let Some(error) = spawns.take_error() {
         super::note_read_error(&mut session, Err(error));
+    }
+    drop(spawns);
+    if session.lineage.continues.is_none() {
+        session.lineage.continues = lineage_sink.detected.take();
     }
     session
 }

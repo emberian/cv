@@ -51,6 +51,7 @@ const TOP: &[&str] = &[
     "parentSessionId",
     "parentLastUuid",
     "contextLength",
+    "continues",
     "prUrl",
     "attachment",
     "rendered",
@@ -738,8 +739,14 @@ pub(super) fn record(
         // the parent transcript up to `parentLastUuid` (`contextLength` records), so the parent is
         // where it was forked from; the cut point rides in the bag as `fork_context`.
         "fork-context-ref" => {
+            let is_continues = r.value("continues")?.and_then(|v| v.as_bool()) == Some(true);
             if let Some(id) = r.top.string("parentSessionId")? {
-                session.lineage.forked_from = Some(id);
+                if is_continues {
+                    session.lineage.continues = Some(id.clone());
+                }
+                if session.lineage.forked_from.is_none() || !is_continues {
+                    session.lineage.forked_from = Some(id);
+                }
             }
             let mut cut = Map::new();
             if let Some(uuid) = r.top.string("parentLastUuid")? {

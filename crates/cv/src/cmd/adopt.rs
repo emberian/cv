@@ -99,6 +99,16 @@ fn join(a: &AdoptArgs) -> Result<()> {
         &only,
         a.dry_run,
     )?;
+    if !a.dry_run && !carried.is_empty() {
+        cv_core::lanes::record_lineage_edge_best_effort(
+            &from.session_id,
+            &into.session_id,
+            "continues",
+            Some(cv_core::harness::derived_host().as_str()),
+            None,
+            json!({"join": true}),
+        );
+    }
     let verb = if a.dry_run { "would join" } else { "joined" };
     let mut h = if carried.is_empty() {
         format!("✦ {} holds no such agents\n", short_id(&from.session_id))

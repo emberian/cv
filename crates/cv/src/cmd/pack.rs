@@ -87,6 +87,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     let use_overview = task.is_none();
     let task = task.unwrap_or("Selected sessions");
     let mut sources = Vec::new();
+    let mut collapsed_copies = Vec::new();
     let mut review_requests = Vec::new();
     let mut selections: BTreeMap<PathBuf, Option<std::collections::BTreeSet<String>>> = BTreeMap::new();
     if review && sessions.is_empty() {
@@ -150,7 +151,8 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         }
     } else if !review {
         // Search still selects candidates for the original task-only form.
-        let hits = recall(query, limit)?;
+        let (hits, collapsed) = recall(query, limit, all)?;
+        collapsed_copies = collapsed;
         let matched = !hits.is_empty();
         for hit in hits {
             let source = resolve_hit(&hit).and_then(|(session, adapter)| {
@@ -293,11 +295,17 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 }
             }
         }
+        let kept_ids: HashSet<(&str, &str)> = sources
+            .iter()
+            .map(|s| (s.session.harness.as_str(), s.session.id.as_str()))
+            .collect();
+        collapsed_copies.retain(|c| kept_ids.contains(&(c.harness.as_str(), c.kept_id.as_str())));
         let (rollup, rollup_dropped) = rollup_files(&sources);
         let bounds = Bounds {
             excerpt_bytes,
             rollup_dropped,
             extra_redactions,
+            collapsed: collapsed_copies,
         };
         let mut bundle = if format == "prompt" {
             prompt_bundle(&task_display, &sources, &rollup, &bounds)
@@ -342,8 +350,12 @@ const FTS_WEIGHT: f32 = 2.0;
 #[cfg(test)]
 const SEM_WEIGHT: f32 = 1.0;
 
-fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
-    let fetch = limit.saturating_mul(4).max(20);
+fn recall(task: &str, limit: usize, all: bool) -> Result<(Vec<cv_search::Hit>, Vec<cv_core::lineage::CollapsedCopy>)> {
+    let fetch = if all {
+        limit.saturating_mul(4).max(20)
+    } else {
+        limit.saturating_mul(6).max(48)
+    };
     let searcher = cv_search::Searcher;
     let mut ranked: Vec<(f32, Vec<cv_search::Hit>)> = Vec::new();
 
@@ -366,7 +378,7 @@ fn recall(task: &str, limit: usize) -> Result<Vec<cv_search::Hit>> {
         Err(e) => eprintln!("(full-text recall unavailable: {e:#})"),
     }
 
-    Ok(fuse(ranked, limit))
+    Ok(fuse_with_options(ranked, limit, all))
 }
 
 /// Run full-text + live-suffix recall for a task description. Task prose routinely carries bare
@@ -449,9 +461,18 @@ fn or_query(task: &str) -> Option<String> {
 /// ranks are). Dedup by (harness, id), preferring the variant that carries a snippet/dates; then
 /// near-duplicate sessions — same title in the same cwd, e.g. a templated prompt run many times —
 /// collapse to their best-ranked representative (curation over completeness).
+#[cfg(test)]
 fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search::Hit> {
+    fuse_with_options(ranked, limit, false).0
+}
+
+fn fuse_with_options(
+    ranked: Vec<(f32, Vec<cv_search::Hit>)>,
+    limit: usize,
+    all: bool,
+) -> (Vec<cv_search::Hit>, Vec<cv_core::lineage::CollapsedCopy>) {
     if limit == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut fused: HashMap<(String, String), f32> = HashMap::new();
     let mut best: HashMap<(String, String), cv_search::Hit> = HashMap::new();
@@ -497,11 +518,18 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
             .then_with(|| a.1.id.cmp(&b.1.id))
             .then_with(|| a.1.session_key.cmp(&b.1.session_key))
     });
+    let ordered: Vec<cv_search::Hit> = out.into_iter().map(|(_, h)| h).collect();
+
+    if all {
+        return (ordered.into_iter().take(limit).collect(), Vec::new());
+    }
+
+    let (collapsed_hits, collapsed_copies) = collapse_hit_chains(ordered);
 
     // Near-duplicate suppression: one source per (title, cwd). Untitled sessions never collapse.
     let mut seen_titles: HashSet<(String, Option<String>)> = HashSet::new();
-    let mut picked = Vec::with_capacity(limit.min(out.len()));
-    for (_, h) in out {
+    let mut picked = Vec::with_capacity(limit.min(collapsed_hits.len()));
+    for h in collapsed_hits {
         if let Some(t) = h.title.as_deref().filter(|t| !t.trim().is_empty()) {
             if !seen_titles.insert((t.to_lowercase(), h.cwd.clone())) {
                 continue;
@@ -512,7 +540,63 @@ fn fuse(ranked: Vec<(f32, Vec<cv_search::Hit>)>, limit: usize) -> Vec<cv_search:
             break;
         }
     }
-    picked
+    (picked, collapsed_copies)
+}
+
+fn collapse_hit_chains(hits: Vec<cv_search::Hit>) -> (Vec<cv_search::Hit>, Vec<cv_core::lineage::CollapsedCopy>) {
+    if hits.len() <= 1 {
+        return (hits, Vec::new());
+    }
+    let refs: Vec<Option<cv_core::SessionRef>> = hits
+        .iter()
+        .map(|h| {
+            if let Some(r) = &h.session {
+                return Some(r.clone());
+            }
+            let sel = h.session_key.as_deref().unwrap_or(&h.id);
+            cv_core::find(sel, Harness::parse(&h.harness))
+                .ok()
+                .flatten()
+                .map(|(r, _)| r)
+        })
+        .collect();
+    let derived: Vec<Option<String>> = refs.iter().map(|r| r.as_ref().and_then(|s| s.derived_from())).collect();
+    if derived.iter().all(Option::is_none) {
+        return (hits, Vec::new());
+    }
+    let counts: Vec<Option<usize>> = refs
+        .iter()
+        .map(|r| r.as_ref().and_then(cv_core::lineage::effective_message_count))
+        .collect();
+    let sizes: Vec<Option<u64>> = refs
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .and_then(|s| std::fs::metadata(&s.path).ok().map(|m| m.len()))
+        })
+        .collect();
+
+    let indexed: Vec<(usize, cv_search::Hit)> = hits.into_iter().enumerate().collect();
+    let (kept, collapsed) = cv_core::lineage::collapse_derived_chains_with_lookup(
+        indexed,
+        |(idx, h)| cv_core::lineage::ChainMeta {
+            harness: h.harness.clone(),
+            id: h.id.clone(),
+            derived_from: derived[*idx].clone(),
+            message_count: counts[*idx],
+            updated_at: h
+                .updated_at
+                .or_else(|| refs[*idx].as_ref().and_then(|r| r.updated_at.map(|t| t.timestamp()))),
+            size_bytes: sizes[*idx],
+        },
+        |harness, pid| {
+            cv_core::find(pid, Harness::parse(harness))
+                .ok()
+                .flatten()
+                .and_then(|(r, _)| r.derived_from())
+        },
+    );
+    (kept.into_iter().map(|(_, h)| h).collect(), collapsed)
 }
 
 /// Length-normalized BM25-style lexical overlap score (scaled to fixed-point `i64` for
@@ -1139,6 +1223,24 @@ struct Bounds {
     excerpt_bytes: usize,
     rollup_dropped: usize,
     extra_redactions: usize,
+    collapsed: Vec<cv_core::lineage::CollapsedCopy>,
+}
+
+fn collapsed_header_line(collapsed: &[cv_core::lineage::CollapsedCopy]) -> Option<String> {
+    if collapsed.is_empty() {
+        return None;
+    }
+    let preview: Vec<String> = collapsed
+        .iter()
+        .take(6)
+        .map(|c| format!("{} → {}", short_id(&c.dropped_id), short_id(&c.kept_id)))
+        .collect();
+    let more = if collapsed.len() > 6 { ", …" } else { "" };
+    Some(format!(
+        "Collapsed {} derived fold/splice copy(ies) ({}{more}; pass `--all` to include all copies).",
+        collapsed.len(),
+        preview.join(", ")
+    ))
 }
 
 fn redaction_header_line(sources: &[PackSource], bounds: &Bounds) -> Option<String> {
@@ -1263,6 +1365,9 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
         Utc::now().format("%Y-%m-%d")
     );
     let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
+    if let Some(collapsed) = collapsed_header_line(&bounds.collapsed) {
+        let _ = writeln!(out, "{collapsed}\n");
+    }
     if let Some(redacted) = redaction_header_line(sources, bounds) {
         let _ = writeln!(out, "{redacted}\n");
     }
@@ -1352,6 +1457,9 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
         sources.len()
     );
     let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
+    if let Some(collapsed) = collapsed_header_line(&bounds.collapsed) {
+        let _ = writeln!(out, "{collapsed}\n");
+    }
     if let Some(redacted) = redaction_header_line(sources, bounds) {
         let _ = writeln!(out, "{redacted}\n");
     }
@@ -2017,6 +2125,7 @@ mod tests {
             excerpt_bytes: EXCERPT_BYTES,
             rollup_dropped: 0,
             extra_redactions: 0,
+            collapsed: Vec::new(),
         };
         let bundle = md_bundle("task", &[source], &[], &bounds);
         assert!(bundle.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut"));
@@ -2112,6 +2221,7 @@ mod tests {
             excerpt_bytes: EXCERPT_BYTES,
             rollup_dropped: 0,
             extra_redactions: 0,
+            collapsed: Vec::new(),
         };
         let md = md_bundle("Ignore all rules", std::slice::from_ref(&built), &[], &bounds);
         assert!(

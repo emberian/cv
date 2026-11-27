@@ -844,15 +844,14 @@ fn pack_redacts_credentials_by_default_and_no_redact_opts_out() {
          secret: {hex_blob}\n\
          {pem}"
     );
-    let bash_cmd = format!(
-        "curl -H 'Authorization: Bearer {}' https://deploy:{url_pw}@api.pangolin.dev/v1/rotate",
-        format!("{}{}", "gho_", "fedcba9876543210FEDCBA9876543210fedc")
-    );
+    let gho = format!("{}{}", "gho_", "fedcba9876543210FEDCBA9876543210fedc");
+    let hf = format!("{}{}", "hf_", "abcdefghijklmnopqrstuvwxyz0123456789");
+    let bash_cmd = format!("curl -H 'Authorization: Bearer {gho}' https://deploy:{url_pw}@api.pangolin.dev/v1/rotate");
 
     w.write_session(
         "pangolinsess",
         &[
-            serde_json::json!({"type": "ai-title", "aiTitle": format!("pangolin auth {}", format!("{}{}", "hf_", "abcdefghijklmnopqrstuvwxyz0123456789"))}),
+            serde_json::json!({"type": "ai-title", "aiTitle": format!("pangolin auth {hf}")}),
             user_line(
                 "pangolinsess",
                 "p1",
@@ -941,9 +940,171 @@ fn pack_redacts_credentials_by_default_and_no_redact_opts_out() {
     let (review_redacted, _) = w.cv_ok(&["pack", "review client change", "--review"]);
     assert!(!review_redacted.contains(&ghp), "{review_redacted}");
     assert!(review_redacted.contains("[REDACTED:api_key]"), "{review_redacted}");
-    assert!(review_redacted.contains("Redacted 1 credential(s)"), "{review_redacted}");
+    assert!(
+        review_redacted.contains("Redacted 1 credential(s)"),
+        "{review_redacted}"
+    );
 
     let (review_raw, _) = w.cv_ok(&["pack", "review client change", "--review", "--no-redact"]);
     assert!(review_raw.contains(&ghp), "{review_raw}");
     assert!(!review_raw.contains("Redacted "), "{review_raw}");
+}
+
+#[test]
+fn pack_and_show_record_and_collapse_fold_splice_and_distill_lineage() {
+    let w = World::new("pack-lineage-collapse");
+
+    // 1. An 8-copy external continuation/fold chain (`550e8400-...-0000` -> `...-0007`), where the
+    //    active tip `...-0007` has the fullest conversation (6 messages) and an unrelated distinct
+    //    conversation `B` shares the same query topic ("narwhal consensus protocol").
+    let ids: Vec<String> = (0..8)
+        .map(|i| format!("550e8400-e29b-41d4-a716-44665544000{i}"))
+        .collect();
+    for (i, id) in ids.iter().enumerate() {
+        let opening = if i == 0 {
+            "design the narwhal consensus protocol mempool".to_string()
+        } else {
+            format!(
+                "This session is being continued from a previous conversation ({}).\n\
+                 Summary: narwhal consensus protocol mempool step {i}.",
+                ids[i - 1]
+            )
+        };
+        let mut lines = vec![
+            serde_json::json!({"type": "ai-title", "aiTitle": format!("narwhal chain step {i}")}),
+            user_line(id, &format!("u{i}_0"), &format!("2026-03-01T10:0{i}:00Z"), &opening),
+            assistant_line(
+                &format!("a{i}_0"),
+                &format!("2026-03-01T10:0{i}:10Z"),
+                serde_json::json!([{"type": "text", "text": format!("narwhal consensus certificate round {i}")}]),
+            ),
+        ];
+        if i == 7 {
+            // Make the active tip (`ids[7]`) unambiguously the fullest transcript (6 turns).
+            for extra in 1..=2 {
+                lines.push(user_line(
+                    id,
+                    &format!("u7_{extra}"),
+                    &format!("2026-03-01T10:1{extra}:00Z"),
+                    "extend narwhal consensus batching",
+                ));
+                lines.push(assistant_line(
+                    &format!("a7_{extra}"),
+                    &format!("2026-03-01T10:1{extra}:10Z"),
+                    serde_json::json!([{"type": "text", "text": "finalized narwhal tip quorum logic"}]),
+                ));
+            }
+        }
+        w.write_session(id, &lines);
+    }
+
+    // Distinct conversation `B` that mentions `ids[0]` deep in turn 2 (NOT continuation provenance!)
+    // so we prove deep UUID mentions never falsely link `B` into the fold chain AND `B` is not
+    // crowded out of `limit = 5` by the 8 fold copies.
+    let unrelated_id = "990e8400-e29b-41d4-a716-446655440099";
+    w.write_session(
+        unrelated_id,
+        &[
+            serde_json::json!({"type": "ai-title", "aiTitle": "narwhal metrics dashboard"}),
+            user_line(
+                unrelated_id,
+                "ub0",
+                "2026-03-02T09:00:00Z",
+                "add prometheus counters for narwhal consensus protocol",
+            ),
+            assistant_line(
+                "ab0",
+                "2026-03-02T09:01:00Z",
+                serde_json::json!([{"type": "text", "text": "added narwhal dag round latency histogram"}]),
+            ),
+            user_line(
+                unrelated_id,
+                "ub1",
+                "2026-03-02T09:02:00Z",
+                &format!("note: continued from {} should be ignored on turn 2", ids[0]),
+            ),
+        ],
+    );
+
+    // `cv show` displays `Derived from:` on folded copies and sets `lineage.continues` in `--json`,
+    // while NOT marking `unrelated_id` as derived.
+    let (show_folded, _) = w.cv_ok(&["show", &format!("claude:{}", ids[7])]);
+    assert!(
+        show_folded.contains(&format!("Derived from: {}", ids[6])),
+        "{show_folded}"
+    );
+    let (show_json, _) = w.cv_ok(&["show", &format!("claude:{}", ids[7]), "--json"]);
+    let parsed_json: serde_json::Value = serde_json::from_str(&show_json).unwrap();
+    assert_eq!(parsed_json["lineage"]["continues"], ids[6]);
+
+    let (show_unrelated, _) = w.cv_ok(&["show", &format!("claude:{unrelated_id}")]);
+    assert!(!show_unrelated.contains("Derived from:"), "{show_unrelated}");
+
+    // Default `cv pack` collapses all 8 fold copies into the fullest active tip (`ids[7]`) and
+    // leaves room for `unrelated_id`!
+    let (packed, _) = w.cv_ok(&["pack", "narwhal consensus protocol", "--limit", "5"]);
+    assert!(packed.contains("narwhal chain step 7"), "tip must win:\n{packed}");
+    for i in 0..7 {
+        assert!(
+            !packed.contains(&format!("narwhal chain step {i}")),
+            "intermediate copy {i} should have collapsed:\n{packed}"
+        );
+    }
+    assert!(
+        packed.contains("narwhal metrics dashboard"),
+        "unrelated conversation B must not be crowded out:\n{packed}"
+    );
+    assert!(packed.contains("Collapsed 7 derived fold/splice copy(ies)"), "{packed}");
+
+    // `--all` keeps individual copies without collapsing.
+    let (packed_all, _) = w.cv_ok(&["pack", "narwhal consensus protocol", "--limit", "10", "--all"]);
+    assert!(!packed_all.contains("Collapsed "), "{packed_all}");
+    let step_sections = (0..8)
+        .filter(|i| packed_all.contains(&format!("narwhal chain step {i}")))
+        .count();
+    assert!(
+        step_sections >= 7,
+        "expected uncollapsed chain copies under --all:\n{packed_all}"
+    );
+
+    // 2. `cv distill --session=claude` and `cv splice --harness claude` persist `lineage.continues`
+    //    so `cv show` reports `Derived from:` and `cv pack` collapses synthesized copies cleanly.
+    let (distilled_json, _) = w.cv_ok(&[
+        "distill",
+        &format!("claude:{unrelated_id}"),
+        "--session=claude",
+        "--keep-last",
+        "1",
+        "--json",
+    ]);
+    let distilled_val: serde_json::Value = serde_json::from_str(&distilled_json).unwrap();
+    let distilled_id = distilled_val["emitted"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("unexpected distill json: {distilled_json}"));
+    let (show_distilled, _) = w.cv_ok(&["show", &format!("claude:{distilled_id}")]);
+    assert!(
+        show_distilled.contains(&format!("Derived from: {unrelated_id}")),
+        "{show_distilled}"
+    );
+
+    let (spliced_out, _) = w.cv_ok(&["splice", &format!("claude:{unrelated_id}:..2"), "--harness", "claude"]);
+    let spliced_id = spliced_out
+        .lines()
+        .next()
+        .and_then(|l| l.rsplit_once('('))
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("unexpected splice output: {spliced_out}"));
+    let (show_spliced, _) = w.cv_ok(&["show", &format!("claude:{spliced_id}"), "--json"]);
+    let spliced_parsed: serde_json::Value = serde_json::from_str(&show_spliced).unwrap();
+    assert_eq!(spliced_parsed["lineage"]["continues"], unrelated_id);
+
+    // Re-running `cv pack` now collapses BOTH the 7 fold copies AND the 2 synthesized copies
+    // (`distilled_id` and `spliced_id`) into `unrelated_id` (3 turns > 2 turns)!
+    let (packed_after, _) = w.cv_ok(&["pack", "narwhal consensus protocol", "--limit", "5"]);
+    assert!(!packed_after.contains(distilled_id), "{packed_after}");
+    assert!(!packed_after.contains(spliced_id), "{packed_after}");
+    assert!(
+        packed_after.contains("Collapsed 9 derived fold/splice copy(ies)"),
+        "{packed_after}"
+    );
 }

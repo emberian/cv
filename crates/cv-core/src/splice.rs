@@ -112,11 +112,21 @@ impl Composition {
         // Provenance is cv's own fact about a session cv synthesized, not something read out of a
         // harness store, so it lives in the `cv` namespace — `Session::extra` has no flat keys
         // (docs/INTERFACE-V2.md §4).
+        let session_id = new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let continues = self
+            .provenance
+            .first()
+            .and_then(|p| p.get("source_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty() && *id != session_id)
+            .map(str::to_owned);
+        let mut cv_bag = serde_json::Map::new();
+        cv_bag.insert("loom".into(), serde_json::Value::Array(self.provenance));
+        if let Some(parent) = &continues {
+            cv_bag.insert("continues".into(), serde_json::Value::String(parent.clone()));
+        }
         let mut extra = serde_json::Map::new();
-        extra.insert(
-            crate::ir::CV_NAMESPACE.into(),
-            serde_json::json!({ "loom": serde_json::Value::Array(self.provenance) }),
-        );
+        extra.insert(crate::ir::CV_NAMESPACE.into(), serde_json::Value::Object(cv_bag));
         let (principal, cwd, title, model, git, system_prompt) = match self.owner {
             Some(mut owner) => {
                 let carry_prompt = emit_target.is_some_and(|target| owner.harness != target);
@@ -143,7 +153,11 @@ impl Composition {
             git,
             principal,
             system_prompt,
-            ..Session::new(new_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()), harness)
+            lineage: crate::ir::Lineage {
+                continues,
+                ..Default::default()
+            },
+            ..Session::new(session_id, harness)
         };
         if let Some(coverage) = self.coverage {
             coverage.attach(&mut result);

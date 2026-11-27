@@ -1514,6 +1514,7 @@ fn tree_line_with_preview(m: &Message, preview: Option<String>) -> String {
 /// [`SessionRef`] (label/cwd) plus the model captured from the first assistant turn.
 pub(crate) struct HeaderInfo {
     coverage: Option<cv_core::coverage::ReadCoverage>,
+    derived_from: Option<String>,
     harness: Harness,
     id: String,
     cwd: Option<PathBuf>,
@@ -1583,6 +1584,7 @@ fn stream_session_render_inner<W: std::io::Write>(
     /// The header fields a `meta` call delivers.
     struct Meta {
         coverage: Option<cv_core::coverage::ReadCoverage>,
+        derived_from: Option<String>,
         title: Option<String>,
         model: Option<String>,
         cwd: Option<PathBuf>,
@@ -1602,6 +1604,8 @@ fn stream_session_render_inner<W: std::io::Write>(
         frames: Frames<'w, W>,
         printed_coverage: Option<cv_core::coverage::ReadCoverage>,
         coverage: Option<cv_core::coverage::ReadCoverage>,
+        printed_derived_from: Option<String>,
+        derived_from: Option<String>,
         harness: Harness,
         id: String,
         cwd: Option<PathBuf>,
@@ -1628,6 +1632,9 @@ fn stream_session_render_inner<W: std::io::Write>(
     impl<W: std::io::Write, H: Fn(&HeaderInfo) -> String, R: Fn(&Message) -> Result<String>> Sink<'_, W, H, R> {
         fn apply_meta(&mut self, s: Meta) {
             self.coverage = s.coverage;
+            if let Some(parent) = s.derived_from {
+                self.derived_from = Some(parent);
+            }
             self.title = s.title;
             if self.model.is_none() {
                 self.model = s.model;
@@ -1673,6 +1680,7 @@ fn stream_session_render_inner<W: std::io::Write>(
         fn header_now(&self) -> String {
             (self.header)(&HeaderInfo {
                 coverage: self.coverage.clone(),
+                derived_from: self.derived_from.clone(),
                 harness: self.harness,
                 id: self.id.clone(),
                 cwd: self.cwd.clone(),
@@ -1689,6 +1697,7 @@ fn stream_session_render_inner<W: std::io::Write>(
             self.bytes += head.len();
             self.frames.start(&head);
             self.printed_coverage = self.coverage.clone();
+            self.printed_derived_from = self.derived_from.clone();
             if let Some(mut buffered) = self.checked_buf.take() {
                 if self.frames.result.is_ok() {
                     self.frames.result = buffered.flush().and_then(|()| {
@@ -1718,6 +1727,7 @@ fn stream_session_render_inner<W: std::io::Write>(
             // first user record, which the parse skips). Model/cwd fill in if discovery lacked them.
             let meta = Meta {
                 coverage: cv_core::coverage::ReadCoverage::of_session(s),
+                derived_from: cv_core::lineage::derived_from_session(s).map(str::to_owned),
                 title: s.title.clone(),
                 model: s.model.clone(),
                 cwd: s.cwd.clone(),
@@ -1850,6 +1860,8 @@ fn stream_session_render_inner<W: std::io::Write>(
         frames: Frames::new(out),
         printed_coverage: None,
         coverage: None,
+        printed_derived_from: None,
+        derived_from: r.derived_from(),
         harness: r.harness,
         id: r.id.clone(),
         cwd: r.cwd.clone(),
@@ -1892,6 +1904,14 @@ fn stream_session_render_inner<W: std::io::Write>(
     // Returned metadata also carries omissions discovered after an eager header was printed.
     // Keep the stream bounded and report the final evidence once, without replaying its body.
     sink.coverage = cv_core::coverage::ReadCoverage::of_session(&read.session);
+    if let Some(parent) = cv_core::lineage::derived_from_session(&read.session) {
+        sink.derived_from = Some(parent.to_owned());
+    }
+    if !checked && sink.frames.printed && sink.derived_from != sink.printed_derived_from {
+        if let Some(parent) = &sink.derived_from {
+            sink.frames.write(&format!("Derived from: {parent}\n\n"));
+        }
+    }
     if sink.frames.printed && sink.coverage != sink.printed_coverage {
         if let Some(coverage) = &sink.coverage {
             sink.frames.write(&format!("Read coverage: {}\n\n", coverage.summary()));
@@ -1910,6 +1930,13 @@ fn stream_session_render_inner<W: std::io::Write>(
 
 /// Header for `cv show` (mirrors the old eager header exactly).
 pub(crate) fn show_header(h: &HeaderInfo) -> String {
+    let mut extra = String::new();
+    if let Some(parent) = &h.derived_from {
+        extra.push_str(&format!("Derived from: {}\n", cv_core::sanitize::sanitize_line(parent)));
+    }
+    if let Some(c) = &h.coverage {
+        extra.push_str(&format!("Read coverage: {}\n", c.summary()));
+    }
     format!(
         "# {}\n{} · {} · {}{}\n{}\n",
         h.label,
@@ -1917,10 +1944,7 @@ pub(crate) fn show_header(h: &HeaderInfo) -> String {
         h.id,
         h.cwd.as_deref().map(home_rel).unwrap_or_else(|| "?".into()),
         h.model.as_ref().map(|m| format!(" · {m}")).unwrap_or_default(),
-        h.coverage
-            .as_ref()
-            .map(|c| format!("Read coverage: {}\n", c.summary()))
-            .unwrap_or_default(),
+        extra,
     )
 }
 

@@ -4696,6 +4696,7 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
         git: session.git.clone(),
         principal: session.principal.clone(),
         lineage: crate::ir::Lineage {
+            continues: Some(session.id.clone()),
             forked_from: Some(session.id.clone()),
             ..Default::default()
         },
