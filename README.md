@@ -43,24 +43,24 @@ cv doctor <id>                                   # spin episodes, post-compactio
 
 ## Successor sessions & trajectory looming
 
-Auto-compaction replaces lived reasoning with a lossy summary; prose handoff briefs play telephone. **Eclosion (`eclo`)** treats transcripts as immutable values: before hitting the context ceiling, an agent or steward constructs a verified **successor session** from existing trajectory spans and resumes inside it—sustaining multi-day work with zero harness compactions.
+Coordinator prose summaries play telephone (`0.5/24` blind state recall vs `21.5/24` for deterministic `cv distill` and `24/24` for the full transcript; `6%` median fact carriage from briefs alone across 156 takeovers). Yet leaving a single session unpruned triggers **context inertia**, a **75%** drop in per-turn reasoning tokens (`arXiv:2610.20563`), and **87–100%** compaction laundering when harnesses flatten untrusted tool outputs into summaries (`arXiv:2610.29869`). **Eclosion (`eclo`)** treats transcripts as immutable values: ahead of the ceiling, an agent constructs a verified **successor session** from existing trajectory spans and resumes in first-person motion—sustaining multi-day runs with zero compactions.
 
-- **Rolling-window fold.** `cv prune --carry-agents` (or caller-authored `--plan plan.json`, or `cv distill --session --bricks`) keeps human prompts and the active tail verbatim, moves acted-on tool payloads to `.flat.jsonl` behind `cv cat` pointers (stable across repeated folds), rewrites nested token `usage` so `/resume` does not trigger immediate auto-compaction, and restamps `subagents/*.meta.json` so helper models survive. Resuming `/resume <new_id>` **in place** inside the live pane keeps background shells and sub-agents attached; `cv adopt --join --from <old> --into <new>` reconciles helper turns written mid-cutover.
-- **Bad-path recut.** When an exploratory suffix hits a dead end, `cv rewind <id> --at <msg|sha>` or `cv splice <id>:..N --session` cuts back to the last clean prefix so subsequent turns condition on an unpolluted trajectory while the shed branch remains addressable via `cv show` and `cv cat`.
-- **Trajectory looming & transcript-seeded sub-agents.** `cv splice A:0..18 B:42..60 codex:C:6.. --session` weaves spans across sessions and harnesses into one history, relinking parent chains and dropping half-open tool calls. Replacing `--session` with `--agent-of <root>` plants a distilled or spliced trajectory directly into `<root>/subagents/`, immediately addressable via `SendMessage` without serializing its state into a prompt brief.
-- **Pre-cutover probe & corpus experts.** Candidate successors can be interviewed non-destructively via `--agent-of <root>` or `claude -p --resume <new_id> --fork-session` before switching a live seat onto them; `cv pack "<topic>" --format session --harness claude` compiles a standing domain-expert session from prior corpus spans ([`manual/src/reshaping.md`](manual/src/reshaping.md)).
+- **Rewind beats tail repair—and unlocks keeper reviewers.** Arguing at the end of a polluted trace conditions on every wrong turn and bloated early draft (`arXiv:2505.06120`); mid-trajectory checkpoint forking flips **18–49%** of failed runs where tail retry flips **0%** (`arXiv:2512.06749`). `cv rewind <id> --at <msg|sha>` cuts dead-end suffixes back to a clean prefix—or pairs with `cv blame -L` to fork the exact veteran session *at the commit it wrote a module* so it reviews incoming changes with its mental model intact.
+- **Fold observations early; keep prompts, orientation & cache prefixes.** Tool outputs and opaque thinking signatures exceed **80%** of long-session tokens (`arXiv:2508.21433`), yet agents voluntarily call self-pruning tools **0%** of the time (`arXiv:2509.23586`) and ignore bare opaque recall IDs **56.3%** of the time (Meno's paradox, `arXiv:2609.20804`). `cv prune --carry-agents` and `cv distill --session --bricks` keep human prompts and active turns verbatim, replace acted-on outputs with **semantically labeled** `cv cat` receipts inside byte-stable dyadic prefix bricks (preserving prompt-cache hits and original session IDs across repeated folds), rewrite nested `usage` so `/resume` never auto-compacts on arrival, and carry `subagents/*.meta.json` across in-place `/resume` (`cv adopt --join` reconciles mid-switch helper turns).
+- **Respect handoff direction & fork cost (`escalate` ≠ `downshift`).** Passing a weak model's raw noisy trace—or an orchestrator's entire 700K history—into a frontier model costs **2.2×**/step and solves less than starting from clean workspace facts (`arXiv:2608.24358`), whereas stripping a frontier model's trajectory when handing off to a fast worker forces **1.6–2.0×** rework. `cv distill --handoff escalate` drops predecessor narrative in favor of consolidated user prompts, verified build/test verdicts, and quarantined `[UNVERIFIED]` notes; `--handoff downshift` preserves the frontier checklist and tail.
+- **Loom trajectories & interview successors before cutover.** `cv splice A:0..18 B:42..60 codex:C:6.. --session` weaves spans across sessions and harnesses while relinking parent chains and dropping half-open tool calls. Passing `--agent-of <root>` (or probing with `claude -p --resume <new_id> --fork-session`, keeping tool schemas identical so the prompt cache hits) plants a trajectory into `<root>/subagents/`—addressable via `SendMessage` before cutover, or compiled from corpus history via `cv pack "<topic>" --format session` ([full empirical notes & pitfalls](manual/src/reshaping.md#why-rewinding-and-folding-beat-telephone)).
 
 ```sh
-# Fold ahead of auto-compact, probe non-destructively, then /resume <next> in place
+# Fold at ~55% window, probe non-destructively, then /resume <next> in place
 next=$(cv prune "$SID" --plan fold.json --carry-agents --json | jq -r .new_id)
 claude -p --resume "$next" --fork-session "state open invariants and next step"
 cv adopt --join --from "$SID" --into "$next"     # reconcile any helper turns written mid-switch
 
-# Loom cross-session spans or plant a trajectory-seeded sub-agent into a live root
-cv rewind da9174f4 --at 6edc8472                 # session state right as commit 6edc8472 landed
-cv splice da9174f4:0..18 codex:019e75e0:6.. --session --carry-agents
+# Keeper-reviewer rewind, direction-aware escalation, and cross-harness looming
+cv blame crates/cv-core/src/emit.rs -L 40,90     # -> commit 6edc8472 in session da9174f4
+cv rewind da9174f4 --at 6edc8472                 # fork author session as of that commit
 cv distill agent-a5e2da77 --handoff escalate --agent-of "$ROOT_SID"
-cv pack "WAL snapshot locking" --format session --harness claude
+cv splice da9174f4:0..18 codex:019e75e0:6.. --session --carry-agents
 ```
 
 ## Harnesses (23 read, 14 `port` targets)

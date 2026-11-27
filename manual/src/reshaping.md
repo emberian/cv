@@ -16,6 +16,83 @@ touched. Four of them are about lanes:
 | the agent as of a past message or the commit it made, as a top-level session | [`cv rewind`](cli.md#cv-rewind) |
 | sub-agents of a dead root moved under a live one so it can `SendMessage` them | [`cv adopt`](cli.md#cv-adopt) |
 
+## Why rewinding and folding beat telephone
+
+Multi-session agent workflows fail at both extremes: **endless telephone** (paraphrasing a living
+session into prose handoff briefs or recursive LLM summaries) and **unpruned continuation**
+(letting a single window bloat into context inertia until auto-compaction wipes its reasoning).
+Controlled harness ablations and multi-month production audits establish six rules behind `cv`'s
+Reshape verbs:
+
+1. **Telephone attenuation vs. the whole-history fork trap.**
+   On a 24-question blind continuation test, the full transcript scored **24/24**, deterministic
+   `cv distill` scored **21.5/24**, the worker's `STATUS` file **11.5/24**, and a coordinator's
+   prose resume summary **0.5/24**. Across 156 consecutive seat successions, coordinator briefs
+   alone carried a median **6%** of the distinctive facts the successor went on to use, and brief +
+   hand-written continuation file carried **37–43%** (while misreporting live processes and
+   stranding messages to retired IDs); `cv distill` carried **73%** at ~69K tokens and selective
+   `cv prune` carried **95–99%**. The opposite overcorrection—forking an orchestrator's entire
+   700K coordination history into every helper—burns quota on irrelevant chatter. Resume veterans
+   directly (`SendMessage` or `cv adopt`), or plant focused spans via `distill --agent-of` and
+   `splice --agent-of` so successors wake in **first-person motion** (`--keep-last 12`) rather than
+   reading a third-person obituary.
+2. **Unpruned inertia AND untyped LLM compaction both degrade reasoning.**
+   Even before hitting the context ceiling, unpruned long sessions suffer context inertia, a **75%**
+   collapse in per-turn thinking tokens (`arXiv:2610.20563`), **98%** late-run zero-tool dawdling
+   (`arXiv:2610.07625`), and **2.2×** cost with **64.6% → 35.5%** pass-rate erosion
+   (`arXiv:2603.24755`). Yet untyped LLM compaction is worse: monolithic block rewrites suffer
+   one-step context collapse (`arXiv:2510.04618`), recursive first-person summaries drive **7×**
+   stylistic attractor convergence (`arXiv:2606.30571`) and elongate SWE runs **+13–15%** by
+   smoothing away sharp error traces (`arXiv:2508.21433`), and plaintext-flattening compactors
+   launder forged `[User]:` lines inside tool outputs into authoritative instructions **87–100%**
+   of the time (`arXiv:2610.29869`, vs. **0%** when role boundaries and line-leading markers are
+   fenced). Folding mechanically around **50–60%** of the window keeps sessions in their peak
+   reasoning band with zero compactions.
+3. **Rewinding beats tail repair—and `blame → rewind` creates instant keeper reviewers.**
+   End-of-trace self-correction conditions on every wrong localization and bloated early draft
+   already in context (`arXiv:2505.06120`: sharded multi-turn corrections lose **39%** accuracy from
+   early-draft anchoring; consolidating prompts cleanly recovers **95%**). Mid-trajectory checkpoint
+   forking flips **18–49%** of failed multi-agent runs where tail retry flips **0%**
+   (`arXiv:2503.02068`, `arXiv:2512.06749`). `cv rewind <id> --at <msg|sha>` and
+   `cv splice <id>:..N --session` cut back to a clean prefix at the same prompt-cache cost as an
+   inline correction—and pairing `cv blame <path> -L lo,hi` with `cv rewind <id> --at <sha>` forks
+   the original authoring session *at the moment it minted a commit*, giving an instant reviewer
+   with 100% of that module's design context and rejected alternatives loaded.
+4. **Escalation and downshift have opposite optimal handoff shapes (`arXiv:2608.24358`, `arXiv:2606.02875`).**
+   Across 58,000 runs, handing a weaker model's raw trajectory—or its eroded dirty branch—to a
+   stronger model (`LC → HC`) recovers under half the quality gain at **2.2×** per-step cost (worse
+   than starting `HC` fresh from clean `base` + deterministic facts) and risks wrong-hypothesis
+   inheritance (`arXiv:2606.02875`). Conversely, dropping a stronger model's trajectory when
+   downshifting to a fast worker (`HC → LC`) forces **1.6–2.0×** rework steps.
+   `cv distill --handoff escalate` drops predecessor narrative, consolidates user prompts + verified
+   build/test verdicts (especially `post_failure_edit`, where handoff debt peaks), and quarantines
+   predecessor notes as `[UNVERIFIED]`; `--handoff downshift` preserves the verified checklist and
+   verbatim tail.
+5. **Meno's paradox breaks bare pointers and voluntary self-pruning (`arXiv:2609.20804`, `arXiv:2509.23586`).**
+   Tool observations and opaque thinking signatures exceed **80%** of long-session tokens
+   (`arXiv:2508.21433`), yet agents voluntarily invoke self-pruning tools **0%** of the time and
+   ignore bare `[recall_event(41)]` stubs in **56.3%** of settings—an agent does not know what it
+   forgot to query. Surfacing *semantic* one-line receipts (command, exit code, touched symbols,
+   error line) beside `cv cat <orig-session> <tool_use_id>` (`arXiv:2408.09559`) and freezing prefix
+   spans into dyadic `--bricks` cuts observation cost **>50%** while keeping provider prompt caches
+   hot and original session IDs stable across fold-of-fold (`eclo`).
+6. **Live `/resume`, tool-schema cache hashes, and harness chatter have four mechanical traps.**
+   - *Nested usage gate*: Claude Code's auto-compact check reads `usage.iterations[-1]` on
+     `/resume`; leaving pre-fold counts intact triggers immediate compaction on arrival (`cv prune`
+     and `cv distill` rewrite or strip both top-level and nested usage).
+   - *In-place `/resume` vs. process relaunch*: `/resume <new-id>` inside the **same** terminal pane
+     keeps the OS process and running background shells/sub-agents alive; spawning a new process
+     orphans them unless the old session stays as a quiet keeper (`cv adopt --join --from <old>
+     --into <new>` reconciles mid-switch helper turns; `--carry-agents` preserves
+     `subagents/*.meta.json` so helpers never silently reset their `model` or `agentType`).
+   - *Tool-schema prompt-cache trap*: prompt caches hash tool definitions ahead of messages, so
+     non-destructive fork probes (`--fork-session`) should keep tool schemas identical (enforcing
+     read-only via permissions/hooks rather than `--tools ""`, which forces a full cache rewrite).
+   - *Orientation records & signature-only thinking*: harness attachment/singleton records orient
+     the model and link `parentUuid` chains (dropping them wholesale causes silent prefix
+     truncation), while ~98% of sub-agent thinking blocks store opaque signatures with no text—so
+     reasons survive reshaping only when stated in replies, notes, or commit messages.
+
 `cv prune` is the sibling for one long session, a main thread or a sub-agent transcript (by id or
 path): same transcript, bulky old tool payloads lifted into a sidecar, written as a standalone
 session under a new id. It never plants the result under a live parent; `cv adopt` moves child
