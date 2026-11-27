@@ -572,7 +572,7 @@ fn contexts(out: Cow<'_, str>) -> Cow<'_, str> {
 }
 
 /// Extend existing credential classes without changing their class-specific markers.
-pub(super) fn additional(s: &str, classes: &super::RedactClasses) -> Option<String> {
+pub(super) fn additional(s: &str, classes: &super::RedactClasses) -> Option<(String, usize)> {
     let mut out = Cow::Borrowed(s);
     if classes.api_keys {
         out = replace(out, |s, cuts| {
@@ -599,7 +599,10 @@ pub(super) fn additional(s: &str, classes: &super::RedactClasses) -> Option<Stri
     }
     match out {
         Cow::Borrowed(_) => None,
-        Cow::Owned(value) => Some(value.replace(MARK, "[REDACTED:secret]")),
+        Cow::Owned(value) => {
+            let count = value.matches(MARK).count().max(1);
+            Some((value.replace(MARK, "[REDACTED:secret]"), count))
+        }
     }
 }
 

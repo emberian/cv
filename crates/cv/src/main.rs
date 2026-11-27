@@ -1085,6 +1085,9 @@ enum Cmd {
         /// what each cut.
         #[arg(long, value_name = "N", default_value_t = pack::EXCERPT_BYTES)]
         excerpt_bytes: usize,
+        /// Skip the default credential-redaction pass (keep raw tokens/passwords in the pack).
+        #[arg(long)]
+        no_redact: bool,
     },
 
     /// Fleet task substrate: dispatch, review, and git-observed landing.
@@ -1598,6 +1601,7 @@ fn run() -> Result<()> {
             thinking,
             json,
             excerpt_bytes,
+            no_redact,
         } => pack::cmd_pack(pack::PackArgs {
             review,
             all,
@@ -1611,6 +1615,7 @@ fn run() -> Result<()> {
             thinking: util::parse_thinking(&thinking)?,
             json,
             excerpt_bytes,
+            no_redact,
         }),
         Cmd::Stats { query, json, tokens } => browse::cmd_stats(query, json, tokens),
         Cmd::Prune {

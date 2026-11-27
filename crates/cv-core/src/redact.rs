@@ -605,6 +605,33 @@ pub fn redact_text(s: &str) -> String {
     scrub(s, &RedactOptions::default(), &mut stats)
 }
 
+/// Credential-only redaction options (`emails: false`, so ordinary git author emails in commit
+/// logs and prose survive while API keys, private keys, JWTs, auth headers, URL/`.netrc`
+/// credentials, secret assignments, and secret-keyworded blobs are scrubbed).
+pub fn credential_options() -> RedactOptions {
+    RedactOptions {
+        classes: RedactClasses {
+            emails: false,
+            ..RedactClasses::default()
+        },
+    }
+}
+
+/// Scrub credential-shaped strings from `s` (leaving ordinary email addresses intact), returning
+/// `(redacted_text, redaction_count)`. Idempotent: `[REDACTED:kind]` markers never re-trigger.
+pub fn redact_credentials(s: &str) -> (String, usize) {
+    let mut stats = RedactStats::default();
+    let out = scrub(s, &credential_options(), &mut stats);
+    (out, stats.total())
+}
+
+/// Allocation-aware twin of [`redact_credentials`]: borrows `s` when no credential matched.
+pub fn redact_credentials_cow(s: &str) -> (Cow<'_, str>, usize) {
+    let mut stats = RedactStats::default();
+    let out = scrub_cow(s, &credential_options(), &mut stats);
+    (out, stats.total())
+}
+
 /// Zero-allocation pre-scan over a single `&str`: returns `true` iff [`scrub_cow`] would redact at
 /// least one non-placeholder span under `opts`.
 pub fn str_needs_scrub(s: &str, opts: &RedactOptions) -> bool {
@@ -1567,8 +1594,8 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// verbatim, which is what makes the transform idempotent.
 pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
     let base = legacy_cow(s, opts, stats);
-    if let Some(changed) = secrets::additional(&base, &opts.classes) {
-        stats.assignments += 1;
+    if let Some((changed, count)) = secrets::additional(&base, &opts.classes) {
+        stats.assignments += count;
         return Cow::Owned(changed);
     }
     base
@@ -1854,6 +1881,22 @@ fn rules() -> &'static [Rule] {
                     value(c, 1)
                 },
             ),
+            // `.netrc` entries (`machine <host> [login <user>] password <secret>` or
+            // `default [login <user>] password <secret>`), single-line or multi-line.
+            rule(
+                Kind::Assignment,
+                r#"(?i)(?:machine[ \t]+\S+|default)(?:[ \t\r\n]+(?:login|macdef)[ \t]+\S+)?[ \t\r\n]+password[ \t]+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"'`]+))"#,
+                |s, c| {
+                    boundary_before(s, c.get(0)?.start()).then_some(())?;
+                    let v = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3))?;
+                    let raw = v.as_str();
+                    (raw.len() >= 3
+                        && !raw.starts_with(PLACEHOLDER_OPEN)
+                        && !raw.starts_with(['$', '<', '{', '%'])
+                        && raw != "[redacted]")
+                        .then_some((v.start(), v.end()))
+                },
+            ),
             // `Authorization: <value>` to end of line; `Proxy-Authorization:` too, not
             // `FooAuthorization:`.
             rule(Kind::ApiKey, r"(?i)authorization:[ \t]*([^ \t\r\n][^\r\n]*)", |s, c| {
@@ -1869,14 +1912,14 @@ fn rules() -> &'static [Rule] {
                 (t.len() >= 16 || !t.bytes().all(|b| b.is_ascii_alphabetic())).then_some(())?;
                 whole(s, c)
             }),
-            // AWS access key ids (the whole uppercase run, so an overlong key leaves no tail),
-            // then the prefix table.
+            // AWS access key ids (`AKIA` long-term and `ASIA` STS temporary, the whole uppercase
+            // run so an overlong key leaves no tail), then the prefix table.
             rule(
                 Kind::ApiKey,
-                &format!(r"AKIA[A-Z0-9]{{16,}}|(?:{})[A-Za-z0-9_-]*", prefixes.join("|")),
+                &format!(r"(?:AKIA|ASIA)[A-Z0-9]{{16,}}|(?:{})[A-Za-z0-9_-]*", prefixes.join("|")),
                 |s, c| {
                     let m = c.get(0)?;
-                    if m.as_str().starts_with("AKIA") {
+                    if m.as_str().starts_with("AKIA") || m.as_str().starts_with("ASIA") {
                         return whole(s, c);
                     }
                     let (p, min, alnum) = PREFIXES.iter().find(|(p, _, _)| m.as_str().starts_with(p))?;
@@ -2134,6 +2177,43 @@ mod tests {
         assert!(out.starts_with("[REDACTED:api_key]"), "got: {out}");
         assert!(out.ends_with(" rest"));
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+        let asia = fixture("ASIA", "IOSFODNN7EXAMPLE");
+        let (out_asia, count) = redact_credentials(&format!("aws {asia} end"));
+        assert_eq!((out_asia.as_str(), count), ("aws [REDACTED:api_key] end", 1));
+    }
+
+    #[test]
+    fn redact_credentials_scrubs_netrc_and_credentials_while_keeping_git_emails() {
+        let netrc_inline = "machine api.github.com login octocat password correcthorsebatterystaple";
+        let (scrubbed, n) = redact_credentials(netrc_inline);
+        assert_eq!(n, 1);
+        assert_eq!(
+            scrubbed,
+            "machine api.github.com login octocat password [REDACTED:secret]"
+        );
+        assert_eq!(redact_credentials(&scrubbed), (scrubbed, 0));
+
+        let netrc_multiline = "machine registry.example.com\n  login deploy\n  password plainwordsecret\n";
+        let (scrubbed_ml, n_ml) = redact_credentials(netrc_multiline);
+        assert_eq!(n_ml, 1);
+        assert!(!scrubbed_ml.contains("plainwordsecret"), "{scrubbed_ml}");
+        assert!(scrubbed_ml.contains("password [REDACTED:secret]"), "{scrubbed_ml}");
+
+        let ghp = fixture("ghp_", "0123456789abcdefABCDEF0123456789abcd");
+        let pat = fixture("github_pat_", "11ABCDEF0123456789abcdefABCDEF0123456789");
+        let sk = fixture("sk-", "abcDEF1234567890ghijkl");
+        let mixed = format!(
+            "Author: Jane Doe <jane@example.com>\ntokens: {ghp} and {pat} and {sk}\nurl: https://user:urlsecretpass@git.example.com/repo.git"
+        );
+        let (clean, count) = redact_credentials(&mixed);
+        assert_eq!(count, 4, "{clean}");
+        assert!(clean.contains("jane@example.com"), "git email must survive:\n{clean}");
+        assert!(
+            !clean.contains(&ghp) && !clean.contains(&pat) && !clean.contains(&sk),
+            "{clean}"
+        );
+        assert!(!clean.contains("urlsecretpass"), "{clean}");
+        assert_eq!(redact_credentials(&clean), (clean, 0), "must be idempotent");
     }
 
     #[test]

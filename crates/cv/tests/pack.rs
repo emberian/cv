@@ -810,3 +810,140 @@ fn pack_bounds_348kb_heredoc_and_caps_commands_per_source() {
         assert!(!out.contains("cargo test -p bandicoot-crate-12"), "{out}");
     }
 }
+
+#[test]
+fn pack_redacts_credentials_by_default_and_no_redact_opts_out() {
+    let w = World::new("pack-redact-default");
+    let ghp = format!("{}{}", "ghp_", "0123456789abcdefABCDEF0123456789abcd");
+    let pat = format!("{}{}", "github_pat_", "11ABCDEF0123456789abcdefABCDEF0123456789");
+    let sk = format!("{}{}", "sk-", "abcDEF1234567890ghijklmnop");
+    let akia = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+    let asia = format!("{}{}", "ASIA", "IOSFODNN7EXAMPLE");
+    let jwt = format!(
+        "{}.{}.{}",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvZSJ9",
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    );
+    let url_pw = "urlsupersecret99";
+    let netrc_pw = "netrcsupersecret88";
+    let assign_pw = "assignsupersecret77";
+    let hex_blob = "0123456789abcdef0123456789abcdef01234567";
+    let pem = concat!(
+        "-----BEGIN PRIVATE KEY-----\n",
+        "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7\n",
+        "-----END PRIVATE KEY-----"
+    );
+
+    let excerpt_body = format!(
+        "pangolin deploy rotation by Author <jane@example.com>\n\
+         tokens: {ghp} {pat} {sk} {akia} {asia}\n\
+         jwt: {jwt}\n\
+         netrc: machine api.pangolin.dev login bot password {netrc_pw}\n\
+         config: api_key = \"{assign_pw}\"\n\
+         secret: {hex_blob}\n\
+         {pem}"
+    );
+    let bash_cmd = format!(
+        "curl -H 'Authorization: Bearer {}' https://deploy:{url_pw}@api.pangolin.dev/v1/rotate",
+        format!("{}{}", "gho_", "fedcba9876543210FEDCBA9876543210fedc")
+    );
+
+    w.write_session(
+        "pangolinsess",
+        &[
+            serde_json::json!({"type": "ai-title", "aiTitle": format!("pangolin auth {}", format!("{}{}", "hf_", "abcdefghijklmnopqrstuvwxyz0123456789"))}),
+            user_line(
+                "pangolinsess",
+                "p1",
+                "2026-02-10T10:00:00Z",
+                "rotate pangolin deploy credentials",
+            ),
+            assistant_line(
+                "p2",
+                "2026-02-10T10:01:00Z",
+                serde_json::json!([
+                    {"type": "text", "text": excerpt_body},
+                    {"type": "tool_use", "id": "pt1", "name": "Bash", "input": {"command": bash_cmd}}
+                ]),
+            ),
+        ],
+    );
+
+    let leaks = [
+        ghp.as_str(),
+        pat.as_str(),
+        sk.as_str(),
+        akia.as_str(),
+        asia.as_str(),
+        jwt.as_str(),
+        url_pw,
+        netrc_pw,
+        assign_pw,
+        hex_blob,
+        "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7",
+    ];
+
+    for format in ["md", "prompt"] {
+        let (out, _) = w.cv_ok(&["pack", "pangolin deploy rotation", "--format", format]);
+        for secret in leaks {
+            assert!(!out.contains(secret), "{format} leaked {secret}:\n{out}");
+        }
+        assert!(
+            out.contains("jane@example.com"),
+            "ordinary git author email must not be scrubbed in {format}:\n{out}"
+        );
+        assert!(out.contains("Redacted "), "{format} missing header summary:\n{out}");
+        assert!(out.contains("redacted "), "{format} missing per-source count:\n{out}");
+        assert!(out.contains("[REDACTED:"), "{format} missing canonical marker:\n{out}");
+    }
+
+    // Overview path (`--session` with no task) also scrubs title, requests, and commands by default.
+    let (ov_out, _) = w.cv_ok(&["pack", "--session", "claude:pangolinsess"]);
+    for secret in [&ghp, &pat, &sk, &akia, &asia] {
+        assert!(!ov_out.contains(secret.as_str()), "overview leaked {secret}:\n{ov_out}");
+    }
+    assert!(!ov_out.contains(url_pw), "overview command leaked url_pw:\n{ov_out}");
+    assert!(ov_out.contains("Redacted "), "{ov_out}");
+
+    // `--no-redact` opts out cleanly and suppresses redaction banners.
+    let (raw_out, _) = w.cv_ok(&["pack", "pangolin deploy rotation", "--no-redact"]);
+    assert!(raw_out.contains(&ghp), "{raw_out}");
+    assert!(raw_out.contains(netrc_pw), "{raw_out}");
+    assert!(!raw_out.contains("Redacted "), "{raw_out}");
+
+    // `--review` scrubs credentials from tracked git diffs by default and honors `--no-redact`.
+    let git = |args: &[&str]| assert!(w.command("git").args(args).status().unwrap().success(), "git {args:?}");
+    git(&["init", "-q"]);
+    fs::write(
+        w.base.join("client.rs"),
+        "pub fn token() -> &'static str { \"none\" }\n",
+    )
+    .unwrap();
+    git(&["add", "client.rs"]);
+    git(&[
+        "-c",
+        "user.name=Jane Doe",
+        "-c",
+        "user.email=jane@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+    fs::write(
+        w.base.join("client.rs"),
+        format!("pub fn token() -> &'static str {{ \"{ghp}\" }}\n"),
+    )
+    .unwrap();
+
+    let (review_redacted, _) = w.cv_ok(&["pack", "review client change", "--review"]);
+    assert!(!review_redacted.contains(&ghp), "{review_redacted}");
+    assert!(review_redacted.contains("[REDACTED:api_key]"), "{review_redacted}");
+    assert!(review_redacted.contains("Redacted 1 credential(s)"), "{review_redacted}");
+
+    let (review_raw, _) = w.cv_ok(&["pack", "review client change", "--review", "--no-redact"]);
+    assert!(review_raw.contains(&ghp), "{review_raw}");
+    assert!(!review_raw.contains("Redacted "), "{review_raw}");
+}

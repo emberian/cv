@@ -48,6 +48,7 @@ pub(crate) struct PackArgs<'a> {
     pub json: bool,
     /// `--excerpt-bytes`: the bytes of one message an excerpt shows.
     pub excerpt_bytes: usize,
+    pub no_redact: bool,
 }
 
 pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
@@ -64,7 +65,9 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         thinking,
         json,
         excerpt_bytes,
+        no_redact,
     } = args;
+    let redact = !no_redact;
     if let (Some(path), "md" | "prompt") = (&out, format) {
         crate::util::user_file_claim(path, force)?;
     }
@@ -139,9 +142,9 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 continue;
             }
             let source = if use_overview {
-                build_overview_source(session, excerpt_bytes, selector)
+                build_overview_source(session, excerpt_bytes, selector, redact)
             } else {
-                build_source(session, adapter.as_ref(), query, excerpt_bytes, selector)
+                build_source(session, adapter.as_ref(), query, excerpt_bytes, selector, redact)
             };
             sources.push(source.with_context(|| format!("reading selected session {}", path.display()))?);
         }
@@ -152,7 +155,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         for hit in hits {
             let source = resolve_hit(&hit).and_then(|(session, adapter)| {
                 let selector = hit.session_key.as_ref().map(|key| format!("{}:{key}", session.harness));
-                build_source(session, adapter.as_ref(), query, excerpt_bytes, selector)
+                build_source(session, adapter.as_ref(), query, excerpt_bytes, selector, redact)
             });
             match source {
                 Ok(source) => sources.push(source),
@@ -163,6 +166,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             bail!("recall matched sessions but none could be read back from disk (stale index? run `cv index`)");
         }
     }
+    let mut task_display = task.to_string();
     let bundle = if review {
         review::bundle(
             if review_requests.is_empty() {
@@ -173,6 +177,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             .as_str(),
             &selections,
             all,
+            redact,
         )?
     } else {
         let mut file_digests = cv_core::task::FileDigests::default();
@@ -191,11 +196,14 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 s.commands.clear();
                 s.commands_cut = 0;
                 s.commands_dropped = 0;
+                s.redactions = 0;
                 s.session.title = None;
                 s.edits.retain(|p, _| !review::runner(p));
                 s.reads.retain(|p, _| !review::runner(p));
                 s.verified.retain(|p| !review::runner(p));
                 s.stale_files.retain(|p| !review::runner(p));
+            } else if redact {
+                redact_source(s);
             }
         }
         let replay = cv_core::lanes::replay_tasks_readonly()?;
@@ -259,25 +267,42 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             }
         }
         if sources.is_empty() && sections.is_empty() {
+            if redact {
+                task_display = cv_core::redact::redact_credentials(&task_display).0;
+            }
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"task":task,"format":format,"sources":[],"content":null,"path":null})
+                    serde_json::json!({"task":task_display,"format":format,"sources":[],"content":null,"path":null})
                 );
             } else {
-                println!("no relevant past sessions for {task:?} — nothing to pack");
+                println!("no relevant past sessions for {task_display:?} — nothing to pack");
             }
             return Ok(());
+        }
+        let mut extra_redactions = 0usize;
+        if redact {
+            let (clean_task, n) = cv_core::redact::redact_credentials(&task_display);
+            task_display = clean_task;
+            extra_redactions += n;
+            for rows in sections.values_mut() {
+                for row in rows {
+                    let (clean_row, n) = cv_core::redact::redact_credentials(row);
+                    *row = clean_row;
+                    extra_redactions += n;
+                }
+            }
         }
         let (rollup, rollup_dropped) = rollup_files(&sources);
         let bounds = Bounds {
             excerpt_bytes,
             rollup_dropped,
+            extra_redactions,
         };
         let mut bundle = if format == "prompt" {
-            prompt_bundle(task, &sources, &rollup, &bounds)
+            prompt_bundle(&task_display, &sources, &rollup, &bounds)
         } else {
-            md_bundle(task, &sources, &rollup, &bounds)
+            md_bundle(&task_display, &sources, &rollup, &bounds)
         };
         for (heading, rows) in sections {
             writeln!(bundle, "\n## {heading}\n\n{}", rows.join("\n"))?;
@@ -286,7 +311,11 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     };
     match to_h {
         Some(harness) => emit_pack_session(
-            if review { "Review the supplied artifacts" } else { task },
+            if review {
+                "Review the supplied artifacts"
+            } else {
+                &task_display
+            },
             &bundle,
             if review { &[] } else { &sources },
             SessionOut {
@@ -559,6 +588,8 @@ struct PackSource {
     commands_cut: usize,
     /// Distinct commands beyond [`MAX_COMMANDS_PER_SOURCE`] left out of `commands`.
     commands_dropped: usize,
+    /// Credential spans redacted from this source's emitted title, excerpt, overview, and commands.
+    redactions: usize,
 }
 
 fn resolve_hit(hit: &cv_search::Hit) -> Result<(cv_core::SessionRef, Box<dyn cv_core::Adapter>)> {
@@ -583,6 +614,7 @@ fn build_source(
     task: &str,
     excerpt_bytes: usize,
     selector: Option<String>,
+    redact: bool,
 ) -> Result<PackSource> {
     // Carry the resolved source through the read, including path-selected duplicate IDs.
     let mut resolved = session.clone();
@@ -595,7 +627,8 @@ fn build_source(
         commands,
         commands_cut,
         commands_dropped,
-    } = event_facts(&rows);
+        redactions,
+    } = event_facts_with_redact(&rows, redact);
 
     Ok(PackSource {
         verified: Default::default(),
@@ -610,6 +643,7 @@ fn build_source(
         commands,
         commands_cut,
         commands_dropped,
+        redactions,
     })
 }
 
@@ -617,6 +651,7 @@ fn build_overview_source(
     session: cv_core::SessionRef,
     excerpt_bytes: usize,
     selector: Option<String>,
+    _redact: bool,
 ) -> Result<PackSource> {
     let overview = cv_core::overview::read(
         &session,
@@ -642,7 +677,59 @@ fn build_overview_source(
         commands: Vec::new(),
         commands_cut: 0,
         commands_dropped: 0,
+        redactions: 0,
     })
+}
+
+fn redact_source(s: &mut PackSource) {
+    let mut scrubbed_title = None;
+    if let Some(title) = s.session.title.as_mut() {
+        let (clean, n) = cv_core::redact::redact_credentials(title);
+        if n > 0 {
+            *title = clean.clone();
+            s.redactions += n;
+        }
+        scrubbed_title = Some(title.clone());
+    }
+    for (_, _, text, _) in &mut s.excerpt {
+        let (clean, n) = cv_core::redact::redact_credentials(text);
+        if n > 0 {
+            *text = clean;
+            s.redactions += n;
+        }
+    }
+    if let Some(overview) = s.overview.as_mut() {
+        if let Some(sess_obj) = overview.get_mut("session").and_then(serde_json::Value::as_object_mut) {
+            if let Some(t) = &scrubbed_title {
+                sess_obj.insert("title".into(), serde_json::Value::String(t.clone()));
+            } else if let Some(serde_json::Value::String(t)) = sess_obj.get_mut("title") {
+                let (clean, n) = cv_core::redact::redact_credentials(t);
+                if n > 0 {
+                    *t = clean;
+                    s.redactions += n;
+                }
+            }
+        }
+        for (section, keys) in [
+            ("requests", &["text"][..]),
+            ("commands", &["command"][..]),
+            ("workers", &["description", "last_text"][..]),
+        ] {
+            if let Some(rows) = overview.get_mut(section).and_then(serde_json::Value::as_array_mut) {
+                for row in rows {
+                    for &key in keys {
+                        if let Some(serde_json::Value::String(val)) = row.get_mut(key) {
+                            let (clean, n) = cv_core::redact::redact_credentials(val);
+                            if n > 0 {
+                                *val = clean;
+                                s.redactions += n;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -652,6 +739,7 @@ struct EventFacts {
     commands: Vec<String>,
     commands_cut: usize,
     commands_dropped: usize,
+    redactions: usize,
 }
 
 /// True when `line` contains an unquoted shell heredoc operator (`<<EOF`, `<<'EOF'`, `<<"EOF"`,
@@ -714,22 +802,42 @@ fn has_heredoc_operator(line: &str) -> bool {
 ///    body with ` …`.
 /// 2. Every command is capped at [`MAX_COMMAND_BYTES`] UTF-8 bytes on a char boundary (`…` when
 ///    cut) and remaining internal newlines collapse to single spaces without allocating long tails.
+#[cfg(test)]
 fn bound_command(raw: &str) -> (String, bool) {
+    let (out, cut, _) = bound_command_with_redact(raw, false);
+    (out, cut)
+}
+
+fn bound_command_with_redact(raw: &str, redact: bool) -> (String, bool, usize) {
     let trimmed = raw.trim();
     if let Some((first_line, _)) = trimmed.split_once('\n') {
         if has_heredoc_operator(first_line) {
-            let head = first_line.trim_end_matches('\r').trim_end();
-            if head.len() > MAX_COMMAND_BYTES {
-                let cut = head[..floor_char(head, MAX_COMMAND_BYTES)].trim_end();
-                return (format!("{cut}…"), true);
+            let head_raw = first_line.trim_end_matches('\r').trim_end();
+            let head_cap = &head_raw[..floor_char(head_raw, head_raw.len().min(4096))];
+            let (head, redactions) = if redact {
+                cv_core::redact::redact_credentials_cow(head_cap)
+            } else {
+                (std::borrow::Cow::Borrowed(head_cap), 0)
+            };
+            if head.len() > MAX_COMMAND_BYTES || head_raw.len() > head_cap.len() {
+                let cut = head[..floor_char(&head, head.len().min(MAX_COMMAND_BYTES))].trim_end();
+                return (format!("{cut}…"), true, redactions);
             }
-            return (format!("{head} …"), true);
+            return (format!("{head} …"), true, redactions);
         }
     }
-    let mut out = String::with_capacity(trimmed.len().min(MAX_COMMAND_BYTES + 8));
+    let prefix_end = floor_char(trimmed, trimmed.len().min(4096));
+    let prefix = &trimmed[..prefix_end];
+    let clipped_tail = prefix_end < trimmed.len();
+    let (source, redactions) = if redact {
+        cv_core::redact::redact_credentials_cow(prefix)
+    } else {
+        (std::borrow::Cow::Borrowed(prefix), 0)
+    };
+    let mut out = String::with_capacity(source.len().min(MAX_COMMAND_BYTES + 8));
     let mut pending_nl = false;
-    let mut truncated = false;
-    for ch in trimmed.chars() {
+    let mut truncated = clipped_tail;
+    for ch in source.chars() {
         if matches!(ch, '\n' | '\r') {
             pending_nl = true;
             continue;
@@ -750,18 +858,23 @@ fn bound_command(raw: &str) -> (String, bool) {
     }
     if truncated {
         let cut = out.trim_end();
-        (format!("{cut}…"), true)
+        (format!("{cut}…"), true, redactions)
     } else {
-        (out, false)
+        (out, false, redactions)
     }
 }
 
 fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
+    event_facts_with_redact(rows, false)
+}
+
+fn event_facts_with_redact(rows: &[cv_core::events::EventRow], redact: bool) -> EventFacts {
     let mut edits: BTreeMap<String, i64> = BTreeMap::new();
     let mut reads: BTreeMap<String, i64> = BTreeMap::new();
     let mut commands: Vec<String> = Vec::new();
     let mut commands_cut = 0usize;
     let mut commands_dropped = 0usize;
+    let mut redactions = 0usize;
     let mut seen: HashSet<String> = HashSet::new();
     for e in rows {
         match e.kind.as_str() {
@@ -777,12 +890,13 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
             }
             "command" => {
                 if let Some(c) = &e.target {
-                    let (bounded, was_cut) = bound_command(c);
+                    let (bounded, was_cut, n_redacted) = bound_command_with_redact(c, redact);
                     if !bounded.is_empty() && seen.insert(bounded.clone()) {
                         if commands.len() < MAX_COMMANDS_PER_SOURCE {
                             if was_cut {
                                 commands_cut += 1;
                             }
+                            redactions += n_redacted;
                             commands.push(bounded);
                         } else {
                             commands_dropped += 1;
@@ -800,6 +914,7 @@ fn event_facts(rows: &[cv_core::events::EventRow]) -> EventFacts {
         commands,
         commands_cut,
         commands_dropped,
+        redactions,
     }
 }
 
@@ -1023,6 +1138,25 @@ fn rollup_files(sources: &[PackSource]) -> (Vec<(String, usize, i64, i64)>, usiz
 struct Bounds {
     excerpt_bytes: usize,
     rollup_dropped: usize,
+    extra_redactions: usize,
+}
+
+fn redaction_header_line(sources: &[PackSource], bounds: &Bounds) -> Option<String> {
+    let source_total: usize = sources.iter().map(|s| s.redactions).sum();
+    let total = source_total + bounds.extra_redactions;
+    if total == 0 {
+        return None;
+    }
+    let sessions = sources.iter().filter(|s| s.redactions > 0).count();
+    if sessions > 0 {
+        Some(format!(
+            "Redacted {total} credential(s) across {sessions} session(s) (pass `--no-redact` to keep raw values)."
+        ))
+    } else {
+        Some(format!(
+            "Redacted {total} credential(s) (pass `--no-redact` to keep raw values)."
+        ))
+    }
 }
 
 /// The header line naming every bound of a pack and what each cut, e.g. `Bounds: each excerpt
@@ -1129,12 +1263,20 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
         Utc::now().format("%Y-%m-%d")
     );
     let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
+    if let Some(redacted) = redaction_header_line(sources, bounds) {
+        let _ = writeln!(out, "{redacted}\n");
+    }
 
     for s in sources {
         let title = sanitize_line(s.session.title.as_deref().unwrap_or("(untitled)"));
+        let redacted_note = if s.redactions > 0 {
+            format!(" (redacted {} credential(s))", s.redactions)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "## {title} ({}, {}, {})\n",
+            "## {title} ({}, {}, {}){redacted_note}\n",
             s.session.harness,
             hit_date(&s.session),
             sanitize_line(&hit_cwd(&s.session))
@@ -1210,11 +1352,19 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
         sources.len()
     );
     let _ = writeln!(out, "{}\n", bounds_line(sources, bounds));
+    if let Some(redacted) = redaction_header_line(sources, bounds) {
+        let _ = writeln!(out, "{redacted}\n");
+    }
     for (i, s) in sources.iter().enumerate() {
         let title = sanitize_line(s.session.title.as_deref().unwrap_or("(untitled)"));
+        let redacted_note = if s.redactions > 0 {
+            format!("; redacted {} credential(s)", s.redactions)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "{}. In \"{title}\" ({}, {}, in {}):",
+            "{}. In \"{title}\" ({}, {}, in {}{redacted_note}):",
             i + 1,
             s.session.harness,
             hit_date(&s.session),
@@ -1861,10 +2011,12 @@ mod tests {
             commands: Vec::new(),
             commands_cut: 0,
             commands_dropped: 0,
+            redactions: 0,
         };
         let bounds = Bounds {
             excerpt_bytes: EXCERPT_BYTES,
             rollup_dropped: 0,
+            extra_redactions: 0,
         };
         let bundle = md_bundle("task", &[source], &[], &bounds);
         assert!(bundle.contains("Bounds: each excerpt message to 1600 bytes (`--excerpt-bytes`; 0 cut"));
@@ -1950,7 +2102,7 @@ mod tests {
         )?;
         let sref = cv_core::SessionRef::new("pack-inj-sess", Harness::OpenSession, &src_path);
         let adapter = cv_core::harness::for_harness(Harness::OpenSession).unwrap();
-        let built = build_source(sref, adapter.as_ref(), "Ignore all rules", EXCERPT_BYTES, None)?;
+        let built = build_source(sref, adapter.as_ref(), "Ignore all rules", EXCERPT_BYTES, None, false)?;
         assert!(
             built.excerpt.iter().any(|(r, _, _, _)| *r == Role::Tool),
             "ToolResult holding matching evidence must be excerpted"
@@ -1959,6 +2111,7 @@ mod tests {
         let bounds = Bounds {
             excerpt_bytes: EXCERPT_BYTES,
             rollup_dropped: 0,
+            extra_redactions: 0,
         };
         let md = md_bundle("Ignore all rules", std::slice::from_ref(&built), &[], &bounds);
         assert!(

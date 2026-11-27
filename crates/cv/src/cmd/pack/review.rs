@@ -174,8 +174,16 @@ pub(super) fn bundle(
     task: &str,
     selections: &BTreeMap<PathBuf, Option<BTreeSet<String>>>,
     all: bool,
+    redact: bool,
 ) -> Result<String> {
-    let mut out = format!("# Review\n\n{}\n", clean(task));
+    let mut redactions = 0usize;
+    let mut request = clean(task);
+    if redact {
+        let (scrubbed, n) = cv_core::redact::redact_credentials(&request);
+        request = scrubbed;
+        redactions += n;
+    }
+    let mut body = String::new();
     let mut count = 0;
     for (cwd, paths) in selections {
         let root = PathBuf::from(String::from_utf8(git(cwd, &["rev-parse", "--show-toplevel"])?)?.trim_end());
@@ -220,16 +228,30 @@ pub(super) fn bundle(
                     &path,
                 ],
             )?;
-            let text = artifact(std::str::from_utf8(&diff).unwrap_or(""), &path);
+            let mut text = artifact(std::str::from_utf8(&diff).unwrap_or(""), &path);
+            if redact && !text.is_empty() {
+                let (scrubbed, n) = cv_core::redact::redact_credentials(&text);
+                text = scrubbed;
+                redactions += n;
+            }
             if !text.is_empty() {
-                writeln!(out, "\n## {}\n\n{text}", cv_core::sanitize::sanitize_line(&path))?;
+                writeln!(body, "\n## {}\n\n{text}", cv_core::sanitize::sanitize_line(&path))?;
                 count += 1;
             }
         }
     }
     if count == 0 {
-        out.push_str("\nNo reviewable tracked changes in the selected checkout.\n");
+        body.push_str("\nNo reviewable tracked changes in the selected checkout.\n");
     }
+    let mut out = String::from("# Review\n\n");
+    if redactions > 0 {
+        writeln!(
+            out,
+            "Redacted {redactions} credential(s) (pass `--no-redact` to keep raw values).\n"
+        )?;
+    }
+    writeln!(out, "{request}")?;
+    out.push_str(&body);
     Ok(out)
 }
 
