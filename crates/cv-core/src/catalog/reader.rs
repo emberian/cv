@@ -50,6 +50,10 @@ impl Reader {
         None
     }
 
+    pub(crate) fn pass_period_secs(&self) -> Option<i64> {
+        None
+    }
+
     pub(crate) fn take_rediscovery_notice(&self) -> bool {
         false
     }
@@ -214,6 +218,10 @@ impl Reader {
 
     pub(crate) fn last_full_sync(&self) -> Option<i64> {
         super::imp::last_full_sync_in(&self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    pub(crate) fn pass_period_secs(&self) -> Option<i64> {
+        super::imp::pass_period_secs_in(&self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// Whether this is the first full discovery since a newer cv upgraded the catalog.

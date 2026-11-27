@@ -1065,8 +1065,6 @@ pub struct IndexDirHealth {
     pub present: bool,
     pub bytes: u64,
     pub files: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clev_segments: Option<u64>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -1074,7 +1072,6 @@ pub struct IndexDirHealth {
 pub struct SearchIndexesHealth {
     pub fts: IndexDirHealth,
     pub trigram: IndexDirHealth,
-    pub columnar_events: IndexDirHealth,
 }
 
 #[cfg(feature = "sqlite")]
@@ -1130,19 +1127,17 @@ fn sqlite_quick_check(conn: &rusqlite::Connection) -> String {
 }
 
 #[cfg(feature = "sqlite")]
-fn inspect_index_dir(dir: Option<std::path::PathBuf>, count_clev: bool) -> IndexDirHealth {
+fn inspect_index_dir(dir: Option<std::path::PathBuf>) -> IndexDirHealth {
     let Some(path) = dir else {
         return IndexDirHealth {
             path: None,
             present: false,
             bytes: 0,
             files: 0,
-            clev_segments: count_clev.then_some(0),
         };
     };
     let mut bytes = 0u64;
     let mut files = 0u64;
-    let mut clev = 0u64;
     let mut stack = vec![path.clone()];
     while let Some(cur) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&cur) else {
@@ -1158,9 +1153,6 @@ fn inspect_index_dir(dir: Option<std::path::PathBuf>, count_clev: bool) -> Index
             } else if ft.is_file() {
                 files += 1;
                 bytes += entry.metadata().map_or(0, |m| m.len());
-                if count_clev && ep.extension().and_then(|s| s.to_str()).is_some_and(|ext| ext == "clev") {
-                    clev += 1;
-                }
             }
         }
     }
@@ -1169,7 +1161,6 @@ fn inspect_index_dir(dir: Option<std::path::PathBuf>, count_clev: bool) -> Index
         present: files > 0,
         bytes,
         files,
-        clev_segments: count_clev.then_some(clev),
     }
 }
 
@@ -1357,11 +1348,10 @@ pub fn collect_store_health() -> StoreHealthReport {
         },
     };
 
-    // 3. Derived search indexes (`tantivy` FTS, `trigram`, `events_columnar` `.clev` segments)
+    // 3. Derived search indexes (`tantivy` FTS, `trigram`)
     let search_indexes = SearchIndexesHealth {
-        fts: inspect_index_dir(cv_cache.as_ref().map(|d| d.join("tantivy")), false),
-        trigram: inspect_index_dir(cv_cache.as_ref().map(|d| d.join("trigram")), false),
-        columnar_events: inspect_index_dir(cv_cache.as_ref().map(|d| d.join("events_columnar")), true),
+        fts: inspect_index_dir(cv_cache.as_ref().map(|d| d.join("tantivy"))),
+        trigram: inspect_index_dir(cv_cache.as_ref().map(|d| d.join("trigram"))),
     };
 
     // 4. Storage class (`IoAdmission`) & free disk space (`statvfs` on `$CLUSTERVISION_HOME`)

@@ -699,14 +699,25 @@ pub fn cataloged_sessions() -> Vec<SessionRef> {
     catalog::all_sessions().unwrap_or_default()
 }
 
+fn max_stale_secs(catalog: Option<&catalog::Reader>) -> i64 {
+    if let Some(explicit) = env::var("CLUSTERVISION_MAX_STALE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        return explicit;
+    }
+    catalog
+        .and_then(catalog::Reader::pass_period_secs)
+        .filter(|&p| p > 0)
+        .map(|p| (p.saturating_mul(3) / 2).max(900))
+        .unwrap_or(900)
+}
+
 /// [`sessions`] plus whether the answer came from a full [`discover_all`] (so `find` knows not to
 /// escalate to a second full scan).
 fn sessions_impl() -> (Vec<SessionRef>, bool) {
-    let max_stale = env::var("CLUSTERVISION_MAX_STALE_SECS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(900);
     let mut catalog = catalog::Reader::open();
+    let max_stale = max_stale_secs(catalog.as_ref());
     let fresh_enough = catalog
         .as_ref()
         .and_then(catalog::Reader::last_full_sync)
@@ -1038,10 +1049,7 @@ fn lookup_subagent_parents_indexed(want: &str) -> Option<Vec<SessionRef>> {
     if wf_harnesses.is_empty() {
         return Some(Vec::new());
     }
-    let max_stale = env::var("CLUSTERVISION_MAX_STALE_SECS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(900);
+    let max_stale = max_stale_secs(Some(&reader));
     let harness_ids: Vec<Harness> = wf_harnesses.iter().map(|(h, _)| *h).collect();
     let stale = reader.probe_workflow_harnesses(&harness_ids, max_stale)?;
     let mut unpersisted = std::collections::HashMap::new();

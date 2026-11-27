@@ -468,6 +468,9 @@ mod imp {
                 return Ok(conn);
             }
         }
+        if schema == 0 {
+            let _ = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;");
+        }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let schema: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let mut rebuilt = false;
@@ -559,7 +562,7 @@ mod imp {
             crate::discover_cache::invalidate_interpretation(path);
         }
         if rebuilt {
-            if let Err(error) = conn.execute_batch("VACUUM;") {
+            if let Err(error) = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;") {
                 crate::env::warn_once("catalog compaction", error);
             }
         }
@@ -1894,6 +1897,79 @@ mod imp {
         Ok(())
     }
 
+    pub(super) fn pass_period_secs_in(conn: &Connection) -> Option<i64> {
+        conn.query_row("SELECT value FROM catalog_meta WHERE key='pass_period_secs'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .inspect_err(note_sql)
+        .ok()?
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&p| p > 0)
+    }
+
+    pub(crate) fn record_index_pass_at_in(conn: &Connection, now_secs: i64) -> rusqlite::Result<()> {
+        let prev: Option<i64> = conn
+            .query_row("SELECT value FROM catalog_meta WHERE key='last_index_pass'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|v| v.parse::<i64>().ok());
+        if let Some(prev) = prev {
+            let delta = now_secs.saturating_sub(prev);
+            if (0..60).contains(&delta) {
+                // Sub-minute re-entry (e.g. `pass_needed` followed immediately by `index_all`).
+                return Ok(());
+            }
+            if (60..=86_400).contains(&delta) {
+                conn.execute(
+                    "INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('pass_period_secs',?1)",
+                    params![delta.to_string()],
+                )?;
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('last_index_pass',?1)",
+            params![now_secs.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Record an index pass timestamp in `catalog_meta` and update `pass_period_secs` when two
+    /// consecutive periodic passes fall within `[60s, 86_400s]`.
+    pub fn record_index_pass() {
+        if crate::env::frozen() {
+            return;
+        }
+        let Some(conn) = open() else { return };
+        if let Err(err) = record_index_pass_at_in(&conn, chrono::Utc::now().timestamp()) {
+            note_sql(&err);
+        }
+    }
+
+    pub(crate) fn finish_pass_in(conn: &Connection) {
+        if crate::env::frozen() {
+            return;
+        }
+        let _ = conn.busy_timeout(Duration::from_millis(100));
+        let auto_vac: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap_or(0);
+        if auto_vac == 2 {
+            let _ = conn.execute_batch("PRAGMA incremental_vacuum(256);");
+        }
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let _ = conn.busy_timeout(Duration::from_secs(5));
+    }
+
+    /// Reclaim up to 256 free pages and truncate an idle `catalog.db-wal` to `0` bytes so
+    /// subsequent `--frozen` reads take the `<0.1ms` `immutable=1` checkpoint fast path.
+    pub fn finish_pass() {
+        if crate::env::frozen() {
+            return;
+        }
+        let Some(conn) = open() else { return };
+        finish_pass_in(&conn);
+    }
+
     use crate::source::Payload as _;
 
     /// Whether `h` never records a sub-agent forest (`Adapter::forest` is always empty).
@@ -2409,7 +2485,7 @@ mod imp {
     /// UTF-8 lexicographic successor of a literal prefix for SQLite's binary text index.
     /// A suffix of maximal scalars carries into the preceding scalar; empty/all-maximal
     /// prefixes need no upper bound. Skip the surrogate gap, which Rust strings cannot contain.
-    fn prefix_end(prefix: &str) -> Option<String> {
+    pub(crate) fn prefix_end(prefix: &str) -> Option<String> {
         for (offset, ch) in prefix.char_indices().rev() {
             if ch != char::MAX {
                 let next = if ch == '\u{d7ff}' {
@@ -3024,6 +3100,36 @@ mod imp {
                 serde_json::to_value(&exact).unwrap(),
                 serde_json::to_value(crate::discover_all()).unwrap()
             );
+        }
+
+        #[test]
+        fn incremental_auto_vacuum_finish_pass_checkpoint_and_pass_period_staleness() {
+            let w = crate::test_world("catalog-maintenance-and-period");
+            let db = db_path().unwrap();
+            {
+                let conn = open_db().unwrap();
+                let av: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+                assert_eq!(av, 2, "fresh catalog.db must enable INCREMENTAL auto_vacuum");
+                conn.execute("INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('pad','1')", [])
+                    .unwrap();
+                record_index_pass_at_in(&conn, 10_000).unwrap();
+                record_index_pass_at_in(&conn, 10_005).unwrap(); // sub-minute re-entry ignored
+                assert_eq!(pass_period_secs_in(&conn), None);
+                record_index_pass_at_in(&conn, 11_800).unwrap(); // 1,800s timer tick
+                assert_eq!(pass_period_secs_in(&conn), Some(1_800));
+            }
+            finish_pass();
+            assert!(
+                checkpoint_only(&db),
+                "finish_pass must truncate idle WAL so --frozen uses open_checkpoint"
+            );
+            assert!(open_checkpoint(&db).is_some());
+
+            let reader = Reader::open();
+            assert_eq!(crate::max_stale_secs(reader.as_ref()), 2_700);
+            w.scope.set("CLUSTERVISION_MAX_STALE_SECS", "120");
+            assert_eq!(crate::max_stale_secs(reader.as_ref()), 120);
+            w.scope.remove("CLUSTERVISION_MAX_STALE_SECS");
         }
 
         /// A home the process may not write (a sandbox's deny-write rule) still serves its catalog:
@@ -4040,12 +4146,13 @@ mod imp {
 }
 
 #[cfg(feature = "sqlite")]
-pub(crate) use imp::{all_sessions, db_path, open_at, open_db, watches_for};
+pub(crate) use imp::{all_sessions, db_path, finish_pass_in, open_at, open_db, prefix_end, watches_for};
 
 #[cfg(feature = "sqlite")]
 pub use imp::{
-    events_codec_version, harness_codec_version, lookup, lookup_exact_authoritative, note_affordances_with_source,
-    session_indexed_fields, skipped_sources, sync, writer_versions, AffordanceTable,
+    events_codec_version, finish_pass, harness_codec_version, lookup, lookup_exact_authoritative,
+    note_affordances_with_source, record_index_pass, session_indexed_fields, skipped_sources, sync, writer_versions,
+    AffordanceTable,
 };
 
 #[cfg(feature = "sqlite")]
@@ -4065,6 +4172,26 @@ pub(crate) fn last_full_sync() -> Option<i64> {
 /// No-op fallbacks when sqlite is disabled — `find`/`sessions` simply always take the scan path.
 #[cfg(not(feature = "sqlite"))]
 pub fn sync(_refs: &[SessionRef]) {}
+#[cfg(not(feature = "sqlite"))]
+pub fn record_index_pass() {}
+#[cfg(not(feature = "sqlite"))]
+pub fn finish_pass() {}
+#[cfg(not(feature = "sqlite"))]
+pub(crate) fn prefix_end(prefix: &str) -> Option<String> {
+    for (offset, ch) in prefix.char_indices().rev() {
+        if ch != char::MAX {
+            let next = if ch == '\u{d7ff}' {
+                '\u{e000}'
+            } else {
+                char::from_u32(ch as u32 + 1)?
+            };
+            let mut end = prefix[..offset].to_owned();
+            end.push(next);
+            return Some(end);
+        }
+    }
+    None
+}
 #[cfg(not(feature = "sqlite"))]
 pub fn harness_codec_version(_h: Harness) -> u32 {
     crate::source::VERSION

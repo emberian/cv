@@ -172,7 +172,7 @@ fn print_store_health(h: &StoreHealthReport) {
         println!("              {path}");
     }
     println!(
-        "Indexes:      fts {} ({}) · trigram {} ({}) · columnar {} seg(s) ({})",
+        "Indexes:      fts {} ({}) · trigram {} ({})",
         if h.search_indexes.fts.present {
             "present"
         } else {
@@ -185,8 +185,6 @@ fn print_store_health(h: &StoreHealthReport) {
             "absent"
         },
         fmt_bytes(h.search_indexes.trigram.bytes),
-        h.search_indexes.columnar_events.clev_segments.unwrap_or(0),
-        fmt_bytes(h.search_indexes.columnar_events.bytes),
     );
     let free_desc = match (h.storage.free_bytes, h.storage.total_bytes) {
         (Some(free), Some(total)) if total > 0 => {

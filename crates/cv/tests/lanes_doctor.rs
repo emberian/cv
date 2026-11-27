@@ -380,8 +380,7 @@ fn doctor_separates_post_compaction_active_window_from_history_and_reports_store
         ],
     );
 
-    // Seed authoritative `state.db` capture_inbox + a columnar `.clev` segment file so
-    // `StoreHealthReport` inspects populated stores and indexes.
+    // Seed authoritative `state.db` capture_inbox so `StoreHealthReport` inspects populated stores.
     {
         let store = cv_core::state::StateStore::at_dir(&w.cv_home);
         store
@@ -392,9 +391,6 @@ fn doctor_separates_post_compaction_active_window_from_history_and_reports_store
             )
             .unwrap();
     }
-    let clev_dir = w.cv_home.join("events_columnar");
-    std::fs::create_dir_all(&clev_dir).unwrap();
-    std::fs::write(clev_dir.join("seg-0001.clev"), b"CVCLEV\x01\x00dummy").unwrap();
 
     let (doc_json, _) = w.cv_ok(&["doctor", sid, "--json"]);
     let doc: Value = serde_json::from_str(&doc_json).unwrap();
@@ -450,7 +446,7 @@ fn doctor_separates_post_compaction_active_window_from_history_and_reports_store
     assert_eq!(sh["state_db"]["capture_inbox_backlog"], 1, "{sh}");
     assert_eq!(sh["catalog_db"]["quick_check"], "ok", "{sh}");
     assert!(sh["catalog_db"]["session_rows"].as_u64().unwrap() >= 1, "{sh}");
-    assert_eq!(sh["search_indexes"]["columnar_events"]["clev_segments"], 1, "{sh}");
+    assert!(sh["search_indexes"].get("columnar_events").is_none(), "{sh}");
     let dev_class = sh["storage"]["device_class"].as_str().unwrap();
     assert!(["nvme", "hdd", "network", "unknown"].contains(&dev_class), "{sh}");
     assert!(sh["storage"]["free_bytes"].as_u64().unwrap() > 0, "{sh}");

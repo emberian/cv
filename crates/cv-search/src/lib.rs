@@ -10,10 +10,6 @@
 //! 2. **Exact trigram substring/symbol search** (`trigram`) — non-positional `roaring` candidate
 //!    postings paired with streaming exact substring verification over decoded source revisions.
 //!
-//! 3. **Derived columnar event segments** (`columnar_events`) — immutable `tantivy-columnar` +
-//!    `tantivy-fst` + `roaring` segments with session revision/rewind visibility masks and 64-bit
-//!    edit hunk fingerprints.
-//!
 //! Rebuildable indexes live under [`cache_dir`] (`$CLUSTERVISION_CACHE`, else
 //! `$CLUSTERVISION_HOME` when set, else `<cache_dir>/clustervision` alongside `catalog.db`),
 //! separate from durable `~/.clustervision` ledgers (`tasks/`, `lanes.jsonl`, `retired.jsonl`,
@@ -22,7 +18,6 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-pub mod columnar_events;
 pub mod fts;
 pub use fts::{IndexedAnswer, PreparedIndex, QueryWork};
 mod ingest;
@@ -514,11 +509,6 @@ pub fn default_trigram_dir() -> PathBuf {
     cache_dir().join("trigram")
 }
 
-/// Default location of the derived columnar event store.
-pub fn default_columnar_events_dir() -> PathBuf {
-    cache_dir().join("events_columnar")
-}
-
 // ---- Convenience wrappers over the default-located indexes ---------------------------------
 
 /// Discover, parse, and update the full-text index at its default location. Incremental by default
@@ -684,7 +674,6 @@ mod tests {
             assert_eq!(home_dir(), PathBuf::from("/u/.clustervision"));
             assert_eq!(default_tantivy_dir(), expected_cache.join("tantivy"));
             assert_eq!(default_trigram_dir(), expected_cache.join("trigram"));
-            assert_eq!(default_columnar_events_dir(), expected_cache.join("events_columnar"));
         }
         {
             let _scope =
@@ -692,10 +681,6 @@ mod tests {
             assert_eq!(home_dir(), PathBuf::from("/scratch/cv-home"));
             assert_eq!(default_tantivy_dir(), PathBuf::from("/scratch/cv-home/tantivy"));
             assert_eq!(default_trigram_dir(), PathBuf::from("/scratch/cv-home/trigram"));
-            assert_eq!(
-                default_columnar_events_dir(),
-                PathBuf::from("/scratch/cv-home/events_columnar")
-            );
         }
         {
             let _scope = cv_core::env::Env::from_vars([
@@ -707,10 +692,6 @@ mod tests {
             assert_eq!(home_dir(), PathBuf::from("/durable/cv-home"));
             assert_eq!(default_tantivy_dir(), PathBuf::from("/fast/cv-cache/tantivy"));
             assert_eq!(default_trigram_dir(), PathBuf::from("/fast/cv-cache/trigram"));
-            assert_eq!(
-                default_columnar_events_dir(),
-                PathBuf::from("/fast/cv-cache/events_columnar")
-            );
         }
     }
 }

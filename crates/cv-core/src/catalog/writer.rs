@@ -83,3 +83,10 @@ impl Writer {
         }
     }
 }
+
+#[cfg(feature = "sqlite")]
+impl Drop for Writer {
+    fn drop(&mut self) {
+        super::finish_pass_in(&self.conn);
+    }
+}

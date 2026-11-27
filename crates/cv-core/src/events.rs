@@ -459,12 +459,11 @@ fn extract_message(
                 tool_name,
                 ..
             } => {
-                // The whole error text: a lazy one is read from the source. A caller that keeps
-                // no text (`cv tools` counts rows) passes no resolver and reads nothing.
+                // Bounded error head (`<= 1024` UTF-8 bytes): a lazy one reads only a small
+                // prefix from the source. A caller that keeps no text (`cv tools` counts rows)
+                // passes no resolver and reads nothing.
                 let detail = match details {
-                    Some(resolver) => Some(content.try_resolve(resolver)?)
-                        .map(|text| text.trim().to_owned())
-                        .filter(|s| !s.is_empty()),
+                    Some(resolver) => extract_capped_detail(content, resolver)?,
                     None => None,
                 };
                 staged.push(Event {
@@ -530,6 +529,83 @@ pub(crate) fn extract_call_into(
 /// [`crate::tools::classify::visit_tool_ops_with_hunks`].
 type ClassifiedToolRow = (&'static str, Option<String>, Vec<u64>);
 
+/// Maximum UTF-8 bytes stored in `Event.target` for a `command` event (file paths stay whole).
+pub const MAX_COMMAND_TARGET_BYTES: usize = 512;
+
+/// Maximum UTF-8 bytes stored in `Event.detail` for a failed tool result.
+pub const MAX_ERROR_DETAIL_BYTES: usize = 1024;
+
+fn floor_utf8_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Cap a shell/command string at [`MAX_COMMAND_TARGET_BYTES`] UTF-8 bytes while collapsing
+/// multiline heredocs and oversized `-c` bodies into `head … [+N bytes]`.
+fn cap_command_target(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let newline_at = trimmed.find(['\n', '\r']);
+    if newline_at.is_none() && trimmed.len() <= MAX_COMMAND_TARGET_BYTES {
+        return trimmed.to_owned();
+    }
+    let first_line = match newline_at {
+        Some(pos) => trimmed[..pos].trim_end(),
+        None => trimmed,
+    };
+    // Reserve worst-case suffix length (` … [+` = 7 UTF-8 bytes + digits + ` bytes]` = 7 bytes).
+    let digits_cap = 20usize;
+    let suffix_budget = 7 + digits_cap + 7;
+    let max_head = MAX_COMMAND_TARGET_BYTES.saturating_sub(suffix_budget);
+    let head_end = floor_utf8_boundary(first_line, max_head);
+    let head = first_line[..head_end].trim_end();
+    let omitted = trimmed.len().saturating_sub(head.len());
+    let formatted = format!("{head} … [+{omitted} bytes]");
+    if formatted.len() <= MAX_COMMAND_TARGET_BYTES {
+        formatted
+    } else {
+        formatted[..floor_utf8_boundary(&formatted, MAX_COMMAND_TARGET_BYTES)].to_owned()
+    }
+}
+
+fn extract_capped_detail(content: &crate::lazy::Text, resolver: &crate::lazy::Resolver) -> Result<Option<String>> {
+    let mut head = String::new();
+    let mut started = false;
+    content.try_for_each_chunk(resolver, 4096, |piece| {
+        if head.len() > MAX_ERROR_DETAIL_BYTES + 64 {
+            return Ok(());
+        }
+        let slice = if started {
+            piece
+        } else {
+            let trimmed = piece.trim_start();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+            started = true;
+            trimmed
+        };
+        let room = (MAX_ERROR_DETAIL_BYTES + 64).saturating_sub(head.len());
+        let take = floor_utf8_boundary(slice, room);
+        head.push_str(&slice[..take]);
+        Ok(())
+    })?;
+    let trimmed = head.trim_end();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let capped = &trimmed[..floor_utf8_boundary(trimmed, MAX_ERROR_DETAIL_BYTES)];
+    Ok(Some(capped.to_owned()))
+}
+
 fn classify_tool_view(
     name: &str,
     input: JsonView<'_>,
@@ -545,7 +621,7 @@ fn classify_tool_view(
     let mut rows = Vec::new();
     let mut fallback_path = None;
     let mut visit = |sem: crate::tools::classify::ToolSemantic<'_>, hunks: Vec<u64>| match sem.op {
-        ToolOp::Command { cmd, .. } => rows.push(("command", cmd.map(std::borrow::Cow::into_owned), Vec::new())),
+        ToolOp::Command { cmd, .. } => rows.push(("command", cmd.map(|c| cap_command_target(&c)), Vec::new())),
         ToolOp::FileEdit { path, .. } => rows.push(("file_edit", Some(absolutize(&path, cwd)), hunks)),
         ToolOp::FileRead { path } | ToolOp::Search { path: Some(path), .. } => {
             rows.push(("file_read", Some(absolutize(&path, cwd)), Vec::new()));
@@ -620,8 +696,8 @@ fn read_ref_rows(r: &crate::SessionRef, kind: Option<&str>) -> Result<Vec<EventR
     let backing = crate::custody::backing_for(r)?;
     #[cfg(not(feature = "sqlite"))]
     let backing: Option<Box<dyn crate::Adapter>> = None;
-    if backing.is_some() || needs_ingest(r) {
-        if backing.is_some() || crate::env::frozen() {
+    if needs_ingest(r) {
+        if crate::env::frozen() {
             let adapter = backing
                 .or_else(|| crate::harness::for_harness(r.harness))
                 .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
@@ -804,8 +880,9 @@ mod db {
              );
              CREATE INDEX IF NOT EXISTS idx_event_sessions_native ON event_sessions(harness, session_id);
              CREATE TABLE IF NOT EXISTS event_targets(
-                 id     INTEGER PRIMARY KEY,
-                 target TEXT NOT NULL UNIQUE
+                 id         INTEGER PRIMARY KEY,
+                 target     TEXT NOT NULL UNIQUE,
+                 rev_target TEXT
              );
              CREATE TABLE IF NOT EXISTS events(
                  session     INTEGER NOT NULL,
@@ -821,17 +898,69 @@ mod db {
              CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id);",
         )
         .ok()?;
-        let has_hunk_col = conn
-            .prepare("PRAGMA table_info(events)")
-            .ok()?
-            .query_map([], |row| row.get::<_, String>(1))
-            .ok()?
-            .any(|name| name.as_deref() == Ok("hunk_hashes"));
+        let has_hunk_col = table_has_column(&conn, "events", "hunk_hashes");
         if !has_hunk_col {
-            conn.execute("ALTER TABLE events ADD COLUMN hunk_hashes BLOB", [])
-                .ok()?;
+            let _ = conn.execute("ALTER TABLE events ADD COLUMN hunk_hashes BLOB", []);
         }
+        ensure_rev_targets(&conn);
         Some(conn)
+    }
+
+    fn reverse_chars(s: &str) -> String {
+        s.chars().rev().collect()
+    }
+
+    fn ensure_rev_targets(conn: &Connection) {
+        if !table_has_column(conn, "event_targets", "rev_target")
+            && conn
+                .execute("ALTER TABLE event_targets ADD COLUMN rev_target TEXT", [])
+                .is_err()
+        {
+            return;
+        }
+        let _ = conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_event_targets_rev ON event_targets(rev_target);");
+        let needs_backfill = conn
+            .query_row(
+                "SELECT 1 FROM event_targets WHERE rev_target IS NULL LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !needs_backfill {
+            return;
+        }
+        let _ = conn.execute_batch("BEGIN IMMEDIATE;").and_then(|()| {
+            let res = (|| -> rusqlite::Result<()> {
+                let pending: Vec<(i64, String)> = {
+                    let mut stmt = conn.prepare("SELECT id, target FROM event_targets WHERE rev_target IS NULL")?;
+                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    rows.collect::<rusqlite::Result<_>>()?
+                };
+                let mut upd = conn.prepare("UPDATE event_targets SET rev_target = ?1 WHERE id = ?2")?;
+                for (id, target) in pending {
+                    upd.execute(params![reverse_chars(&target), id])?;
+                }
+                Ok(())
+            })();
+            match res {
+                Ok(()) => conn.execute_batch("COMMIT;"),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        });
+    }
+
+    fn has_rev_target_ready(conn: &Connection) -> bool {
+        table_has_column(conn, "event_targets", "rev_target")
+            && conn
+                .query_row(
+                    "SELECT 1 FROM event_targets WHERE rev_target IS NULL LIMIT 1",
+                    [],
+                    |_| Ok(()),
+                )
+                .is_err()
     }
 
     fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -1053,7 +1182,8 @@ mod db {
             params![session, from as i64],
         )?;
         {
-            let mut intern = tx.prepare_cached("INSERT OR IGNORE INTO event_targets(target) VALUES(?1)")?;
+            let mut intern =
+                tx.prepare_cached("INSERT OR IGNORE INTO event_targets(target, rev_target) VALUES(?1, ?2)")?;
             let mut intern_id = tx.prepare_cached("SELECT id FROM event_targets WHERE target=?1")?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO events(session,msg_idx,ts,kind,tool,target_id,detail,hunk_hashes)
@@ -1072,7 +1202,7 @@ mod db {
                     Some(t) => match targets.get(t) {
                         Some(&id) => Some(id),
                         None => {
-                            intern.execute(params![t])?;
+                            intern.execute(params![t, reverse_chars(t)])?;
                             let id = intern_id.query_row(params![t], |row| row.get(0))?;
                             // Repeated targets benefit from interning without retaining every
                             // distinct file in a session-sized map.
@@ -1140,8 +1270,9 @@ mod db {
     /// the rows are attributable to the orchestrator that spawned it. Same streaming discipline as
     /// [`ingest_ref`] (lazy parse → large content stays on disk); returns the events extracted.
     pub fn ingest_subagent(r: &SessionRef, prov: &Provenance) -> Result<usize> {
-        let adapter =
-            crate::harness::for_harness(r.harness).ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
+        let adapter = crate::custody::backing_for(r)?
+            .or_else(|| crate::harness::for_harness(r.harness))
+            .ok_or_else(|| anyhow::anyhow!("no adapter for {}", r.harness))?;
         let source = crate::source::Probe::default().snapshot(r);
         let mut sink = SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone());
         adapter.try_stream(r, &crate::stream::Demand::LEAN.with_spans(), &mut sink)?;
@@ -1304,16 +1435,11 @@ mod db {
     /// instead of scanning every event row.
     pub fn sessions_touching(path: &str, edits_only: bool) -> Result<Vec<TouchedSession>> {
         let abs = absolutize(path, crate::env::current_dir().as_deref());
-        // Escape LIKE metacharacters in the user's path, then match any target ending in /<path>.
-        let escaped = path
-            .trim_start_matches("./")
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let suffix = if escaped.starts_with('/') {
-            format!("%{escaped}")
+        let trimmed = path.trim_start_matches("./");
+        let suffix = if trimmed.starts_with('/') {
+            trimmed.to_owned()
         } else {
-            format!("%/{escaped}")
+            format!("/{trimmed}")
         };
         touching(&abs, Some(&suffix), edits_only)
     }
@@ -1417,15 +1543,30 @@ mod db {
         }
     }
 
+    fn escape_like(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    }
+
     fn touching(abs: &str, suffix: Option<&str>, edits_only: bool) -> Result<Vec<TouchedSession>> {
         let conn = open().context("the event catalog cannot be opened")?;
         let having = if edits_only { "HAVING edits > 0" } else { "" };
-        // With a suffix: `target = ?1 OR target LIKE ?2` — the IN-subquery (not a join) pins the
-        // plan to one scan over the distinct targets, then matching event rows through
-        // idx_events_target, never a scan of all events. Without one: a point lookup.
-        let target_where = match suffix {
-            Some(_) => "target = ?1 OR target LIKE ?2 ESCAPE '\\'",
-            None => "target = ?1",
+        let use_rev = suffix.is_some() && has_rev_target_ready(&conn);
+        let rev_bounds = suffix.filter(|_| use_rev).map(|sfx| {
+            let rev = reverse_chars(sfx);
+            let upper = crate::catalog::prefix_end(&rev);
+            (rev, upper)
+        });
+        let target_subquery = match (suffix, &rev_bounds) {
+            (None, _) => "SELECT id FROM event_targets WHERE target = ?1",
+            (Some(_), Some((_, Some(_)))) => {
+                "SELECT id FROM event_targets WHERE target = ?1 \
+                 UNION SELECT id FROM event_targets WHERE rev_target >= ?2 AND rev_target < ?3"
+            }
+            (Some(_), Some((_, None))) => {
+                "SELECT id FROM event_targets WHERE target = ?1 \
+                 UNION SELECT id FROM event_targets WHERE rev_target >= ?2"
+            }
+            (Some(_), None) => "SELECT id FROM event_targets WHERE target = ?1 OR target LIKE ?2 ESCAPE '\\'",
         };
         let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         let sql = format!(
@@ -1438,13 +1579,12 @@ mod db {
              FROM events e
              JOIN event_sessions es ON es.id = e.session
              WHERE e.kind IN ('file_edit','file_read')
-               AND e.target_id IN (SELECT id FROM event_targets WHERE {target_where})
+               AND e.target_id IN ({target_subquery})
              GROUP BY es.id
              {having}
              ORDER BY last_ts DESC, es.session_id"
         );
         let mut stmt = conn.prepare(&sql)?;
-        // rusqlite refuses a parameter the SQL never references, so bind exactly what it names.
         let map = |row: &rusqlite::Row| {
             Ok((
                 row.get::<_, Option<String>>(5)?,
@@ -1461,11 +1601,19 @@ mod db {
                 },
             ))
         };
-        let raw: Vec<(Option<String>, TouchedSession)> = match suffix {
-            Some(sfx) => stmt
-                .query_map(params![abs, sfx], map)?
+        let raw: Vec<(Option<String>, TouchedSession)> = match (suffix, &rev_bounds) {
+            (None, _) => stmt.query_map(params![abs], map)?.collect::<rusqlite::Result<_>>()?,
+            (Some(_), Some((rev, Some(upper)))) => stmt
+                .query_map(params![abs, rev, upper], map)?
                 .collect::<rusqlite::Result<_>>()?,
-            None => stmt.query_map(params![abs], map)?.collect::<rusqlite::Result<_>>()?,
+            (Some(_), Some((rev, None))) => stmt
+                .query_map(params![abs, rev], map)?
+                .collect::<rusqlite::Result<_>>()?,
+            (Some(sfx), None) => {
+                let pat = format!("%{}", escape_like(sfx));
+                stmt.query_map(params![abs, pat], map)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
         };
         let lookup = CatalogMetaLookup::load(
             &conn,
@@ -1492,11 +1640,21 @@ mod db {
     pub fn edits_touching_file(abs: &str, rel: &str) -> Result<Vec<EditEvent>> {
         let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
-        let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        let suffix = format!("%/{escaped}");
+        let use_rev = has_rev_target_ready(&conn);
+        let rev_prefix = reverse_chars(&format!("/{rel}"));
+        let rev_upper = crate::catalog::prefix_end(&rev_prefix);
+        let target_subquery = match (use_rev, &rev_upper) {
+            (true, Some(_)) => {
+                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
+                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3 AND rev_target < ?4"
+            }
+            (true, None) => {
+                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
+                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3"
+            }
+            (false, _) => "SELECT id FROM event_targets WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\'",
+        };
         let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
-        // IN-subquery for the same plan-pinning reason as [`sessions_touching`]; the extra join
-        // back to event_targets only resolves the matched rows' target strings by rowid.
         let mut stmt = conn.prepare(&format!(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
                     MAX(es.parent_id), {selector_expr}
@@ -1504,30 +1662,40 @@ mod db {
              JOIN event_targets t ON t.id = e.target_id
              JOIN event_sessions es ON es.id = e.session
              WHERE e.kind = 'file_edit'
-               AND e.target_id IN (SELECT id FROM event_targets
-                                   WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
+               AND e.target_id IN ({target_subquery})
              GROUP BY es.id, e.msg_idx, e.ts, t.target
              ORDER BY e.ts, e.msg_idx, es.id"
         ))?;
-        let raw: Vec<(Option<String>, EditEvent)> = stmt
-            .query_map(params![&abs, rel, suffix], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(6)?,
-                    EditEvent {
-                        harness: row.get(0)?,
-                        session_id: row.get(1)?,
-                        msg_idx: row.get(2)?,
-                        ts: row.get(3)?,
-                        target: row.get(4)?,
-                        title: None,
-                        cwd: None,
-                        created_at: None,
-                        updated_at: None,
-                        parent_id: row.get(5)?,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        let map = |row: &rusqlite::Row| {
+            Ok((
+                row.get::<_, Option<String>>(6)?,
+                EditEvent {
+                    harness: row.get(0)?,
+                    session_id: row.get(1)?,
+                    msg_idx: row.get(2)?,
+                    ts: row.get(3)?,
+                    target: row.get(4)?,
+                    title: None,
+                    cwd: None,
+                    created_at: None,
+                    updated_at: None,
+                    parent_id: row.get(5)?,
+                },
+            ))
+        };
+        let raw: Vec<(Option<String>, EditEvent)> = match (use_rev, &rev_upper) {
+            (true, Some(upper)) => stmt
+                .query_map(params![&abs, rel, &rev_prefix, upper], map)?
+                .collect::<rusqlite::Result<_>>()?,
+            (true, None) => stmt
+                .query_map(params![&abs, rel, &rev_prefix], map)?
+                .collect::<rusqlite::Result<_>>()?,
+            (false, _) => {
+                let suffix = format!("%/{}", escape_like(rel));
+                stmt.query_map(params![&abs, rel, suffix], map)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+        };
         let lookup = CatalogMetaLookup::load(
             &conn,
             raw.iter().map(|(_, e)| (e.harness.as_str(), e.session_id.as_str())),
@@ -1551,8 +1719,20 @@ mod db {
     pub fn edits_with_hunks_touching_file(abs: &str, rel: &str) -> Result<Vec<EditHunkEvent>> {
         let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
-        let escaped = rel.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        let suffix = format!("%/{escaped}");
+        let use_rev = has_rev_target_ready(&conn);
+        let rev_prefix = reverse_chars(&format!("/{rel}"));
+        let rev_upper = crate::catalog::prefix_end(&rev_prefix);
+        let target_subquery = match (use_rev, &rev_upper) {
+            (true, Some(_)) => {
+                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
+                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3 AND rev_target < ?4"
+            }
+            (true, None) => {
+                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
+                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3"
+            }
+            (false, _) => "SELECT id FROM event_targets WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\'",
+        };
         let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         let mut stmt = conn.prepare(&format!(
             "SELECT es.id, es.harness, es.session_id, e.msg_idx, e.ts, t.target,
@@ -1561,34 +1741,44 @@ mod db {
              JOIN event_targets t ON t.id = e.target_id
              JOIN event_sessions es ON es.id = e.session
              WHERE e.kind = 'file_edit'
-               AND e.target_id IN (SELECT id FROM event_targets
-                                   WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\')
+               AND e.target_id IN ({target_subquery})
              ORDER BY e.ts, e.msg_idx, es.id, e.rowid"
         ))?;
-        let raw_rows: Vec<(i64, Option<String>, EditHunkEvent)> = stmt
-            .query_map(params![&abs, rel, suffix], |row| {
-                let blob: Option<Vec<u8>> = row.get(7)?;
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(8)?,
-                    EditHunkEvent {
-                        edit: EditEvent {
-                            harness: row.get(1)?,
-                            session_id: row.get(2)?,
-                            msg_idx: row.get(3)?,
-                            ts: row.get(4)?,
-                            target: row.get(5)?,
-                            title: None,
-                            cwd: None,
-                            created_at: None,
-                            updated_at: None,
-                            parent_id: row.get(6)?,
-                        },
-                        hunk_hashes: decode_hunk_hashes(blob.as_deref()),
+        let map = |row: &rusqlite::Row| {
+            let blob: Option<Vec<u8>> = row.get(7)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(8)?,
+                EditHunkEvent {
+                    edit: EditEvent {
+                        harness: row.get(1)?,
+                        session_id: row.get(2)?,
+                        msg_idx: row.get(3)?,
+                        ts: row.get(4)?,
+                        target: row.get(5)?,
+                        title: None,
+                        cwd: None,
+                        created_at: None,
+                        updated_at: None,
+                        parent_id: row.get(6)?,
                     },
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+                    hunk_hashes: decode_hunk_hashes(blob.as_deref()),
+                },
+            ))
+        };
+        let raw_rows: Vec<(i64, Option<String>, EditHunkEvent)> = match (use_rev, &rev_upper) {
+            (true, Some(upper)) => stmt
+                .query_map(params![&abs, rel, &rev_prefix, upper], map)?
+                .collect::<rusqlite::Result<_>>()?,
+            (true, None) => stmt
+                .query_map(params![&abs, rel, &rev_prefix], map)?
+                .collect::<rusqlite::Result<_>>()?,
+            (false, _) => {
+                let suffix = format!("%/{}", escape_like(rel));
+                stmt.query_map(params![&abs, rel, suffix], map)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+        };
         let lookup = CatalogMetaLookup::load(
             &conn,
             raw_rows
@@ -2347,31 +2537,115 @@ await tools.view_image({ path: "docs/arch.png" });
         assert_eq!(ev[0].detail.as_deref(), Some("command failed: no such file"));
         assert_eq!(ev[0].tool.as_deref(), Some("Bash"));
         assert_eq!(ev[1].kind, "error");
-        assert_eq!(ev[1].detail.as_deref(), Some(dump.trim()));
+        assert_eq!(ev[1].kind, "error");
+        let capped_detail = ev[1].detail.as_deref().unwrap();
+        assert_eq!(capped_detail.len(), MAX_ERROR_DETAIL_BYTES);
+        assert!(dump.trim().starts_with(capped_detail));
         // A source that is gone fails the extraction instead of dropping the detail.
         std::fs::remove_file(&path).unwrap();
         assert!(extract(&m, 3, None, &crate::lazy::Resolver::new(None)).is_err());
     }
 
     #[test]
-    fn long_commands_and_details_are_whole() {
+    fn long_commands_and_details_are_capped_safely_while_file_paths_stay_whole() {
         let long_cmd = format!("cat <<'EOF'\n{}\nEOF", "x".repeat(100_000));
-        let m = msg(vec![tool_use("Bash", json!({"command": long_cmd}))]);
+        let giant_inline = format!("python3 -c '{}'", "🦀".repeat(5_000));
+        let long_path = format!("/repo/{}/deep/file.rs", "segment_dir_".repeat(60));
+        let m = msg(vec![
+            tool_use("Bash", json!({"command": long_cmd})),
+            tool_use("Bash", json!({"command": giant_inline})),
+            tool_use("Read", json!({"file_path": long_path})),
+        ]);
         let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
-        assert_eq!(ev[0].target.as_deref(), Some(long_cmd.as_str()));
+        let heredoc_target = ev[0].target.as_deref().unwrap();
+        assert!(heredoc_target.len() <= MAX_COMMAND_TARGET_BYTES, "{heredoc_target}");
+        assert!(heredoc_target.starts_with("cat <<'EOF' … [+"), "{heredoc_target}");
+        assert!(!heredoc_target.contains('\n'), "{heredoc_target}");
+
+        let inline_target = ev[1].target.as_deref().unwrap();
+        assert!(inline_target.len() <= MAX_COMMAND_TARGET_BYTES, "{inline_target}");
+        assert!(inline_target.contains(" … [+"), "{inline_target}");
+
+        assert_eq!(
+            ev[2].target.as_deref(),
+            Some(long_path.as_str()),
+            "file paths must stay whole above 512 bytes"
+        );
 
         let mut m = Message::new(Role::Tool);
-        m.content = vec![Block::ToolResult {
-            tool_use_id: "t".into(),
-            content: "e".repeat(1000).into(),
-            is_error: true,
-            tool_name: None,
-            status: None,
-            details: None,
-            extensions: Default::default(),
-        }];
+        m.content = vec![
+            Block::ToolResult {
+                tool_use_id: "t".into(),
+                content: "e".repeat(1000).into(),
+                is_error: true,
+                tool_name: None,
+                status: None,
+                details: None,
+                extensions: Default::default(),
+            },
+            Block::ToolResult {
+                tool_use_id: "t2".into(),
+                content: "🦀".repeat(1000).into(),
+                is_error: true,
+                tool_name: None,
+                status: None,
+                details: None,
+                extensions: Default::default(),
+            },
+        ];
         let ev = extract(&m, 0, None, &crate::lazy::Resolver::new(None)).unwrap();
         assert_eq!(ev[0].detail, Some("e".repeat(1000)));
+        assert_eq!(ev[1].detail.as_ref().unwrap().len(), MAX_ERROR_DETAIL_BYTES);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn rev_target_migrates_legacy_rows_and_uses_covering_btree_index() {
+        let _world = crate::test_world("events-rev-target");
+        {
+            let conn = crate::catalog::open_db().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE event_sessions(
+                     id INTEGER PRIMARY KEY, selector TEXT NOT NULL UNIQUE,
+                     harness TEXT NOT NULL, session_id TEXT NOT NULL,
+                     parent_id TEXT, agent_id TEXT, workflow TEXT
+                 );
+                 CREATE TABLE event_targets(
+                     id INTEGER PRIMARY KEY,
+                     target TEXT NOT NULL UNIQUE
+                 );
+                 CREATE TABLE events(
+                     session INTEGER NOT NULL, msg_idx INTEGER NOT NULL, ts INTEGER,
+                     kind TEXT NOT NULL, tool TEXT, target_id INTEGER, detail TEXT, hunk_hashes BLOB
+                 );
+                 INSERT INTO event_sessions(id, selector, harness, session_id) VALUES(1, 'leg', 'claude', 'leg');
+                 INSERT INTO event_targets(id, target) VALUES(1, '/work/%2Fweird_dir/src/ir.rs');
+                 INSERT INTO events(session, msg_idx, ts, kind, tool, target_id) VALUES(1, 0, 10, 'file_edit', 'Edit', 1);",
+            )
+            .unwrap();
+        }
+        let touched = sessions_touching("src/ir.rs", true).unwrap();
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].session_id, "leg");
+        let weird = sessions_touching("%2Fweird_dir/src/ir.rs", true).unwrap();
+        assert_eq!(weird.len(), 1);
+
+        let conn = db::open().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM event_targets \
+                 WHERE rev_target >= 'sr.ri/crs/' AND rev_target < 'sr.ri/crs0'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("idx_event_targets_rev") && !joined.contains("SCAN"),
+            "expected B-tree index range scan without table SCAN, got: {joined}"
+        );
     }
 
     #[test]

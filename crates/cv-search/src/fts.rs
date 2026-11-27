@@ -397,8 +397,12 @@ pub fn index_all(
     subagents: bool,
     strict: bool,
 ) -> Result<(Indexed, Vec<cv_core::SessionRef>)> {
+    let default_index = dir == crate::default_tantivy_dir();
+    if default_index {
+        cv_core::catalog::record_index_pass();
+    }
     let threads = cv_core::resolve_worker_threads(None)?;
-    cv_core::with_worker_threads(threads, || {
+    let res = cv_core::with_worker_threads(threads, || {
         let (swept, refs) = if let Some(migration) = migration::Migration::prepare(dir, rebuild)? {
             // Migration requires authoritative discovery before ingest. The ordinary compatible
             // path keeps its decode-once handoff and partial-success behavior.
@@ -411,7 +415,11 @@ pub fn index_all(
             sweep_all(dir, rebuild, subagents)?
         };
         Ok((report(swept, rebuild, strict)?, refs))
-    })
+    });
+    if default_index {
+        cv_core::catalog::finish_pass();
+    }
+    res
 }
 
 /// Discovery beside [`sweep_decoded`], then the full sweep over what discovery found.
@@ -654,13 +662,9 @@ struct Job {
     size: i64,
     /// Rewrite its FTS docs (else the pass only feeds the catalog: events and counts).
     fts: bool,
-    /// Its events are stale in either SQLite or the derived columnar store: tee the pass into an
+    /// Its events are stale in the SQLite event catalog: tee the pass into an
     /// [`cv_core::events::EventSink`].
     events: bool,
-    /// SQLite `events` needs re-ingestion for this session.
-    sql_events: bool,
-    /// Derived columnar `events` store needs re-ingestion for this session.
-    col_events: bool,
     /// The index holds docs for its id, to delete before the new ones land.
     existing: bool,
     /// Only growth relative to the indexed source can be an append. Equal-size timestamp changes
@@ -890,6 +894,7 @@ fn sweep_refs_after(
             break (plan, before);
         }
         if !rebuild && plan.jobs.is_empty() && plan.missing.is_empty() && !compact {
+            cv_core::catalog::finish_pass();
             return Ok(Swept {
                 total,
                 copies,
@@ -911,7 +916,6 @@ fn sweep_refs_after(
         jobs,
         missing,
         absent,
-        retained,
         consumer,
         mut unreadable,
     } = plan;
@@ -922,21 +926,11 @@ fn sweep_refs_after(
     for id in &missing {
         writer.delete_term(Term::from_field_text(f.id, id));
     }
-    // Columnar events are keyed by the same selectors: reap exactly the vanished copies.
-    if !missing.is_empty() && !cv_core::env::frozen() {
-        crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-            .and_then(|mut cs| cs.remove_sessions_by_id(&missing))
-            .context("reaping vanished sessions from columnar events")?;
-    }
     let removed = missing.len();
     writer.commit().context("committing index")?;
-    if rebuild && prune_missing && !cv_core::env::frozen() {
-        crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-            .and_then(|mut cs| cs.retain_sessions_by_id(&retained))
-            .context("reaping unselected columnar sessions after rebuild")?;
-    }
     cv_core::resume::update(&ran.marks);
     publish_dependencies(&mut ran, &consumer);
+    cv_core::catalog::finish_pass();
     compact(dir, &index, &mut writer)?;
     unreadable.extend(ran.unreadable);
     Ok(Swept {
@@ -969,7 +963,6 @@ struct SweepPlan {
     jobs: Vec<Job>,
     missing: Vec<String>,
     absent: Vec<AbsentStore>,
-    retained: HashSet<String>,
     consumer: String,
     unreadable: Vec<Unreadable>,
 }
@@ -1087,15 +1080,11 @@ impl SweepPlanner<'_> {
             }
             false
         });
-        if !subagents {
-            seen.extend(state.folded);
-        }
         Ok(SweepPlan {
             unchanged,
             jobs,
             missing,
             absent,
-            retained: seen,
             consumer: state.consumer,
             unreadable,
         })
@@ -1128,7 +1117,6 @@ struct PlanState {
     folded: HashSet<String>,
     metadata: HashMap<String, DiscoveryMetadata>,
     event_sync: cv_core::events::SyncTable,
-    col_events: Option<crate::columnar_events::ColumnarEventStore>,
     affordances: cv_core::catalog::AffordanceTable,
     consumer: String,
     dependencies: cv_core::source::Table<InIndex>,
@@ -1139,14 +1127,6 @@ impl PlanState {
     fn load(index: &Index, f: &Fields, dir: &Path) -> Result<Self> {
         let (existing, folded, metadata) = read_indexed_metadata(index, f, true)
             .context("reading prior index metadata (use cv index --rebuild to replace corrupt metadata)")?;
-        let col_events = if cv_core::env::frozen() {
-            None
-        } else {
-            Some(
-                crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir())
-                    .context("opening columnar events store")?,
-            )
-        };
         let consumer = source_consumer(dir)?;
         Ok(Self {
             existing,
@@ -1154,7 +1134,6 @@ impl PlanState {
             metadata,
             // One query each for the event skip-table and the affordance counts `has:<kind>` reads.
             event_sync: cv_core::events::SyncTable::load(),
-            col_events,
             affordances: cv_core::catalog::AffordanceTable::load(),
             dependencies: cv_core::source::Table::load(&consumer),
             consumer,
@@ -1169,7 +1148,6 @@ impl PlanState {
             existing,
             metadata,
             event_sync,
-            col_events,
             affordances,
             dependencies,
             probe,
@@ -1184,13 +1162,7 @@ impl PlanState {
         } = Freshness::of(existing, metadata, dependencies, probe, r, prov, &source);
         let is_pack = cv_core::custody::is_pack_ref(r);
         let fts_fresh = fts_fresh && !force;
-        let sql_events = !is_pack && event_sync.needs_ingest(r, &source, prov, probe);
-        let col_events_needed = !is_pack
-            && !cv_core::env::frozen()
-            && col_events
-                .as_ref()
-                .is_none_or(|cs| cs.needs_ingest_with_probe(r, &source, prov, probe));
-        let events = sql_events || col_events_needed;
+        let events = event_sync.needs_ingest(r, &source, prov, probe);
         // Unchanged on every axis → skip entirely (no re-parse beyond the metadata scan).
         // Folded subagents have no independent catalog affordance row; their FTS/event
         // freshness suffices, while top-level sessions also need certified counts.
@@ -1206,15 +1178,12 @@ impl PlanState {
             size,
             fts: !fts_fresh,
             events,
-            sql_events,
-            col_events: col_events_needed,
             existing: existing.contains_key(&r.session_selector()),
             grew: !force
                 && existing
                     .get(&r.session_selector())
                     .is_some_and(|&(_, old_size)| old_size > 0 && size > old_size)
-                && (!sql_events || event_sync.can_resume(r, prov))
-                && (!col_events_needed || col_events.as_ref().is_some_and(|cs| cs.can_resume(r, prov))),
+                && (!events || event_sync.can_resume(r, prov)),
             prov: prov.clone(),
             mark: None,
             mark_loaded: false,
@@ -1225,7 +1194,7 @@ impl PlanState {
         };
         (
             fts_fresh,
-            cv_core::harness::for_harness(r.harness).is_some().then_some(job),
+            (is_pack || cv_core::harness::for_harness(r.harness).is_some()).then_some(job),
         )
     }
 }
@@ -2680,14 +2649,16 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     /// that ends on a record the codec still holds reaches this with the boundary due, since
     /// no boundary checkpoint is offered between that record and the end.
     fn wants_final_checkpoint(&mut self, _offset: u64) -> bool {
-        const MAX_OPEN_MARK_BYTES: usize = 64 * 1024;
-        let open_bytes = self
-            .buf
-            .len()
-            .saturating_add(self.other.len())
+        const MAX_OPEN_MARK_BYTES: usize = 4096;
+        let text_bytes = self.buf.len().saturating_add(self.other.len());
+        let open_bytes = text_bytes
             .saturating_add(self.facets.len())
             .saturating_add(self.other_facets.len());
-        self.keep_open = !self.failed && self.err.is_none() && !self.boundary_due && open_bytes <= MAX_OPEN_MARK_BYTES;
+        self.keep_open = !self.failed
+            && self.err.is_none()
+            && !self.boundary_due
+            && text_bytes <= MAX_OPEN_MARK_BYTES
+            && open_bytes <= MAX_OPEN_MARK_BYTES;
         self.keep_open
     }
 
@@ -3063,6 +3034,9 @@ pub fn indexed_top_level_count(dir: &Path) -> Option<usize> {
 /// transcript would fail the same way every pass, so counting it would pin the gate open forever.
 pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
     let check_catalog = dir == crate::default_tantivy_dir();
+    if check_catalog {
+        cv_core::catalog::record_index_pass();
+    }
     pass_needed_with_catalog(dir, &cv_core::sessions(), subagents, check_catalog)
 }
 
@@ -3096,11 +3070,6 @@ fn pass_needed_with_catalog(
     let dependencies = cv_core::source::Table::<InIndex>::load(&consumer);
     let check_derived = check_catalog && !cv_core::env::frozen();
     let event_sync = check_derived.then(cv_core::events::SyncTable::load);
-    let col_events = if check_derived {
-        Some(crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).ok()?)
-    } else {
-        None
-    };
     let affordances = check_derived.then(cv_core::catalog::AffordanceTable::load);
     let mut probe = cv_core::source::Probe::default();
     let prov = cv_core::events::Provenance::default();
@@ -3111,7 +3080,8 @@ fn pass_needed_with_catalog(
     let mut live_ids = HashSet::new();
     let aliases = Default::default();
     for r in &candidates {
-        if cv_core::harness::for_harness(r.harness).is_none() {
+        let is_pack = cv_core::custody::is_pack_ref(r);
+        if !is_pack && cv_core::harness::for_harness(r.harness).is_none() {
             continue;
         }
         let r = &*live::as_indexed(r, &metadata, &aliases);
@@ -3131,15 +3101,10 @@ fn pass_needed_with_catalog(
             {
                 return Some(true);
             }
-            if col_events
-                .as_ref()
-                .is_some_and(|cs| cs.needs_ingest_with_probe(r, &source, &prov, &mut probe))
-            {
-                return Some(true);
-            }
-            if affordances
-                .as_ref()
-                .is_some_and(|af| af.counts_with_probe(r, &source, &mut probe).is_none())
+            if !is_pack
+                && affordances
+                    .as_ref()
+                    .is_some_and(|af| af.counts_with_probe(r, &source, &mut probe).is_none())
             {
                 return Some(true);
             }
@@ -3182,19 +3147,12 @@ fn pass_needed_with_catalog(
                 {
                     return Some(true);
                 }
-                if check_derived {
-                    if event_sync
+                if check_derived
+                    && event_sync
                         .as_ref()
                         .is_some_and(|es| es.needs_ingest(&m.session, &source, &m_prov, &mut probe))
-                    {
-                        return Some(true);
-                    }
-                    if col_events
-                        .as_ref()
-                        .is_some_and(|cs| cs.needs_ingest_with_probe(&m.session, &source, &m_prov, &mut probe))
-                    {
-                        return Some(true);
-                    }
+                {
+                    return Some(true);
                 }
             }
         }
@@ -4785,8 +4743,6 @@ mod tests {
             size,
             fts: true,
             events: true,
-            sql_events: true,
-            col_events: true,
             existing: false,
             grew: false,
             source,
@@ -5293,8 +5249,7 @@ mod tests {
         assert_eq!((result.changed, result.removed, result.errors), (1, 0, 0));
         assert_eq!(text_search_indexed(&dir, "zqunseen", 10).unwrap().len(), 1);
         assert_eq!(text_search_indexed(&dir, "zqreplacement", 10).unwrap().len(), 1);
-        let events = crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
-        assert!(!events.needs_ingest(&refs[0], &Default::default()));
+        assert!(!cv_core::events::needs_ingest(&refs[0]));
     }
 
     #[test]
@@ -5328,9 +5283,8 @@ mod tests {
         assert!(cv_core::source::Table::<InIndex>::load(&consumer)
             .get(&refs[0])
             .is_none());
-        let events = crate::columnar_events::ColumnarEventStore::open(crate::default_columnar_events_dir()).unwrap();
         assert!(
-            !events.needs_ingest(&refs[0], &Default::default()),
+            !cv_core::events::needs_ingest(&refs[0]),
             "rebuild never clears previous event revisions"
         );
         let retried = sweep(&dir, refs.clone(), false, false).unwrap();
@@ -11470,8 +11424,8 @@ mod tests {
     }
 
     #[test]
-    fn pass_needed_detects_missing_derived_columnar_events_and_compaction() {
-        let _home = IsolatedHome::new();
+    fn pass_needed_detects_missing_derived_events_and_compaction() {
+        let home = IsolatedHome::new();
         let dir = crate::default_tantivy_dir();
         let sdir = tmpdir();
         let p = write_claude(&sdir, "s1", "alpha derived gate");
@@ -11483,12 +11437,15 @@ mod tests {
             Some(false)
         );
 
-        // Wiping `events_columnar/` while FTS docs stay fresh must re-open `pass_needed`.
-        std::fs::remove_dir_all(crate::default_columnar_events_dir()).unwrap();
+        // Wiping SQLite `events` baselines while FTS docs stay fresh must re-open `pass_needed`.
+        let conn = rusqlite::Connection::open(home.home.join("catalog.db")).unwrap();
+        conn.execute("DELETE FROM source_dependencies WHERE consumer='events'", [])
+            .unwrap();
+        drop(conn);
         assert_eq!(
             pass_needed_with_catalog(&dir, std::slice::from_ref(&r1), false, true),
             Some(true),
-            "wiped columnar events store must trigger pass_needed"
+            "wiped SQLite event baselines must trigger pass_needed"
         );
     }
 

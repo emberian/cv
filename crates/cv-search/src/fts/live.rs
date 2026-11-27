@@ -552,8 +552,6 @@ fn plan(
             size: fresh.size,
             fts: true,
             events: false,
-            sql_events: false,
-            col_events: false,
             existing: existing.contains_key(&r.session_selector()),
             grew: existing
                 .get(&r.session_selector())
