@@ -110,7 +110,7 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
     fs::write(settings_path(&w), serde_json::to_string_pretty(&theirs).unwrap()).unwrap();
 
     let out = cv_ok(&w, &["hooks", "install", "claude"]);
-    assert!(out.contains("installed 6 entries"), "{out}");
+    assert!(out.contains("installed 7 entries"), "{out}");
     let once = fs::read_to_string(settings_path(&w)).unwrap();
     let s = settings(&w);
     assert_eq!(s["theme"], "dark");
@@ -126,6 +126,10 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
         "absolute binary path: {cmd}"
     );
     assert_eq!(s["hooks"]["SessionStart"][1]["matcher"], "startup|resume");
+    assert!(s["hooks"]["SessionStart"][2]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with(" hook hint --harness claude"));
     assert_eq!(s["hooks"]["SubagentStart"][0]["hooks"][0]["async"], true);
     assert_eq!(s["hooks"]["SubagentStop"][0]["hooks"][0]["async"], true);
     assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
@@ -145,7 +149,7 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
 
     let out = cv_ok(&w, &["hooks", "show", "claude", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["installed"].as_array().unwrap().len(), 6);
+    assert_eq!(v["installed"].as_array().unwrap().len(), 7);
     assert_eq!(v["missing"].as_array().unwrap().len(), 0);
     assert_eq!(v["would_change"], false);
     assert_eq!(v["skill_present"], true);
@@ -157,7 +161,7 @@ fn install_is_idempotent_show_reports_and_remove_restores_the_file() {
 
     // Remove: exactly ours go; the file equals what was there before.
     let out = cv_ok(&w, &["hooks", "remove", "claude"]);
-    assert!(out.contains("removed 6 entries"), "{out}");
+    assert!(out.contains("removed 7 entries"), "{out}");
     assert_eq!(settings(&w), theirs);
     assert!(!skill.exists(), "skill removed");
     let out = cv_ok(&w, &["hooks", "remove", "claude"]);
@@ -188,7 +192,7 @@ fn doctor_reports_hook_install_state_and_policy() {
     );
     let (ok, _, out, err) = w.cv_env(&["doctor", "docsess"], &[("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70")]);
     assert!(ok, "{err}");
-    assert!(out.contains("Hooks:       6/6 in"), "{out}");
+    assert!(out.contains("Hooks:       7/7 in"), "{out}");
     assert!(out.contains("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70"), "{out}");
     assert!(out.contains("autoCompactEnabled unset (default on)"), "{out}");
 }
@@ -476,7 +480,7 @@ fn codex_install_scopes_preserve_unrelated_hooks_and_are_reversible() {
         assert_eq!(fs::read(&path).unwrap(), once);
         let shown: serde_json::Value =
             serde_json::from_str(&cv_ok(&w, &["hooks", "show", "codex", "--scope", scope, "--json"])).unwrap();
-        assert_eq!(shown["installed"].as_array().unwrap().len(), 6);
+        assert_eq!(shown["installed"].as_array().unwrap().len(), 7);
         assert_eq!(shown["would_change"], false);
         assert!(shown["installed"]
             .as_array()
@@ -660,11 +664,11 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
     );
     // A fresh install is untrusted, and install says so with the two ways out.
     let out = cv_ok(&w, &["hooks", "install", "codex"]);
-    assert!(out.contains("Codex trust: 6 untrusted"), "{out}");
+    assert!(out.contains("Codex trust: 7 untrusted"), "{out}");
     assert!(out.contains("startup hooks review"), "{out}");
     assert!(out.contains("--dangerously-bypass-hook-trust"), "{out}");
     let rows = trust_rows(&w, "user");
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), 7);
     // Codex keys by the canonical path (`/var/…` is `/private/var/…` on macOS).
     let hooks_json = fs::canonicalize(w.home.join(".codex/hooks.json"))
         .unwrap()
@@ -688,7 +692,7 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
     let (ok, _, out, _) = w.cv(&["doctor", "docsess"]);
     assert!(ok);
     assert!(
-        out.contains("Codex hooks: 6/6 in ~/.codex/hooks.json (User), 6 untrusted"),
+        out.contains("Codex hooks: 7/7 in ~/.codex/hooks.json (User), 7 untrusted"),
         "{out}"
     );
     assert!(out.contains("Hooks:       not installed"), "{out}");
@@ -699,7 +703,7 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
     fs::write(&project, "{ not json").unwrap();
     let (_, _, out, _) = w.cv(&["doctor", "docsess"]);
     assert!(
-        out.contains("6 untrusted") && out.contains("/.codex/hooks.json (Project) unreadable (key must be a string"),
+        out.contains("7 untrusted") && out.contains("/.codex/hooks.json (Project) unreadable (key must be a string"),
         "{out}"
     );
     let (_, _, out, _) = w.cv(&["doctor", "docsess", "--json"]);
@@ -724,11 +728,11 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
     );
     let (_, _, out, _) = w.cv(&["doctor", "docsess"]);
     assert!(
-        out.contains("Codex hooks: 6/6 in ~/.codex/hooks.json (User), trusted"),
+        out.contains("Codex hooks: 7/7 in ~/.codex/hooks.json (User), trusted"),
         "{out}"
     );
     let doc: serde_json::Value = serde_json::from_str(&cv_ok(&w, &["doctor", "docsess", "--json"])).unwrap();
-    assert_eq!(doc["hooks"]["codex"][0]["trust"].as_array().unwrap().len(), 6);
+    assert_eq!(doc["hooks"]["codex"][0]["trust"].as_array().unwrap().len(), 7);
     assert!(doc["hooks"]["codex"][0]["trust"]
         .as_array()
         .unwrap()
@@ -752,7 +756,7 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
     );
     let rows = trust_rows(&w, "user");
     assert_eq!(rows.iter().filter(|(_, _, t)| t == "modified").count(), 1, "{rows:?}");
-    assert_eq!(rows.iter().filter(|(_, _, t)| t == "trusted").count(), 5, "{rows:?}");
+    assert_eq!(rows.iter().filter(|(_, _, t)| t == "trusted").count(), 6, "{rows:?}");
     let (_, _, out, _) = w.cv(&["doctor", "docsess"]);
     assert!(
         out.contains("(User), 1 modified since trusted — Codex skips them"),
@@ -767,7 +771,7 @@ fn codex_trust_is_read_from_the_store_codex_writes() {
 
     // Project scope: its own keys under ./.codex/hooks.json, and the extra project-trust step.
     let out = cv_ok(&w, &["hooks", "install", "codex", "--scope", "project"]);
-    assert!(out.contains("6 untrusted") && out.contains("trusted project"), "{out}");
+    assert!(out.contains("7 untrusted") && out.contains("trusted project"), "{out}");
     let project = fs::canonicalize(w.base.join(".codex/hooks.json"))
         .unwrap()
         .display()
@@ -853,7 +857,7 @@ fn codex_trust_matches_the_real_binary() {
     let _ = child.kill();
     let _ = child.wait();
     let rows = trust_rows(&w, "user");
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), 7);
     for (key, hash, trust) in &rows {
         let (their_hash, their_trust) = reported.get(key).unwrap_or_else(|| panic!("codex did not list {key}"));
         assert_eq!(their_hash, hash, "{key}");
@@ -1809,4 +1813,150 @@ fn session_start_whispers_adopt_pointer_for_sibling_subagents_and_tracks_uptake(
     );
     assert_eq!(hook(&w, "decisions", &prompt_already, &[]).trim(), "");
     rx.read_one().unwrap();
+}
+
+#[test]
+fn hint_and_nudge_hooks_install_emit_verb_map_without_denying_and_remove_cleanly() {
+    let w = World::new("hooks-hint-nudge");
+    fs::create_dir_all(w.home.join(".claude")).unwrap();
+    let theirs = json!({"theme": "dark"});
+    fs::write(settings_path(&w), serde_json::to_string_pretty(&theirs).unwrap()).unwrap();
+
+    // 1. Default `cv hooks install claude` includes `hint`, `--no-hint` omits it, and opt-in `--nudge` installs alongside.
+    let out = cv_ok(&w, &["hooks", "install", "claude", "--no-hint"]);
+    assert!(out.contains("6 entries"), "{out}");
+    let s_no_hint = settings(&w);
+    assert_eq!(s_no_hint["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+
+    let out = cv_ok(&w, &["hooks", "install", "claude", "--nudge"]);
+    assert!(out.contains("transcript-grep nudge"), "{out}");
+    assert!(cv_ok(&w, &["hooks", "install", "claude", "--nudge"]).contains("nothing written"));
+    let out = cv_ok(&w, &["hooks", "install", "claude", "--hint"]);
+    assert!(out.contains("verb-map hint"), "{out}");
+
+    let shown: serde_json::Value = serde_json::from_str(&cv_ok(&w, &["hooks", "show", "claude", "--json"])).unwrap();
+    assert!(shown["opt_in"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["hook"] == "nudge" && r["installed"] == true && r["matcher"] == "Grep|Bash"));
+    assert!(shown["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["hook"] == "hint" && r["opt_in"] == false && r["installed"] == true));
+
+    // Standard install writes `hint` by default and keeps opt-in `--nudge` intact.
+    cv_ok(&w, &["hooks", "install", "claude"]);
+    let s = settings(&w);
+    assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 3);
+    assert!(s["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["matcher"] == "Grep|Bash"));
+    cv_ok(&w, &["hooks", "remove", "claude", "--nudge"]);
+    cv_ok(&w, &["hooks", "remove", "claude", "--hint"]);
+    assert_eq!(settings(&w)["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+    cv_ok(&w, &["hooks", "remove", "claude"]);
+    assert_eq!(settings(&w), theirs);
+
+    // Codex opt-in `--nudge` also installs and removes cleanly.
+    cv_ok(&w, &["hooks", "install", "codex", "--nudge"]);
+    let codex_shown: serde_json::Value =
+        serde_json::from_str(&cv_ok(&w, &["hooks", "show", "codex", "--json"])).unwrap();
+    assert!(codex_shown["opt_in"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["hook"] == "nudge" && r["installed"] == true));
+    cv_ok(&w, &["hooks", "remove", "codex", "--nudge"]);
+
+    // 2. `cv hook hint` and `cv schema --hint` emit the verb map with zero store reads/writes (even under CV_FROZEN=1).
+    let cold_home = w.base.join("cold-hint-home");
+    let (schema_hint_ok, _, schema_hint_out, schema_hint_err) = w.cv_env(
+        &["schema", "--hint"],
+        &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", cold_home.to_str().unwrap())],
+    );
+    assert!(schema_hint_ok && schema_hint_err.is_empty(), "{schema_hint_err}");
+    let (hint_out, hint_err) = hook_full(
+        &w,
+        &["hook", "hint", "--harness", "claude"],
+        &with(common(&w, "s1", "SessionStart"), json!({"source": "startup"})),
+        &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", cold_home.to_str().unwrap())],
+    );
+    assert_eq!(hint_err, "");
+    let hint_ctx = context_of(&hint_out);
+    assert_eq!(schema_hint_out.trim(), hint_ctx);
+    assert!(
+        hint_ctx.contains("search \"<words>\"") && hint_ctx.contains("never grep transcripts"),
+        "{hint_ctx}"
+    );
+    assert!(hint_ctx.split_whitespace().count() <= 38, "{hint_ctx}");
+    assert!(!cold_home.exists());
+
+    // 3. `cv hook nudge` emits PreToolUse `additionalContext` (no permissionDecision deny) on transcript folders,
+    // and stays completely silent on ordinary workspace files/commands.
+    let claude_projects = w.home.join(".claude/projects");
+    for (tool, input) in [
+        ("Grep", json!({"pattern": "needle", "path": claude_projects})),
+        ("Grep", json!({"pattern": "needle", "path": "~/.claude/projects"})),
+        ("Bash", json!({"command": "rg -n foo ~/.claude/projects"})),
+        (
+            "Bash",
+            json!({"command": format!("grep -r bar {}", w.home.join(".codex/sessions").display())}),
+        ),
+    ] {
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "nudge", "--harness", "claude"],
+            &with(
+                common(&w, "s1", "PreToolUse"),
+                json!({"tool_name": tool, "tool_input": input}),
+            ),
+            &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", cold_home.to_str().unwrap())],
+        );
+        assert_eq!(err, "");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecision"].is_null(),
+            "nudge must never deny: {v}"
+        );
+        assert_eq!(context_of(&out), hint_ctx);
+    }
+
+    // Codex `shell` array command hitting `~/.codex/sessions` nudges too.
+    let codex_nudge_out = codex_hook(
+        &w,
+        "nudge",
+        &with(
+            common(&w, "s1", "PreToolUse"),
+            json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "rg needle ~/.codex/sessions"]}}),
+        ),
+        &[("CV_FROZEN", "1")],
+    );
+    assert_eq!(context_of(&codex_nudge_out), hint_ctx);
+
+    // Ordinary repo paths and `cv` invocations itself stay silent.
+    for (tool, input) in [
+        ("Grep", json!({"pattern": "needle", "path": "/repo/src"})),
+        ("Bash", json!({"command": "rg -n needle /repo/src"})),
+        (
+            "Bash",
+            json!({"command": format!("cv show {}", claude_projects.join("x.jsonl").display())}),
+        ),
+    ] {
+        let (out, err) = hook_full(
+            &w,
+            &["hook", "nudge", "--harness", "claude"],
+            &with(
+                common(&w, "s1", "PreToolUse"),
+                json!({"tool_name": tool, "tool_input": input}),
+            ),
+            &[("CV_FROZEN", "1"), ("CLUSTERVISION_HOME", cold_home.to_str().unwrap())],
+        );
+        assert_eq!((out.as_str(), err.as_str()), ("", ""), "{tool} {input}");
+    }
+    assert!(!cold_home.exists());
 }

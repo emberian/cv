@@ -1,9 +1,11 @@
 ---
 name: cv
-description: Read agent transcripts, recover compacted work, inspect shared edits and coordinate tasks across harnesses.
+description: Find what past agent sessions said or did, search transcripts and file touches, recover compacted work, and coordinate tasks across harnesses.
 ---
 
 # Working across sessions
+
+To find what past sessions said or did, run `cv search "<words>"`, `cv touched <path>`, or `cv pack "<task>"` instead of `rg` or `grep` over raw transcript folders.
 
 On takeover, read `cv lanes <session>` and `cv task inbox`. Use
 `cv task events --since <id>` for changes since your last read.

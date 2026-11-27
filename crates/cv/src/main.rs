@@ -1228,6 +1228,9 @@ enum Cmd {
         /// required). Human list without `--json`, one JSON array with it.
         #[arg(long)]
         commands: bool,
+        /// Print the compact one-line past-session verb map (`cv hook hint`) and exit.
+        #[arg(long, conflicts_with_all = ["json", "commands"])]
+        hint: bool,
     },
     /// The format census: what the most recent sessions actually contain, per harness — message
     /// kinds, block types and the record vocabulary the adapter did not interpret. Types the
@@ -1245,8 +1248,9 @@ enum Cmd {
     /// The agent quickstart: the things agents do with cv, each as one command line with the JSON
     /// keys it returns.
     Recipes,
-    /// Wire cv into Claude Code or Codex: install / remove / show the five hooks (`cv hook …`),
-    /// `--retired` (retired-agent PreToolUse guard), `--receipts` (hash-chained tool receipt log),
+    /// Wire cv into Claude Code or Codex: install / remove / show the six standard hooks (`cv hook …`,
+    /// including `hint` unless `--no-hint`), `--retired` (retired-agent PreToolUse guard), `--receipts`
+    /// (hash-chained tool receipt log), `--nudge` (PreToolUse transcript-grep nudge),
     /// and the `cv` skill in settings. Idempotent and reversible; agents set this up for themselves.
     Hooks {
         #[command(subcommand)]
@@ -1689,7 +1693,7 @@ fn run() -> Result<()> {
             generator: BUILD_VERSION,
         }),
         Cmd::Config { add_export, rm_export } => config::cmd_config(add_export, rm_export),
-        Cmd::Schema { json, commands } => schema::cmd_schema(&build_cli(), json, commands),
+        Cmd::Schema { json, commands, hint } => schema::cmd_schema(&build_cli(), json, commands, hint),
         Cmd::Formats { harness, recent, json } => formats::cmd_formats(harness, recent, json),
         Cmd::Recipes => recipes::cmd_recipes(),
         Cmd::Hooks { action } => hooks::cmd_hooks(action),

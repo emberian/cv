@@ -10,7 +10,11 @@ use std::any::TypeId;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub(crate) fn cmd_schema(cli: &clap::Command, json: bool, commands: bool) -> Result<()> {
+pub(crate) fn cmd_schema(cli: &clap::Command, json: bool, commands: bool, hint: bool) -> Result<()> {
+    if hint {
+        println!("{}", crate::cmd::hooks::VERB_HINT);
+        return Ok(());
+    }
     if commands {
         if json {
             println!("{}", serde_json::to_string_pretty(&commands_json(cli))?);

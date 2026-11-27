@@ -37,12 +37,17 @@ use crate::util::short_id;
 /// published package carries it; a path outside the crate builds in the repo and nowhere else.
 const SKILL: &str = include_str!("../../skill/SKILL.md");
 
+/// Compact verb map injected by `cv hook hint` (`SessionStart`, installed by default unless
+/// `--no-hint`), `cv hook nudge` (`PreToolUse`, opt-in `--nudge`), and `cv schema --hint` with
+/// zero catalog or filesystem reads.
+pub(crate) const VERB_HINT: &str = "cv (past agent sessions): search \"<words>\" | touched <file> | show <id> | lanes | pack \"<task>\" | distill <id>; never grep transcripts";
+
 /// A session whose transcript changed within this many minutes is *live* for the edit guard.
 const LIVE_MINUTES: i64 = 30;
 #[derive(Subcommand)]
 pub(crate) enum HooksCmd {
-    /// Merge cv's five hooks into the harness's settings file and copy the `cv` skill beside them.
-    /// Idempotent: a second run writes nothing.
+    /// Merge cv's six standard hooks (including `hint` unless `--no-hint`) into the harness's
+    /// settings file and copy the `cv` skill beside them. Idempotent: a second run writes nothing.
     Install {
         /// The harness (`claude` or `codex`).
         #[arg(default_value = "claude")]
@@ -60,9 +65,21 @@ pub(crate) enum HooksCmd {
         /// before the call runs; `CV_RECEIPT_STRICT=1` refuses a call it cannot log.
         #[arg(long, conflicts_with = "retired")]
         receipts: bool,
+        /// Install only the SessionStart verb-map hint (`cv hook hint`, startup|resume): injects
+        /// cv's one-line past-session verb map without touching disk or stores.
+        #[arg(long, conflicts_with_all = ["retired", "receipts"])]
+        hint: bool,
+        /// Omit the SessionStart verb-map hint (`cv hook hint`) from the standard install.
+        #[arg(long = "no-hint", conflicts_with_all = ["retired", "receipts", "hint", "nudge"])]
+        no_hint: bool,
+        /// Install only the transcript-grep nudge (`cv hook nudge`, PreToolUse): injects cv's
+        /// verb map as `additionalContext` (never denying) when a search/shell tool targets a
+        /// raw harness transcript folder.
+        #[arg(long, conflicts_with_all = ["retired", "receipts"])]
+        nudge: bool,
     },
     /// Delete exactly the entries `install` wrote (and the copied skill), nothing else.
-    /// `--retired` deletes only the retired-agent guard.
+    /// `--retired`, `--receipts`, `--hint`, and `--nudge` delete only those opt-in entries.
     Remove {
         #[arg(default_value = "claude")]
         harness: String,
@@ -73,6 +90,12 @@ pub(crate) enum HooksCmd {
         /// Delete only the receipt log's entries.
         #[arg(long, conflicts_with = "retired")]
         receipts: bool,
+        /// Delete only the SessionStart verb-map hint (`cv hook hint`).
+        #[arg(long, conflicts_with_all = ["retired", "receipts"])]
+        hint: bool,
+        /// Delete only the PreToolUse transcript-grep nudge (`cv hook nudge`).
+        #[arg(long, conflicts_with_all = ["retired", "receipts"])]
+        nudge: bool,
     },
     /// Print what `install` would change: each entry present / missing, the skill, the settings path.
     Show {
@@ -112,6 +135,12 @@ pub(crate) enum HookName {
     /// the call to the session's hash-chained receipt log and fsync it BEFORE the tool runs
     /// (commit-before-forward), then its result's digest after.
     Receipt,
+    /// `SessionStart` matcher `startup|resume` (opt-in, `cv hooks install --hint`): inject cv's
+    /// compact past-session verb map without reading stores or transcripts.
+    Hint,
+    /// `PreToolUse` (opt-in, `cv hooks install --nudge`): inject cv's compact verb map as
+    /// `additionalContext` (never denying) when a search or shell call targets a transcript folder.
+    Nudge,
 }
 
 impl HookName {
@@ -124,6 +153,8 @@ impl HookName {
             HookName::Edit => "edit",
             HookName::Retired => "retired",
             HookName::Receipt => "receipt",
+            HookName::Hint => "hint",
+            HookName::Nudge => "nudge",
         }
     }
     pub(crate) fn parse(s: &str) -> Option<HookName> {
@@ -135,6 +166,8 @@ impl HookName {
             HookName::Edit,
             HookName::Retired,
             HookName::Receipt,
+            HookName::Hint,
+            HookName::Nudge,
         ]
         .into_iter()
         .find(|n| n.as_str() == s)
@@ -149,7 +182,7 @@ struct Spec {
     asynchronous: bool,
 }
 
-/// Five hooks, six entries (`lane` serves both sub-agent events).
+/// Six hooks, seven entries (`lane` serves both sub-agent events; `--no-hint` skips `hint`).
 const SPECS: &[Spec] = &[
     Spec {
         event: "SessionStart",
@@ -161,6 +194,12 @@ const SPECS: &[Spec] = &[
         event: "SessionStart",
         matcher: Some("startup|resume"),
         name: HookName::Start,
+        asynchronous: false,
+    },
+    Spec {
+        event: "SessionStart",
+        matcher: Some("startup|resume"),
+        name: HookName::Hint,
         asynchronous: false,
     },
     Spec {
@@ -220,6 +259,34 @@ const CODEX_EDIT: Spec = Spec {
     name: HookName::Edit,
     asynchronous: false,
 };
+
+/// Opt-in SessionStart verb-map hint (`cv hooks install --hint`).
+const HINT: Spec = Spec {
+    event: "SessionStart",
+    matcher: Some("startup|resume"),
+    name: HookName::Hint,
+    asynchronous: false,
+};
+
+/// Opt-in PreToolUse transcript-grep nudge (`cv hooks install --nudge`).
+const NUDGE: Spec = Spec {
+    event: "PreToolUse",
+    matcher: Some("Grep|Bash"),
+    name: HookName::Nudge,
+    asynchronous: false,
+};
+
+const CODEX_NUDGE: Spec = Spec {
+    event: "PreToolUse",
+    matcher: None,
+    name: HookName::Nudge,
+    asynchronous: false,
+};
+
+fn nudge_spec(harness: Harness) -> &'static Spec {
+    host(harness).and_then(|h| h.nudge).unwrap_or(&NUDGE)
+}
+
 fn specs(harness: Harness) -> impl Iterator<Item = &'static Spec> {
     let edit = host(harness).and_then(|h| h.edit);
     SPECS.iter().map(move |spec| match edit {
@@ -241,6 +308,8 @@ struct Host {
     settings: &'static str,
     /// The Edit hook's entry where it differs from [`SPECS`]'.
     edit: Option<&'static Spec>,
+    /// The Nudge hook's entry where it differs from [`NUDGE`].
+    nudge: Option<&'static Spec>,
     /// A handler runs only once the harness's own config trusts it (Codex's `trusted_hash`).
     trust: bool,
     /// The settings also hold the compaction policy `cv doctor` reports.
@@ -260,6 +329,7 @@ fn host(h: Harness) -> Option<Host> {
             dir: ".claude",
             settings: "settings.json",
             edit: None,
+            nudge: None,
             trust: false,
             policy: true,
             receipts: true,
@@ -271,6 +341,7 @@ fn host(h: Harness) -> Option<Host> {
             dir: ".codex",
             settings: "hooks.json",
             edit: Some(&CODEX_EDIT),
+            nudge: Some(&CODEX_NUDGE),
             trust: true,
             policy: false,
             receipts: true,
@@ -583,6 +654,7 @@ fn strip_where(settings: &mut Value, selected: impl Fn(HookName) -> bool) {
     for ev in SPECS
         .iter()
         .chain(RECEIPTS.iter())
+        .chain([&RETIRED, &HINT, &NUDGE])
         .map(|s| s.event)
         .collect::<std::collections::BTreeSet<_>>()
     {
@@ -607,17 +679,23 @@ fn strip_where(settings: &mut Value, selected: impl Fn(HookName) -> bool) {
     }
 }
 
-/// `settings` with our six entries present (one group per spec, appended under its event).
-fn with_ours(harness: Harness, mut settings: Value, exe: &str) -> Value {
-    // The opt-in retired-agent guard and receipt log are not of the six; a reinstall keeps them.
-    strip_where(&mut settings, |n| n != HookName::Retired && n != HookName::Receipt);
+/// `settings` with our standard entries present (one group per spec, appended under its event).
+fn with_ours(harness: Harness, settings: Value, exe: &str) -> Value {
+    with_ours_opts(harness, settings, exe, true)
+}
+
+fn with_ours_opts(harness: Harness, mut settings: Value, exe: &str, include_hint: bool) -> Value {
+    // Opt-in entries are not part of the standard set; a reinstall keeps them.
+    strip_where(&mut settings, |n| {
+        !matches!(n, HookName::Retired | HookName::Receipt | HookName::Nudge)
+    });
     let obj = settings.as_object_mut().expect("settings is an object");
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     if !hooks.is_object() {
         *hooks = json!({});
     }
     let hooks = hooks.as_object_mut().expect("object");
-    for spec in specs(harness) {
+    for spec in specs(harness).filter(|s| include_hint || s.name != HookName::Hint) {
         let mut group = Map::new();
         if let Some(m) = spec.matcher {
             group.insert("matcher".into(), json!(m));
@@ -677,6 +755,38 @@ fn with_receipts(harness: Harness, mut settings: Value, exe: &str) -> Value {
     settings
 }
 
+fn with_single_spec(harness: Harness, mut settings: Value, exe: &str, spec: &Spec) -> Value {
+    strip_where(&mut settings, |n| n == spec.name);
+    let obj = settings.as_object_mut().expect("settings is an object");
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let groups = hooks
+        .as_object_mut()
+        .expect("object")
+        .entry(spec.event)
+        .or_insert_with(|| json!([]));
+    if !groups.is_array() {
+        *groups = json!([]);
+    }
+    let mut group = Map::new();
+    if let Some(m) = spec.matcher {
+        group.insert("matcher".into(), json!(m));
+    }
+    group.insert("hooks".into(), json!([handler_for(harness, exe, spec)]));
+    groups.as_array_mut().expect("array").push(Value::Object(group));
+    settings
+}
+
+fn with_hint(harness: Harness, settings: Value, exe: &str) -> Value {
+    with_single_spec(harness, settings, exe, &HINT)
+}
+
+fn with_nudge(harness: Harness, settings: Value, exe: &str) -> Value {
+    with_single_spec(harness, settings, exe, nudge_spec(harness))
+}
+
 fn opt_in_specs(harness: Harness) -> Vec<(&'static Spec, &'static str)> {
     let mut out = Vec::new();
     if host(harness).is_some_and(|h| h.retired_guard) {
@@ -687,6 +797,7 @@ fn opt_in_specs(harness: Harness) -> Vec<(&'static Spec, &'static str)> {
             out.push((s, "--receipts"));
         }
     }
+    out.push((nudge_spec(harness), "--nudge"));
     out
 }
 
@@ -813,7 +924,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             harness,
             scope,
             retired: true,
-            receipts: false,
+            ..
         } => {
             let harness = hook_harness(&harness)?;
             if !host(harness).is_some_and(|h| h.retired_guard) {
@@ -841,7 +952,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             harness,
             scope,
             retired: true,
-            receipts: false,
+            ..
         } => {
             let harness = hook_harness(&harness)?;
             let (settings_path, _) = paths(harness, scope)?;
@@ -867,16 +978,57 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             scope,
             retired: false,
             receipts: false,
+            hint,
+            no_hint,
+            nudge,
         } => {
+            if hint || nudge {
+                let harness = hook_harness(&harness)?;
+                let (settings_path, _) = paths(harness, scope)?;
+                let exe = this_exe()?;
+                let before = read_settings(&settings_path)?;
+                let mut after = before.clone();
+                let mut labels = Vec::new();
+                if hint {
+                    after = with_hint(harness, after, &exe);
+                    labels.push("the verb-map hint (SessionStart)");
+                }
+                if nudge {
+                    after = with_nudge(harness, after, &exe);
+                    labels.push("the transcript-grep nudge (PreToolUse)");
+                }
+                if after == before {
+                    println!(
+                        "cv hooks: {} already in {}; nothing written",
+                        labels.join(" and "),
+                        home_rel(&settings_path)
+                    );
+                } else {
+                    write_settings(&settings_path, &after)?;
+                    println!(
+                        "cv hooks: installed {} → {}",
+                        labels.join(" and "),
+                        home_rel(&settings_path)
+                    );
+                }
+                if needs_trust(harness) {
+                    println!(
+                        "  Codex trust: {}",
+                        trust_summary(&codex_trust(&settings_path, &after), scope)
+                    );
+                }
+                return Ok(());
+            }
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
             let exe = this_exe()?;
             let before = read_settings(&settings_path)?;
-            let after = with_ours(harness, before.clone(), &exe);
+            let entry_count = if no_hint { SPECS.len() - 1 } else { SPECS.len() };
+            let after = with_ours_opts(harness, before.clone(), &exe, !no_hint);
             let mut changed = Vec::new();
             if after != before {
                 write_settings(&settings_path, &after)?;
-                changed.push(format!("{} entries → {}", SPECS.len(), home_rel(&settings_path)));
+                changed.push(format!("{entry_count} entries → {}", home_rel(&settings_path)));
             }
             if std::fs::read_to_string(&skill_path).ok().as_deref() != Some(SKILL) {
                 if let Some(dir) = skill_path.parent() {
@@ -887,8 +1039,7 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             }
             if changed.is_empty() {
                 println!(
-                    "cv hooks: already installed ({} entries in {}); nothing written",
-                    SPECS.len(),
+                    "cv hooks: already installed ({entry_count} entries in {}); nothing written",
                     home_rel(&settings_path)
                 );
             } else {
@@ -908,7 +1059,40 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             scope,
             retired: false,
             receipts: false,
+            hint,
+            nudge,
         } => {
+            if hint || nudge {
+                let harness = hook_harness(&harness)?;
+                let (settings_path, _) = paths(harness, scope)?;
+                let before = read_settings(&settings_path)?;
+                let mut after = before.clone();
+                strip_where(&mut after, |n| {
+                    (hint && n == HookName::Hint) || (nudge && n == HookName::Nudge)
+                });
+                let mut labels = Vec::new();
+                if hint {
+                    labels.push("verb-map hint");
+                }
+                if nudge {
+                    labels.push("transcript-grep nudge");
+                }
+                if after == before {
+                    println!(
+                        "cv hooks: no {} in {}; nothing written",
+                        labels.join(" or "),
+                        home_rel(&settings_path)
+                    );
+                } else {
+                    write_settings(&settings_path, &after)?;
+                    println!(
+                        "cv hooks: removed the {} from {}",
+                        labels.join(" and "),
+                        home_rel(&settings_path)
+                    );
+                }
+                return Ok(());
+            }
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
             let before = read_settings(&settings_path)?;
@@ -960,11 +1144,13 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             let all_hook_names = [
                 (HookName::Compact, false),
                 (HookName::Start, false),
+                (HookName::Hint, false),
                 (HookName::Lane, false),
                 (HookName::Decisions, false),
                 (HookName::Edit, false),
                 (HookName::Retired, true),
                 (HookName::Receipt, true),
+                (HookName::Nudge, true),
             ];
             let hook_summary: Vec<Value> = all_hook_names
                 .iter()
@@ -1296,7 +1482,7 @@ fn invalid_frame(name: HookName, parse_err: Option<&serde_json::Error>) {
         );
     } else if !matches!(
         name,
-        HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane
+        HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane | HookName::Hint
     ) {
         match parse_err {
             Some(e) => eprintln!(
@@ -1437,6 +1623,16 @@ fn handle_hook(name: HookName, harness: Option<String>) -> Result<()> {
             return Ok(());
         }
     };
+    if name == HookName::Hint {
+        println!("{}", context("SessionStart", VERB_HINT.to_string()));
+        return Ok(());
+    }
+    if name == HookName::Nudge {
+        if let Some(v) = hook_nudge(&payload) {
+            println!("{v}");
+        }
+        return Ok(());
+    }
     if matches!(
         name,
         HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane
@@ -1473,7 +1669,12 @@ fn handle_hook(name: HookName, harness: Option<String>) -> Result<()> {
     let out = match decoded {
         Ok(None) => Ok(None),
         Ok(Some(event)) => match name {
-            HookName::Compact | HookName::Start | HookName::Decisions | HookName::Lane => unreachable!(),
+            HookName::Compact
+            | HookName::Start
+            | HookName::Decisions
+            | HookName::Lane
+            | HookName::Hint
+            | HookName::Nudge => unreachable!(),
             HookName::Edit => hook_edit(&event, &payload),
             HookName::Retired => hook_retired(&event, &payload),
             HookName::Receipt => hook_receipt(&event, &payload),
@@ -1523,6 +1724,201 @@ fn selector(harness: Harness, id: &str) -> String {
 
 fn context(event: &str, text: String) -> Value {
     json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
+}
+
+/// Known harness transcript store roots from the active environment (`HOME`, `CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, `XDG_DATA_HOME`, etc.), constructed in memory with zero disk discovery.
+fn transcript_store_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |p: PathBuf| {
+        roots.push(cv_core::tools::classify::normalize_path(&p, None));
+        roots.push(p);
+    };
+    if let Some(dir) = cv_core::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        push(dir.join("projects"));
+        push(dir.join("transcripts"));
+    }
+    if let Some(dir) = cv_core::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        push(dir.join("sessions"));
+        push(dir.join("archived_sessions"));
+    }
+    for var in ["ANTIGRAVITY_APP_DATA_DIR", "JETSKI_APP_DATA_DIR"] {
+        if let Some(dir) = cv_core::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from) {
+            push(dir.join("brain"));
+            push(dir.join("conversations"));
+        }
+    }
+    if let Some(dir) = cv_core::env::var_os("HERMES_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        push(dir);
+    }
+    if let Some(dir) = cv_core::env::var_os("OPENCLAW_STATE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        push(dir.join("agents"));
+    }
+    if let Some(xdg) = cv_core::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        for sub in ["opencode", "zed/threads", "goose/sessions", "devin/cli", "kimi"] {
+            push(xdg.join(sub));
+        }
+    }
+    if let Some(home) = crate::util::dirs_home() {
+        for sub in [
+            ".claude/projects",
+            ".claude/transcripts",
+            ".codex/sessions",
+            ".codex/archived_sessions",
+            ".gemini/tmp",
+            ".gemini/antigravity",
+            ".gemini/antigravity-cli",
+            ".local/share/opencode",
+            ".local/share/zed/threads",
+            ".local/share/goose/sessions",
+            ".local/share/devin/cli",
+            ".local/share/kimi",
+            "Library/Application Support/Cursor/User/globalStorage",
+            "Library/Application Support/Cursor/User/workspaceStorage",
+            "Library/Application Support/Zed/threads",
+            "Library/Application Support/Block.block.goose/sessions",
+            ".cursor/chats",
+            ".cursor/acp-sessions",
+            ".hermes",
+            ".openclaw/agents",
+            ".kimi/sessions",
+            ".qwen/projects",
+            ".qwen/tmp",
+            ".continue/sessions",
+            ".pi/agent/sessions",
+            ".grok",
+        ] {
+            push(home.join(sub));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+const SHELL_STORE_MARKERS: &[&str] = &[
+    "/.claude/projects",
+    "/.claude/transcripts",
+    "$CLAUDE_CONFIG_DIR/projects",
+    "${CLAUDE_CONFIG_DIR}/projects",
+    "/.codex/sessions",
+    "/.codex/archived_sessions",
+    "$CODEX_HOME/sessions",
+    "${CODEX_HOME}/sessions",
+    "/.gemini/tmp",
+    "/.gemini/antigravity",
+    "/.local/share/opencode",
+    "/.local/share/devin/cli",
+    "/.local/share/zed/threads",
+    "/.local/share/goose/sessions",
+    "/.hermes",
+    "/.openclaw/agents",
+    "/.kimi/sessions",
+    "/.qwen/projects",
+    "/.continue/sessions",
+    "/.pi/agent/sessions",
+];
+
+fn expand_candidate_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = crate::util::dirs_home() {
+            return home.join(rest);
+        }
+    } else if trimmed == "~" {
+        if let Some(home) = crate::util::dirs_home() {
+            return home;
+        }
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else if let Some(cwd) = cwd {
+        cwd.join(p)
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// `PreToolUse` (opt-in `--nudge`): advise `VERB_HINT` without denying when a search or shell tool
+/// targets a raw harness transcript store root.
+fn hook_nudge(payload: &Value) -> Option<Value> {
+    let tool_input = payload.get("tool_input")?;
+    let cwd = payload.get("cwd").and_then(Value::as_str).map(Path::new);
+    let roots = transcript_store_roots();
+    let hits_root_path = |raw: &str| {
+        if raw.trim().is_empty() {
+            return false;
+        }
+        let expanded = expand_candidate_path(raw, cwd);
+        let norm = cv_core::tools::classify::normalize_path(&expanded, cwd);
+        roots.iter().any(|r| expanded.starts_with(r) || norm.starts_with(r))
+    };
+
+    for key in [
+        "path",
+        "file_path",
+        "directory",
+        "dir",
+        "SearchDirectory",
+        "DirectoryPath",
+    ] {
+        if let Some(s) = tool_input.get(key).and_then(Value::as_str) {
+            if hits_root_path(s) {
+                return Some(context("PreToolUse", VERB_HINT.to_string()));
+            }
+        }
+    }
+    if let Some(arr) = tool_input.get("paths").and_then(Value::as_array) {
+        if arr.iter().filter_map(Value::as_str).any(hits_root_path) {
+            return Some(context("PreToolUse", VERB_HINT.to_string()));
+        }
+    }
+
+    let mut commands: Vec<String> = Vec::new();
+    for key in ["command", "cmd"] {
+        match tool_input.get(key) {
+            Some(Value::String(s)) => commands.push(s.clone()),
+            Some(Value::Array(items)) => {
+                let joined: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+                if !joined.is_empty() {
+                    commands.push(joined.join(" "));
+                }
+            }
+            _ => {}
+        }
+    }
+    for cmd in &commands {
+        let trimmed = cmd.trim_start();
+        if trimmed.starts_with("cv ") || trimmed.contains("/cv ") {
+            continue;
+        }
+        if SHELL_STORE_MARKERS.iter().any(|m| cmd.contains(m)) {
+            return Some(context("PreToolUse", VERB_HINT.to_string()));
+        }
+        if roots.iter().any(|r| {
+            let s = r.to_string_lossy();
+            !s.is_empty() && cmd.contains(s.as_ref())
+        }) {
+            return Some(context("PreToolUse", VERB_HINT.to_string()));
+        }
+    }
+    None
 }
 
 /// Extract cross-harness target agent identifiers addressed by a tool call (via `tools::classify`),
@@ -1987,7 +2383,7 @@ mod tests {
         // The keys Codex stores trust under, and the three states its `hooks/list` reports.
         let path = Path::new("/home/u/.codex/hooks.json");
         let rows = codex_trust(path, &settings);
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), SPECS.len());
         assert!(rows.iter().all(|r| r.trust == Trust::Untrusted));
         assert!(rows
             .iter()
@@ -2108,6 +2504,9 @@ mod tests {
             scope: Scope::User,
             retired: false,
             receipts: false,
+            hint: false,
+            no_hint: false,
+            nudge: false,
         })
         .unwrap();
         let mut held = String::new();
@@ -2141,10 +2540,13 @@ mod tests {
         assert_eq!(once["hooks"]["PreToolUse"][1]["matcher"], "Edit|Write");
         assert_eq!(once["hooks"]["SubagentStop"][0]["hooks"][0]["async"], true);
         assert!(once["hooks"]["SessionStart"][0]["hooks"][0]["async"].is_null());
-        // A reinstall from another binary path replaces ours rather than adding a seventh.
+        // A reinstall from another binary path replaces ours rather than duplicating.
         let moved = with_ours(Harness::Claude, once.clone(), "/usr/local/bin/cv");
         assert_eq!(present(Harness::Claude, &moved).len(), SPECS.len());
-        assert_eq!(moved["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(moved["hooks"]["SessionStart"].as_array().unwrap().len(), 3);
+        let without_hint = with_ours_opts(Harness::Claude, theirs.clone(), "/opt/cv", false);
+        assert_eq!(present(Harness::Claude, &without_hint).len(), SPECS.len() - 1);
+        assert_eq!(without_hint["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
         let mut back = moved;
         strip_ours(&mut back);
         assert_eq!(back, theirs, "remove restores the original exactly");
