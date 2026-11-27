@@ -447,3 +447,193 @@ fn cold_rewind_offline_root_without_out_and_live_or_locked_refusal() -> Result<(
     drop(hold_tx);
     Ok(())
 }
+
+#[test]
+fn cold_prune_splices_checkpoints_strips_sludge_replaces_summary_and_stashes_sidecar() -> Result<()> {
+    // #tooth: native Antigravity `cold::prune` operates across cleared early steps, drops intermediate
+    // `step_type = 23` compaction walls, strips `30.26` sludge sections, injects `--replace-summary`
+    // at step 0, snips `step_type = 132` outputs + `140.2.3`/`render_info` outside `keep_last`, and
+    // writes a `<new_id>.flat.jsonl` sidecar retrievable via `prune::retrieve`.
+    use super::prune::{prune, ColdPruneOptions, KeepSelector};
+    use crate::harness::Parse as _;
+
+    let env_guard = crate::env::Env::enter_isolated(Vec::new(), Vec::new());
+    env_guard.remove("ANTIGRAVITY_LS_ADDRESS");
+    env_guard.remove("ANTIGRAVITY_CSRF_TOKEN");
+
+    let world = crate::test_world("antigravity-cold-prune");
+    let src_root = world.base.join("source");
+    let (db, _) = fixture(&src_root)?;
+    {
+        let conn = Connection::open(&db.path)?;
+        // Simulate Antigravity clearing early history `0..80`, leaving a bloated checkpoint at `85`,
+        // pre-compaction turns `88..139`, a compaction wall at `140`, and post-compaction turns `141..148`.
+        conn.execute("UPDATE steps SET status=5, step_payload=NULL WHERE idx < 80", [])?;
+
+        let sludge_goal = [
+            field(1, b"all_goals"),
+            field(2, b"Goal"),
+            field(4, &field(1, &vec![b'G'; 16_384])),
+        ]
+        .concat();
+        let cp_body = [
+            int(1, 1),
+            field(5, b"stale old summary"),
+            int(12, 85),
+            int(24, 1),
+            field(26, &sludge_goal),
+            int(27, 4),
+        ]
+        .concat();
+        let md85 = metadata(85);
+        let payload85 = [int(1, 23), int(4, 3), field(5, &md85), field(30, &cp_body)].concat();
+        conn.execute(
+            "UPDATE steps SET step_type=23, status=3, metadata=?1, step_payload=?2 WHERE idx=85",
+            params![md85, payload85],
+        )?;
+
+        // Also bloat the intermediate compaction wall at step `140` so dropping it proves seamless splicing.
+        let md140 = metadata(140);
+        let payload140 = [int(1, 23), int(4, 3), field(5, &md140), field(30, &cp_body)].concat();
+        conn.execute(
+            "UPDATE steps SET step_type=23, status=3, metadata=?1, step_payload=?2 WHERE idx=140",
+            params![md140, payload140],
+        )?;
+
+        // Turn step `90` (outside `keep_last = 1`, since step `148` is the newest user turn) into a
+        // bulky `step_type = 132` (`CortexStepGeneric`) tool result with embedded `140.2.3` render_info.
+        let tool_call = [
+            field(1, b"call_bulky_90"),
+            field(2, b"run_command"),
+            field(3, br#"{"CommandLine":"cargo test"}"#),
+            field(7, b"sig-bytes-preserved"),
+        ]
+        .concat();
+        let mut md90 = metadata(90);
+        md90.extend(field(4, &tool_call));
+        let big_out = format!("Created At: 2026-11-27T00:00:00Z\n{}", "L".repeat(6000));
+        let gen_res = [
+            field(1, big_out.as_bytes()),
+            field(3, &field(1, &vec![b'R'; 8192])),
+            field(
+                6,
+                &[field(1, b"type.googleapis.com/x.Run"), field(2, &vec![b'A'; 4096])].concat(),
+            ),
+        ]
+        .concat();
+        let generic90 = [
+            field(1, &[field(1, b"CommandLine"), field(2, b"cargo test")].concat()),
+            field(2, &gen_res),
+        ]
+        .concat();
+        let payload90 = [int(1, 132), int(4, 3), field(5, &md90), field(140, &generic90)].concat();
+        conn.execute(
+            "UPDATE steps SET step_type=132, status=3, metadata=?1, render_info=?2, step_payload=?3 WHERE idx=90",
+            params![md90, vec![b'C'; 2048], payload90],
+        )?;
+
+        // Nested git worktree with a `.git` file inside `scratch/wt-a` must be excluded even with `copy_resources`.
+        let wt_dir = src_root.join("brain").join(OLD).join("scratch/wt-a");
+        fs::create_dir_all(&wt_dir)?;
+        fs::write(wt_dir.join(".git"), b"gitdir: /tmp/somewhere/.git/worktrees/wt-a\n")?;
+        fs::write(wt_dir.join("huge.xml"), vec![b'X'; 4096])?;
+        fs::write(
+            src_root.join("brain").join(OLD).join("ledger.md"),
+            b"top-level artifact",
+        )?;
+    }
+
+    // 1. Prune WITHOUT `--replace-summary` from step `85..`: retains leading checkpoint `85` with `30.26`
+    // sludge stripped, drops intermediate checkpoint `140`, snips `call_bulky_90`, and keeps `148` verbatim.
+    let out1 = world.base.join("out_sludge_only");
+    let res1 = prune(
+        &db,
+        &ColdPruneOptions {
+            min_size: 1024,
+            keep_last: 1,
+            keep: Some(KeepSelector::Steps(85, None)),
+            out_dir: Some(out1.clone()),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(res1.checkpoints_dropped, 1);
+    assert_eq!(res1.checkpoint_sections_stripped, 1);
+    assert!(res1.checkpoint_bytes_saved > 16_000, "{}", res1.checkpoint_bytes_saved);
+    assert_eq!(res1.pruned_count, 1);
+    assert!(!res1.selected_steps.contains(&140));
+
+    // 2. Prune WITH `--replace-summary` + `--title` across `88..` (splicing pre-140 + post-140 seamlessly!).
+    let out2 = world.base.join("out_curated");
+    let res2 = prune(
+        &db,
+        &ColdPruneOptions {
+            min_size: 1024,
+            keep_last: 1,
+            keep: Some(KeepSelector::Steps(88, None)),
+            replace_summary: Some("# Fresh Curated Anchor\nClean summary.".into()),
+            title: Some("Curated Successor".into()),
+            out_dir: Some(out2.clone()),
+            ..Default::default()
+        },
+    )?;
+    assert!(res2.synthesized_checkpoint);
+    assert_eq!(res2.checkpoints_dropped, 1);
+    assert_eq!(res2.pruned_count, 1);
+    let sc_path = res2.sidecar_path.as_ref().expect("sidecar path");
+    let retrieved = crate::prune::retrieve(sc_path, "call_bulky_90")?;
+    assert!(retrieved
+        .as_str()
+        .unwrap()
+        .starts_with("Created At: 2026-11-27T00:00:00Z\nLLLL"));
+
+    let agy = crate::harness::antigravity::Antigravity::with_home(&out2);
+    let sref = SessionRef::new(&res2.new_id, Harness::Antigravity, res2.new_path.as_ref().unwrap());
+    assert_eq!(
+        crate::harness::prune_sidecar(&sref, &res2.new_id).as_deref(),
+        Some(sc_path.as_path())
+    );
+    let parsed = agy.parse(&sref)?;
+    assert_eq!(parsed.title.as_deref(), Some("Curated Successor"));
+    // Step 0 is the clean replaced checkpoint; intermediate checkpoint 140 is gone!
+    let summaries: Vec<_> = parsed
+        .messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::CompactionSummary)
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0].text().as_deref(),
+        Some("# Fresh Curated Anchor\nClean summary.")
+    );
+    assert!(parsed
+        .messages
+        .iter()
+        .any(|m| m.text().as_deref() == Some("last historical instruction")));
+    assert!(parsed
+        .messages
+        .iter()
+        .any(|m| m.text().as_deref() == Some("later correction")));
+
+    // Top-level brain artifact copied; `scratch/` omitted by default without `--copy-resources`.
+    let dst_brain = out2.join("brain").join(&res2.new_id);
+    assert_eq!(fs::read(dst_brain.join("ledger.md"))?, b"top-level artifact");
+    assert!(!dst_brain.join("scratch").exists());
+
+    // With `copy_resources = true`, `scratch/notes.txt` copies while nested `.git` worktree `scratch/wt-a` is excluded.
+    let out3 = world.base.join("out_with_res");
+    let res3 = prune(
+        &db,
+        &ColdPruneOptions {
+            min_size: 1024,
+            keep_last: 1,
+            copy_resources: true,
+            keep: Some(KeepSelector::Steps(88, None)),
+            out_dir: Some(out3.clone()),
+            ..Default::default()
+        },
+    )?;
+    let dst_brain3 = out3.join("brain").join(&res3.new_id);
+    assert_eq!(fs::read(dst_brain3.join("scratch/notes.txt"))?, b"source artifact");
+    assert!(!dst_brain3.join("scratch/wt-a").exists());
+    Ok(())
+}

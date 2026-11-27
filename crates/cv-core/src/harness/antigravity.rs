@@ -245,6 +245,14 @@ impl Adapter for Antigravity {
         source_for_path(path).map(|(r, a)| (r, Box::new(a) as Box<dyn Adapter>))
     }
 
+    fn prune_sidecar(&self, r: &SessionRef, id: &str) -> Option<PathBuf> {
+        if id.is_empty() || id.contains(['/', '\\']) {
+            return None;
+        }
+        BrainLoc::from_transcript(&r.path)
+            .map(|loc| loc.app_data_dir.join("conversations").join(format!("{id}.flat.jsonl")))
+    }
+
     fn has_cold_rewind(&self) -> bool {
         cfg!(feature = "sqlite")
     }
@@ -1142,7 +1150,7 @@ impl Adapter for Antigravity {
                 let Some(fname) = entry.name.to_str() else {
                     continue;
                 };
-                if fname == "history.jsonl" || !fname.ends_with(".jsonl") {
+                if fname == "history.jsonl" || !fname.ends_with(".jsonl") || super::is_cv_sidecar(&root.join(fname)) {
                     continue;
                 }
                 let path = root.join(&entry.name);

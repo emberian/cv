@@ -867,6 +867,12 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// Location of a `<id>.flat.jsonl` prune sidecar when this harness stores conversations in a
+    /// structured root separate from its exported transcript log. Default: none.
+    fn prune_sidecar(&self, _r: &SessionRef, _id: &str) -> Option<PathBuf> {
+        None
+    }
+
     /// Whether `cv rewind --out` can publish an offline native store copy for this harness
     /// without inline JSONL identity restamping. Default: false.
     fn has_cold_rewind(&self) -> bool {
@@ -1272,6 +1278,11 @@ pub fn has_derived_copies(h: Harness) -> bool {
 /// ([`Adapter::has_cold_rewind`]).
 pub fn has_cold_rewind(h: Harness) -> bool {
     rootless(h).is_some_and(|a| a.has_cold_rewind())
+}
+
+/// Harness-specific `<id>.flat.jsonl` sidecar path for `r`, when separate from `r.path`'s folder.
+pub fn prune_sidecar(r: &SessionRef, id: &str) -> Option<PathBuf> {
+    rootless(r.harness).and_then(|a| a.prune_sidecar(r, id))
 }
 
 /// The form in which a harness's session file is archived natively

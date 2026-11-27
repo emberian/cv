@@ -20,7 +20,7 @@ use rusqlite::{params, Connection};
 use std::fs;
 use std::path::Path;
 
-fn pbtxt_escape(s: &str) -> String {
+pub(super) fn pbtxt_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

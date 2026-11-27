@@ -150,6 +150,8 @@ pub(crate) struct PruneArgs<'a> {
     pub revive_estimate: bool,
     pub window: Option<u64>,
     pub keep: Option<String>,
+    pub replace_summary: Option<PathBuf>,
+    pub title: Option<String>,
     pub declassify: bool,
     pub declassify_tokens: Option<String>,
     pub declassify_tokens_file: Option<PathBuf>,
@@ -186,6 +188,8 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         revive_estimate,
         window,
         keep,
+        replace_summary,
+        title,
         declassify,
         declassify_tokens,
         declassify_tokens_file,
@@ -200,7 +204,21 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             return usage(e.to_string());
         }
     }
-    let keep_range = keep.as_deref().map(parse_range).transpose()?;
+    let (keep_native_steps, keep_spec) = match keep.as_deref() {
+        Some(s) => match s.strip_prefix("steps:").or_else(|| s.strip_prefix("step:")) {
+            Some(rest) => (true, Some(rest)),
+            None => (false, Some(s)),
+        },
+        None => (false, None),
+    };
+    let keep_range = keep_spec.map(parse_range).transpose()?;
+    let summary_text = match replace_summary.as_deref() {
+        Some(path) => Some(
+            fs::read_to_string(path)
+                .map_err(|e| crate::util::UsageError(format!("--replace-summary {}: {e}", path.display())))?,
+        ),
+        None => None,
+    };
     let declassify_tokens = resolve_declassify_tokens(declassify_tokens, declassify_tokens_file)?;
     if declassify && declassify_tokens.is_empty() {
         eprintln!(
@@ -226,10 +244,47 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
     carry_source(carry_agents, &r)?;
 
     if !cv_core::harness::has_derived_copies(r.harness) {
+        if cv_core::harness::has_cold_rewind(r.harness) {
+            let claude_only = [
+                (plan.is_some(), "--plan"),
+                (declassify, "--declassify"),
+                (carry_agents.is_some(), "--carry-agents"),
+                (skills_policy != SkillsPolicy::Keep, "--skills"),
+                (revive_estimate, "--revive-estimate"),
+            ];
+            if let Some((_, flag)) = claude_only.iter().find(|(set, _)| *set) {
+                return usage(format!(
+                    "{flag} prunes Claude Code records; {} sessions prune native SQLite steps",
+                    r.harness
+                ));
+            }
+            return prune_cold_antigravity(
+                &r,
+                ColdAntigravityPruneArgs {
+                    min_size,
+                    keep_last,
+                    drop,
+                    thinking,
+                    copy_resources,
+                    window,
+                    keep_range,
+                    keep_native_steps,
+                    replace_summary: summary_text,
+                    title,
+                    to,
+                    force,
+                    out,
+                    dry_run,
+                    json,
+                },
+            );
+        }
         let native_only = [
             (plan.is_some(), "--plan"),
             (window.is_some(), "--window"),
-            (keep_range.is_some(), "--range"),
+            (keep_range.is_some(), "--keep"),
+            (replace_summary.is_some(), "--replace-summary"),
+            (title.is_some(), "--title"),
             (declassify, "--declassify"),
             (thinking, "--drop-thinking"),
             (copy_resources, "--copy-resources"),
@@ -239,7 +294,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         ];
         if let Some((_, flag)) = native_only.iter().find(|(set, _)| *set) {
             return usage(format!(
-                "{flag} prunes Claude Code records; {} sessions prune by selection",
+                "{flag} prunes native records; {} sessions prune by selection",
                 r.harness
             ));
         }
@@ -255,6 +310,12 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
                 json,
             },
         );
+    }
+    if keep_native_steps {
+        return usage("--keep steps:A..B addresses native Antigravity SQLite step indices; pass --keep A..B");
+    }
+    if replace_summary.is_some() || title.is_some() {
+        return usage("--replace-summary and --title apply to native Antigravity checkpoint sessions");
     }
     if out.is_some() {
         return usage("--out writes a pruned session of another harness; a Claude prune writes beside its source");
@@ -520,6 +581,129 @@ pub(crate) fn ir_sidecar_path(written: &std::path::Path, new_id: &str) -> PathBu
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."))
         .join(format!("{new_id}.flat.jsonl"))
+}
+
+struct ColdAntigravityPruneArgs {
+    min_size: usize,
+    keep_last: usize,
+    drop: bool,
+    thinking: bool,
+    copy_resources: bool,
+    window: Option<u64>,
+    keep_range: Option<(usize, Option<usize>)>,
+    keep_native_steps: bool,
+    replace_summary: Option<String>,
+    title: Option<String>,
+    to: Option<String>,
+    force: bool,
+    out: Option<PathBuf>,
+    dry_run: bool,
+    json: bool,
+}
+
+fn prune_cold_antigravity(r: &cv_core::ir::SessionRef, args: ColdAntigravityPruneArgs) -> Result<()> {
+    use cv_core::harness::antigravity::cold::prune::{prune, ColdPruneOptions, KeepSelector};
+    let pinned = args.to.is_some();
+    let keep = args.keep_range.map(|(s, e)| {
+        if args.keep_native_steps {
+            KeepSelector::Steps(s as u64, e.map(|x| x as u64))
+        } else {
+            KeepSelector::Messages(s, e)
+        }
+    });
+    let opts = ColdPruneOptions {
+        min_size: args.min_size,
+        keep_last: args.keep_last,
+        drop: args.drop,
+        thinking: args.thinking,
+        copy_resources: args.copy_resources,
+        window: args.window,
+        keep,
+        replace_summary: args.replace_summary,
+        title: args.title,
+        new_id: args.to,
+        out_dir: args.out,
+        force: args.force,
+        dry_run: args.dry_run,
+    };
+    let res = prune(r, &opts)?;
+    let pct = if res.before_bytes > 0 {
+        100.0 * res.bytes_saved() as f64 / res.before_bytes as f64
+    } else {
+        0.0
+    };
+    let mut h = String::new();
+    let tag = if args.dry_run {
+        " (dry run — nothing written)"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        h,
+        "✦ pruned {} → {}{tag}",
+        short_id(&res.source_id),
+        short_id(&res.new_id)
+    );
+    let _ = writeln!(
+        h,
+        "  {} native step(s) written ({} selected, {} dropped, {} compaction wall(s) removed) · {} payload(s) snipped · {} → {} (−{:.0}%) · ~{} token equivalents removed",
+        res.steps_written,
+        res.selected_steps.len(),
+        res.dropped_steps,
+        res.checkpoints_dropped,
+        res.pruned_count,
+        human_bytes(res.before_bytes),
+        human_bytes(res.after_bytes),
+        pct,
+        res.tokens_freed,
+    );
+    if res.checkpoint_bytes_saved > 0 || res.replaced_summary {
+        let summary_note = if res.replaced_summary {
+            "replaced checkpoint summary + "
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            h,
+            "  checkpoint:  {summary_note}stripped {} sludge section(s) (−{})",
+            res.checkpoint_sections_stripped,
+            human_bytes(res.checkpoint_bytes_saved)
+        );
+    }
+    if res.thinking_steps_stripped > 0 {
+        let _ = writeln!(
+            h,
+            "  thinking:    stripped {} planner step(s) (−{})",
+            res.thinking_steps_stripped,
+            human_bytes(res.thinking_bytes_saved)
+        );
+    }
+    for w in &res.warnings {
+        let _ = writeln!(h, "  ⚠ {w}");
+    }
+    let resume = crate::cmd::port::resume_lines(r.harness, &res.new_id, res.cwd.as_deref());
+    if !args.dry_run {
+        if let Some(p) = &res.new_path {
+            let _ = writeln!(h, "  new session: {}", p.display());
+        }
+        if let Some(sc) = &res.sidecar_path {
+            let _ = writeln!(
+                h,
+                "  sidecar:     {} (fetch an original: cv cat {} <tool_use_id>)",
+                sc.display(),
+                short_id(&res.new_id)
+            );
+        }
+        for line in &resume {
+            let _ = writeln!(h, "  resume with: {line}");
+        }
+    }
+    let mut v = serde_json::to_value(&res)?;
+    v["harness"] = r.harness.as_str().into();
+    v["route"] = "native_sqlite".into();
+    v["resume"] = serde_json::json!(resume);
+    dry_run_nulls(&mut v, pinned, &["new_path", "sidecar_path"], &["new_id", "resume"]);
+    report(args.json, &h, &v)
 }
 
 struct IrPruneArgs {

@@ -600,9 +600,18 @@ enum Cmd {
         #[arg(long, value_name = "TOKENS")]
         window: Option<u64>,
         /// Keep only this turn-index window, `A..B` (0-based, end-exclusive; `A..` through the
-        /// last), dropping everything outside it. Like --window but by index.
+        /// last; or `steps:A..B` for native Antigravity SQLite step indices), dropping everything
+        /// outside it. Like --window but by index.
         #[arg(long, value_name = "A..B")]
         keep: Option<String>,
+        /// Replace (or seed) the leading native Antigravity compaction checkpoint summary from this
+        /// UTF-8 file while stripping accumulated checkpoint sludge sections.
+        #[arg(long, value_name = "PATH")]
+        replace_summary: Option<PathBuf>,
+        /// Custom title for a pruned native Antigravity successor (`annotations/<id>.pbtxt` and
+        /// `conversation_summaries.db`).
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
         /// Snip message TEXT (user prompts + assistant replies) whose density of caller-supplied
         /// TERMS is high, into the sidecar with a `[PRUNED …]` marker. Motivation: a safeguard
         /// classifier scores the WHOLE loaded context, so term-dense PROSE in the history can silently
@@ -1653,6 +1662,8 @@ fn run() -> Result<()> {
             revive_estimate,
             window,
             keep,
+            replace_summary,
+            title,
             declassify,
             declassify_tokens,
             declassify_tokens_file,
@@ -1677,6 +1688,8 @@ fn run() -> Result<()> {
             revive_estimate,
             window,
             keep,
+            replace_summary,
+            title,
             declassify,
             declassify_tokens,
             declassify_tokens_file,

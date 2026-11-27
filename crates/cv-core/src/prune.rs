@@ -3322,7 +3322,7 @@ fn retrieval_command(session: &str, id: &str, input: bool) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_marker(
+pub(crate) fn build_marker(
     id: &str,
     name: &str,
     input: &Value,

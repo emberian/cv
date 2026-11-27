@@ -1,5 +1,6 @@
 //! Cold publication of a selected trajectory under a fresh identity in an app-data root.
 pub(super) mod proto;
+pub mod prune;
 use super::{native, BrainLoc};
 use crate::harness::store::{bytes::ByteSource, sqlite};
 use crate::ir::{Harness, MessageKind, Session, SessionRef};
@@ -7,6 +8,7 @@ use crate::publish::{Claim, StagedDir};
 use crate::rewind::{CutAt, RewindOptions};
 use crate::uncompact::Plan;
 use anyhow::{ensure, Context, Result};
+pub use prune::{prune, ColdPruneOptions, ColdPruneResult};
 use rusqlite::{params, Connection, OptionalExtension as _, Transaction};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -366,11 +368,11 @@ pub(crate) fn rewind_with_closure_budget(
 }
 
 const STEP_COLUMNS: &str = "step_type,status,has_subtrajectory,metadata,error_details,permissions,task_details,render_info,step_payload,step_format";
-struct ExpectedStep {
-    turn: u64,
-    source_body: blake3::Hash,
-    metadata: blake3::Hash,
-    payload: blake3::Hash,
+pub(super) struct ExpectedStep {
+    pub turn: u64,
+    pub source_body: blake3::Hash,
+    pub metadata: blake3::Hash,
+    pub payload: blake3::Hash,
 }
 fn copy_steps(src: &Connection, tx: &Transaction<'_>, tid: &str, report: &mut Derived) -> Result<Vec<ExpectedStep>> {
     use rusqlite::types::Value;
@@ -437,7 +439,12 @@ fn copy_steps(src: &Connection, tx: &Transaction<'_>, tid: &str, report: &mut De
     Ok(expected)
 }
 
-fn verify_steps(tx: &Transaction<'_>, report: &Derived, expected: &[ExpectedStep]) -> Result<()> {
+pub(super) fn verify_trajectory(
+    tx: &Transaction<'_>,
+    trajectory_id: &str,
+    new_id: &str,
+    expected: &[ExpectedStep],
+) -> Result<()> {
     let mut query = tx.prepare("SELECT idx,metadata,step_payload FROM steps ORDER BY idx")?;
     let mut rows = query.query([])?;
     for (idx, want) in expected.iter().enumerate() {
@@ -446,10 +453,10 @@ fn verify_steps(tx: &Transaction<'_>, report: &Derived, expected: &[ExpectedStep
         let md = row.get_ref(1)?.as_blob()?;
         let payload = row.get_ref(2)?.as_blob()?;
         let reference = proto::Reference {
-            trajectory: &report.trajectory_id,
+            trajectory: trajectory_id,
             step: idx as u64,
             turn: want.turn,
-            cascade: &report.new_id,
+            cascade: new_id,
         };
         reference.verify(md)?;
         reference.verify(&proto::nested(payload, 5)?)?;
@@ -466,12 +473,19 @@ fn verify_steps(tx: &Transaction<'_>, report: &Derived, expected: &[ExpectedStep
     Ok(())
 }
 
-fn excluded_closure_dir(name: &str, path: &Path) -> Option<&'static str> {
+fn verify_steps(tx: &Transaction<'_>, report: &Derived, expected: &[ExpectedStep]) -> Result<()> {
+    verify_trajectory(tx, &report.trajectory_id, &report.new_id, expected)
+}
+
+pub(super) fn excluded_closure_dir(name: &str, path: &Path) -> Option<&'static str> {
     if name == ".git" {
         return Some("excluded git directory");
     }
     if name == "worktrees" {
         return Some("excluded worktree directory");
+    }
+    if path.join(".git").symlink_metadata().is_ok() {
+        return Some("excluded nested git checkout");
     }
     if name == "target" || name.starts_with("target-") || name.starts_with("target_") {
         return Some("excluded build directory");
@@ -775,11 +789,16 @@ pub(super) fn publish_staged_app_root(
     let brain = PathBuf::from("brain").join(spec.new_id);
     let annotations = PathBuf::from("annotations").join(format!("{}.pbtxt", spec.new_id));
     let db = PathBuf::from("conversations").join(format!("{}.db", spec.new_id));
+    let sidecar = PathBuf::from("conversations").join(format!("{}.flat.jsonl", spec.new_id));
+    let has_sidecar = stage.path().join(&sidecar).is_file();
     let replace = matches!(claim, Claim::Replace);
     if !replace {
         // The conversation's own files claim the name first, so a taken id is `publish::Exists`.
         for rel in [&db, &annotations, &brain] {
             crate::publish::refuse_existing(&out.join(rel), "")?;
+        }
+        if has_sidecar || out.join(&sidecar).exists() {
+            crate::publish::refuse_existing(&out.join(&sidecar), "")?;
         }
         ensure!(
             !summary_key_taken(&index, spec.new_id)?,
@@ -789,18 +808,18 @@ pub(super) fn publish_staged_app_root(
         );
     }
     for suffix in ["-wal", "-shm", "-journal"] {
-        let sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
+        let wal_sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
         if replace {
-            let _ = fs::remove_file(&sidecar);
+            let _ = fs::remove_file(&wal_sidecar);
         } else {
-            crate::publish::refuse_existing(&sidecar, "")?;
+            crate::publish::refuse_existing(&wal_sidecar, "")?;
         }
     }
     if replace {
         if out.join(&brain).exists() {
             fs::remove_dir_all(out.join(&brain))?;
         }
-        for rel in [&annotations, &db] {
+        for rel in [&annotations, &db, &sidecar] {
             if out.join(rel).exists() {
                 fs::remove_file(out.join(rel))?;
             }
@@ -823,7 +842,11 @@ pub(super) fn publish_staged_app_root(
                 fs::hard_link(e.path(), dest)?;
             }
         }
-        for path in [annotations.clone(), db.clone()] {
+        let mut files_to_install = vec![annotations.clone(), db.clone()];
+        if has_sidecar {
+            files_to_install.push(sidecar.clone());
+        }
+        for path in files_to_install {
             fs::hard_link(stage.path().join(&path), out.join(&path))?;
             installed.push(path);
         }
