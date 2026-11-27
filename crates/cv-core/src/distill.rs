@@ -3943,8 +3943,112 @@ fn named_state_files(session: &Session, cache: &mut TranscriptCache<'_>) -> anyh
     Ok(named)
 }
 
-fn is_state(path: &str, named: &[String]) -> bool {
-    is_state_path(path) || named.iter().any(|n| basename(n) == basename(path))
+fn expand_tilde(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = crate::env::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
+/// Resolve `raw` as a clean relative path strictly inside `session_cwd` (rejecting empty paths,
+/// missing `session_cwd`, `..` traversal, and absolute/`~/` paths outside `session_cwd`).
+fn rel_under_cwd(raw: &str, session_cwd: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cwd = session_cwd?;
+    let expanded = expand_tilde(trimmed);
+    let clean_normal = |p: &std::path::Path| -> Option<PathBuf> {
+        let mut out = PathBuf::new();
+        for comp in p.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::Normal(part) => out.push(part),
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        (!out.as_os_str().is_empty()).then_some(out)
+    };
+    if expanded.is_absolute() {
+        if let Ok(stripped) = expanded.strip_prefix(cwd) {
+            return clean_normal(stripped);
+        }
+        let canon_cwd = std::fs::canonicalize(cwd).ok()?;
+        if let Ok(stripped) = expanded.strip_prefix(&canon_cwd) {
+            return clean_normal(stripped);
+        }
+        let canon_parent = std::fs::canonicalize(expanded.parent()?).ok()?;
+        let joined = canon_parent.join(expanded.file_name()?);
+        let stripped = joined.strip_prefix(&canon_cwd).ok()?;
+        clean_normal(stripped)
+    } else {
+        clean_normal(&expanded)
+    }
+}
+
+fn matches_named_state(path: &str, named: &[String], session_cwd: Option<&std::path::Path>) -> bool {
+    let Some(rel_path) = rel_under_cwd(path, session_cwd) else {
+        return false;
+    };
+    named.iter().any(|n| {
+        let Some(rel_named) = rel_under_cwd(n, session_cwd) else {
+            return false;
+        };
+        if rel_named.components().count() > 1 {
+            rel_path == rel_named || rel_path.ends_with(&rel_named)
+        } else if n.contains('/') {
+            rel_path == rel_named
+        } else {
+            rel_path.file_name() == rel_named.file_name()
+        }
+    })
+}
+
+fn is_state(path: &str, named: &[String], session_cwd: Option<&std::path::Path>) -> bool {
+    is_state_path(path) || matches_named_state(path, named, session_cwd)
+}
+
+/// True only for native local sessions anchored to an explicit checkout `cwd` — never imported,
+/// portable, custody/pack-backed, or remotely replicated transcripts.
+fn session_allows_live_fs(session: &Session) -> bool {
+    if session.cwd.is_none() || session.harness == Harness::OpenSession {
+        return false;
+    }
+    if session.messages.iter().any(|m| m.origin == Origin::Import) {
+        return false;
+    }
+    if let Some(sp) = &session.source_path {
+        if sp.components().any(|c| c.as_os_str() == ".custody-view")
+            || sp
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "cvbundle" | "zip"))
+        {
+            return false;
+        }
+    }
+    if session.extra.contains_key("producer_id")
+        || session.cv_extra().is_some_and(|cv| {
+            cv.keys().any(|k| {
+                matches!(
+                    k.as_str(),
+                    "producer_id" | "pack_id" | "custody" | "replicated" | "bundle" | "import"
+                )
+            })
+        })
+    {
+        return false;
+    }
+    if let Some(cov) = crate::coverage::ReadCoverage::of_session(session) {
+        if !cov.sources.is_empty() && !cov.sources.contains(crate::coverage::ReadCoverage::NATIVE_STORE) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The body of the heredoc that writes `target` in `cmd`, up to its delimiter line.
@@ -3961,18 +4065,21 @@ fn note_shell_state(
     i: usize,
     cmd: &str,
     named: &[String],
+    session_cwd: Option<&std::path::Path>,
     state: &mut Option<(usize, String, String, Option<String>)>,
 ) {
     for c in re(Re::HeredocTarget).captures_iter(cmd) {
-        if is_state(&c[1], named) {
+        if is_state(&c[1], named, session_cwd) {
             let body = heredoc_body(cmd, &c[1]);
             *state = Some((i, c[1].to_string(), "shell".into(), body));
         }
     }
-    // A named state file rewritten in place by a script (`sed -i`, `python3 -`, `perl -i`):
-    // the transcript holds no content.
+    // A named state file inside `session_cwd` rewritten in place by a script (`sed -i`,
+    // `python3 -`, `perl -i`): the transcript holds no content.
     let rewrites = re(Re::InPlace).is_match(cmd);
-    let hit = named.iter().find(|p| rewrites && cmd.contains(basename(p)));
+    let hit = named
+        .iter()
+        .find(|p| rewrites && rel_under_cwd(p, session_cwd).is_some() && cmd.contains(basename(p)));
     if let Some(path) = hit.filter(|_| state.as_ref().is_none_or(|st| st.0 != i)) {
         *state = Some((i, path.clone(), "a script, in place".into(), None));
     }
@@ -3988,6 +4095,7 @@ fn ground(
 ) -> anyhow::Result<Grounding> {
     use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
     let harness = session.harness;
+    let session_cwd = session.cwd.as_deref();
     let open_re = re(Re::OpenItem);
     let decided_re = re(Re::Decision);
     let window = tail_cut(msgs, GROUNDING_WINDOW, uses);
@@ -4031,26 +4139,28 @@ fn ground(
                             match name.as_str() {
                                 "Write" => {
                                     let path = string_field("file_path")?.unwrap_or_default();
-                                    if is_state(&path, &named) {
+                                    if is_state(&path, &named, session_cwd) {
                                         let content = string_field("content")?.unwrap_or_default();
                                         g.state = Some((i, path, "Write".into(), Some(content)));
                                     }
                                 }
                                 "Edit" | "MultiEdit" => {
                                     let path = string_field("file_path")?.unwrap_or_default();
-                                    if is_state(&path, &named) {
+                                    if is_state(&path, &named, session_cwd) {
                                         g.state = Some((i, path, "Edit".into(), None));
                                     }
                                 }
                                 "Bash" => {
                                     if let Some(cmd) = string_field("command")? {
-                                        note_shell_state(i, &cmd, &named, &mut g.state);
+                                        note_shell_state(i, &cmd, &named, session_cwd, &mut g.state);
                                     }
                                 }
                                 _ => {
                                     for sem in &ops {
                                         match &sem.op {
-                                            ToolOp::FileEdit { path, is_full_write } if is_state(path, &named) => {
+                                            ToolOp::FileEdit { path, is_full_write }
+                                                if is_state(path, &named, session_cwd) =>
+                                            {
                                                 let content = if *is_full_write {
                                                     let c = match string_field("content")? {
                                                         Some(c) => Some(c),
@@ -4064,7 +4174,7 @@ fn ground(
                                                     Some((i, path.as_ref().to_owned(), sem.tool.to_string(), content));
                                             }
                                             ToolOp::Command { cmd: Some(cmd), .. } => {
-                                                note_shell_state(i, cmd, &named, &mut g.state);
+                                                note_shell_state(i, cmd, &named, session_cwd, &mut g.state);
                                             }
                                             _ => {}
                                         }
@@ -4129,12 +4239,15 @@ fn ground(
         let skip = list.len().saturating_sub(GROUNDING_LINES);
         list.drain(..skip);
     }
-    // Written in place: the file itself is the content, read now (read-only, bounded, regular-file
-    // and drift-gated) when allowed and still contemporaneous with the transcript.
-    if let Some((_, path, how, content @ None)) = g.state.as_mut() {
-        if let Some(text) = read_bounded_live_state_file(path, live_fs, session_updated_at) {
-            *content = Some(text);
-            how.push_str("; content read from disk when distilled");
+    // Written in place: the file itself is the content, read now (read-only, bounded, regular-file,
+    // `session.cwd`-contained, `O_NOFOLLOW` and drift-gated) when allowed on a local session and
+    // still contemporaneous with the transcript.
+    if session_allows_live_fs(session) {
+        if let Some((_, path, how, content @ None)) = g.state.as_mut() {
+            if let Some(text) = read_bounded_live_state_file(path, session_cwd, live_fs, session_updated_at) {
+                *content = Some(text);
+                how.push_str("; content read from disk when distilled");
+            }
         }
     }
     g.open = open;
@@ -4144,6 +4257,7 @@ fn ground(
 
 fn read_bounded_live_state_file(
     path: &str,
+    session_cwd: Option<&std::path::Path>,
     live_fs: &LiveFsPolicy,
     session_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<String> {
@@ -4151,18 +4265,51 @@ fn read_bounded_live_state_file(
     if !live_fs.allow || live_fs.max_bytes == 0 {
         return None;
     }
-    let local = match path.strip_prefix("~/") {
-        Some(rest) => crate::env::home_dir().map(|home| home.join(rest)),
-        None => Some(std::path::PathBuf::from(path)).filter(|p| p.is_absolute()),
-    }?;
-    let sym = std::fs::symlink_metadata(&local).ok()?;
+    let cwd = session_cwd?;
+    let canon_cwd = std::fs::canonicalize(cwd).ok()?;
+    if !canon_cwd.is_dir() {
+        return None;
+    }
+    let rel = rel_under_cwd(path, Some(cwd))?;
+    let candidate = cwd.join(&rel);
+    // Reject leaf symlinks upfront before canonicalizing the parent directory.
+    let pre_sym = std::fs::symlink_metadata(&candidate).ok()?;
+    if !pre_sym.file_type().is_file() || pre_sym.len() > live_fs.max_bytes as u64 {
+        return None;
+    }
+    let canon_parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+    if !canon_parent.starts_with(&canon_cwd) {
+        return None;
+    }
+    let safe_path = canon_parent.join(candidate.file_name()?);
+    if !safe_path.starts_with(&canon_cwd) || safe_path == canon_cwd {
+        return None;
+    }
+    let sym = std::fs::symlink_metadata(&safe_path).ok()?;
     if !sym.file_type().is_file() || sym.len() > live_fs.max_bytes as u64 {
         return None;
     }
-    let file = std::fs::File::open(&local).ok()?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&safe_path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(&safe_path).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.file_type().is_file() || meta.len() > live_fs.max_bytes as u64 {
         return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if (meta.dev(), meta.ino()) != (sym.dev(), sym.ino()) {
+            return None;
+        }
     }
     // Prevent leaking current-disk drift into historical transcripts when the state file was
     // modified long after the session ended.
@@ -6885,6 +7032,7 @@ facts text",
         let rewrite = format!("python3 -I - <<'PY'\nimport pathlib\np=pathlib.Path('{path}')\np.write_text(p.read_text().replace('1 purse','2 purses'))\nPY");
         let read = format!("sed -n 1,5p {path} 2>&1");
         let mut s = Session::new("agent-checklist", Harness::Claude);
+        s.cwd = Some(dir.clone());
         s.messages = vec![msg(Role::User, MessageKind::Prompt, vec![text(&brief)])];
         for (id, cmd) in [("r1", rewrite.as_str()), ("r2", read.as_str()), ("z", "ls")] {
             s.messages
@@ -7168,6 +7316,7 @@ facts text",
         assert_eq!(projected.commands(), vec!["cargo test -p clustervision-core"]);
 
         let mut session = Session::new("codex-lane", Harness::Codex);
+        session.cwd = Some(world.base.clone());
         session.messages = vec![
             msg(
                 Role::User,
@@ -7684,6 +7833,7 @@ facts text",
         let path_str = state_path.to_str().unwrap().to_string();
 
         let mut s = Session::new("hist-drift", Harness::Claude);
+        s.cwd = Some(world.base.clone());
         // Historical session ended in 2024; file on disk was modified in 2026 -> drift gate skips it.
         s.updated_at = Some(chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")?.with_timezone(&chrono::Utc));
         s.messages = vec![
@@ -7741,6 +7891,128 @@ facts text",
 
         let d_allowed = distill_pack(&s, &opts)?;
         assert!(d_allowed.head_md.contains("current live disk drift"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_state_file_reads_enforce_cwd_containment_symlink_nofollow_and_origin_gates() -> anyhow::Result<()> {
+        let world = crate::test_world("distill-live-fs-containment");
+        let cwd = world.base.join("workspace");
+        let outside = world.base.join("outside");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&outside)?;
+
+        let outside_secret = outside.join("secret.txt");
+        let canary = "OUTSIDE_SECRET_CANARY_DO_NOT_READ";
+        std::fs::write(&outside_secret, canary)?;
+        let outside_state = outside.join("scratch_state.md");
+        std::fs::write(&outside_state, canary)?;
+
+        let opts = DistillOptions {
+            keep_last: 0,
+            ..Default::default()
+        };
+        let make_edit_session =
+            |named_hint: &str, target_path: &str, sess_cwd: Option<std::path::PathBuf>, origin: Origin| {
+                let mut s = Session::new("contain-check", Harness::Claude);
+                s.cwd = sess_cwd;
+                let mut prompt = Message::of_kind(Role::User, MessageKind::Prompt, origin);
+                prompt
+                    .content
+                    .push(text(&format!("Your state file is `{named_hint}`.")));
+                s.messages = vec![
+                    prompt,
+                    msg(
+                        Role::Assistant,
+                        MessageKind::Reply,
+                        vec![Block::ToolUse {
+                            id: "e1".into(),
+                            name: "Edit".into(),
+                            input: json!({"file_path": target_path}).into(),
+                            namespace: None,
+                            extensions: Default::default(),
+                        }],
+                    ),
+                    msg(Role::Tool, MessageKind::ToolResult, vec![result("e1", "ok", false)]),
+                ];
+                s
+            };
+
+        // 1. Direct path outside `session.cwd` matching bare basename (`secret.txt` / `scratch_state.md`).
+        for target in [outside_secret.to_str().unwrap(), outside_state.to_str().unwrap()] {
+            let s = make_edit_session("/claimed/dir/secret.txt", target, Some(cwd.clone()), Origin::Human);
+            let d = distill_pack(&s, &opts)?;
+            assert!(
+                !d.head_md.contains(canary),
+                "leaked file outside session.cwd ({target}):\n{}",
+                d.head_md
+            );
+        }
+
+        // 2. Missing `session.cwd` (`None`) must never read live disk files, even inside `world.base`.
+        let inside_file = cwd.join("secret.txt");
+        std::fs::write(&inside_file, "LOCAL_WORKSPACE_STATE_OK")?;
+        let inside_str = inside_file.to_str().unwrap();
+        let s_no_cwd = make_edit_session(inside_str, inside_str, None, Origin::Human);
+        let d_no_cwd = distill_pack(&s_no_cwd, &opts)?;
+        assert!(
+            !d_no_cwd.head_md.contains("LOCAL_WORKSPACE_STATE_OK"),
+            "missing session.cwd must disallow live disk reads:\n{}",
+            d_no_cwd.head_md
+        );
+
+        // 3. Imported (`Origin::Import`), `OpenSession`, custody-view, or remote-producer sessions
+        //    must never read live disk files even when `session.cwd` contains `inside_file`.
+        let s_import = make_edit_session(inside_str, inside_str, Some(cwd.clone()), Origin::Import);
+        assert!(!distill_pack(&s_import, &opts)?
+            .head_md
+            .contains("LOCAL_WORKSPACE_STATE_OK"));
+
+        let mut s_custody = make_edit_session(inside_str, inside_str, Some(cwd.clone()), Origin::Human);
+        s_custody.source_path = Some(world.base.join("packs/.custody-view/claude/contain-check.jsonl"));
+        assert!(!distill_pack(&s_custody, &opts)?
+            .head_md
+            .contains("LOCAL_WORKSPACE_STATE_OK"));
+
+        let mut s_remote = make_edit_session(inside_str, inside_str, Some(cwd.clone()), Origin::Human);
+        s_remote
+            .extra
+            .insert("producer_id".into(), Value::String("prod-remote".into()));
+        assert!(!distill_pack(&s_remote, &opts)?
+            .head_md
+            .contains("LOCAL_WORKSPACE_STATE_OK"));
+
+        // 4. Symlink inside `session.cwd` (both leaf symlink and parent-directory symlink) pointing
+        //    to `outside/secret.txt` must read zero bytes from outside `session.cwd`.
+        #[cfg(unix)]
+        {
+            let leaf_link = cwd.join("link_secret.txt");
+            std::os::unix::fs::symlink(&outside_secret, &leaf_link)?;
+            let leaf_str = leaf_link.to_str().unwrap();
+            let s_leaf = make_edit_session(leaf_str, leaf_str, Some(cwd.clone()), Origin::Human);
+            let d_leaf = distill_pack(&s_leaf, &opts)?;
+            assert!(
+                !d_leaf.head_md.contains(canary),
+                "leaf symlink escaped:\n{}",
+                d_leaf.head_md
+            );
+
+            let dir_link = cwd.join("escaped_dir");
+            std::os::unix::fs::symlink(&outside, &dir_link)?;
+            let nested_target = dir_link.join("secret.txt");
+            let nested_str = nested_target.to_str().unwrap();
+            let s_dir = make_edit_session(nested_str, nested_str, Some(cwd.clone()), Origin::Human);
+            let d_dir = distill_pack(&s_dir, &opts)?;
+            assert!(
+                !d_dir.head_md.contains(canary),
+                "directory symlink escaped:\n{}",
+                d_dir.head_md
+            );
+        }
+
+        // Positive control: genuine local `Origin::Human` session with regular file inside `session.cwd` works.
+        let s_ok = make_edit_session(inside_str, inside_str, Some(cwd), Origin::Human);
+        assert!(distill_pack(&s_ok, &opts)?.head_md.contains("LOCAL_WORKSPACE_STATE_OK"));
         Ok(())
     }
 
