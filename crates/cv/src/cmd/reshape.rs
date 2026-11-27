@@ -147,6 +147,7 @@ pub(crate) struct PruneArgs<'a> {
     pub copy_resources: bool,
     pub carry_agents: Option<CarryAgents>,
     pub revive: bool,
+    pub revive_estimate: bool,
     pub window: Option<u64>,
     pub keep: Option<String>,
     pub declassify: bool,
@@ -182,6 +183,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         copy_resources,
         carry_agents,
         revive,
+        revive_estimate,
         window,
         keep,
         declassify,
@@ -233,6 +235,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
             (copy_resources, "--copy-resources"),
             (carry_agents.is_some(), "--carry-agents"),
             (skills_policy != SkillsPolicy::Keep, "--skills"),
+            (revive_estimate, "--revive-estimate"),
         ];
         if let Some((_, flag)) = native_only.iter().find(|(set, _)| *set) {
             return usage(format!(
@@ -266,6 +269,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         new_id: to,
         copy_resources,
         revive,
+        revive_estimate,
         window,
         keep_range,
         declassify,
@@ -378,7 +382,17 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
                 );
             }
             _ => {
-                let _ = writeln!(h, "  revive: no recorded usage required an estimated-window rewrite");
+                if let Some(overhead) = res.inherited_usage_warning {
+                    let _ = writeln!(
+                        h,
+                        "  ⚠ recorded prompt size implies ~{}k fixed-overhead tokens above visible turns \
+                         (likely inherited from a fold/splice without a compaction boundary); \
+                         pass --revive-estimate to rewrite from visible content",
+                        overhead / 1000,
+                    );
+                } else {
+                    let _ = writeln!(h, "  revive: no recorded usage required an estimated-window rewrite");
+                }
             }
         }
     }

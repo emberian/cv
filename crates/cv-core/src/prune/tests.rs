@@ -340,6 +340,126 @@ fn revive_rewrites_stale_usage_below_loaded_content() {
 }
 
 #[test]
+fn revive_handles_multi_record_post_boundary_carry_and_revive_estimate_without_boundary() {
+    let world = crate::test_world("prune-issue-40");
+    let dir = world.proj.clone();
+    let sid = "40404040-4040-4040-8040-404040404040";
+    let line = |uuid: &str, parent: Option<&str>, role: &str, content: Value, usage: Option<Value>| {
+        let mut m = serde_json::json!({"role": role, "model": "claude-opus-5", "content": content});
+        if let Some(u) = usage {
+            m["usage"] = u;
+        }
+        serde_json::json!({"type": role, "sessionId": sid, "uuid": uuid, "parentUuid": parent,
+            "timestamp": "2026-11-01T00:00:00Z", "message": m})
+    };
+    let u = |ctx: u64| {
+        serde_json::json!({"input_tokens": 100, "cache_read_input_tokens": ctx - 100,
+            "cache_creation_input_tokens": 0, "output_tokens": 25})
+    };
+
+    // 1. External fold/splice without `compact_boundary` carrying two inherited wall records (922,155 and 976,850):
+    // default prune warns with implied overhead, while `--revive-estimate` rewrites both down to ~21k.
+    let no_boundary = dir.join(format!("{sid}.jsonl"));
+    let folded_lines = [
+        line("u1", None, "user", serde_json::json!("folded summary prompt"), None),
+        line(
+            "a1",
+            Some("u1"),
+            "assistant",
+            serde_json::json!([{"type": "text", "text": "acknowledge folded summary"}]),
+            Some(u(922_155)),
+        ),
+        line(
+            "u2",
+            Some("a1"),
+            "user",
+            serde_json::json!("continue implementation"),
+            None,
+        ),
+        line(
+            "a2",
+            Some("u2"),
+            "assistant",
+            serde_json::json!([{"type": "text", "text": "ready to proceed"}]),
+            Some(u(976_850)),
+        ),
+    ];
+    std::fs::write(
+        &no_boundary,
+        folded_lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+
+    let dry = prune_session(
+        crate::Harness::Claude,
+        &no_boundary,
+        &PruneOptions {
+            revive: true,
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(dry.usage_rewritten, 0);
+    let implied = dry.inherited_usage_warning.expect("must warn on inherited 922k usage");
+    assert!(implied > 900_000, "unexpected implied overhead {implied}");
+
+    let estimated = prune_session(
+        crate::Harness::Claude,
+        &no_boundary,
+        &PruneOptions {
+            revive_estimate: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(estimated.usage_rewritten, 2);
+    assert_eq!(estimated.revive_old_tokens, Some(976_850));
+    assert!(estimated.inherited_usage_warning.is_none());
+    let after = estimated.revive_tokens.expect("rewritten tokens");
+    assert!((20_000..25_000).contains(&after), "expected ~21k-23k, got {after}");
+    assert_eq!(estimated.last_request_tokens_after, Some(after));
+
+    // 2. With a `compact_boundary` before two inherited records (922,155 then 976,850), default revive
+    // drops all implausible leading post-boundary responses and rewrites both automatically!
+    let sid2 = "40404040-4040-4040-8040-404040404041";
+    let with_boundary = dir.join(format!("{sid2}.jsonl"));
+    let boundary_lines = [
+        serde_json::json!({"type": "system", "subtype": "compact_boundary", "sessionId": sid2, "uuid": "b0",
+            "timestamp": "2026-11-01T00:00:00Z"}),
+        serde_json::json!({"type": "user", "sessionId": sid2, "uuid": "u1", "parentUuid": "b0",
+            "message": {"role": "user", "content": "post-boundary summary"}}),
+        serde_json::json!({"type": "assistant", "sessionId": sid2, "uuid": "a1", "parentUuid": "u1",
+            "message": {"role": "assistant", "model": "claude-opus-5", "content": [{"type": "text", "text": "ok"}], "usage": u(922_155)}}),
+        serde_json::json!({"type": "user", "sessionId": sid2, "uuid": "u2", "parentUuid": "a1",
+            "message": {"role": "user", "content": "next step"}}),
+        serde_json::json!({"type": "assistant", "sessionId": sid2, "uuid": "a2", "parentUuid": "u2",
+            "message": {"role": "assistant", "model": "claude-opus-5", "content": [{"type": "text", "text": "done"}], "usage": u(976_850)}}),
+    ];
+    std::fs::write(
+        &with_boundary,
+        boundary_lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let auto_revived = prune_session(
+        crate::Harness::Claude,
+        &with_boundary,
+        &PruneOptions {
+            revive: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(auto_revived.usage_rewritten, 2);
+    assert_eq!(auto_revived.revive_old_tokens, Some(976_850));
+    let auto_after = auto_revived.revive_tokens.expect("auto rewritten");
+    assert!(
+        (20_000..25_000).contains(&auto_after),
+        "expected ~21k-23k, got {auto_after}"
+    );
+}
+
+#[test]
 fn usage_total_reads_the_last_request_iteration_like_claude_code() {
     // Claude Code ≥ 2.1.277 sizes context from `usage.iterations` (the last non-advisor/compaction
     // request) — the top-level counters are only a fallback. cv must see the same number.
@@ -1773,8 +1893,13 @@ fn staged_usage_projection_preserves_mixed_raw_framing_and_source_guard() -> Res
     let mut stage = ByteStage::new();
     stage.write_all(raw.as_bytes())?;
     let facts = [None, fixture_decisions(std::slice::from_ref(&row)).remove(0), None];
-    let (output, rewritten, honest, stale) =
-        revive_staged(&source, stage.finish()?, &facts, &[false; 3], None, true, None)?;
+    let ReviveOutcome {
+        output,
+        rewritten,
+        honest_tokens: honest,
+        stale_max: stale,
+        ..
+    } = revive_staged(&source, stage.finish()?, &facts, &[false; 3], None, true, None, false)?;
     assert_eq!(rewritten, 1);
     assert_eq!(stale, Some(900));
     row["_cv_orig_ctx"] = Value::from(900);
@@ -1789,7 +1914,7 @@ fn staged_usage_projection_preserves_mixed_raw_framing_and_source_guard() -> Res
     let mut stage = ByteStage::new();
     stage.write_all(raw.as_bytes())?;
     std::fs::write(&path, b"changed source")?;
-    assert!(revive_staged(&source, stage.finish()?, &facts, &[false; 3], None, true, None).is_err());
+    assert!(revive_staged(&source, stage.finish()?, &facts, &[false; 3], None, true, None, false).is_err());
     Ok(())
 }
 
@@ -1804,7 +1929,12 @@ fn staged_usage_trim_preserves_whitespace_only_buffers_and_eof_failure() -> Resu
     let facts = [fixture_decisions(std::slice::from_ref(&row)).remove(0)];
     let mut stage = ByteStage::new();
     stage.write_all(raw.as_bytes())?;
-    let (output, rewritten, honest, _) = revive_staged(&source, stage.finish()?, &facts, &[false], None, true, None)?;
+    let ReviveOutcome {
+        output,
+        rewritten,
+        honest_tokens: honest,
+        ..
+    } = revive_staged(&source, stage.finish()?, &facts, &[false], None, true, None, false)?;
     assert_eq!(rewritten, 1);
     let mut expected = row;
     expected["_cv_orig_ctx"] = Value::from(900);
@@ -1818,7 +1948,7 @@ fn staged_usage_trim_preserves_whitespace_only_buffers_and_eof_failure() -> Resu
     // The producer promises newline framing; truncated private rows still fail at EOF.
     let mut stage = ByteStage::new();
     stage.write_all(raw.trim_end_matches('\n').as_bytes())?;
-    assert!(revive_staged(&source, stage.finish()?, &facts, &[false], None, true, None).is_err());
+    assert!(revive_staged(&source, stage.finish()?, &facts, &[false], None, true, None, false).is_err());
     Ok(())
 }
 

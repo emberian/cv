@@ -578,6 +578,11 @@ enum Cmd {
         /// figure — a no-op when the recorded size is already honest. (Source untouched.)
         #[arg(long)]
         no_revive: bool,
+        /// Size revived `usage` records outright from visible transcript content plus default
+        /// system overhead instead of anchoring on recorded prompt usage (for transcripts folded
+        /// or spliced externally without a `compact_boundary`).
+        #[arg(long, conflicts_with = "no_revive")]
+        revive_estimate: bool,
         /// Sliding window: keep only the NEWEST turns totalling ≤ this many REAL tokens, dropping
         /// older turns (lossy — the source keeps the full history). Sized from Claude's OWN recorded
         /// `usage` counts (no byte/tokenizer estimation), so the budget lands true; the resumed
@@ -1618,6 +1623,7 @@ fn run() -> Result<()> {
             copy_resources,
             carry_agents,
             no_revive,
+            revive_estimate,
             window,
             keep,
             declassify,
@@ -1641,6 +1647,7 @@ fn run() -> Result<()> {
             copy_resources,
             carry_agents: carry_agents.as_deref().map(str::parse).transpose()?,
             revive: !no_revive,
+            revive_estimate,
             window,
             keep,
             declassify,

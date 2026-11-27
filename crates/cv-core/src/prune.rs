@@ -85,6 +85,10 @@ pub struct PruneOptions {
     /// replacement; it is not provider-measured new usage and does not verify resume acceptance.
     /// Off by default at the core level. Only the new transcript's metadata is changed.
     pub revive: bool,
+    /// Size revived `message.usage` records outright from visible transcript content plus default
+    /// fixed overhead instead of anchoring on recorded prompt usage (for transcripts folded or
+    /// spliced externally without a `compact_boundary`). Implies `revive`.
+    pub revive_estimate: bool,
     /// Sliding window: keep only the NEWEST conversational turns whose content sums to **≤ this many
     /// tokens**, dropping older turns entirely (lossy — but the source session is never touched, so it
     /// stays the full backup). The kept tail is re-rooted into a standalone resumable session. If even
@@ -133,6 +137,7 @@ impl Default for PruneOptions {
             new_id: None,
             copy_resources: false,
             revive: false,
+            revive_estimate: false,
             window: None,
             keep_range: None,
             declassify: false,
@@ -220,6 +225,10 @@ pub struct PruneResult {
     /// turns to break even on the cache it invalidates. Advice, not a data-safety warning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_warning: Option<String>,
+    /// Implied fixed-overhead tokens when default revive left a window without a compaction
+    /// boundary unrewritten despite recorded prompt usage far above visible content (`#40`).
+    #[serde(rename = "inherited_overhead_tokens", skip_serializing_if = "Option::is_none")]
+    pub inherited_usage_warning: Option<u64>,
 }
 
 /// Prompt-cache write price, as a multiple of the input price.
@@ -668,6 +677,16 @@ fn prune_session_after_stage(
     opts: &PruneOptions,
     after_stage: impl FnOnce() -> Result<()>,
 ) -> Result<PruneResult> {
+    let opts_owned;
+    let opts = if opts.revive_estimate && !opts.revive {
+        opts_owned = PruneOptions {
+            revive: true,
+            ..opts.clone()
+        };
+        &opts_owned
+    } else {
+        opts
+    };
     if let Some(id) = &opts.new_id {
         crate::publish::validate_output_id(id)?;
     }
@@ -1176,7 +1195,13 @@ fn prune_session_after_stage(
     source.check_metadata(file.metadata()?)?;
     source.check()?;
     let output = output.into_inner().map_err(|e| e.into_error())?.finish()?;
-    let (output, usage_rewritten, revive_tokens, revive_old_tokens) = if opts.revive {
+    let ReviveOutcome {
+        output,
+        rewritten: usage_rewritten,
+        honest_tokens: revive_tokens,
+        stale_max: revive_old_tokens,
+        inherited_warning: inherited_usage_warning,
+    } = if opts.revive {
         revive_staged(
             &source,
             output,
@@ -1185,9 +1210,16 @@ fn prune_session_after_stage(
             before.as_deref(),
             windowing,
             window_real,
+            opts.revive_estimate,
         )?
     } else {
-        (output, 0, None, None)
+        ReviveOutcome {
+            output,
+            rewritten: 0,
+            honest_tokens: None,
+            stale_max: None,
+            inherited_warning: None,
+        }
     };
     // `--drop-thinking` empties thinking-only records and `--plan` drops records; they go,
     // their children relinked.
@@ -1329,6 +1361,7 @@ fn prune_session_after_stage(
         headroom_gained_tokens: saved_now,
         cache_cold,
         cache_warning,
+        inherited_usage_warning,
         source_id,
         parent_session_id,
         new_id,
@@ -2648,13 +2681,21 @@ impl<W: Write> Write for MarkerWriter<'_, W> {
     }
 }
 
+struct ReviveOutcome {
+    output: ByteSource,
+    rewritten: usize,
+    honest_tokens: Option<u64>,
+    stale_max: Option<u64>,
+    inherited_warning: Option<u64>,
+}
+
 /// Rewrite trailing recorded usage using an estimated post-prune prompt size (`--revive`).
 /// Claude Code checks saved usage before making another provider request. The estimate combines
 /// recorded-usage deltas across transcript spans with byte estimates for the content after the last
 /// compaction boundary, preferring available recorded evidence. Trailing records that exceed this
 /// estimate are rewritten (including nested iteration usage). This changes saved gate metadata;
 /// it neither measures the new request nor verifies provider acceptance or behavior on resume.
-/// Returns `(records rewritten, estimated tokens written, prior maximum recorded tokens)`.
+#[allow(clippy::too_many_arguments)]
 fn revive_staged(
     source: &crate::json::JsonSource,
     output: ByteSource,
@@ -2663,7 +2704,8 @@ fn revive_staged(
     before: Option<&[Option<Est>]>,
     windowed: bool,
     real_override: Option<u64>,
-) -> Result<(ByteSource, usize, Option<u64>, Option<u64>)> {
+    revive_estimate: bool,
+) -> Result<ReviveOutcome> {
     let window = if windowed {
         0
     } else {
@@ -2672,11 +2714,24 @@ fn revive_staged(
             .rposition(|p| p.as_ref().is_some_and(|v| v.facts.is_compact_boundary()))
             .map_or(0, |i| i + 1)
     };
-    let honest = before
-        .filter(|before| before.len() == parsed.len())
-        .and_then(|before| anchored_window_tokens(parsed, before, window))
-        .unwrap_or_else(|| honest_window_tokens(parsed, pruned, window, window == 0 && !windowed))
-        .max(real_override.unwrap_or(0));
+    let (honest, min_implied_overhead) = if revive_estimate {
+        (
+            outright_window_tokens(parsed, window)
+                .unwrap_or_else(|| honest_window_tokens(parsed, pruned, window, false)),
+            None,
+        )
+    } else {
+        match before
+            .filter(|before| before.len() == parsed.len())
+            .and_then(|before| anchored_window_tokens(parsed, before, window))
+        {
+            Some((est, overhead)) => (est.max(real_override.unwrap_or(0)), overhead),
+            None => (
+                honest_window_tokens(parsed, pruned, window, window == 0 && !windowed).max(real_override.unwrap_or(0)),
+                None,
+            ),
+        }
+    };
     let mut rewritten = 0;
     let mut stale_max = 0;
     let mut stage = std::io::BufWriter::with_capacity(64 * 1024, ByteStage::new());
@@ -2732,12 +2787,17 @@ fn revive_staged(
             stale_max = stale_max.max(total);
         }
     }
-    Ok((
-        stage.into_inner().map_err(|e| e.into_error())?.finish()?,
+    let inherited_warning = (window == 0 && !windowed && !revive_estimate && rewritten == 0)
+        .then_some(min_implied_overhead)
+        .flatten()
+        .filter(|&o| o > MAX_FIXED_OVERHEAD_TOKENS);
+    Ok(ReviveOutcome {
+        output: stage.into_inner().map_err(|e| e.into_error())?.finish()?,
         rewritten,
-        (rewritten > 0).then_some(honest),
-        (rewritten > 0).then_some(stale_max),
-    ))
+        honest_tokens: (rewritten > 0).then_some(honest),
+        stale_max: (rewritten > 0).then_some(stale_max),
+        inherited_warning,
+    })
 }
 
 /// Keep source bodies untouched while applying the established owned usage correction. Only
@@ -2810,19 +2870,58 @@ const SIGNATURE_CREDIT: f64 = 0.6;
 /// The fixed prompt (system prompt, tool definitions) when no trustworthy recorded prompt implies
 /// it: Claude Code 2.1.299 sent 19–36k tokens of it with no MCP servers configured.
 const UNKNOWN_OVERHEAD_TOKENS: u64 = 20_000;
+/// Largest plausible fixed prompt overhead (system prompt + tool schemas + CLAUDE.md). Recorded
+/// prompt sizes exceeding visible content by more than this come from pre-compaction / pre-fold
+/// history held outside the window (`#40`).
+const MAX_FIXED_OVERHEAD_TOKENS: u64 = 150_000;
+
+/// Outright post-prune window estimate (`--revive-estimate`): [`UNKNOWN_OVERHEAD_TOKENS`] plus
+/// visible content on the resumed branch, ignoring inherited recorded prompt usage.
+fn outright_window_tokens(parsed: &[Option<Decision>], window: usize) -> Option<u64> {
+    let chain = resumed_branch(parsed, window);
+    let main = |i: usize| {
+        parsed[i]
+            .as_ref()
+            .filter(|v| !v.sidechain() && chain.as_ref().is_none_or(|c| c.contains(&i)))
+    };
+    let mut any = false;
+    let mut whole = Est::default();
+    for i in window..parsed.len() {
+        if let Some(v) = main(i) {
+            any = true;
+            whole.add(v.est);
+        }
+    }
+    if !any {
+        return None;
+    }
+    let model = (window..parsed.len())
+        .rev()
+        .filter_map(main)
+        .find_map(|v| v.facts.model.as_deref().filter(|m| *m != "<synthetic>"))
+        .unwrap_or("");
+    let scale = crate::ir::tokenizer_scale(model);
+    let estimate = (UNKNOWN_OVERHEAD_TOKENS + whole.total()) as f64 / scale;
+    Some((estimate * (1.0 + REVIVE_SAFETY_MARGIN)).ceil() as u64)
+}
 
 /// The post-prune prompt size, anchored on recorded usage: the last recorded prompt, adjusted by
 /// what pruning changed before it, plus everything after it; floored by an outright estimate of
 /// the resumed branch plus the fixed overhead the recorded prompts imply.
 ///
-/// A recorded prompt is not evidence when it is the first after the window's compaction boundary:
-/// it still carries the pre-compaction size revive exists to correct. With no other, only the
-/// outright estimate stands.
+/// Leading recorded prompts after a compaction boundary that still carry pre-compaction sizes
+/// (the first unconditionally, plus any subsequent leading responses implying more than
+/// [`MAX_FIXED_OVERHEAD_TOKENS`]) are dropped. With no remaining response, only the outright
+/// estimate stands.
 ///
 /// Removed thinking signatures are credited only for [`SIGNATURES_COUNTED`] models; everywhere
 /// else they are still counted as present (the estimate errs high). `None` when the window holds
-/// no turns.
-fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], window: usize) -> Option<u64> {
+/// no turns; otherwise `(estimated_window_tokens, min_implied_overhead)`.
+fn anchored_window_tokens(
+    parsed: &[Option<Decision>],
+    before: &[Option<Est>],
+    window: usize,
+) -> Option<(u64, Option<u64>)> {
     // Claude Code resumes the branch ending at the newest turn; records on abandoned branches
     // (edits, rewinds) are not sent, so their pruning frees nothing.
     let chain = resumed_branch(parsed, window);
@@ -2845,6 +2944,23 @@ fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], w
     }
     if window > 0 && !responses.is_empty() {
         responses.remove(0);
+        let mut lead_prefix = Est::default();
+        let mut lead_next = window;
+        let mut drop_count = 0;
+        for &(at, total) in &responses {
+            for i in lines(lead_next, at) {
+                lead_prefix.add(pre(i));
+            }
+            lead_next = at;
+            if total.saturating_sub(Est::total(lead_prefix)) > MAX_FIXED_OVERHEAD_TOKENS {
+                drop_count += 1;
+            } else {
+                break;
+            }
+        }
+        if drop_count > 0 {
+            responses.drain(..drop_count);
+        }
     }
     let model = (window..parsed.len())
         .rev()
@@ -2896,6 +3012,7 @@ fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], w
     for i in lines(window, parsed.len()) {
         whole.add(post(i));
     }
+    let min_implied_overhead = overhead;
     let overhead = overhead.unwrap_or(UNKNOWN_OVERHEAD_TOKENS);
     let mut estimate = (overhead + size(whole)) as f64 / scale;
 
@@ -2922,7 +3039,10 @@ fn anchored_window_tokens(parsed: &[Option<Decision>], before: &[Option<Est>], w
         }
         estimate = estimate.max(anchored);
     }
-    Some((estimate * (1.0 + REVIVE_SAFETY_MARGIN)).ceil() as u64)
+    Some((
+        (estimate * (1.0 + REVIVE_SAFETY_MARGIN)).ceil() as u64,
+        min_implied_overhead,
+    ))
 }
 
 /// Record indices on the branch ending at the window's newest turn, walking `parentUuid` (or

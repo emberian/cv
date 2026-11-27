@@ -481,6 +481,79 @@ fn spliced_claude_compaction_boundary_reports_zero_spurious_fidelity_deltas() {
 
 // ───────────────────────────── prune: the count it prints ─────────────────────────────
 
+#[test]
+fn prune_warns_on_inherited_usage_without_boundary_and_revive_estimate_rewrites_it() {
+    const SID: &str = "5e1ec7ed-0000-4000-8000-000000000040";
+    let w = World::new("prune-inherited-40");
+    let usage = |ctx: u64| {
+        json!({"input_tokens": 100, "cache_read_input_tokens": ctx - 100,
+        "cache_creation_input_tokens": 0, "output_tokens": 30})
+    };
+    let record = |ty: &str, uuid: &str, parent: Option<&str>, content: Value, usage: Option<Value>| {
+        let mut v = json!({"type": ty, "uuid": uuid, "parentUuid": parent, "sessionId": SID,
+            "timestamp": "2026-11-01T08:00:00Z", "cwd": "/work/proj",
+            "message": {"role": ty, "model": "claude-opus-5", "content": content}});
+        if let Some(usage) = usage {
+            v["message"]["usage"] = usage;
+        }
+        v
+    };
+    w.write_session(
+        SID,
+        &[
+            record("user", "u1", None, json!("folded summary context"), None),
+            record(
+                "assistant",
+                "a1",
+                Some("u1"),
+                json!([{"type": "text", "text": "noted"}]),
+                Some(usage(922_155)),
+            ),
+            record("user", "u2", Some("a1"), json!("ship the fix"), None),
+            record(
+                "assistant",
+                "a2",
+                Some("u2"),
+                json!([{"type": "text", "text": "shipping"}]),
+                Some(usage(976_850)),
+            ),
+        ],
+    );
+
+    // Default `cv prune --dry-run` warns about implausible inherited overhead and names `--revive-estimate`.
+    let (dry_out, dry_err) = w.cv_ok(&["prune", SID, "--dry-run", "--json"]);
+    let dry_report: Value = serde_json::from_str(dry_out.trim()).unwrap();
+    assert!(
+        dry_report["inherited_overhead_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 900_000),
+        "{dry_report}"
+    );
+    assert!(
+        dry_err.contains("--revive-estimate") && dry_err.contains("fixed-overhead tokens above visible turns"),
+        "{dry_err}"
+    );
+    assert!(
+        !dry_err.contains("no recorded usage required an estimated-window rewrite"),
+        "{dry_err}"
+    );
+
+    // Passing `--revive-estimate` rewrites 922k and 976k down to ~21k-25k.
+    let (est_out, est_err) = w.cv_ok(&["prune", SID, "--revive-estimate", "--json"]);
+    let est_report: Value = serde_json::from_str(est_out.trim()).unwrap();
+    assert_eq!(est_report["revived"]["usage_records_rewritten"], 2, "{est_report}");
+    assert_eq!(est_report["revived"]["recorded_tokens_before"], 976_850, "{est_report}");
+    let after = est_report["revived"]["recorded_tokens_after"].as_u64().unwrap();
+    assert!((20_000..25_000).contains(&after), "{est_report}");
+    assert_eq!(est_report["resume_reads_tokens_after"], after, "{est_report}");
+    assert!(est_report.get("inherited_overhead_tokens").is_none(), "{est_report}");
+    assert!(est_err.contains("2 usage record(s)"), "{est_err}");
+
+    // `--revive-estimate` conflicts with `--no-revive`.
+    let (ok, code, _, conflict_err) = w.cv(&["prune", SID, "--revive-estimate", "--no-revive"]);
+    assert!(!ok && code == 2, "{conflict_err}");
+}
+
 /// A session whose context shrank before the prune: an early request recorded 900k, the last
 /// one 500k. Revive rewrites the records above its estimate; the harness sizes a resume by the
 /// LAST record. The report names both, and skips a trailing thinking-only record removed by
