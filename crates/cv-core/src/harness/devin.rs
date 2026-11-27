@@ -607,6 +607,210 @@ fn child_ref(
     })
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SessionListing(Vec<ListedSession>);
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ListedSession {
+    id: String,
+    cwd: Option<PathBuf>,
+    title: Option<String>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    message_count: Option<usize>,
+}
+
+impl super::store::sqlite::listing::Listing for SessionListing {
+    const TAG: &'static str = "devin-listing";
+}
+
+struct DiscoverRow {
+    id: String,
+    wd: Option<String>,
+    title: Option<String>,
+    created: Option<i64>,
+    last: Option<i64>,
+    main_chain_id: Option<i64>,
+}
+
+fn discover_session_sql(
+    conn: &Connection,
+    has_subagent_heads: bool,
+    has_node_meta: bool,
+    row: DiscoverRow,
+) -> Result<Vec<ListedSession>> {
+    let DiscoverRow {
+        id,
+        wd,
+        title,
+        created,
+        last,
+        main_chain_id,
+    } = row;
+    let id = id.as_str();
+    let mut parents: HashMap<i64, Option<i64>> = HashMap::new();
+    {
+        let mut stmt =
+            conn.prepare_cached("SELECT node_id, parent_node_id FROM message_nodes WHERE session_id = ?1")?;
+        let rows = stmt.query_map([id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)))?;
+        for row in rows {
+            let (node, parent) = row?;
+            parents.insert(node, parent);
+        }
+    }
+
+    let head = match main_chain_id {
+        Some(h) if parents.contains_key(&h) => Some(h),
+        _ => parents.keys().max().copied(),
+    };
+
+    let mut heads: Vec<(String, i64, Option<i64>)> = Vec::new();
+    if has_subagent_heads {
+        let mut stmt = conn
+            .prepare_cached("SELECT agent_id, chain_node_id, updated_at FROM subagent_heads WHERE session_id = ?1")?;
+        let rows = stmt.query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2).ok().flatten(),
+            ))
+        })?;
+        for row in rows {
+            heads.push(row?);
+        }
+    }
+    {
+        let listed: HashSet<String> = heads.iter().map(|(a, ..)| a.clone()).collect();
+        let mut from_tools: Vec<(String, i64, Option<i64>)> = Vec::new();
+        let mut at_index: HashMap<String, usize> = HashMap::new();
+        let mut stmt = conn.prepare_cached(
+            "SELECT created_at, chat_message FROM message_nodes \
+             WHERE session_id = ?1 AND typeof(chat_message) = 'text' \
+             AND instr(chat_message, 'subagent/chain_node_id') > 0 \
+             ORDER BY node_id",
+        )?;
+        let mut rows = stmt.query([id])?;
+        while let Some(row) = rows.next()? {
+            let at = row.get::<_, Option<i64>>(0).ok().flatten();
+            let raw: String = row.get(1)?;
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if val.get("role").and_then(Value::as_str) != Some("tool") {
+                continue;
+            }
+            let ext = val.get("metadata").and_then(|m| m.get("extensions"));
+            let Some(agent) = ext.and_then(|e| e.get("subagent/agent_id")).and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(child_head) = ext
+                .and_then(|e| e.get("subagent/chain_node_id"))
+                .and_then(Value::as_i64)
+            else {
+                continue;
+            };
+            if listed.contains(agent) {
+                continue;
+            }
+            match at_index.get(agent) {
+                Some(&i) if child_head > from_tools[i].1 => {
+                    from_tools[i] = (agent.to_string(), child_head, at);
+                }
+                Some(_) => {}
+                None => {
+                    at_index.insert(agent.to_string(), from_tools.len());
+                    from_tools.push((agent.to_string(), child_head, at));
+                }
+            }
+        }
+        heads.extend(from_tools);
+    }
+
+    let parent_chain = head.map(|h| chain_to_root(&parents, h)).unwrap_or_default();
+    let live_children: Vec<(String, Vec<i64>, Option<i64>)> = heads
+        .into_iter()
+        .filter(|(_, child_head, _)| parents.contains_key(child_head))
+        .map(|(agent, child_head, updated)| (agent, chain_to_root(&parents, child_head), updated))
+        .collect();
+
+    let mut needed: HashSet<i64> = parent_chain.iter().copied().collect();
+    for (_, chain, _) in &live_children {
+        needed.extend(chain.iter().copied());
+    }
+
+    let mut turn_nodes: HashSet<i64> = HashSet::new();
+    if !needed.is_empty() {
+        let mut sorted_nodes: Vec<i64> = needed.into_iter().collect();
+        sorted_nodes.sort_unstable();
+        let nodes_json = serde_json::to_string(&sorted_nodes)?;
+        let summary_expr = if has_node_meta {
+            "CASE WHEN typeof(metadata) = 'text' AND json_valid(metadata) AND json_type(metadata) = 'object' \
+             THEN (json_type(metadata, '$.summarized_from') IS NOT NULL AND json_type(metadata, '$.summarized_from') != 'null') \
+             ELSE 0 END"
+        } else {
+            "0"
+        };
+        let sql = format!(
+            "SELECT node_id, \
+                    CASE WHEN typeof(chat_message) = 'text' AND json_valid(chat_message) AND json_type(chat_message) = 'object' \
+                         THEN CASE json_extract(chat_message, '$.role') \
+                              WHEN 'assistant' THEN 1 \
+                              WHEN 'user' THEN (json_type(chat_message, '$.metadata.is_user_input') = 'true') \
+                              ELSE 0 \
+                         END \
+                         ELSE 0 \
+                    END AS is_turn, \
+                    {summary_expr} AS is_summary \
+             FROM message_nodes \
+             WHERE session_id = ?1 AND node_id IN (SELECT value FROM json_each(?2))"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(rusqlite::params![id, nodes_json])?;
+        while let Some(row) = rows.next()? {
+            let node_id: i64 = row.get(0)?;
+            let is_turn: bool = row.get::<_, i64>(1).unwrap_or(0) != 0;
+            let is_summary: bool = row.get::<_, i64>(2).unwrap_or(0) != 0;
+            if is_turn && !is_summary {
+                turn_nodes.insert(node_id);
+            }
+        }
+    }
+
+    let cwd = wd.filter(|s| !s.is_empty()).map(PathBuf::from);
+    let parent_title = title
+        .filter(|s| !s.trim().is_empty())
+        .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE));
+    let created_at = created.and_then(ts_from_epoch);
+    let updated_at = last.and_then(ts_from_epoch).or(created_at);
+    let parent_count = parent_chain.iter().filter(|n| turn_nodes.contains(n)).count();
+
+    let mut out = Vec::with_capacity(1 + live_children.len());
+    out.push(ListedSession {
+        id: id.to_string(),
+        cwd: cwd.clone(),
+        title: parent_title.clone(),
+        created_at,
+        updated_at,
+        message_count: Some(parent_count),
+    });
+    for (agent, chain, updated) in live_children {
+        let child_title = match &parent_title {
+            Some(t) => format!("[{agent}] {t}"),
+            None => format!("[{agent}]"),
+        };
+        let child_count = chain.iter().filter(|n| turn_nodes.contains(n)).count();
+        out.push(ListedSession {
+            id: format!("{id}/{agent}"),
+            cwd: cwd.clone(),
+            title: Some(crate::ir::truncate(&child_title, crate::projection::Head::TITLE)),
+            created_at,
+            updated_at: updated.and_then(ts_from_epoch).or(updated_at),
+            message_count: Some(child_count),
+        });
+    }
+    Ok(out)
+}
+
 fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     let select = Select::of(conn, "sessions")
         .always(&["id", "working_directory"])
@@ -625,28 +829,39 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
             row.get::<_, Option<i64>>(5).ok().flatten(),
         ))
     })?;
+    let has_subagent_heads = table_exists(conn, "subagent_heads");
+    let has_node_meta = super::store::sqlite::columns(conn, "message_nodes").contains("metadata");
+    let certificates = rows_conn(conn).unwrap_or_default();
+    let mut pass = super::store::sqlite::listing::Pass::<SessionListing>::begin(Harness::Devin, db);
     let mut out = Vec::new();
     for row in rows {
         let (id, wd, title, created, last, main_chain_id) = row?;
-        let cells = Cells::new(conn, db, &crate::source::ReadSet::default(), "message_nodes")?;
-        // One forest load serves the parent's count AND its sub-agent children's.
-        let forest = load_forest(conn, &id, &cells)?;
-        let (head, _) = chain_head(&forest, main_chain_id);
-        let parent = SessionRef {
-            cwd: wd.filter(|s| !s.is_empty()).map(PathBuf::from),
-            title: title
-                .filter(|s| !s.trim().is_empty())
-                .map(|t| crate::ir::truncate(&t, crate::projection::Head::TITLE)),
-            created_at: created.and_then(ts_from_epoch),
-            updated_at: last.and_then(ts_from_epoch).or_else(|| created.and_then(ts_from_epoch)),
-            message_count: Some(chain_message_count(&forest, head)),
-            ..SessionRef::new(id.clone(), Harness::Devin, db.to_path_buf())
+        let cert = certificates.get(&id).copied();
+        let row = DiscoverRow {
+            id: id.clone(),
+            wd,
+            title,
+            created,
+            last,
+            main_chain_id,
         };
-        out.push(parent.clone());
-        for (agent, head, updated) in subagent_head_rows(conn, &id, &forest)? {
-            if let Some(r) = child_ref(db, &id, &agent, head, updated, &forest, &parent) {
-                out.push(r);
-            }
+        let listed = pass.list(&id, cert, || {
+            discover_session_sql(conn, has_subagent_heads, has_node_meta, row)
+                .map(SessionListing)
+                .map_err(|_| ())
+        });
+        let Ok(SessionListing(items)) = listed else {
+            anyhow::bail!("failed to list Devin session {id}");
+        };
+        for item in items {
+            out.push(SessionRef {
+                cwd: item.cwd,
+                title: item.title,
+                created_at: item.created_at,
+                updated_at: item.updated_at,
+                message_count: item.message_count,
+                ..SessionRef::new(item.id, Harness::Devin, db.to_path_buf())
+            });
         }
     }
     Ok(out)

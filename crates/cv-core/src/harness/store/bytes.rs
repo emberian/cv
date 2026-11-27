@@ -52,6 +52,7 @@ impl std::io::Write for ScratchWriter<'_> {
 #[derive(Debug)]
 pub(crate) struct Spill {
     pub(crate) file: Option<std::fs::File>,
+    pub(crate) dev: crate::io_admission::DeviceId,
     path: std::path::PathBuf,
     linked: bool,
 }
@@ -63,6 +64,18 @@ thread_local! {
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) fn spills_created() -> usize {
     SPILLS.with(std::cell::Cell::get)
+}
+pub(crate) fn file_dev(file: &std::fs::File) -> std::io::Result<crate::io_admission::DeviceId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(crate::io_admission::DeviceId(file.metadata()?.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(crate::io_admission::DeviceId(0))
+    }
 }
 impl Spill {
     pub(crate) fn create(append: bool) -> std::io::Result<Self> {
@@ -76,8 +89,11 @@ impl Spill {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        let file = options.open(&path)?;
+        let dev = file_dev(&file)?;
         let spill = Self {
-            file: Some(options.open(&path)?),
+            file: Some(file),
+            dev,
             path,
             // Unix unlinks the private path immediately so a reused path survives; other
             // targets unlink on Drop.
@@ -104,8 +120,200 @@ pub struct ByteSource {
 enum Bytes {
     Memory(Vec<u8>),
     File(Spill),
-    Arena { spill: Spill, append: std::sync::Mutex<()> },
+    Arena(Arena),
     Positioned(Box<dyn Positioned>),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Arena {
+    append: std::sync::Mutex<()>,
+    state: std::sync::Mutex<ArenaState>,
+}
+
+#[derive(Debug, Default)]
+struct ArenaState {
+    memory: Vec<u8>,
+    spill: Option<std::sync::Arc<Spill>>,
+    len: u64,
+    file_exposed: bool,
+}
+
+struct ArenaSink<'a>(&'a Arena);
+
+impl std::io::Write for ArenaSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+        let next_len = state
+            .len
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("arena length overflow"))?;
+        if state.spill.is_none() && state.memory.len().saturating_add(bytes.len()) > MEMORY_LIMIT {
+            let spill = Spill::create(true)?;
+            let mut file = spill.file.as_ref().unwrap();
+            file.write_all(&state.memory)?;
+            state.memory = Vec::new();
+            state.spill = Some(std::sync::Arc::new(spill));
+        }
+        if let Some(spill) = &state.spill {
+            let mut file = spill.file.as_ref().unwrap();
+            file.write_all(bytes)?;
+        } else {
+            let required = state.memory.len() + bytes.len();
+            if required > state.memory.capacity() {
+                let capacity = state
+                    .memory
+                    .capacity()
+                    .max(super::IO_CHUNK)
+                    .saturating_mul(2)
+                    .min(MEMORY_LIMIT)
+                    .max(required);
+                let additional = capacity - state.memory.len();
+                state.memory.reserve_exact(additional);
+            }
+            state.memory.extend_from_slice(bytes);
+        }
+        state.len = next_len;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let spill = {
+            let state = self
+                .0
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+            state.spill.clone()
+        };
+        if let Some(spill) = spill {
+            let mut file = spill.file.as_ref().unwrap();
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl Arena {
+    fn append(&self, f: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>) -> anyhow::Result<(u64, u64)> {
+        let _append_guard = self
+            .append
+            .lock()
+            .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+        let offset = self.byte_len()?;
+        // `self.state` is acquired only per chunk inside `ArenaSink`, never held across `f`, so
+        // producer closures reading an earlier range of this same `Arena` cannot deadlock.
+        {
+            use std::io::Write;
+            let mut sink = ArenaSink(self);
+            let mut writer = std::io::BufWriter::with_capacity(super::IO_CHUNK, ScratchWriter::new(&mut sink, false));
+            let produced = f(&mut writer);
+            // Flush before observing the published extent. Failed producer output remains an
+            // unreachable append, and the producer's error takes precedence over a flush error.
+            let flushed = writer.flush();
+            produced?;
+            flushed?;
+        }
+        let end = self.byte_len()?;
+        Ok((offset, end - offset))
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+        if state.file_exposed {
+            if let Some(spill) = &state.spill {
+                return Ok(spill.file.as_ref().unwrap().metadata()?.len());
+            }
+        }
+        Ok(state.len)
+    }
+
+    fn file(&self) -> std::io::Result<(std::fs::File, crate::io_admission::DeviceId)> {
+        use std::io::Write;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+        if state.spill.is_none() {
+            let spill = Spill::create(true)?;
+            let mut file = spill.file.as_ref().unwrap();
+            file.write_all(&state.memory)?;
+            state.memory = Vec::new();
+            state.spill = Some(std::sync::Arc::new(spill));
+        }
+        state.file_exposed = true;
+        let spill = state.spill.as_ref().unwrap();
+        Ok((spill.file.as_ref().unwrap().try_clone()?, spill.dev))
+    }
+
+    pub(crate) fn copy_inline_range(&self, offset: u64, out: &mut [u8]) -> std::io::Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+        if state.spill.is_some() {
+            return Ok(false);
+        }
+        let Some(start) = usize::try_from(offset).ok() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "backing range out of bounds",
+            ));
+        };
+        let Some(end) = start.checked_add(out.len()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backing range overflow",
+            ));
+        };
+        let Some(slice) = state.memory.get(start..end) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "backing range out of bounds",
+            ));
+        };
+        out.copy_from_slice(slice);
+        Ok(true)
+    }
+}
+
+impl Positioned for Arena {
+    fn len(&self) -> u64 {
+        self.byte_len().unwrap_or(0)
+    }
+
+    fn read_at(&self, out: &mut [u8], at: u64) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let spill = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+            match &state.spill {
+                Some(spill) => std::sync::Arc::clone(spill),
+                None => {
+                    let Ok(start) = usize::try_from(at) else {
+                        return Ok(0);
+                    };
+                    if start >= state.memory.len() {
+                        return Ok(0);
+                    }
+                    let n = out.len().min(state.memory.len() - start);
+                    out[..n].copy_from_slice(&state.memory[start..start + n]);
+                    return Ok(n);
+                }
+            }
+        };
+        read_at_dev(spill.file.as_ref().unwrap(), spill.dev, out, at)
+    }
 }
 
 /// Immutable bytes that are neither in memory nor a file of their own, read by position: an
@@ -216,11 +424,18 @@ impl ByteSource {
     pub(crate) fn as_positioned(&self) -> Option<&dyn Positioned> {
         match &self.bytes {
             Bytes::Positioned(source) => Some(source.as_ref()),
+            Bytes::Arena(arena) => Some(arena),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_arena(&self) -> Option<&Arena> {
+        match &self.bytes {
+            Bytes::Arena(arena) => Some(arena),
             _ => None,
         }
     }
     pub(crate) fn is_arena(&self) -> bool {
-        matches!(self.bytes, Bytes::Arena { .. })
+        matches!(self.bytes, Bytes::Arena(_))
     }
     pub(crate) fn memory_bytes(&self) -> Option<&[u8]> {
         match &self.bytes {
@@ -229,57 +444,39 @@ impl ByteSource {
         }
     }
 
-    /// An operation-owned append-only arena. Published prefixes are never overwritten/truncated.
+    /// An operation-owned append-only arena, buffered inline up to [`MEMORY_LIMIT`] before spilling.
     pub(crate) fn arena() -> std::io::Result<Self> {
         Ok(Self {
-            bytes: Bytes::Arena {
-                spill: Spill::create(true)?,
-                append: std::sync::Mutex::new(()),
-            },
+            bytes: Bytes::Arena(Arena::default()),
         })
     }
     pub(crate) fn append(
         &self,
         f: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
     ) -> anyhow::Result<(u64, u64)> {
-        let Bytes::Arena { spill, append } = &self.bytes else {
+        let Bytes::Arena(arena) = &self.bytes else {
             anyhow::bail!("not an append arena")
         };
-        let _guard = append
-            .lock()
-            .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
-        let mut file = spill.file.as_ref().unwrap().try_clone()?;
-        let offset = file.metadata()?.len();
-        // O_APPEND makes published prefixes immutable even while positioned readers run.
-        // Failed appends remain unreachable; truncating could invalidate mapped views.
-        {
-            use std::io::Write;
-            let mut writer = std::io::BufWriter::with_capacity(super::IO_CHUNK, ScratchWriter::new(&mut file, false));
-            let produced = f(&mut writer);
-            // Flush before observing the published extent. Failed producer output remains an
-            // unreachable append, and the producer's error takes precedence over a flush error.
-            let flushed = writer.flush();
-            produced?;
-            flushed?;
-        }
-        let end = file.metadata()?.len();
-        Ok((offset, end - offset))
+        arena.append(f)
     }
     /// Length of the immutable backing without reading its payload.
     pub fn byte_len(&self) -> std::io::Result<u64> {
         match &self.bytes {
             Bytes::Memory(bytes) => Ok(bytes.len() as u64),
             Bytes::File(spill) => Ok(spill.file.as_ref().unwrap().metadata()?.len()),
-            Bytes::Arena { .. } => Ok(self.file()?.metadata()?.len()),
+            Bytes::Arena(arena) => arena.byte_len(),
             Bytes::Positioned(source) => Ok(source.len()),
         }
     }
-    pub(crate) fn file(&self) -> std::io::Result<std::fs::File> {
+    pub(crate) fn file_with_dev(&self) -> std::io::Result<(std::fs::File, crate::io_admission::DeviceId)> {
         match &self.bytes {
-            Bytes::File(spill) => spill.file.as_ref().unwrap().try_clone(),
-            Bytes::Arena { spill, .. } => spill.file.as_ref().unwrap().try_clone(),
+            Bytes::File(spill) => Ok((spill.file.as_ref().unwrap().try_clone()?, spill.dev)),
+            Bytes::Arena(arena) => arena.file(),
             Bytes::Memory(_) | Bytes::Positioned(_) => Err(std::io::Error::other("expected file-backed bytes")),
         }
+    }
+    pub(crate) fn file(&self) -> std::io::Result<std::fs::File> {
+        self.file_with_dev().map(|(file, _)| file)
     }
 
     /// Read an operation-owned source, spilling above the fixed memory budget.
@@ -297,11 +494,11 @@ impl ByteSource {
         stage.finish()
     }
     /// Prefer native contiguous parsing. Mapping never outlives this exclusively owned source.
-    #[cfg(feature = "mmap")]
+    #[cfg(all(test, feature = "mmap"))]
     pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> std::io::Result<Option<T>> {
         match &self.bytes {
             Bytes::Memory(bytes) => Ok(Some(f(bytes))),
-            Bytes::Arena { .. } | Bytes::Positioned(_) => Ok(None),
+            Bytes::Arena(_) | Bytes::Positioned(_) => Ok(None),
             Bytes::File(spill) => {
                 let file = spill.file.as_ref().unwrap();
                 if file.metadata()?.len() == 0 {
@@ -316,12 +513,16 @@ impl ByteSource {
     pub fn reader(&self) -> std::io::Result<Box<dyn std::io::Read + '_>> {
         match &self.bytes {
             Bytes::Memory(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))),
-            Bytes::Arena { .. } => Ok(Box::new(std::io::BufReader::new(FileReader {
-                file: self.file()?,
-                position: 0,
-            }))),
+            Bytes::Arena(arena) => Ok(Box::new(std::io::BufReader::with_capacity(
+                super::IO_CHUNK,
+                PositionedReader {
+                    source: arena,
+                    position: 0,
+                },
+            ))),
             Bytes::File(spill) => Ok(Box::new(std::io::BufReader::new(FileReader {
                 file: spill.file.as_ref().unwrap(),
+                dev: spill.dev,
                 position: 0,
             }))),
             Bytes::Positioned(source) => Ok(Box::new(std::io::BufReader::with_capacity(
@@ -340,7 +541,7 @@ impl ByteSource {
                 out.write_all(bytes)?;
                 Ok(bytes.len() as u64)
             }
-            Bytes::File(_) | Bytes::Arena { .. } | Bytes::Positioned(_) => std::io::copy(&mut self.reader()?, out),
+            Bytes::File(_) | Bytes::Arena(_) | Bytes::Positioned(_) => std::io::copy(&mut self.reader()?, out),
         }
     }
 }
@@ -357,25 +558,29 @@ impl std::io::Read for PositionedReader<'_> {
 }
 struct FileReader<F> {
     file: F,
+    dev: crate::io_admission::DeviceId,
     position: u64,
 }
 impl<F: std::borrow::Borrow<std::fs::File>> std::io::Read for FileReader<F> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let n = read_at(self.file.borrow(), bytes, self.position)?;
+        let n = read_at_dev(self.file.borrow(), self.dev, bytes, self.position)?;
         self.position += n as u64;
         Ok(n)
     }
 }
-/// The platform boundary for positioned source reads. Unix reads leave the shared cursor
-/// untouched; other targets retain their platform's positioned-read or seek fallback.
-pub(crate) fn read_at(file: &std::fs::File, bytes: &mut [u8], at: u64) -> std::io::Result<usize> {
+/// Positioned read using a pre-resolved [`crate::io_admission::DeviceId`], avoiding per-chunk `fstat`.
+pub(crate) fn read_at_dev(
+    file: &std::fs::File,
+    dev: crate::io_admission::DeviceId,
+    bytes: &mut [u8],
+    at: u64,
+) -> std::io::Result<usize> {
     // Charge actual positioned I/O, including lazy large-record reads from a visitor.
     // Never retain admission across parsing or callbacks that can read another device.
     #[cfg(unix)]
-    let _permit = {
-        use std::os::unix::fs::MetadataExt;
-        crate::io_admission::IoAdmission::global().acquire(crate::io_admission::DeviceId(file.metadata()?.dev()), None)
-    };
+    let _permit = crate::io_admission::IoAdmission::global().acquire(dev, None);
+    #[cfg(not(unix))]
+    let _ = dev;
     #[cfg(unix)]
     {
         std::os::unix::fs::FileExt::read_at(file, bytes, at)
@@ -391,6 +596,11 @@ pub(crate) fn read_at(file: &std::fs::File, bytes: &mut [u8], at: u64) -> std::i
         file.seek(std::io::SeekFrom::Start(at))?;
         file.read(bytes)
     }
+}
+/// The platform boundary for positioned source reads when the caller has not cached [`crate::io_admission::DeviceId`].
+pub(crate) fn read_at(file: &std::fs::File, bytes: &mut [u8], at: u64) -> std::io::Result<usize> {
+    let dev = file_dev(file)?;
+    read_at_dev(file, dev, bytes, at)
 }
 #[cfg(test)]
 mod tests {
@@ -482,6 +692,7 @@ mod tests {
     #[test]
     fn arena_failed_appends_never_truncate_published_prefixes() {
         use std::io::Read;
+        let spills_before = SPILLS.with(std::cell::Cell::get);
         let source = ByteSource::arena().unwrap();
         assert_eq!(
             source
@@ -508,6 +719,8 @@ mod tests {
                 .unwrap(),
             (12, 4)
         );
+        // Inline <= 1 MiB arena creates zero temporary files.
+        assert_eq!(SPILLS.with(std::cell::Cell::get), spills_before);
         let mut first = source.reader().unwrap();
         let mut second = source.reader().unwrap();
         let mut prefix = [0; 5];
@@ -515,14 +728,30 @@ mod tests {
         assert_eq!(&prefix, b"first");
         second.read_exact(&mut prefix).unwrap();
         assert_eq!(&prefix, b"first");
-        let Bytes::Arena { spill, .. } = &source.bytes else {
-            unreachable!()
-        };
-        let path = spill.path.clone();
-        #[cfg(unix)]
-        assert!(!path.exists());
         drop(first);
         drop(second);
+
+        // Appending past 1 MiB spills to a single unlinked temporary file and preserves all prefixes.
+        let large = vec![b'z'; MEMORY_LIMIT];
+        assert_eq!(
+            source
+                .append(|file| {
+                    file.write_all(&large)?;
+                    Ok(())
+                })
+                .unwrap(),
+            (16, MEMORY_LIMIT as u64)
+        );
+        assert_eq!(SPILLS.with(std::cell::Cell::get), spills_before + 1);
+        let Bytes::Arena(arena) = &source.bytes else {
+            unreachable!()
+        };
+        let path = arena.state.lock().unwrap().spill.as_ref().unwrap().path.clone();
+        #[cfg(unix)]
+        assert!(!path.exists());
+        let mut tail_check = [0u8; 4];
+        assert_eq!(arena.read_at(&mut tail_check, 12).unwrap(), 4);
+        assert_eq!(&tail_check, b"last");
         drop(source);
         assert!(!path.exists());
     }

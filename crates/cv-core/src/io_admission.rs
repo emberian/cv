@@ -450,21 +450,17 @@ pub fn byte_source_policy(path: &Path) -> ByteSourcePolicy {
 }
 
 /// Whether `path` names a sealed immutable artifact owned by `cv` (never a mutable external
-/// harness transcript).
+/// harness transcript or untrusted external `.pack.zst`).
 pub fn is_sealed_immutable_path(path: &Path) -> bool {
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| name.ends_with(".pack.zst"))
-    {
-        return true;
-    }
     if IoAdmission::global().is_registered_sealed_path(path) {
         return true;
     }
     let env = crate::env::Env::current();
     if let Some(home) = env.cv_home() {
-        if path.starts_with(home.join("packs")) || path.starts_with(home.join("segments")) {
+        if path.starts_with(home.join("packs"))
+            || path.starts_with(home.join("hub").join("packs"))
+            || path.starts_with(home.join("segments"))
+        {
             return true;
         }
     }
@@ -535,7 +531,7 @@ fn detect_unix_device_class(path: &Path, _dev: DeviceId) -> DeviceClass {
     if matches!(fstype, "nfs" | "smbfs" | "afpfs" | "webdav" | "cifs" | "sshfs") {
         return DeviceClass::Network;
     }
-    if matches!(fstype, "apfs" | "hfs") {
+    if matches!(fstype, "apfs" | "hfs" | "tmpfs") {
         return DeviceClass::Nvme;
     }
     DeviceClass::Unknown
@@ -554,11 +550,18 @@ fn detect_unix_device_class(path: &Path, dev: DeviceId) -> DeviceClass {
             if matches!(f_type, 0x6969 | 0x517B | 0xFF53_4D42 | 0xFE53_4D42) {
                 return DeviceClass::Network;
             }
+            // tmpfs (0x0102_1994) and ramfs (0x8584_58F6) are in-memory filesystems.
+            if matches!(f_type, 0x0102_1994 | 0x8584_58F6) {
+                return DeviceClass::Nvme;
+            }
         }
     }
     if dev.0 != 0 {
         // Linux device-number helpers only extract bits and are safe functions.
         let major = libc::major(dev.0 as libc::dev_t);
+        if major == 0 {
+            return DeviceClass::Nvme;
+        }
         let minor = libc::minor(dev.0 as libc::dev_t);
         let sys_path = format!("/sys/dev/block/{major}:{minor}/queue/rotational");
         if let Ok(rot) = std::fs::read_to_string(sys_path) {
@@ -1092,20 +1095,32 @@ mod tests {
         std::fs::create_dir_all(external_transcript.parent().unwrap()).unwrap();
         std::fs::write(&external_transcript, "{}\n").unwrap();
 
-        // External mutable transcript MUST always use Buffered so concurrent truncation never SIGBUSes.
+        // External mutable transcript or unregistered `.pack.zst` MUST always use Buffered so
+        // concurrent truncation never SIGBUSes.
         assert_eq!(byte_source_policy(&external_transcript), ByteSourcePolicy::Buffered);
+        let unregistered_pack = world.home.join("untrusted/external.pack.zst");
+        std::fs::create_dir_all(unregistered_pack.parent().unwrap()).unwrap();
+        std::fs::write(&unregistered_pack, b"untrusted").unwrap();
+        assert_eq!(byte_source_policy(&unregistered_pack), ByteSourcePolicy::Buffered);
 
-        let sealed_pack = crate::env::Env::current()
-            .cv_home()
-            .unwrap()
-            .join("packs/pack-001.pack.zst");
+        let home = crate::env::Env::current().cv_home().unwrap();
+        let sealed_pack = home.join("packs/pack-001.pack.zst");
+        let hub_pack = home.join("hub/packs/pack-002.pack.zst");
         std::fs::create_dir_all(sealed_pack.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(hub_pack.parent().unwrap()).unwrap();
         std::fs::write(&sealed_pack, b"sealed").unwrap();
+        std::fs::write(&hub_pack, b"hub-sealed").unwrap();
 
         #[cfg(all(feature = "mmap", not(target_family = "wasm")))]
-        assert_eq!(byte_source_policy(&sealed_pack), ByteSourcePolicy::Mapped);
+        {
+            assert_eq!(byte_source_policy(&sealed_pack), ByteSourcePolicy::Mapped);
+            assert_eq!(byte_source_policy(&hub_pack), ByteSourcePolicy::Mapped);
+        }
         #[cfg(all(not(feature = "mmap"), not(target_family = "wasm")))]
-        assert_eq!(byte_source_policy(&sealed_pack), ByteSourcePolicy::Buffered);
+        {
+            assert_eq!(byte_source_policy(&sealed_pack), ByteSourcePolicy::Buffered);
+            assert_eq!(byte_source_policy(&hub_pack), ByteSourcePolicy::Buffered);
+        }
     }
 
     #[test]

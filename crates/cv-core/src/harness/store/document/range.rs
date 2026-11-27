@@ -4,7 +4,7 @@
 //! in-memory build keeps memchr speed. Offsets count consumed bytes, never underlying reads or
 //! serde lookahead. Scalar/depth acceptance stays in `store::json`.
 
-use super::super::bytes::{read_at, ByteSource, Positioned};
+use super::super::bytes::{read_at_dev, ByteSource, Positioned};
 use crate::lazy::INLINE_MAX;
 use anyhow::{Context, Result};
 use std::borrow::Cow;
@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, BufRead, Read};
 
 const WINDOW: usize = 64 * 1024;
+const ARENA_STACK_MAX: usize = 16 * 1024;
 
 /// Containers longer than this (and strings over INLINE_MAX) are remembered while validating,
 /// so each later structural selection (record, message, content, block) skips them in O(1).
@@ -77,20 +78,20 @@ enum Backing<'a> {
     /// Bytes in memory whose first byte sits at this absolute offset; `true` when they are known
     /// to be UTF-8 (a `str`), so borrowed strings and keys need no second check.
     Bytes(&'a [u8], u64, bool),
-    File(File),
+    File(File, crate::io_admission::DeviceId),
     Positioned(&'a dyn Positioned),
 }
 
 /// A positioned backing a cursor reads windows from.
 #[derive(Clone, Copy)]
 enum At<'a> {
-    File(&'a File),
+    File(&'a File, crate::io_admission::DeviceId),
     Positioned(&'a dyn Positioned),
 }
 impl At<'_> {
     fn read_at(self, bytes: &mut [u8], at: u64) -> io::Result<usize> {
         match self {
-            At::File(file) => read_at(file, bytes, at),
+            At::File(file, dev) => read_at_dev(file, dev, bytes, at),
             At::Positioned(source) => source.read_at(bytes, at),
         }
     }
@@ -146,7 +147,10 @@ impl<'a> RangeSource<'a> {
         let backing = match (bytes.memory_bytes(), bytes.as_positioned()) {
             (Some(memory), _) => Backing::Bytes(memory, 0, false),
             (None, Some(source)) => Backing::Positioned(source),
-            (None, None) => Backing::File(bytes.file()?),
+            (None, None) => {
+                let (file, dev) = bytes.file_with_dev()?;
+                Backing::File(file, dev)
+            }
         };
         Ok(Self {
             backing,
@@ -170,8 +174,18 @@ impl<'a> RangeSource<'a> {
     }
     /// Reuse an already opened original-source descriptor for framing and selected reads.
     pub(crate) fn from_file(file: File, captured: crate::json::JsonSource) -> Result<Self> {
-        let source = Self {
-            backing: Backing::File(file),
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        let dev = {
+            use std::os::unix::fs::MetadataExt;
+            crate::io_admission::DeviceId(meta.dev())
+        };
+        #[cfg(not(unix))]
+        let dev = crate::io_admission::DeviceId(0);
+        captured.check_metadata(meta)?;
+        captured.check()?;
+        Ok(Self {
+            backing: Backing::File(file, dev),
             extent: Range {
                 offset: 0,
                 len: captured.len(),
@@ -179,9 +193,7 @@ impl<'a> RangeSource<'a> {
             captured: Some(captured),
             original: true,
             index: Index::default(),
-        };
-        source.check_identity()?;
-        Ok(source)
+        })
     }
     /// The source's private decoded bytes, with the original's provenance.
     pub(crate) fn decoded(captured: crate::json::JsonSource, bytes: &'a ByteSource) -> Result<Self> {
@@ -197,7 +209,7 @@ impl<'a> RangeSource<'a> {
     }
     pub fn check_identity(&self) -> Result<()> {
         let Some(captured) = &self.captured else { return Ok(()) };
-        if let (true, Backing::File(file)) = (self.original, &self.backing) {
+        if let (true, Backing::File(file, _)) = (self.original, &self.backing) {
             captured.check_metadata(file.metadata()?)?;
         }
         captured.check()
@@ -224,7 +236,7 @@ impl<'a> RangeSource<'a> {
         Ok(Cursor {
             backing: match &self.backing {
                 Backing::Bytes(bytes, base, _) => CursorBacking::Bytes(bytes, *base),
-                Backing::File(file) => CursorBacking::File(At::File(file)),
+                Backing::File(file, dev) => CursorBacking::File(At::File(file, *dev)),
                 Backing::Positioned(source) => CursorBacking::File(At::Positioned(*source)),
             },
             index: Some(&self.index),
@@ -245,7 +257,7 @@ impl<'a> RangeSource<'a> {
             return Ok(Some(bytes[0]));
         }
         let at = match &self.backing {
-            Backing::File(file) => At::File(file),
+            Backing::File(file, dev) => At::File(file, *dev),
             Backing::Positioned(source) => At::Positioned(*source),
             Backing::Bytes(..) => unreachable!(),
         };
@@ -283,50 +295,55 @@ impl<'a> RangeSource<'a> {
     }
 }
 
-/// The one place the two builds differ for a range of a captured source: mapped builds map that
-/// range alone (or borrow the decoded bytes); positioned builds read it in windows.
+/// The one place the two builds differ for a range of a captured source: in-memory decoded bytes
+/// are borrowed directly, spilled/arena decoded bytes use positioned reads without per-cell
+/// `mmap`/`munmap`, and local sealed immutable captures map that range alone under `feature = "mmap"`.
 pub(crate) fn scoped<T>(
     captured: &crate::json::JsonSource,
     decoded: Option<&ByteSource>,
     range: Range,
     f: impl FnOnce(&RangeSource<'_>) -> Result<T>,
 ) -> Result<T> {
-    #[cfg(feature = "mmap")]
-    if decoded.is_some_and(|bytes| bytes.as_positioned().is_none())
-        || (decoded.is_none()
-            && crate::io_admission::byte_source_policy(captured.path())
-                == crate::io_admission::ByteSourcePolicy::Mapped)
-    {
-        let mut callback = Some(f);
-        if let Some(bytes) = decoded {
-            if let Some(result) = bytes.with_bytes(|bytes| {
-                let start = usize::try_from(range.offset)?;
-                let end = start
-                    .checked_add(usize::try_from(range.len)?)
-                    .context("backing range overflow")?;
-                let bytes = bytes.get(start..end).context("backing range out of bounds")?;
-                callback.take().unwrap()(&RangeSource::borrowed(
-                    Some(captured.clone()),
-                    bytes,
-                    range.offset,
-                    false,
-                ))
-            })? {
-                return result;
+    if let Some(bytes) = decoded {
+        if let Some(memory) = bytes.memory_bytes() {
+            let start = usize::try_from(range.offset)?;
+            let end = start
+                .checked_add(usize::try_from(range.len)?)
+                .context("backing range overflow")?;
+            let slice = memory.get(start..end).context("backing range out of bounds")?;
+            return f(&RangeSource::borrowed(
+                Some(captured.clone()),
+                slice,
+                range.offset,
+                false,
+            ));
+        }
+        if let Some(arena) = bytes.as_arena() {
+            if let Ok(len) = usize::try_from(range.len) {
+                if len <= ARENA_STACK_MAX {
+                    let mut buf = [0u8; ARENA_STACK_MAX];
+                    if arena.copy_inline_range(range.offset, &mut buf[..len])? {
+                        return f(&RangeSource::borrowed(
+                            Some(captured.clone()),
+                            &buf[..len],
+                            range.offset,
+                            false,
+                        ));
+                    }
+                }
             }
         }
-        let file = match decoded {
-            Some(bytes) => bytes.file()?,
-            None => File::open(captured.path())?,
-        };
-        if decoded.is_none() {
-            captured.check_metadata(file.metadata()?)?;
-        }
+        let source = RangeSource::decoded(captured.clone(), bytes)?;
+        return f(&source);
+    }
+    #[cfg(feature = "mmap")]
+    if crate::io_admission::byte_source_policy(captured.path()) == crate::io_admission::ByteSourcePolicy::Mapped {
+        let file = File::open(captured.path())?;
+        captured.check_metadata(file.metadata()?)?;
         let map = if range.len == 0 {
             None
         } else {
-            // SAFETY: a read-only mapping of a private decoded spill or local sealed immutable file,
-            // dropped with this scope.
+            // SAFETY: a read-only mapping of a local sealed immutable file, dropped with this scope.
             Some(unsafe {
                 memmap2::MmapOptions::new()
                     .offset(range.offset)
@@ -338,24 +355,19 @@ pub(crate) fn scoped<T>(
         #[cfg(test)]
         crate::harness::store::jsonl::note_mapped(range.len as usize);
         let bytes: &[u8] = map.as_deref().unwrap_or(&[]);
-        let result = callback.take().unwrap()(&RangeSource::borrowed(
+        let result = f(&RangeSource::borrowed(
             Some(captured.clone()),
             bytes,
             range.offset,
-            decoded.is_none(),
+            true,
         ));
-        if decoded.is_none() {
-            captured.check_metadata(file.metadata()?)?;
-        }
+        captured.check_metadata(file.metadata()?)?;
         return result;
     }
     // Positioned RangeSource: mutable external transcripts never mmap (SIGBUS-immune on concurrent
     // truncation), addressing the capture by absolute offset through bounded read windows.
     let _ = range;
-    let source = match decoded {
-        Some(bytes) => RangeSource::decoded(captured.clone(), bytes)?,
-        None => RangeSource::from_captured(captured.clone())?,
-    };
+    let source = RangeSource::from_captured(captured.clone())?;
     f(&source)
 }
 

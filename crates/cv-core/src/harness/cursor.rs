@@ -442,11 +442,11 @@ fn discover_global(conn: &Connection, db: &Path, cwd_map: &HashMap<String, PathB
         let Some(composer_id) = key.strip_prefix("composerData:") else {
             continue;
         };
-        // A private arena per composer: discovery holds one composer cell at a time.
-        let Ok(cells) = Cells::new(conn, db, &crate::source::ReadSet::default(), "cursorDiskKV") else {
-            return;
-        };
         let listed = pass.list(composer_id, certificates.get(composer_id).copied(), || {
+            // A private arena per missed composer: cache hits never allocate or probe `cursorDiskKV`.
+            let Ok(cells) = Cells::new(conn, db, &crate::source::ReadSet::default(), "cursorDiskKV") else {
+                return Err(());
+            };
             // A cell that cannot be read is skipped and decoded again next time.
             let cell = match source::cell(conn, &cells, "cursorDiskKV", &key) {
                 Ok(Some(cell)) => cell,

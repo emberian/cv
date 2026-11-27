@@ -995,8 +995,9 @@ fn read_session_facts(
 /// v11 on, the `active` flags: a rewind or an in-place compaction flips them), each chain
 /// session's whole `sessions` row (title, prompt hash, lineage, counters), the end reason of the
 /// parent that stopped the walk, the `(id, model_config, started_at)` of its children (the
-/// compression continuation), and its `state_meta` rows. The aggregates come from the
-/// `messages(session_id, …)` indexes; no `content` is read.
+/// compression continuation), and its `state_meta` rows. Store-wide `rows_from` reads only
+/// B-tree leaf metadata (`typeof`, `octet_length`, and `<= 256`-byte inline cells), never
+/// chasing overflow page chains.
 #[cfg(test)]
 fn rows_conn(conn: &Connection) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
     rows_from(conn, &walk_conn(conn)?)
@@ -1040,7 +1041,7 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
         let digest = children.entry(parent.to_owned()).or_insert(Rows::SEED);
         *digest = Rows::fold(*digest, &child.to_le_bytes());
     }
-    let msg_plan = MessageRevisionPlan::of(conn);
+    let msg_plan = MessageRevisionPlan::leaf_only(conn);
     let mut messages: HashMap<String, (u64, i64, u64)> = HashMap::new();
     {
         let mut exprs = vec!["session_id".to_string()];
@@ -1120,6 +1121,7 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
 }
 
 const INLINE_REVISION_MAX: i64 = 2048;
+const LEAF_REVISION_MAX: i64 = 256;
 
 const MESSAGE_BODY_COLS: &[&str] = &[
     "content",
@@ -1202,19 +1204,30 @@ fn fold_bounded_col(
     Ok(digest)
 }
 
-/// Bounded message-row revision projection for [`rows_from`] and [`session_revision`]:
-/// small scalar/status columns and `<= 2 KiB` inline bodies are read directly from the b-tree
-/// leaf page (`CASE WHEN octet_length(col) <= 2048 THEN col END`), while `> 2 KiB` overflow
-/// cells stream through `sqlite3_blob_open` in 16 KiB stack chunks so same-length `UPDATE`s
-/// always move the digest without ever materializing giant cells in SQLite's VDBE.
+/// Message-row revision projection for [`rows_from`] (`deep_overflow = false`) and
+/// [`session_revision`] (`deep_overflow = true`):
+/// - `leaf_only` (whole-DB freshness scans): folds scalar columns, `typeof(col)`, `octet_length(col)`,
+///   and `CASE WHEN octet_length(col) <= 256 THEN col END`, reading zero overflow pages across
+///   multi-GB databases while still catching inline cell edits and any length change.
+/// - `deep` (single-session `read_session` guard): reads `<= 2 KiB` inline cells and streams
+///   `> 2 KiB` overflow cells via `sqlite3_blob_open` so mid-stream same-length mutations fail.
 struct MessageRevisionPlan {
     has_rowid: bool,
+    deep_overflow: bool,
     scalar_cols: Vec<String>,
     body_cols: Vec<&'static str>,
 }
 
 impl MessageRevisionPlan {
-    fn of(conn: &Connection) -> Self {
+    fn leaf_only(conn: &Connection) -> Self {
+        Self::build(conn, false)
+    }
+
+    fn deep(conn: &Connection) -> Self {
+        Self::build(conn, true)
+    }
+
+    fn build(conn: &Connection, deep_overflow: bool) -> Self {
         let msg_cols = super::store::sqlite::columns(conn, "messages");
         let mut scalar_cols = vec![
             "id".to_string(),
@@ -1246,7 +1259,8 @@ impl MessageRevisionPlan {
             .filter(|col| msg_cols.contains(*col))
             .collect();
         Self {
-            has_rowid: table_has_rowid(conn, "messages"),
+            has_rowid: deep_overflow && table_has_rowid(conn, "messages"),
+            deep_overflow,
             scalar_cols,
             body_cols,
         }
@@ -1259,7 +1273,11 @@ impl MessageRevisionPlan {
         for col in &self.body_cols {
             exprs.push(format!("typeof({col})"));
             exprs.push(format!("octet_length({col})"));
-            if self.has_rowid {
+            if !self.deep_overflow {
+                exprs.push(format!(
+                    "CASE WHEN octet_length({col}) <= {LEAF_REVISION_MAX} THEN {col} END"
+                ));
+            } else if self.has_rowid {
                 exprs.push(format!(
                     "CASE WHEN octet_length({col}) <= {INLINE_REVISION_MAX} THEN {col} END"
                 ));
@@ -1289,7 +1307,14 @@ impl MessageRevisionPlan {
         }
         let base = offset + 1 + self.scalar_cols.len();
         for (idx, col) in self.body_cols.iter().enumerate() {
-            digest = fold_bounded_col(conn, "messages", col, rowid, row, base + idx * 3, digest)?;
+            let at = base + idx * 3;
+            if self.deep_overflow {
+                digest = fold_bounded_col(conn, "messages", col, rowid, row, at, digest)?;
+            } else {
+                digest = fold_value(digest, row.get_ref(at)?);
+                digest = fold_value(digest, row.get_ref(at + 1)?);
+                digest = fold_value(digest, row.get_ref(at + 2)?);
+            }
         }
         Ok((msg_id, digest))
     }
@@ -1344,7 +1369,7 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         }
     }
     let session_sql = format!("SELECT {} FROM sessions WHERE id = ?1", session_exprs.join(", "));
-    let msg_plan = MessageRevisionPlan::of(conn);
+    let msg_plan = MessageRevisionPlan::deep(conn);
     let msg_sql = format!(
         "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY id ASC",
         msg_plan.exprs().join(", ")
@@ -4987,13 +5012,28 @@ mod tests {
             )
             .unwrap();
         let rev2 = session_revision(&writer, "target").unwrap();
-        let rows2 = rows_conn(&writer).unwrap();
         assert_ne!(rev2, rev1, "same-length overflow body edit must move session_revision");
+        // Store-wide `rows_conn` intentionally avoids chasing overflow pages; any length change
+        // on an overflow cell moves `octet_length(col)` immediately.
+        let overflow_grown = format!("{overflow_after}!");
+        writer
+            .execute(
+                "UPDATE messages SET content = ?1 WHERE session_id = 'target' AND timestamp = 2100.0",
+                [&overflow_grown],
+            )
+            .unwrap();
+        let rows2 = rows_conn(&writer).unwrap();
         assert_ne!(
             rows2["target"], rows1["target"],
-            "same-length overflow body edit must move rows_conn"
+            "overflow length edit must move rows_conn without reading overflow chains"
         );
         assert_eq!(rows2["other"], rows1["other"]);
+        writer
+            .execute(
+                "UPDATE messages SET content = ?1 WHERE session_id = 'target' AND timestamp = 2100.0",
+                [&overflow_after],
+            )
+            .unwrap();
 
         struct SameLengthBodyMutator<'a>(&'a Connection);
         impl MessageSink for SameLengthBodyMutator<'_> {
@@ -5090,11 +5130,14 @@ mod tests {
         conn.execute("UPDATE messages SET content = ?1 WHERE id = 4", [&big_b])
             .unwrap();
         let rev_b = session_revision(&conn, "s-1").unwrap();
-        let rows_b = rows_conn(&conn).unwrap();
         assert_ne!(rev_a, rev_b, "WITHOUT ROWID overflow edit must move session_revision");
+        let big_c = format!("{big_b}!");
+        conn.execute("UPDATE messages SET content = ?1 WHERE id = 4", [&big_c])
+            .unwrap();
+        let rows_c = rows_conn(&conn).unwrap();
         assert_ne!(
-            rows_a["s-1"], rows_b["s-1"],
-            "WITHOUT ROWID overflow edit must move rows_conn"
+            rows_a["s-1"], rows_c["s-1"],
+            "WITHOUT ROWID overflow length edit must move rows_conn"
         );
     }
 }

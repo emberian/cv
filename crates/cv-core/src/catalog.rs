@@ -4177,22 +4177,6 @@ pub fn record_index_pass() {}
 #[cfg(not(feature = "sqlite"))]
 pub fn finish_pass() {}
 #[cfg(not(feature = "sqlite"))]
-pub(crate) fn prefix_end(prefix: &str) -> Option<String> {
-    for (offset, ch) in prefix.char_indices().rev() {
-        if ch != char::MAX {
-            let next = if ch == '\u{d7ff}' {
-                '\u{e000}'
-            } else {
-                char::from_u32(ch as u32 + 1)?
-            };
-            let mut end = prefix[..offset].to_owned();
-            end.push(next);
-            return Some(end);
-        }
-    }
-    None
-}
-#[cfg(not(feature = "sqlite"))]
 pub fn harness_codec_version(_h: Harness) -> u32 {
     crate::source::VERSION
 }
