@@ -21,6 +21,10 @@ pub struct QueryWork {
     pub live_snippet_reads: usize,
     /// Not instrumented: `null` is deliberately different from zero index I/O.
     pub index_bytes: Option<u64>,
+    /// Index posting documents and metadata documents examined for this query.
+    pub index_docs_examined: usize,
+    /// Returned hits whose snippet came from stored index previews.
+    pub stored_previews_used: usize,
     /// Top-level ranking/count passes; metadata ID lookups are counted separately.
     pub top_level_query_passes: usize,
     /// Distinct matching sessions whose metadata was evaluated for a filter.
@@ -42,6 +46,23 @@ pub struct IndexedAnswer {
     pub indexed_documents: u64,
     pub source_freshness_assessed: bool,
     pub work: QueryWork,
+}
+
+impl IndexedAnswer {
+    /// Unified logical read-work summary for this query (`setup_micros` is `0` on an already-pinned
+    /// snapshot; callers that refreshed on the same request pass the refresh setup duration).
+    pub fn search_work(&self, setup_micros: u64) -> crate::SearchWork {
+        crate::SearchWork {
+            basis: crate::SEARCH_WORK_BASIS.to_owned(),
+            index_docs_examined: self.work.index_docs_examined,
+            stored_previews_used: self.work.stored_previews_used,
+            discovery_sessions: self.work.discovery_sessions,
+            source_sessions_read: self.work.live_snippet_reads,
+            source_bytes_read: self.work.source_bytes,
+            setup_micros,
+            eval_micros: self.work.evaluation_micros,
+        }
+    }
 }
 
 impl PreparedIndex {
@@ -104,22 +125,25 @@ impl PreparedIndex {
             std::sync::Arc::new(move |id: &str| decisions.resolve(id).map(|d| d.accepted))
                 as crate::session_collector::SessionFilter
         });
-        let candidates = rank(
+        let examined = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let candidates = rank_counted(
             &self.fields,
             &self.searcher,
             &*parsed,
             limit,
             accept.clone(),
             &self.searcher,
+            Some(examined.clone()),
         )?;
         let mut query_passes = 1;
         let total = if candidates.len() < limit {
             candidates.len()
         } else {
             query_passes += 1;
-            let ids = self
-                .searcher
-                .search(&*parsed, &crate::session_collector::SessionIds(self.fields.id))?;
+            let ids = self.searcher.search(
+                &*parsed,
+                &crate::session_collector::SessionIds::counted(self.fields.id, examined.clone()),
+            )?;
             let mut count = 0;
             for id in ids {
                 if match &accept {
@@ -136,13 +160,19 @@ impl PreparedIndex {
             .map(|candidate| indexed_hit(&self.searcher, &self.fields, candidate, &decisions))
             .collect::<Result<Vec<_>>>()?;
         let predicate_sessions = decisions.cache.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let metadata_lookup_queries = decisions.metadata_queries.load(std::sync::atomic::Ordering::Relaxed);
+        let index_docs_examined = examined
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(metadata_lookup_queries as usize);
         let work = QueryWork {
             source_bytes: 0,
             discovery_sessions: 0,
             live_snippet_reads: 0,
             index_bytes: None,
+            index_docs_examined,
+            stored_previews_used: hits.len(),
             top_level_query_passes: query_passes,
-            metadata_lookup_queries: decisions.metadata_queries.load(std::sync::atomic::Ordering::Relaxed),
+            metadata_lookup_queries,
             predicate_sessions,
             stored_document_reads: decisions.stored_reads.load(std::sync::atomic::Ordering::Relaxed),
             returned_hits: hits.len(),

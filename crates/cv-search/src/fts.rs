@@ -2680,7 +2680,14 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     /// that ends on a record the codec still holds reaches this with the boundary due, since
     /// no boundary checkpoint is offered between that record and the end.
     fn wants_final_checkpoint(&mut self, _offset: u64) -> bool {
-        self.keep_open = !self.failed && self.err.is_none() && !self.boundary_due;
+        const MAX_OPEN_MARK_BYTES: usize = 64 * 1024;
+        let open_bytes = self
+            .buf
+            .len()
+            .saturating_add(self.other.len())
+            .saturating_add(self.facets.len())
+            .saturating_add(self.other_facets.len());
+        self.keep_open = !self.failed && self.err.is_none() && !self.boundary_due && open_bytes <= MAX_OPEN_MARK_BYTES;
         self.keep_open
     }
 
@@ -3555,7 +3562,7 @@ pub fn text_search_keys_suffixed(
                 let parsed = live::without_shadowed(f, parsed, shadows);
                 ids.extend(
                     searcher
-                        .search(&*parsed, &crate::session_collector::SessionIds(f.id))
+                        .search(&*parsed, &crate::session_collector::SessionIds::new(f.id))
                         .context("matching session IDs")?,
                 );
             }
@@ -3563,7 +3570,7 @@ pub fn text_search_keys_suffixed(
                 let parsed = parse_text_query(l.searcher.index(), &l.f, query, scope)?;
                 ids.extend(
                     l.searcher
-                        .search(&*parsed, &crate::session_collector::SessionIds(l.f.id))
+                        .search(&*parsed, &crate::session_collector::SessionIds::new(l.f.id))
                         .context("matching live session IDs")?,
                 );
             }
@@ -3582,7 +3589,7 @@ fn matching_ids(
 ) -> Result<HashSet<String>> {
     let parsed = parse_text_query(index, f, query, scope)?;
     let ids = searcher
-        .search(&parsed, &crate::session_collector::SessionIds(f.id))
+        .search(&parsed, &crate::session_collector::SessionIds::new(f.id))
         .context("matching session IDs")?;
     Ok(ids.into_iter().map(|id| crate::native_id(&id).to_owned()).collect())
 }
@@ -3619,6 +3626,13 @@ fn source_path(searcher: &tantivy::Searcher, f: &Fields, id: &str) -> Result<Str
         .with_context(|| format!("search metadata for {id} names no source path"))
 }
 
+#[derive(Default)]
+struct SnippetWork {
+    sessions_read: usize,
+    bytes_read: u64,
+    stored_previews_used: usize,
+}
+
 /// [`enrich_snippets`] with each hit's source path from `path_of`.
 fn enrich_snippets_from(
     path_of: impl Fn(&str) -> Result<String>,
@@ -3626,22 +3640,40 @@ fn enrich_snippets_from(
     scope: crate::Scope,
     hits: &mut [Hit],
 ) -> Result<Option<String>> {
+    Ok(enrich_snippets_counted(path_of, query, scope, hits)?.0)
+}
+
+fn enrich_snippets_counted(
+    path_of: impl Fn(&str) -> Result<String>,
+    query: &str,
+    scope: crate::Scope,
+    hits: &mut [Hit],
+) -> Result<(Option<String>, SnippetWork)> {
     let (mut unreadable, mut first) = (0usize, None);
+    let mut work = SnippetWork::default();
     for hit in hits {
         let path = path_of(hit.session_key.as_deref().unwrap_or(&hit.id))?;
         let path = path.as_str();
         // The stored preview stands in when the live read cannot: marked when the source is
         // gone, returned as the search's note when it is there but cannot be read.
-        match live_snippet(
+        match live_snippet_counted(
             path,
             hit.session_key.as_deref().unwrap_or(&hit.id),
             &hit.harness,
             query,
             scope,
         ) {
-            Ok(snippet) if !snippet.is_empty() => hit.snippet = snippet,
-            Ok(_) => {}
+            Ok((snippet, bytes)) => {
+                work.sessions_read += 1;
+                work.bytes_read = work.bytes_read.saturating_add(bytes);
+                if !snippet.is_empty() {
+                    hit.snippet = snippet;
+                } else {
+                    work.stored_previews_used += 1;
+                }
+            }
             Err(_) if !Path::new(path).exists() => {
+                work.stored_previews_used += 1;
                 hit.snippet = if hit.snippet.is_empty() {
                     "(source file moved)".to_string()
                 } else {
@@ -3649,12 +3681,13 @@ fn enrich_snippets_from(
                 };
             }
             Err(error) => {
+                work.stored_previews_used += 1;
                 unreadable += 1;
                 first.get_or_insert_with(|| format!("{} ({}): {error:#}", hit.id, hit.harness));
             }
         }
     }
-    Ok(first.map(|first| format!("{unreadable} hit(s), first {first}")))
+    Ok((first.map(|first| format!("{unreadable} hit(s), first {first}")), work))
 }
 
 /// Run a full-text query, returning up to `limit` hits ranked by BM25, each with a live snippet and
@@ -3770,20 +3803,28 @@ pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
     live: LiveRead,
     discover: impl FnOnce() -> Result<R>,
 ) -> Result<Searched> {
-    let indexed =
-        if dir.join("meta.json").exists() || (live == LiveRead::Frozen && cv_core::custody::inventory()?.is_empty()) {
-            Some(query_index(dir)?)
-        } else {
-            None
-        };
+    let setup_started = std::time::Instant::now();
+    let live_mode = live;
+    let indexed = if dir.join("meta.json").exists()
+        || (live_mode == LiveRead::Frozen && cv_core::custody::inventory()?.is_empty())
+    {
+        Some(query_index(dir)?)
+    } else {
+        None
+    };
     // Validate/open first: an unusable index must not trigger expensive discovery.
     let refs = discover()?;
+    let discovery_sessions = refs.as_ref().len();
     let (live, suffix) = live::read(
         dir,
         indexed.as_ref().map(|(_, f, searcher)| live::Indexed { searcher, f }),
         refs.as_ref(),
-        live,
+        live_mode,
     )?;
+    let setup_micros = setup_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+
+    let eval_started = std::time::Instant::now();
+    let examined = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let empty = HashMap::new();
     let shadows = live.as_ref().map_or(&empty, |l| &l.shadows);
     let stats = live::Union(
@@ -3826,11 +3867,22 @@ pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
     let mut exhaustive = true;
     if let (Some((index, f, searcher)), Some(decisions)) = (&indexed, &indexed_decisions) {
         let parsed = live::without_shadowed(f, parse_text_query(index, f, query, filter.scope)?, shadows);
-        let candidates = rank(f, searcher, &*parsed, limit, accept(decisions), &stats)?;
+        let candidates = rank_counted(
+            f,
+            searcher,
+            &*parsed,
+            limit,
+            accept(decisions),
+            &stats,
+            Some(examined.clone()),
+        )?;
         if candidates.len() >= limit {
             exhaustive = false;
             let ids = searcher
-                .search(&*parsed, &crate::session_collector::SessionIds(f.id))
+                .search(
+                    &*parsed,
+                    &crate::session_collector::SessionIds::counted(f.id, examined.clone()),
+                )
                 .context("counting matching sessions")?;
             counts.push((ids, accept(decisions)));
         }
@@ -3840,12 +3892,23 @@ pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
     }
     if let (Some(l), Some(decisions)) = (&live, &live_decisions) {
         let parsed = parse_text_query(l.searcher.index(), &l.f, query, filter.scope)?;
-        let candidates = rank(&l.f, &l.searcher, &*parsed, limit, accept(decisions), &stats)?;
+        let candidates = rank_counted(
+            &l.f,
+            &l.searcher,
+            &*parsed,
+            limit,
+            accept(decisions),
+            &stats,
+            Some(examined.clone()),
+        )?;
         if candidates.len() >= limit {
             exhaustive = false;
             let ids = l
                 .searcher
-                .search(&*parsed, &crate::session_collector::SessionIds(l.f.id))
+                .search(
+                    &*parsed,
+                    &crate::session_collector::SessionIds::counted(l.f.id, examined.clone()),
+                )
                 .context("counting matching live sessions")?;
             counts.push((ids, accept(decisions)));
         }
@@ -3881,31 +3944,67 @@ pub(crate) fn search_suffixed_allowed<R: AsRef<[cv_core::SessionRef]>>(
             _ => unreachable!("a candidate comes from a side that exists"),
         });
     }
-    let note = enrich_snippets_from(
-        |id| match (&live, &indexed) {
-            (Some(l), _) if shadows.contains_key(id) => source_path(&l.searcher, &l.f, id),
-            (_, Some((_, f, searcher))) => source_path(searcher, f, id),
-            _ => Err(missing_meta(id).into()),
-        },
-        query,
-        filter.scope,
-        &mut hits,
-    )?;
+    // Under `--frozen`, never stream live source transcripts to enrich snippets: the index's
+    // stored preview answers alone, keeping live transcript parsing strictly zero.
+    let (note, snippet_work) = if live_mode == LiveRead::Frozen {
+        (
+            None,
+            SnippetWork {
+                sessions_read: 0,
+                bytes_read: 0,
+                stored_previews_used: hits.len(),
+            },
+        )
+    } else {
+        enrich_snippets_counted(
+            |id| match (&live, &indexed) {
+                (Some(l), _) if shadows.contains_key(id) => source_path(&l.searcher, &l.f, id),
+                (_, Some((_, f, searcher))) => source_path(searcher, f, id),
+                _ => Err(missing_meta(id).into()),
+            },
+            query,
+            filter.scope,
+            &mut hits,
+        )?
+    };
+    let meta_queries = indexed_decisions
+        .as_ref()
+        .map_or(0, |d| d.metadata_queries.load(std::sync::atomic::Ordering::Relaxed))
+        .saturating_add(
+            live_decisions
+                .as_ref()
+                .map_or(0, |d| d.metadata_queries.load(std::sync::atomic::Ordering::Relaxed)),
+        );
+    let eval_micros = eval_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let work = crate::SearchWork {
+        basis: crate::SEARCH_WORK_BASIS.to_owned(),
+        index_docs_examined: examined
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(meta_queries as usize),
+        stored_previews_used: snippet_work.stored_previews_used,
+        discovery_sessions,
+        source_sessions_read: suffix.read.saturating_add(snippet_work.sessions_read),
+        source_bytes_read: suffix.bytes.saturating_add(snippet_work.bytes_read),
+        setup_micros,
+        eval_micros,
+    };
     Ok(Searched {
         hits,
         total,
         note,
         suffix,
+        work,
     })
 }
 
 /// What [`search_suffixed`] found: the top hits, how many sessions matched in all, the snippet
-/// note, and the live suffix's account.
+/// note, the live suffix's account, and the query's logical read work.
 pub(crate) struct Searched {
     pub hits: Vec<Hit>,
     pub total: usize,
     pub note: Option<String>,
     pub suffix: Suffix,
+    pub work: crate::SearchWork,
 }
 
 fn ranked_search(
@@ -3945,12 +4044,25 @@ fn rank(
     accept: Option<crate::session_collector::SessionFilter>,
     stats: &dyn tantivy::query::Bm25StatisticsProvider,
 ) -> Result<Vec<crate::session_collector::Candidate>> {
+    rank_counted(f, searcher, query, limit, accept, stats, None)
+}
+
+fn rank_counted(
+    f: &Fields,
+    searcher: &tantivy::Searcher,
+    query: &dyn tantivy::query::Query,
+    limit: usize,
+    accept: Option<crate::session_collector::SessionFilter>,
+    stats: &dyn tantivy::query::Bm25StatisticsProvider,
+    examined: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) -> Result<Vec<crate::session_collector::Candidate>> {
     // Collect sessions rather than chunks. Each segment's top `limit` sessions contains every
     // possible global winner, even when one session has arbitrarily many matching chunks.
     let mut collector = crate::session_collector::TopSessions::new(f.id, limit);
     // Resumed chunks can retain older labels/cwd: filter the same current meta doc that
     // describes the returned hit.
     collector.filter = accept;
+    collector.examined = examined;
     searcher
         .search_with_statistics_provider(query, &collector, stats)
         .context("running search")
@@ -4102,7 +4214,18 @@ fn snippet_ready(matcher: &cv_core::scan::Matcher, terms_len: usize, clauses: &C
 /// tool dump) costs its read, not its size in memory; the read stops once a complete snippet
 /// excerpt is ready (including when satisfied branches of an `OR` query match).
 /// The snippet is the first term (in query order) that occurs anywhere, else the head.
+#[cfg(test)]
 fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::Scope) -> Result<String> {
+    Ok(live_snippet_counted(path, id, harness, query, scope)?.0)
+}
+
+fn live_snippet_counted(
+    path: &str,
+    id: &str,
+    harness: &str,
+    query: &str,
+    scope: crate::Scope,
+) -> Result<(String, u64)> {
     use cv_core::projection::Searchable;
     use cv_core::scan::Matcher;
     use cv_core::{Block, Demand, Flow, Message, MessageSink, SessionRef};
@@ -4141,6 +4264,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         terms_len: usize,
         clauses: ClauseExpr,
         resolver: cv_core::Resolver,
+        bytes_read: u64,
         error: Option<anyhow::Error>,
         failed: bool,
         scope: crate::Scope,
@@ -4150,11 +4274,17 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         fn ready(&self) -> bool {
             snippet_ready(&self.matcher, self.terms_len, &self.clauses)
         }
+        fn push_str(&mut self, s: &str) {
+            self.bytes_read = self.bytes_read.saturating_add(s.len() as u64);
+            self.matcher.push(s);
+        }
         fn feed_text(&mut self, text: &cv_core::Text) -> Result<()> {
             let matcher = &mut self.matcher;
+            let bytes_read = &mut self.bytes_read;
             let terms_len = self.terms_len;
             let clauses = &self.clauses;
             cv_core::stream::stopped(text.try_for_each_chunk(&self.resolver, 4096, |part| {
+                *bytes_read = bytes_read.saturating_add(part.len() as u64);
                 matcher.push(part);
                 if snippet_ready(matcher, terms_len, clauses) {
                     Err(cv_core::stream::Stop.into())
@@ -4169,26 +4299,32 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
             match b {
                 Block::Text { text, .. } | Block::Thinking { text, .. } => {
                     self.feed_text(text)?;
-                    self.matcher.push("\n");
+                    self.push_str("\n");
                 }
                 Block::ToolUse { name, input, .. } => {
-                    self.matcher.push(name);
-                    self.matcher.push(" ");
+                    self.push_str(name);
+                    self.push_str(" ");
+                    let before = self.matcher.held();
                     self.matcher.json(input, none)?;
-                    self.matcher.push("\n");
+                    self.bytes_read = self
+                        .bytes_read
+                        .saturating_add(self.matcher.held().saturating_sub(before).max(2) as u64);
+                    self.push_str("\n");
                 }
                 Block::ToolResult { content, .. } => {
                     self.feed_text(content)?;
-                    self.matcher.push("\n");
+                    self.push_str("\n");
                     if !self.ready() {
                         if let Some(p) = b.persisted_output_path() {
                             let matcher = &mut self.matcher;
+                            let bytes_read = &mut self.bytes_read;
                             let terms_len = self.terms_len;
                             let clauses = &self.clauses;
                             let read = cv_core::stream::stopped(cv_core::lazy::read_pieces_checked(
                                 std::path::Path::new(p),
                                 64 * 1024,
                                 |piece| {
+                                    *bytes_read = bytes_read.saturating_add(piece.len() as u64);
                                     matcher.push(piece);
                                     if snippet_ready(matcher, terms_len, clauses) {
                                         Err(cv_core::stream::Stop.into())
@@ -4198,11 +4334,11 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                                 },
                             ))?;
                             match read {
-                                Some(cv_core::lazy::PersistedHead::Text(_)) => matcher.push("\n"),
+                                Some(cv_core::lazy::PersistedHead::Text(_)) => self.push_str("\n"),
                                 Some(head) => {
                                     if let Some(note) = head.indexed_text(p) {
-                                        matcher.push(&note);
-                                        matcher.push("\n");
+                                        self.push_str(&note);
+                                        self.push_str("\n");
                                     }
                                 }
                                 None => {}
@@ -4212,8 +4348,8 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
                 }
                 Block::File { path, source, .. } => {
                     if let Some(p) = path.as_deref().or(source.as_deref()) {
-                        self.matcher.push(p);
-                        self.matcher.push("\n");
+                        self.push_str(p);
+                        self.push_str("\n");
                     }
                 }
                 Block::Image { .. } | Block::Opaque { .. } => {}
@@ -4264,6 +4400,7 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         terms_len,
         clauses,
         resolver: cv_core::Resolver::new(Some(PathBuf::from(path))),
+        bytes_read: 0,
         error: None,
         failed: false,
         scope,
@@ -4276,11 +4413,13 @@ fn live_snippet(path: &str, id: &str, harness: &str, query: &str, scope: crate::
         &mut acc,
         cv_core::stream::Pass::RECORD,
     )?;
+    let bytes_read = acc.bytes_read;
     let head = acc.matcher.finish();
-    Ok(match (0..terms_len).find_map(|i| acc.matcher.excerpt_of(i)) {
+    let snippet = match (0..terms_len).find_map(|i| acc.matcher.excerpt_of(i)) {
         Some(e) => window(&e.text, e.at, e.len),
         None => self::head(&head.text, 200),
-    })
+    };
+    Ok((snippet, bytes_read))
 }
 
 /// Window the body around the first matching query term; fall back to a head if nothing matches:
@@ -11646,7 +11785,7 @@ mod tests {
 
         let index = Index::create_in_ram(build_schema());
         let w_default = open_writer(&index, 60_000_000).unwrap();
-        assert_eq!(w_default.num_threads(), default_n.min(4).max(1));
+        assert_eq!(w_default.num_threads(), default_n.clamp(1, 4));
         drop(w_default);
 
         // `--threads 1` / `CV_THREADS=1` bounds sweep workers AND Tantivy writer threads to 1.
@@ -11666,8 +11805,12 @@ mod tests {
 
         // Explicit `--threads` overrides even a malformed `$CV_THREADS`, while bare resolution rejects 0/bad.
         home._scope.set(cv_core::THREADS_VAR, "not-a-number");
-        assert!(cv_core::resolve_worker_threads(None).unwrap_err().is::<cv_core::BadThreads>());
+        assert!(cv_core::resolve_worker_threads(None)
+            .unwrap_err()
+            .is::<cv_core::BadThreads>());
         assert_eq!(cv_core::resolve_worker_threads(Some(3)).unwrap(), 3);
-        assert!(cv_core::resolve_worker_threads(Some(0)).unwrap_err().is::<cv_core::BadThreads>());
+        assert!(cv_core::resolve_worker_threads(Some(0))
+            .unwrap_err()
+            .is::<cv_core::BadThreads>());
     }
 }

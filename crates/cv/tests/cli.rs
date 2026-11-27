@@ -606,6 +606,280 @@ fn search_batch_refreshes_snapshot_in_place_and_survives_failed_refresh() {
     assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+#[test]
+fn search_batch_exposes_bounded_logical_work_without_rediscovery_or_source_reads() {
+    let w = World::new("search-batch-work");
+    let mut paths = Vec::new();
+    for i in 0..20 {
+        let id = format!("broad-{i:02}");
+        let text = if i == 0 {
+            format!("zqcommonbatch zqnarrowbatch session {i}")
+        } else {
+            format!("zqcommonbatch session {i}")
+        };
+        paths.push(w.write_session(&id, &[user_line(&id, "u1", "2026-06-01T12:00:00Z", &text)]));
+    }
+    for i in 0..4 {
+        let id = format!("other-{i:02}");
+        paths.push(w.write_session(&id, &[user_line(&id, "u1", "2026-06-01T12:00:00Z", "unrelated topic")]));
+    }
+    w.cv_ok(&["index"]);
+
+    // Make live source files unreadable after indexing so any accidental source read or live
+    // snippet fetch would fail or surface in work counters.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in &paths {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+    }
+
+    let input = concat!(
+        "\"zqnarrowbatch\"\n",
+        "\"zqnarrowbatch\"\n",
+        "\"zqcommonbatch\"\n",
+        "\"zqmissingbatch\"\n",
+        "\"(unclosed\"\n",
+        "{\"query\":\"zqnarrowbatch\",\"refresh\":true}\n"
+    );
+    let (ok, _, out, err) = w.cv_stdin(&["search", "--batch", "--limit", "5"], input);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in &paths {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    assert!(ok, "{err}");
+    assert!(err.is_empty(), "{err}");
+    let rows: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.len(), 6, "{out}");
+
+    for idx in [0usize, 1, 2, 3, 5] {
+        let work = &rows[idx]["work"];
+        assert_eq!(work["basis"], "logical_app_reads", "row {idx}: {rows:?}");
+        assert_eq!(work["discovery_sessions"], 0, "row {idx}: {work}");
+        assert_eq!(work["source_sessions_read"], 0, "row {idx}: {work}");
+        assert_eq!(work["source_bytes_read"], 0, "row {idx}: {work}");
+        assert!(work["eval_micros"].is_u64(), "row {idx}: {work}");
+    }
+
+    // Repeated narrow query: 1 hit, stored preview used, per-query setup 0, O(matches) docs examined.
+    let narrow_examined = rows[0]["work"]["index_docs_examined"].as_u64().unwrap();
+    assert_eq!(rows[0]["answer"]["total"], 1);
+    assert_eq!(rows[0]["work"]["stored_previews_used"], 1);
+    assert_eq!(rows[0]["work"]["setup_micros"], 0);
+    assert_eq!(rows[1]["work"]["index_docs_examined"], narrow_examined);
+    assert_eq!(rows[1]["work"]["setup_micros"], 0);
+    assert!(
+        (1..=4).contains(&narrow_examined),
+        "narrow match should examine only matching posting + winner metadata docs, got {narrow_examined}: {}",
+        rows[0]
+    );
+
+    // Broad match: 20 matching sessions (`--limit 5` returns 5 stored previews, counts all 20).
+    let broad_examined = rows[2]["work"]["index_docs_examined"].as_u64().unwrap();
+    assert_eq!(rows[2]["answer"]["total"], 20);
+    assert_eq!(rows[2]["work"]["stored_previews_used"], 5);
+    assert!(
+        broad_examined > narrow_examined,
+        "broad match ({broad_examined}) must examine more posting docs than narrow match ({narrow_examined})"
+    );
+
+    // No-hit control: 0 docs examined, 0 previews used.
+    assert_eq!(rows[3]["answer"]["total"], 0);
+    assert_eq!(rows[3]["work"]["index_docs_examined"], 0);
+    assert_eq!(rows[3]["work"]["stored_previews_used"], 0);
+
+    // Malformed query control: isolated error row, snapshot preserved.
+    assert!(rows[4]["error"].is_string(), "{}", rows[4]);
+
+    // Refresh+query row charges refresh setup_micros on that request.
+    assert_eq!(rows[5]["answer"]["total"], 1);
+    assert_eq!(rows[5]["work"]["setup_micros"], rows[5]["setup_micros"]);
+}
+
+#[test]
+fn frozen_search_stats_skips_live_snippets_and_counts_shared_sqlite_staleness_by_row() {
+    let w = World::new("frozen-stats-sqlite");
+
+    // 1. Seed 4 sessions in one shared Hermes SQLite database (`~/.hermes/state.db`) + 1 Claude session.
+    let hermes_dir = w.home.join(".hermes");
+    fs::create_dir_all(&hermes_dir).unwrap();
+    let db_path = hermes_dir.join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 1,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                title TEXT,
+                cwd TEXT,
+                git_branch TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_content TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT,
+                codex_message_items TEXT,
+                platform_message_id TEXT,
+                observed INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1,
+                compacted INTEGER DEFAULT 0
+             );",
+        )
+        .unwrap();
+        for i in 1..=4 {
+            let sid = format!("hermes-{i}");
+            let title = format!("Hermes Session {i}");
+            let body = format!("zqhermesshared uniquehermes{i} payload");
+            conn.execute(
+                "INSERT INTO sessions (id, source, model, started_at, message_count, title, cwd)
+                 VALUES (?1, 'cli', 'test-model', 1717200000.0, 1, ?2, '/work/proj')",
+                rusqlite::params![sid, title],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp, active, compacted)
+                 VALUES (?1, 'user', ?2, 1717200001.0, 1, 0)",
+                rusqlite::params![sid, body],
+            )
+            .unwrap();
+        }
+    }
+    let claude_path = w.write_session(
+        "claudefrozen",
+        &[user_line(
+            "claudefrozen",
+            "u1",
+            "2026-06-01T12:00:00Z",
+            "zqclaudefrozen stored preview check",
+        )],
+    );
+    cv_testkit::settle(&w.home);
+    w.cv_ok(&["index"]);
+
+    // Default `--json` without `--stats` keeps top-level keys strictly `{"hits", "total"}`.
+    let (plain_json_out, _) = w.cv_ok(&["search", "zqclaudefrozen", "--json"]);
+    let plain_json: serde_json::Value = serde_json::from_str(&plain_json_out).unwrap();
+    let mut plain_keys: Vec<&str> = plain_json.as_object().unwrap().keys().map(String::as_str).collect();
+    plain_keys.sort_unstable();
+    assert_eq!(plain_keys, ["hits", "total"], "{plain_json_out}");
+
+    // Non-frozen `--stats --json` includes `"work"` and records live snippet source reads;
+    // plain text `--stats` prints `(work: basis=logical_app_reads ...)` on stderr.
+    let (live_stats_out, _) = w.cv_ok(&["search", "zqclaudefrozen", "--stats", "--json"]);
+    let live_stats: serde_json::Value = serde_json::from_str(&live_stats_out).unwrap();
+    assert_eq!(live_stats["work"]["basis"], "logical_app_reads");
+    assert!(
+        live_stats["work"]["source_sessions_read"].as_u64().unwrap() >= 1
+            && live_stats["work"]["source_bytes_read"].as_u64().unwrap() > 0,
+        "non-frozen search enriches snippets from live transcript: {live_stats}"
+    );
+    let (_, text_stats_err) = w.cv_ok(&["search", "zqclaudefrozen", "--stats"]);
+    assert!(
+        text_stats_err.contains("(work: basis=logical_app_reads ") && text_stats_err.contains("source_bytes_read="),
+        "{text_stats_err}"
+    );
+
+    // 2. Under `--frozen`, even if the matching Claude transcript is `chmod 000` (unreadable),
+    //    `cv --frozen search` performs ZERO live transcript reads (`source_bytes_read == 0`,
+    //    `stored_previews_used == 1`) and emits NO snippet failure warning!
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let (frozen_claude_out, frozen_claude_err) =
+        w.cv_ok(&["--frozen", "search", "zqclaudefrozen", "--stats", "--json"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    assert!(
+        !frozen_claude_err.contains("snippets unavailable"),
+        "frozen search must never open live transcripts for snippets: {frozen_claude_err}"
+    );
+    let frozen_claude: serde_json::Value = serde_json::from_str(&frozen_claude_out).unwrap();
+    assert_eq!(frozen_claude["total"], 1);
+    assert_eq!(frozen_claude["work"]["basis"], "logical_app_reads");
+    assert_eq!(frozen_claude["work"]["source_sessions_read"], 0);
+    assert_eq!(frozen_claude["work"]["source_bytes_read"], 0);
+    assert_eq!(frozen_claude["work"]["stored_previews_used"], 1);
+
+    // Refresh after `chmod` ctime change so all 5 sessions start certified fresh before step 3.
+    cv_testkit::settle(&w.home);
+    w.cv_ok(&["index"]);
+    let (_, clean_hermes_err) = w.cv_ok(&["--frozen", "search", "zqhermesshared", "--stats", "--json"]);
+    assert!(clean_hermes_err.is_empty(), "{clean_hermes_err}");
+
+    // 3. Mutate ONLY 1 of the 4 sessions in the shared Hermes SQLite DB (`hermes-1`), bumping the
+    //    shared `state.db` file's mtime & size. `--frozen` must certify the other 3 fresh via
+    //    `by_rows` (`stale == 1`, NOT `4`) and still read 0 live transcript bytes!
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active, compacted)
+             VALUES ('hermes-1', 'assistant', 'zqhermesappended', 1717200099.0, 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET message_count = 2, ended_at = 1717200099.0 WHERE id = 'hermes-1'",
+            [],
+        )
+        .unwrap();
+    }
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(&db_path)
+        .and_then(|f| f.set_modified(future))
+        .unwrap();
+
+    let (frozen_hermes_out, frozen_hermes_err) =
+        w.cv_ok(&["--frozen", "search", "zqhermesshared", "--stats", "--json"]);
+    let frozen_hermes: serde_json::Value = serde_json::from_str(&frozen_hermes_out).unwrap();
+    assert_eq!(frozen_hermes["total"], 4, "{frozen_hermes_out}");
+    assert_eq!(frozen_hermes["work"]["source_sessions_read"], 0);
+    assert_eq!(frozen_hermes["work"]["source_bytes_read"], 0);
+    assert_eq!(frozen_hermes["work"]["stored_previews_used"], 4);
+    assert!(
+        frozen_hermes_err.contains("for 1 session(s)") && !frozen_hermes_err.contains("for 4 session(s)"),
+        "shared SQLite DB row certificates must count only the 1 mutated session stale, got:\n{frozen_hermes_err}"
+    );
+}
+
 /// `cv search --json`'s stdout: `{"hits": [...], "total": M}`, as its hits and total.
 fn search_json(out: &str) -> (Vec<serde_json::Value>, u64) {
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stdout must be pure JSON");

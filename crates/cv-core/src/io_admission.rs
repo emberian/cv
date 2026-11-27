@@ -111,7 +111,7 @@ struct DeviceSlot {
     peak_active: usize,
     next_ticket: u64,
     serving_ticket: u64,
-    waiters: VecDeque<u64>,
+    waiters: VecDeque<(u64, std::sync::Arc<Condvar>)>,
     owners: HashMap<std::thread::ThreadId, usize>,
 }
 
@@ -128,11 +128,16 @@ impl DeviceSlot {
             owners: HashMap::new(),
         }
     }
+
+    fn next_runnable_waiter(&self) -> Option<std::sync::Arc<Condvar>> {
+        (self.active < self.policy.max_streams)
+            .then(|| self.waiters.front().map(|(_, cv)| cv.clone()))
+            .flatten()
+    }
 }
 
 struct DeviceLock {
     state: Mutex<DeviceSlot>,
-    ready: Condvar,
 }
 
 /// Shared per-device I/O admission controller.
@@ -184,7 +189,6 @@ impl IoAdmission {
                 .or_insert_with(|| {
                     std::sync::Arc::new(DeviceLock {
                         state: Mutex::new(DeviceSlot::new(policy, true)),
-                        ready: Condvar::new(),
                     })
                 })
                 .clone()
@@ -192,7 +196,11 @@ impl IoAdmission {
         let mut slot = lock.state.lock().unwrap_or_else(|e| e.into_inner());
         slot.policy = policy;
         slot.overridden = true;
-        lock.ready.notify_all();
+        let next = slot.next_runnable_waiter();
+        drop(slot);
+        if let Some(cv) = next {
+            cv.notify_one();
+        }
     }
 
     /// Clear any manual override for `dev`, reverting new acquisitions to detected/env policy.
@@ -202,7 +210,11 @@ impl IoAdmission {
             let mut slot = lock.state.lock().unwrap_or_else(|e| e.into_inner());
             slot.overridden = false;
             slot.policy = env_override_policy(fallback_class);
-            lock.ready.notify_all();
+            let next = slot.next_runnable_waiter();
+            drop(slot);
+            if let Some(cv) = next {
+                cv.notify_one();
+            }
         }
     }
 
@@ -214,7 +226,6 @@ impl IoAdmission {
         let policy = env_override_policy(class_hint.unwrap_or(DeviceClass::Unknown));
         let arc = std::sync::Arc::new(DeviceLock {
             state: Mutex::new(DeviceSlot::new(policy, false)),
-            ready: Condvar::new(),
         });
         map.insert(dev, arc.clone());
         arc
@@ -254,19 +265,23 @@ impl IoAdmission {
         }
         let ticket = slot.next_ticket;
         slot.next_ticket = slot.next_ticket.wrapping_add(1);
-        slot.waiters.push_back(ticket);
+        let waiter = std::sync::Arc::new(Condvar::new());
+        slot.waiters.push_back((ticket, waiter.clone()));
 
-        while slot.active >= slot.policy.max_streams || slot.waiters.front().copied() != Some(ticket) {
-            slot = lock.ready.wait(slot).unwrap_or_else(|e| e.into_inner());
+        while slot.active >= slot.policy.max_streams || slot.waiters.front().map(|(t, _)| *t) != Some(ticket) {
+            slot = waiter.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
         slot.waiters.pop_front();
         slot.serving_ticket = ticket;
         slot.active += 1;
         slot.peak_active = slot.peak_active.max(slot.active);
         slot.owners.insert(tid, 1);
+        let next = slot.next_runnable_waiter();
         drop(slot);
-        // If additional stream slots remain available on this device, wake the next FIFO waiter.
-        lock.ready.notify_all();
+        // If additional stream slots remain available on this device, wake only the next FIFO waiter.
+        if let Some(cv) = next {
+            cv.notify_one();
+        }
         IoPermit { lock, owner: tid }
     }
 
@@ -372,8 +387,11 @@ impl Drop for IoPermit {
         };
         if release_slot {
             slot.active = slot.active.saturating_sub(1);
+            let next = slot.next_runnable_waiter();
             drop(slot);
-            self.lock.ready.notify_all();
+            if let Some(cv) = next {
+                cv.notify_one();
+            }
         }
     }
 }
@@ -1443,5 +1461,42 @@ mod tests {
             .expect("per-entry ATTR_CMN_ERROR without ATTR_CMN_NAME must not be dropped");
         assert!(parsed.name.is_empty());
         assert_eq!(parsed.entry_error, Some(libc::EACCES));
+    }
+
+    #[test]
+    fn per_waiter_fifo_admission_bounds_concurrency_without_lost_wakeups() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let admission = IoAdmission::new();
+        let dev = DeviceId(42_042);
+        admission.set_device_override(
+            dev,
+            DevicePolicy {
+                class: DeviceClass::Unknown,
+                max_streams: 2,
+                coalesce_gap_bytes: 4096,
+                max_coalesced_bytes: 65536,
+            },
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let completed = std::sync::Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..24 {
+                let bar = barrier.clone();
+                let done = completed.clone();
+                let adm = &admission;
+                s.spawn(move || {
+                    bar.wait();
+                    for _ in 0..8 {
+                        let _p1 = adm.acquire(dev, None);
+                        let _p2 = adm.acquire(dev, None); // reentrant on same thread
+                        std::thread::yield_now();
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(completed.load(Ordering::SeqCst), 24);
+        assert_eq!(admission.active_streams(dev), 0);
+        assert!(admission.peak_active_streams(dev) <= 2);
     }
 }

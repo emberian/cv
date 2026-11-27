@@ -151,6 +151,38 @@ pub enum Note {
     Unscanned(String),
 }
 
+/// Accounting basis for [`SearchWork`]: logical application/index operations and bytes read,
+/// distinct from OS page-cache hits or physical block faults.
+pub const SEARCH_WORK_BASIS: &str = "logical_app_reads";
+
+/// Per-query logical read-work accounting across index evaluation, discovery, and live source reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SearchWork {
+    pub basis: String,
+    pub index_docs_examined: usize,
+    pub stored_previews_used: usize,
+    pub discovery_sessions: usize,
+    pub source_sessions_read: usize,
+    pub source_bytes_read: u64,
+    pub setup_micros: u64,
+    pub eval_micros: u64,
+}
+
+impl Default for SearchWork {
+    fn default() -> Self {
+        Self {
+            basis: SEARCH_WORK_BASIS.to_owned(),
+            index_docs_examined: 0,
+            stored_previews_used: 0,
+            discovery_sessions: 0,
+            source_sessions_read: 0,
+            source_bytes_read: 0,
+            setup_micros: 0,
+            eval_micros: 0,
+        }
+    }
+}
+
 /// What one search found: the hits in rank order (or discovery order, live), where they came
 /// from, the degradations, and how many sessions matched in all.
 pub struct Found {
@@ -206,6 +238,27 @@ impl Searcher {
         )
     }
 
+    /// [`search_allowed`](Self::search_allowed) paired with [`SearchWork`] accounting.
+    pub fn search_allowed_with_work(
+        &self,
+        query: &str,
+        filter: SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+        limit: usize,
+        source: Source,
+        live_bytes: Option<u64>,
+    ) -> Result<(Found, SearchWork)> {
+        self.search_in_allowed_with_work(
+            &default_tantivy_dir(),
+            query,
+            filter,
+            allowed_ids,
+            limit,
+            source,
+            live_bytes,
+        )
+    }
+
     /// Search with an explicit full-text index location; live sources use their configured stores.
     /// This avoids changing the process environment to select an index.
     pub fn search_in(
@@ -232,18 +285,35 @@ impl Searcher {
         source: Source,
         live_bytes: Option<u64>,
     ) -> Result<Found> {
+        self.search_in_allowed_with_work(dir, query, filter, allowed_ids, limit, source, live_bytes)
+            .map(|(found, _)| found)
+    }
+
+    /// [`search_in_allowed`](Self::search_in_allowed) paired with [`SearchWork`] accounting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_in_allowed_with_work(
+        &self,
+        dir: &std::path::Path,
+        query: &str,
+        filter: SearchFilter<'_>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+        limit: usize,
+        source: Source,
+        live_bytes: Option<u64>,
+    ) -> Result<(Found, SearchWork)> {
         let mut found = Found {
             hits: Vec::new(),
             source,
             notes: Vec::new(),
             total: 0,
         };
+        let mut work = SearchWork::default();
         let harness = filter.harness.and_then(cv_core::Harness::parse);
         if filter.harness.is_some() && harness.is_none() {
-            return Ok(found);
+            return Ok((found, work));
         }
         if allowed_ids.is_some_and(std::collections::HashSet::is_empty) {
-            return Ok(found);
+            return Ok((found, work));
         }
         let filter = SearchFilter {
             harness: harness.map(cv_core::Harness::as_str),
@@ -251,14 +321,42 @@ impl Searcher {
         };
         match source {
             Source::Live => {
+                let started = std::time::Instant::now();
+                let mut discovery_sessions = 0usize;
+                let mut admitted_paths: Vec<PathBuf> = Vec::new();
                 let live = cv_core::scan::live_search_filtered(query, harness, limit, |r| {
-                    allowed_ids.is_none_or(|ids| ids.contains(&r.id) || ids.contains(&r.session_selector()))
+                    discovery_sessions += 1;
+                    let keep = allowed_ids.is_none_or(|ids| ids.contains(&r.id) || ids.contains(&r.session_selector()))
                         && filter.cwd.is_none_or(|needle| {
                             r.cwd
                                 .as_ref()
                                 .is_some_and(|path| path.to_string_lossy().contains(needle))
-                        })
+                        });
+                    if keep {
+                        admitted_paths.push(r.path.clone());
+                    }
+                    keep
                 })?;
+                let unreadable_paths: std::collections::HashSet<&std::path::Path> =
+                    live.unreadable.iter().map(|s| s.path.as_path()).collect();
+                let mut counted_paths: std::collections::HashSet<&std::path::Path> = std::collections::HashSet::new();
+                let mut source_bytes_read = 0u64;
+                for p in &admitted_paths {
+                    if !unreadable_paths.contains(p.as_path()) && counted_paths.insert(p.as_path()) {
+                        source_bytes_read =
+                            source_bytes_read.saturating_add(std::fs::metadata(p).map_or(0, |m| m.len()));
+                    }
+                }
+                work = SearchWork {
+                    basis: SEARCH_WORK_BASIS.to_owned(),
+                    index_docs_examined: 0,
+                    stored_previews_used: 0,
+                    discovery_sessions,
+                    source_sessions_read: admitted_paths.len().saturating_sub(live.unreadable.len()),
+                    source_bytes_read,
+                    setup_micros: 0,
+                    eval_micros: started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                };
                 found.hits = live.hits.into_iter().map(Hit::from).collect();
                 found.total = live.total;
                 if let Some(first) = live.unreadable.first() {
@@ -269,7 +367,7 @@ impl Searcher {
                         first.why
                     )));
                 }
-                return Ok(found);
+                return Ok((found, work));
             }
             Source::Index => {
                 let _sources = cv_core::source::read_scope();
@@ -280,6 +378,7 @@ impl Searcher {
                     total,
                     note,
                     suffix,
+                    work: searched_work,
                 } = fts::search_suffixed_allowed(dir, query, limit, filter, shared_allowed, live, || {
                     let mut refs = cv_core::try_sessions_for(harness)?;
                     if let Some(ids) = allowed_ids {
@@ -289,6 +388,7 @@ impl Searcher {
                 })?;
                 found.hits = hits;
                 found.total = total;
+                work = searched_work;
                 if let Some(why) = note {
                     found.notes.push(Note::SnippetsUnavailable(why));
                 }
@@ -300,7 +400,7 @@ impl Searcher {
                 }
             }
         }
-        Ok(found)
+        Ok((found, work))
     }
 
     /// Exact code/symbol/substring search backed by the trigram candidate index plus live tail
@@ -336,18 +436,39 @@ impl Searcher {
         limit: usize,
         live_bytes: Option<u64>,
     ) -> Result<Found> {
+        self.search_exact_in_allowed_with_work(dir, query, filter, case_sensitive, allowed_ids, limit, live_bytes)
+            .map(|(found, _)| found)
+    }
+
+    /// [`search_exact_in_allowed`](Self::search_exact_in_allowed) paired with [`SearchWork`] accounting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_exact_in_allowed_with_work(
+        &self,
+        dir: &std::path::Path,
+        query: &str,
+        filter: SearchFilter<'_>,
+        case_sensitive: bool,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+        limit: usize,
+        live_bytes: Option<u64>,
+    ) -> Result<(Found, SearchWork)> {
         let harness = filter.harness.and_then(cv_core::Harness::parse);
         if filter.harness.is_some() && harness.is_none() {
-            return Ok(Found {
-                hits: Vec::new(),
-                source: Source::Index,
-                notes: Vec::new(),
-                total: 0,
-            });
+            return Ok((
+                Found {
+                    hits: Vec::new(),
+                    source: Source::Index,
+                    notes: Vec::new(),
+                    total: 0,
+                },
+                SearchWork::default(),
+            ));
         }
         let _sources = cv_core::source::read_scope();
+        let disc_started = std::time::Instant::now();
         let refs = cv_core::sessions_for(harness);
         let live = LiveRead::of(live_bytes)?;
+        let disc_micros = disc_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         trigram::search(
             dir,
             query,
@@ -363,7 +484,10 @@ impl Searcher {
             &refs,
             allowed_ids,
         )
-        .map(trigram::TrigramFound::into_found)
+        .map(|mut tf| {
+            tf.work.setup_micros = tf.work.setup_micros.saturating_add(disc_micros);
+            tf.into_found_with_work()
+        })
     }
 }
 

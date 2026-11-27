@@ -316,12 +316,18 @@ pub(super) fn read(
     }
     let has_index = indexed.is_some();
     let mut pending = plan(dir, indexed, &native, &mut suffix)?;
-    if live == LiveRead::Frozen && has_index {
-        for p in pending {
-            suffix.cut += 1;
-            if let Cost::Known(cost) = p.cost {
+    let mut cut_paths: HashSet<PathBuf> = HashSet::new();
+    let mut add_cut_cost = |suffix: &mut Suffix, p: &Pending| {
+        suffix.cut += 1;
+        if let Cost::Known(cost) = p.cost {
+            if cut_paths.insert(p.job.r.path.clone()) {
                 suffix.cut_bytes += cost;
             }
+        }
+    };
+    if live == LiveRead::Frozen && has_index {
+        for p in &pending {
+            add_cut_cost(&mut suffix, p);
         }
         return Ok((None, suffix));
     }
@@ -364,15 +370,11 @@ pub(super) fn read(
     for cand in candidates {
         match cand {
             Candidate::Native(p) if live == LiveRead::Frozen => {
-                suffix.cut += 1;
-                if let Cost::Known(cost) = p.cost {
-                    suffix.cut_bytes += cost;
-                }
+                add_cut_cost(&mut suffix, &p);
             }
             Candidate::Native(p) => match p.cost {
                 Cost::Known(cost) if cost > remaining => {
-                    suffix.cut += 1;
-                    suffix.cut_bytes += cost;
+                    add_cut_cost(&mut suffix, &p);
                 }
                 Cost::Known(cost) => {
                     remaining -= cost;
@@ -515,7 +517,7 @@ fn plan(
     } else {
         dependencies
     };
-    let reader = cv_core::resume::Reader::default();
+    let reader = (suffix.live != LiveRead::Frozen).then(cv_core::resume::Reader::default);
     let mut probe = cv_core::source::Probe::default();
     let newest_indexed = existing
         .values()
@@ -534,16 +536,16 @@ fn plan(
         let r = &*as_indexed(r, &metadata, &aliases);
         let source = probe.snapshot(r);
         let fresh = Freshness::of(&existing, &metadata, &dependencies, &mut probe, r, &prov, &source);
-        newest_on_disk = newest_on_disk.max(fresh.mtime);
         if fresh.fresh {
             continue;
         }
+        newest_on_disk = newest_on_disk.max(fresh.mtime);
         suffix.stale += 1;
         // Frozen needs freshness coverage, but will never consume a resume checkpoint.
         // Do not read/decode large saved parser state or sample its source prefix.
-        if suffix.live == LiveRead::Frozen {
+        let Some(reader) = &reader else {
             continue;
-        }
+        };
         let job = Job {
             r: r.clone(),
             mtime: fresh.mtime,
@@ -564,8 +566,8 @@ fn plan(
             decoded: None,
             appended: None,
         };
-        let from = resumable_from(&job, &cv_core::resume::version(adapter.as_ref(), RESUME_TAG), &reader);
-        let cost = if adapter.sqlite_source(r) == Some(true) {
+        let from = resumable_from(&job, &cv_core::resume::version(adapter.as_ref(), RESUME_TAG), reader);
+        let cost = if adapter.sqlite_source(r) == Some(true) || !adapter.path_selects_session(r) {
             Cost::Metered
         } else {
             let size = u64::try_from(fresh.size).unwrap_or(0);

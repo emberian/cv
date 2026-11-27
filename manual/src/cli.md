@@ -332,6 +332,8 @@ cv search "flux inference refactor"
 cv search "nom parser" --harness codex --limit 10
 cv search "leep 4" --exact
 cv search "flux inference" --cwd cv -q "msgs>=20" --json
+cv --frozen search "flux inference" --stats --json
+printf '"flux"\n{"query":"nom","refresh":true}\n' | cv search --batch
 ```
 
 ```text
@@ -351,7 +353,13 @@ source text. It matches the exchange; `--kind context` matches injected context,
 hits shown, never the count: the footer says `N of M matches`, M every session that matched.
 `--json` prints `{"hits": [...],
 "total": M}`, each hit a session row plus `score` (`null` on a live scan), full `snippet`, and
-`agent_id`/`parent_id`/`workflow` (set for hits indexed with `--subagents`).
+`agent_id`/`parent_id`/`workflow` (set for hits indexed with `--subagents`). `--stats` adds
+logical read accounting (`basis = "logical_app_reads"`, `index_docs_examined`,
+`stored_previews_used`, `discovery_sessions`, `source_sessions_read`, `source_bytes_read`,
+`setup_micros`, `eval_micros`) under `"work"` in `--json` or on stderr in text mode. `--batch`
+reads JSON query strings or `{"query", "refresh"}` / `{"refresh": true}` objects from piped stdin
+over one pinned index snapshot, emitting one JSON answer (`answer`, `work`, `setup_micros`),
+refresh ack, or error line per request with zero per-query discovery or live source reads.
 
 ### `cv events`
 
@@ -943,6 +951,7 @@ cv index --exact        # also build the trigram accelerator for `cv search --ex
 cv index --subagents    # also fold the sub-agent / workflow forest into the index + events
 cv index --rebuild      # reread all sessions; retain old history until replacement succeeds
 cv index --if-changed   # skip the pass when nothing changed since the last index
+cv index --threads 4    # cap discovery, sweep and writer worker threads (or $CV_THREADS)
 ```
 
 ```text
@@ -952,6 +961,8 @@ indexed 2245 session(s) → ~/.clustervision/tantivy
 
 Incremental; `--if-changed` probes session stamps first and skips the pass on a quiet corpus
 (incompatible with `--rebuild`); `--json` reports `indexed`, `changed`, `removed`, `errors`.
+`--threads <N>` (or `$CV_THREADS`, default `min(cores, 8)`) bounds worker concurrency across
+discovery, sweep parsing, and index writers.
 `--exact` adds one source pass for literal substring trigrams (`~/.clustervision/trigram`).
 `--subagents` tags forest hits with parent, run and agent (can add hundreds of
 MB). The same pass fills the **event catalog** for [`events`](#cv-events), [`touched`](#cv-touched)

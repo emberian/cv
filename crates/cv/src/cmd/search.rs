@@ -19,6 +19,7 @@ pub(crate) struct SearchArgs<'a> {
     pub kind: Option<String>,
     pub live_bytes: Option<u64>,
     pub json: bool, // emit `{hits, total}` (session rows + score/snippet/provenance) instead of the table
+    pub stats: bool,
 }
 
 fn resolve_allowed_ids(
@@ -53,6 +54,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         kind,
         live_bytes,
         json,
+        stats,
     } = args;
     let want = parse_harness(&harness)?;
     let scope = match kind.as_deref() {
@@ -88,7 +90,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     // means "no match", and an unusable index is an error naming the cause and the fix, never a
     // silent full scan of every transcript.
     let result = if exact {
-        cv_search::Searcher.search_exact_in_allowed(
+        cv_search::Searcher.search_exact_in_allowed_with_work(
             &cv_search::default_trigram_dir(),
             query,
             filter,
@@ -98,11 +100,11 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
             live_bytes,
         )
     } else {
-        cv_search::Searcher.search_allowed(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
+        cv_search::Searcher.search_allowed_with_work(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
     };
-    let found =
+    let (found, work) =
         match result {
-            Ok(found) => found,
+            Ok(pair) => pair,
             Err(e) => return match source {
                 Source::Index if cv_search::is_invalid_text_query(&e) || e.is::<cv_search::BadLiveBytes>() => {
                     crate::util::usage(format!("{e:#}"))
@@ -116,7 +118,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
                 Source::Live => Err(e),
             },
         };
-    render(found, query, json)
+    render(found, work, query, json, stats)
 }
 
 #[derive(serde::Deserialize)]
@@ -133,7 +135,10 @@ fn explicit_string<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Resul
 }
 
 enum BatchOutcome {
-    Answer(cv_search::IndexedAnswer),
+    Answer {
+        answer: cv_search::IndexedAnswer,
+        refreshed: bool,
+    },
     Refreshed,
 }
 
@@ -181,18 +186,31 @@ fn batch_search(filter: cv_search::SearchFilter<'_>, limit: usize) -> Result<()>
                         if refresh {
                             prepared.refresh()?;
                         }
-                        prepared.search(&query, limit, filter, None).map(BatchOutcome::Answer)
+                        prepared
+                            .search(&query, limit, filter, None)
+                            .map(|answer| BatchOutcome::Answer {
+                                answer,
+                                refreshed: refresh,
+                            })
                     }
                 })
         } else {
             serde_json::from_slice::<String>(&line)
                 .map_err(anyhow::Error::from)
                 .and_then(|query| prepared.search(&query, limit, filter, None))
-                .map(BatchOutcome::Answer)
+                .map(|answer| BatchOutcome::Answer {
+                    answer,
+                    refreshed: false,
+                })
         };
         let row = match result {
-            Ok(BatchOutcome::Answer(answer)) => {
-                serde_json::json!({"answer":answer,"setup_micros":prepared.setup_micros()})
+            Ok(BatchOutcome::Answer { answer, refreshed }) => {
+                let work = answer.search_work(if refreshed { prepared.setup_micros() } else { 0 });
+                serde_json::json!({
+                    "answer": answer,
+                    "work": work,
+                    "setup_micros": prepared.setup_micros(),
+                })
             }
             Ok(BatchOutcome::Refreshed) => serde_json::json!({
                 "refreshed": true,
@@ -222,6 +240,20 @@ fn note_line(note: &Note) -> Option<String> {
     }
 }
 
+fn work_line(w: &cv_search::SearchWork) -> String {
+    format!(
+        "(work: basis={} index_docs_examined={} stored_previews_used={} discovery_sessions={} source_sessions_read={} source_bytes_read={} setup_micros={} eval_micros={})",
+        w.basis,
+        w.index_docs_examined,
+        w.stored_previews_used,
+        w.discovery_sessions,
+        w.source_sessions_read,
+        w.source_bytes_read,
+        w.setup_micros,
+        w.eval_micros,
+    )
+}
+
 /// The footer: `N of M matches`, and how to see the rest when `--limit` cut them.
 fn matches_line(shown: usize, total: usize) -> String {
     let more = if shown < total { "; use --limit for more" } else { "" };
@@ -232,7 +264,7 @@ fn matches_line(shown: usize, total: usize) -> String {
 /// `N of M matches` footer and the notes, or, with `json`, `{"hits": [...], "total": M}` on
 /// stdout with the SAME hits in the same order — notes on stderr, an empty result `"hits": []` —
 /// so the output pipes cleanly.
-fn render(found: Found, query: &str, json: bool) -> Result<()> {
+fn render(found: Found, work: cv_search::SearchWork, query: &str, json: bool, stats: bool) -> Result<()> {
     let Found {
         hits,
         source,
@@ -246,7 +278,9 @@ fn render(found: Found, query: &str, json: bool) -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let rows = std::cell::LazyCell::new(cv_core::rows::SearchRowContext::new);
-        write_json_rows(&mut out, &hits, total, |hit| cv_search::row(hit, &rows))?;
+        write_json_rows(&mut out, &hits, total, stats.then_some(&work), |hit| {
+            cv_search::row(hit, &rows)
+        })?;
         out.flush()?;
         if hits.len() < total {
             eprintln!("({})", matches_line(hits.len(), total));
@@ -265,6 +299,9 @@ fn render(found: Found, query: &str, json: bool) -> Result<()> {
                 ),
                 other => println!("{}", note_line(other).unwrap_or_default()),
             }
+        }
+        if stats {
+            eprintln!("{}", work_line(&work));
         }
         return Ok(());
     }
@@ -314,15 +351,20 @@ fn render(found: Found, query: &str, json: bool) -> Result<()> {
     for line in notes.iter().filter_map(note_line) {
         println!("{line}");
     }
+    if stats {
+        eprintln!("{}", work_line(&work));
+    }
     Ok(())
 }
 
 // Preserve the shared row contract, retaining only one projected row at a time rather than
 // another complete Value array and serialized String.
 #[derive(serde::Serialize)]
-struct JsonFound<R> {
+struct JsonFound<'a, R> {
     hits: R,
     total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work: Option<&'a cv_search::SearchWork>,
 }
 struct JsonRows<'a, T, F> {
     rows: &'a [T],
@@ -342,6 +384,7 @@ fn write_json_rows<T>(
     out: &mut impl Write,
     rows: &[T],
     total: usize,
+    work: Option<&cv_search::SearchWork>,
     row: impl Fn(&T) -> serde_json::Value,
 ) -> Result<()> {
     serde_json::to_writer_pretty(
@@ -349,6 +392,7 @@ fn write_json_rows<T>(
         &JsonFound {
             hits: JsonRows { rows, row },
             total,
+            work,
         },
     )?;
     writeln!(out)?;
@@ -364,8 +408,7 @@ pub(crate) fn cmd_index(
     json: bool,
     exact: bool,
 ) -> Result<()> {
-    let threads = cv_core::resolve_worker_threads(threads)
-        .map_err(|e| crate::util::UsageError(format!("{e:#}")))?;
+    let threads = cv_core::resolve_worker_threads(threads).map_err(|e| crate::util::UsageError(format!("{e:#}")))?;
     cv_core::with_worker_threads(threads, || {
         let dir = cv_search::default_tantivy_dir();
         let trigram_dir = cv_search::default_trigram_dir();
@@ -460,7 +503,7 @@ mod tests {
             ],
         ] {
             let mut output = Vec::new();
-            write_json_rows(&mut output, &rows, 7, Clone::clone).unwrap();
+            write_json_rows(&mut output, &rows, 7, None, Clone::clone).unwrap();
             let expected = serde_json::json!({"hits": rows, "total": 7});
             assert_eq!(
                 String::from_utf8(output).unwrap(),
@@ -470,7 +513,7 @@ mod tests {
         let rows = vec![1, 2, 3];
         let visits = std::cell::RefCell::new(Vec::new());
         let mut out = Vec::new();
-        write_json_rows(&mut out, &rows, 3, |row| {
+        write_json_rows(&mut out, &rows, 3, None, |row| {
             visits.borrow_mut().push(*row);
             serde_json::json!(row)
         })

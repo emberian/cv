@@ -1296,11 +1296,7 @@ fn subagent_forest_lossy(
     if let Some(dir) = sidecar::workflow_runs_dir(parent_path) {
         match super::side_entries(&dir) {
             Ok(rd) => {
-                let wf_dirs: Vec<PathBuf> = rd
-                    .into_iter()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect();
+                let wf_dirs: Vec<PathBuf> = rd.into_iter().map(|e| e.path()).filter(|p| p.is_dir()).collect();
                 let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
                     let run_id = wf_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
                     vec![agents_in_dir_lossy(

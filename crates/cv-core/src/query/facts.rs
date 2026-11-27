@@ -983,7 +983,7 @@ pub fn filter_refs(refs: &mut Vec<SessionRef>, query: &SessionQuery, text_sets: 
     // estimate (SQLite contains other sessions, mapped JSON may own only descriptors).
     // A source exceeding the 2 GiB guard runs alone. Width is bounded by available cores.
     const SOURCE_BYTES: u64 = 2 << 30;
-    let width = std::thread::available_parallelism().map_or(1, usize::from);
+    let width = crate::configured_worker_threads();
     if !pending.is_empty() && writer.is_none() {
         writer = crate::catalog::Writer::open();
     }
@@ -991,16 +991,20 @@ pub fn filter_refs(refs: &mut Vec<SessionRef>, query: &SessionQuery, text_sets: 
     while next < pending.len() {
         let start = next;
         let mut bytes: u64 = 0;
+        let mut seen_paths: HashSet<&std::path::Path> = HashSet::new();
         while next < pending.len() && next - start < width {
-            let size = refs[pending[next]].path.metadata().map_or(0, |m| m.len());
-            if next > start && size > SOURCE_BYTES.saturating_sub(bytes) {
+            let path = refs[pending[next]].path.as_path();
+            if seen_paths.contains(path) {
+                next += 1;
+                continue;
+            }
+            let size = path.metadata().map_or(0, |m| m.len());
+            if next > start && (bytes >= SOURCE_BYTES || size > SOURCE_BYTES.saturating_sub(bytes)) {
                 break;
             }
+            seen_paths.insert(path);
             bytes = bytes.saturating_add(size);
             next += 1;
-            if bytes >= SOURCE_BYTES {
-                break;
-            }
         }
         let mut results = crate::par_filter_map(pending[start..next].to_vec(), |index| {
             let r = &refs[index];

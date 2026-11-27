@@ -136,6 +136,7 @@ pub(crate) type SessionFilter = std::sync::Arc<dyn Fn(&str) -> tantivy::Result<b
 
 pub(crate) struct TopSessions {
     pub(crate) filter: Option<SessionFilter>,
+    pub(crate) examined: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
     pub(crate) full_documents: bool,
     #[cfg(test)]
@@ -150,6 +151,7 @@ impl TopSessions {
             id,
             limit,
             filter: None,
+            examined: None,
             #[cfg(test)]
             full_documents: false,
             #[cfg(test)]
@@ -190,8 +192,12 @@ impl Collector for TopSessions {
         }
         // Tantivy's pruning threshold is strict. Include equal scores so lexical id ties are
         // resolved independently of segment/document order, while retaining Block-WAND pruning.
+        let examined = self.examined.as_ref();
         weight.for_each_pruning(Score::NEG_INFINITY, reader, &mut |doc, score| {
             if reader.alive_bitset().is_none_or(|alive| alive.is_alive(doc)) {
+                if let Some(examined) = examined {
+                    examined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 child.collect(doc, score);
             }
             child.winners.threshold()
@@ -299,13 +305,28 @@ impl SegmentCollector for SessionSegment {
 }
 
 /// Membership needs the unique ID set, never a retained address for every matching chunk.
-pub(crate) struct SessionIds(pub Field);
+pub(crate) struct SessionIds {
+    pub(crate) id: Field,
+    pub(crate) examined: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+impl SessionIds {
+    pub(crate) fn new(id: Field) -> Self {
+        Self { id, examined: None }
+    }
+    pub(crate) fn counted(id: Field, examined: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            id,
+            examined: Some(examined),
+        }
+    }
+}
 impl Collector for SessionIds {
     type Fruit = std::collections::HashSet<String>;
     type Child = IdSegment;
     fn for_segment(&self, _: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
         Ok(IdSegment {
-            id: self.0,
+            id: self.id,
+            examined: self.examined.clone(),
             store: segment.get_store_reader(1)?,
             ids: Default::default(),
             error: None,
@@ -325,6 +346,7 @@ impl Collector for SessionIds {
 
 pub(crate) struct IdSegment {
     id: Field,
+    examined: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     store: StoreReader,
     ids: std::collections::HashSet<String>,
     error: Option<tantivy::TantivyError>,
@@ -334,6 +356,9 @@ impl SegmentCollector for IdSegment {
     fn collect(&mut self, doc: DocId, _: Score) {
         if self.error.is_some() {
             return;
+        }
+        if let Some(examined) = &self.examined {
+            examined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         match stored_id(&self.store, doc, self.id) {
             Ok(id) => {

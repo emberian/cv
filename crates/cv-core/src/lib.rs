@@ -381,8 +381,8 @@ fn in_bounded_rayon<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R 
     thread_local! {
         static ACTIVE_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
-    let already_in_pool =
-        ACTIVE_THREADS.with(|c| c.get() == Some(threads)) || rayon::current_thread_index().is_some() && rayon::current_num_threads() <= threads;
+    let already_in_pool = ACTIVE_THREADS.with(|c| c.get() == Some(threads))
+        || rayon::current_thread_index().is_some() && rayon::current_num_threads() <= threads;
     if already_in_pool {
         return f();
     }

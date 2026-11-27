@@ -302,6 +302,11 @@ enum Cmd {
         /// session that matched. Nothing else goes to stdout.
         #[arg(long)]
         json: bool,
+        /// Report per-query logical read accounting (`basis = "logical_app_reads"`, index docs
+        /// examined, stored previews used, discovery sessions, source sessions/bytes read, and
+        /// setup/evaluation microseconds): under `"work"` in `--json`, or on stderr otherwise.
+        #[arg(long)]
+        stats: bool,
     },
     /// List what a session DID: its extracted events (file edits/reads, commands, errors).
     ///
@@ -1456,6 +1461,7 @@ fn run() -> Result<()> {
             kind,
             live_bytes,
             json,
+            stats,
         } => search::cmd_search(search::SearchArgs {
             query: query.as_deref().unwrap_or_default(),
             batch,
@@ -1468,6 +1474,7 @@ fn run() -> Result<()> {
             kind,
             live_bytes,
             json,
+            stats,
         }),
         Cmd::Show {
             id,

@@ -714,30 +714,31 @@ impl StateStore {
 
     /// List all published pack manifests ordered by `min_commit_pos`.
     pub fn list_pack_manifests(&self) -> Result<Vec<PackManifest>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
-                    digest, pack_path, index_meta_json, published_at
-             FROM pack_manifests
-             ORDER BY min_commit_pos ASC, pack_id ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let meta_str: String = r.get(7)?;
-            Ok(PackManifest {
-                pack_id: r.get(0)?,
-                min_commit_pos: r.get(1)?,
-                max_commit_pos: r.get(2)?,
-                record_count: r.get::<_, i64>(3)? as u64,
-                byte_len: r.get::<_, i64>(4)? as u64,
-                digest: r.get(5)?,
-                pack_path: r.get(6)?,
-                index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                published_at: r.get(8)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
+                            digest, pack_path, index_meta_json, published_at
+                     FROM pack_manifests
+                     ORDER BY min_commit_pos ASC, pack_id ASC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    let meta_str: String = r.get(7)?;
+                    Ok(PackManifest {
+                        pack_id: r.get(0)?,
+                        min_commit_pos: r.get(1)?,
+                        max_commit_pos: r.get(2)?,
+                        record_count: r.get::<_, i64>(3)? as u64,
+                        byte_len: r.get::<_, i64>(4)? as u64,
+                        digest: r.get(5)?,
+                        pack_path: r.get(6)?,
+                        index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+                        published_at: r.get(8)?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Look up a single published pack manifest by `pack_id`.

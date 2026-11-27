@@ -84,17 +84,26 @@ pub struct TrigramFound {
     pub candidate_docs: usize,
     /// Candidates whose source revision was streamed through the exact verifier.
     pub verified_docs: usize,
+    pub work: crate::SearchWork,
 }
 
 impl TrigramFound {
     /// Convert into the unified [`Found`] search envelope.
     pub fn into_found(self) -> Found {
-        Found {
-            hits: self.hits,
-            source: Source::Index,
-            notes: self.notes,
-            total: self.total,
-        }
+        self.into_found_with_work().0
+    }
+
+    /// Convert into [`Found`] paired with its [`crate::SearchWork`] accounting.
+    pub fn into_found_with_work(self) -> (Found, crate::SearchWork) {
+        (
+            Found {
+                hits: self.hits,
+                source: Source::Index,
+                notes: self.notes,
+                total: self.total,
+            },
+            self.work,
+        )
     }
 }
 
@@ -2068,6 +2077,7 @@ pub fn search(
     allowed_ids: Option<&HashSet<String>>,
 ) -> Result<TrigramFound> {
     let _sources = cv_core::source::read_scope();
+    let setup_started = std::time::Instant::now();
     let mut manifest = Manifest::load(dir)?;
     if manifest.is_none() && opts.live == LiveRead::Frozen {
         anyhow::bail!(
@@ -2092,6 +2102,11 @@ pub fn search(
                     notes: Vec::new(),
                     candidate_docs: 0,
                     verified_docs: 0,
+                    work: crate::SearchWork {
+                        discovery_sessions: refs.len(),
+                        setup_micros: setup_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                        ..Default::default()
+                    },
                 });
             }
         },
@@ -2106,6 +2121,11 @@ pub fn search(
             notes: Vec::new(),
             candidate_docs: 0,
             verified_docs: 0,
+            work: crate::SearchWork {
+                discovery_sessions: refs.len(),
+                setup_micros: setup_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                ..Default::default()
+            },
         });
     }
 
@@ -2116,6 +2136,7 @@ pub fn search(
     //    manifest holds `--subagents`) against `manifest`.
     let fold_subagents = manifest.as_ref().is_some_and(|m| m.has_subagents);
     let (candidates, unreadable_subs) = expand_sessions(refs, fold_subagents);
+    let discovery_sessions = candidates.len().saturating_add(unreadable_subs.len());
     for err in unreadable_subs {
         if harness_filter.is_some_and(|h| err.harness.as_str() != h) {
             continue;
@@ -2134,7 +2155,6 @@ pub fn search(
     for (r, prov) in candidates {
         let snap = probe.snapshot(&r);
         let mtime = snap.primary.map_or(0, |id| id.mtime_ns as i64);
-        newest_on_disk = newest_on_disk.max(mtime);
 
         let is_fresh = manifest
             .as_ref()
@@ -2145,6 +2165,7 @@ pub fn search(
             });
 
         if !is_fresh {
+            newest_on_disk = newest_on_disk.max(mtime);
             stale_ids.insert(r.id.clone());
         }
 
@@ -2172,7 +2193,7 @@ pub fn search(
         if !is_fresh {
             suffix.stale += 1;
             let known_cost = cv_core::harness::for_harness(r.harness).and_then(|ad| {
-                if ad.sqlite_source(&r) == Some(true) {
+                if ad.sqlite_source(&r) == Some(true) || !ad.path_selects_session(&r) {
                     None
                 } else {
                     Some(snap.primary_len())
@@ -2182,6 +2203,9 @@ pub fn search(
         }
     }
     suffix.behind_ns = newest_on_disk.saturating_sub(newest_indexed);
+    let setup_micros = setup_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let eval_started = std::time::Instant::now();
+    let mut segment_verified_bytes = 0u64;
 
     // Also reap/shadow any indexed top-level session that was deleted on disk when `refs` is non-empty
     // or when checking on-disk existence during verification.
@@ -2391,6 +2415,7 @@ pub fn search(
                             &mut probe,
                         ) {
                             Ok(VerifyOutcome::Matched(m)) => {
+                                segment_verified_bytes = segment_verified_bytes.saturating_add(m.metered_bytes);
                                 hits.push(Hit {
                                     session_key: Some(doc_ref.session_selector()),
                                     id: meta.id.clone(),
@@ -2420,7 +2445,9 @@ pub fn search(
                                     suffix.cut += 1;
                                 } else {
                                     let known_cost = cv_core::harness::for_harness(doc_ref.harness).and_then(|ad| {
-                                        if ad.sqlite_source(&doc_ref) == Some(true) {
+                                        if ad.sqlite_source(&doc_ref) == Some(true)
+                                            || !ad.path_selects_session(&doc_ref)
+                                        {
                                             None
                                         } else {
                                             Some(live_snap.primary_len())
@@ -2495,7 +2522,9 @@ pub fn search(
                                     }
                                 }
                             }
-                            Ok(VerifyOutcome::NoMatch { .. }) => {}
+                            Ok(VerifyOutcome::NoMatch { metered_bytes }) => {
+                                segment_verified_bytes = segment_verified_bytes.saturating_add(metered_bytes);
+                            }
                             Err(_) => {
                                 suffix.stale += 1;
                                 suffix.failed += 1;
@@ -2512,6 +2541,7 @@ pub fn search(
                 hits.truncate(live_hits_len);
                 candidate_docs = 0;
                 verified_docs = live_verified_docs;
+                segment_verified_bytes = 0;
                 suffix = live_suffix.clone();
                 remaining = live_remaining;
                 manifest = Manifest::load(dir)?;
@@ -2532,6 +2562,17 @@ pub fn search(
     if hits.is_empty() && !suffix.no_index && !manifest.as_ref().is_some_and(|m| m.has_subagents) {
         notes.push(Note::NoSubagents);
     }
+    let eval_micros = eval_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let work = crate::SearchWork {
+        basis: crate::SEARCH_WORK_BASIS.to_owned(),
+        index_docs_examined: candidate_docs,
+        stored_previews_used: 0,
+        discovery_sessions,
+        source_sessions_read: verified_docs,
+        source_bytes_read: suffix.bytes.saturating_add(segment_verified_bytes),
+        setup_micros,
+        eval_micros,
+    };
 
     Ok(TrigramFound {
         hits,
@@ -2540,6 +2581,7 @@ pub fn search(
         notes,
         candidate_docs,
         verified_docs,
+        work,
     })
 }
 

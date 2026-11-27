@@ -323,6 +323,70 @@ impl StateStore {
         }
         Ok(Some(conn))
     }
+
+    /// Execute a bounded read-only query against `state.db`.
+    ///
+    /// Under `--frozen`, delegates to [`crate::harness::store::sqlite::read`] so a checkpointed
+    /// store without `-wal`/`-journal` frames is read in place via `immutable=1` without copying
+    /// `state.db` to `TMPDIR`, while a store with active WAL/journal sidecars shares one
+    /// [`crate::harness::store::sqlite::ReadScope`] snapshot.
+    pub(crate) fn read_in<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StateError>,
+    ) -> Result<Option<T>, StateError> {
+        if crate::env::frozen() {
+            let meta = match std::fs::metadata(&self.db_path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(StateError::Io(e)),
+            };
+            if !meta.is_file() {
+                return Err(StateError::Io(std::io::Error::other(format!(
+                    "{} is not a regular file",
+                    self.db_path.display()
+                ))));
+            }
+            if meta.len() == 0 {
+                return Ok(None);
+            }
+            let mut inner_err: Option<StateError> = None;
+            let res = crate::harness::store::sqlite::read(&self.db_path, |conn, _| {
+                let ver = match schema::current_schema_version(conn) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        inner_err = Some(e);
+                        anyhow::bail!("state schema check failed");
+                    }
+                };
+                if ver > schema::STATE_SCHEMA_VERSION {
+                    inner_err = Some(StateError::NewerSchema {
+                        found: ver,
+                        supported: schema::STATE_SCHEMA_VERSION,
+                    });
+                    anyhow::bail!("newer state schema");
+                }
+                if ver == 0 {
+                    return Ok(None);
+                }
+                match f(conn) {
+                    Ok(val) => Ok(Some(val)),
+                    Err(e) => {
+                        inner_err = Some(e);
+                        anyhow::bail!("state read failed");
+                    }
+                }
+            });
+            return match res {
+                Ok(val) => Ok(val),
+                Err(_) if inner_err.is_some() => Err(inner_err.unwrap()),
+                Err(other) => Err(StateError::Io(std::io::Error::other(other))),
+            };
+        }
+        let Some(conn) = self.open_readonly()? else {
+            return Ok(None);
+        };
+        f(&conn).map(Some)
+    }
 }
 
 fn sibling_with_suffix(db_path: &Path, suffix: &str) -> PathBuf {
