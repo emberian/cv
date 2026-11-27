@@ -27,13 +27,9 @@ cv search --exact "MmapOptions::new()"           # homomorphic trigram candidate
 cv touched crates/cv-core/src/ir.rs              # every session and sub-agent that edited this path
 cv blame crates/cv-core/src/ir.rs -L 40,90       # commit -> session -> turn, across file splits and moves
 
-# Context surgery & cross-harness continuation
-cv distill da9174f4 --handoff escalate           # 5-7x deterministic compression; zero LLM drift
-cv pack "fix WAL snapshot contention"            # credential-redacted brief with bounded command history
-cv prune da9174f4 --drop-thinking                # sidecar heavy old outputs + repair inherited token usage
-cv rewind da9174f4 --at 6edc8472                 # reconstruct session state right as commit 6edc8472 landed
-cv splice da9174f4:0..18 codex:019e75e0:6.. --harness claude
+# Cross-harness portability & task briefs
 cv port da9174f4 --harness devin                 # verified emit -> devin -r <id> (or codex, antigravity, ...)
+cv pack "fix WAL snapshot contention"            # credential-redacted brief with bounded command history
 cv adopt a5d8fd7aa0b73f0e7 --into 945e6fa2       # re-parent an orphaned sub-agent into a live session
 
 # Multi-place collection & live swarm instruments
@@ -43,6 +39,28 @@ cv archive sync --pull devbox.internal           # agentless SSH: pull deltas un
 cv hooks install claude                          # <1ms SessionStart verb hint + live edit-overlap guard
 cv lanes --unfinished                            # attention order: NeedsYou > Working > Stale > Idle > Done
 cv doctor <id>                                   # spin episodes, post-compaction churn, context overhead
+```
+
+## Successor sessions & trajectory looming
+
+Auto-compaction replaces lived reasoning with a lossy summary; prose handoff briefs play telephone. **Eclosion (`eclo`)** treats transcripts as immutable values: before hitting the context ceiling, an agent or steward constructs a verified **successor session** from existing trajectory spans and resumes inside it—sustaining multi-day work with zero harness compactions.
+
+- **Rolling-window fold.** `cv prune --carry-agents` (or caller-authored `--plan plan.json`, or `cv distill --session --bricks`) keeps human prompts and the active tail verbatim, moves acted-on tool payloads to `.flat.jsonl` behind `cv cat` pointers (stable across repeated folds), rewrites nested token `usage` so `/resume` does not trigger immediate auto-compaction, and restamps `subagents/*.meta.json` so helper models survive. Resuming `/resume <new_id>` **in place** inside the live pane keeps background shells and sub-agents attached; `cv adopt --join --from <old> --into <new>` reconciles helper turns written mid-cutover.
+- **Bad-path recut.** When an exploratory suffix hits a dead end, `cv rewind <id> --at <msg|sha>` or `cv splice <id>:..N --session` cuts back to the last clean prefix so subsequent turns condition on an unpolluted trajectory while the shed branch remains addressable via `cv show` and `cv cat`.
+- **Trajectory looming & transcript-seeded sub-agents.** `cv splice A:0..18 B:42..60 codex:C:6.. --session` weaves spans across sessions and harnesses into one history, relinking parent chains and dropping half-open tool calls. Replacing `--session` with `--agent-of <root>` plants a distilled or spliced trajectory directly into `<root>/subagents/`, immediately addressable via `SendMessage` without serializing its state into a prompt brief.
+- **Pre-cutover probe & corpus experts.** Candidate successors can be interviewed non-destructively via `--agent-of <root>` or `claude -p --resume <new_id> --fork-session` before switching a live seat onto them; `cv pack "<topic>" --format session --harness claude` compiles a standing domain-expert session from prior corpus spans ([`manual/src/reshaping.md`](manual/src/reshaping.md)).
+
+```sh
+# Fold ahead of auto-compact, probe non-destructively, then /resume <next> in place
+next=$(cv prune "$SID" --plan fold.json --carry-agents --json | jq -r .new_id)
+claude -p --resume "$next" --fork-session "state open invariants and next step"
+cv adopt --join --from "$SID" --into "$next"     # reconcile any helper turns written mid-switch
+
+# Loom cross-session spans or plant a trajectory-seeded sub-agent into a live root
+cv rewind da9174f4 --at 6edc8472                 # session state right as commit 6edc8472 landed
+cv splice da9174f4:0..18 codex:019e75e0:6.. --session --carry-agents
+cv distill agent-a5e2da77 --handoff escalate --agent-of "$ROOT_SID"
+cv pack "WAL snapshot locking" --format session --harness claude
 ```
 
 ## Harnesses (23 read, 14 `port` targets)
