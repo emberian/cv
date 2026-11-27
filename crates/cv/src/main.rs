@@ -257,8 +257,12 @@ enum Cmd {
         /// from stdin, one per line, over one pinned index snapshot. Emits one JSON answer,
         /// refresh ack, or error per line; no discovery, live reads or current-source freshness
         /// checks. Filters and stored previews describe indexed revisions.
-        #[arg(long, conflicts_with_all = ["scan", "exact", "filter_query", "live_bytes"])]
+        #[arg(long, conflicts_with_all = ["scan", "exact", "filter_query", "live_bytes", "all"])]
         batch: bool,
+        /// Include derived fold, splice, distill, and rewind copies instead of collapsing each
+        /// chain to its fullest session.
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         harness: Option<String>,
         /// Only sessions whose cwd contains this substring.
@@ -1452,6 +1456,7 @@ fn run() -> Result<()> {
         Cmd::Search {
             query,
             batch,
+            all,
             harness,
             cwd,
             filter_query,
@@ -1465,6 +1470,7 @@ fn run() -> Result<()> {
         } => search::cmd_search(search::SearchArgs {
             query: query.as_deref().unwrap_or_default(),
             batch,
+            all,
             harness,
             cwd,
             filter_query,

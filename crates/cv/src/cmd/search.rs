@@ -9,6 +9,7 @@ use std::io::Write;
 
 pub(crate) struct SearchArgs<'a> {
     pub batch: bool,
+    pub all: bool,
     pub query: &'a str,
     pub harness: Option<String>,
     pub cwd: Option<String>,
@@ -45,6 +46,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     let SearchArgs {
         query,
         batch,
+        all,
         harness,
         cwd,
         filter_query,
@@ -86,6 +88,15 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         cwd: cwd.as_deref(),
         scope,
     };
+    let live_allowed = !cv_core::env::frozen() && live_bytes != Some(0);
+    let fetch_limit = if all || limit == 0 {
+        limit
+    } else {
+        limit
+            .saturating_mul(2)
+            .max(limit.saturating_add(4))
+            .min(limit.saturating_add(16))
+    };
     // The index (+ live suffix of unindexed changes) answers full-text search: an empty result
     // means "no match", and an unusable index is an error naming the cause and the fix, never a
     // silent full scan of every transcript.
@@ -96,13 +107,20 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
             filter,
             false,
             allowed_ids.as_ref(),
-            limit,
+            fetch_limit,
             live_bytes,
         )
     } else {
-        cv_search::Searcher.search_allowed_with_work(query, filter, allowed_ids.as_ref(), limit, source, live_bytes)
+        cv_search::Searcher.search_allowed_with_work(
+            query,
+            filter,
+            allowed_ids.as_ref(),
+            fetch_limit,
+            source,
+            live_bytes,
+        )
     };
-    let (found, work) =
+    let (mut found, work) =
         match result {
             Ok(pair) => pair,
             Err(e) => return match source {
@@ -118,7 +136,127 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
                 Source::Live => Err(e),
             },
         };
+    if all {
+        found.hits.truncate(limit);
+    } else {
+        collapse_search_hits(&mut found, limit, live_allowed);
+    }
     render(found, work, query, json, stats)
+}
+
+fn state_lineage_parent(id: &str) -> Option<String> {
+    cv_core::lanes::session_lineage(id)
+        .ancestors
+        .into_iter()
+        .find(|link| {
+            link.dst_session_id == id
+                && link.src_session_id != id
+                && matches!(
+                    link.edge_kind.as_str(),
+                    "continues" | "fork" | "rewind" | "splice" | "distill"
+                )
+        })
+        .map(|link| link.src_session_id)
+}
+
+fn collapse_search_hits(found: &mut Found, limit: usize, live_allowed: bool) {
+    if found.hits.len() <= 1 {
+        found.hits.truncate(limit);
+        return;
+    }
+    let refs: Vec<Option<cv_core::SessionRef>> = found
+        .hits
+        .iter()
+        .map(|h| {
+            if h.agent_id.is_some() {
+                return None;
+            }
+            if let Some(r) = &h.session {
+                return Some(r.clone());
+            }
+            let sel = h.session_key.as_deref().unwrap_or(&h.id);
+            cv_core::find(sel, cv_core::Harness::parse(&h.harness))
+                .ok()
+                .flatten()
+                .map(|(r, _)| r)
+        })
+        .collect();
+    let derived: Vec<Option<String>> = found
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(idx, h)| {
+            if h.agent_id.is_some() {
+                return None;
+            }
+            if live_allowed {
+                refs[idx]
+                    .as_ref()
+                    .and_then(|s| s.derived_from())
+                    .or_else(|| state_lineage_parent(&h.id))
+            } else {
+                state_lineage_parent(&h.id)
+            }
+        })
+        .collect();
+    if derived.iter().all(Option::is_none) {
+        found.hits.truncate(limit);
+        return;
+    }
+    let counts: Vec<Option<usize>> = refs
+        .iter()
+        .map(|r| {
+            if live_allowed {
+                r.as_ref().and_then(cv_core::lineage::effective_message_count)
+            } else {
+                r.as_ref().and_then(|s| s.message_count)
+            }
+        })
+        .collect();
+    let sizes: Vec<Option<u64>> = refs
+        .iter()
+        .map(|r| {
+            if live_allowed {
+                r.as_ref()
+                    .and_then(|s| std::fs::metadata(&s.path).ok().map(|m| m.len()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let hits = std::mem::take(&mut found.hits);
+    let indexed: Vec<(usize, cv_search::Hit)> = hits.into_iter().enumerate().collect();
+    let (kept, collapsed) = cv_core::lineage::collapse_derived_chains_with_lookup(
+        indexed,
+        |(idx, h)| cv_core::lineage::ChainMeta {
+            harness: h.harness.clone(),
+            id: if h.agent_id.is_some() {
+                format!("subagent:{idx}:{}", h.id)
+            } else {
+                h.id.clone()
+            },
+            derived_from: derived[*idx].clone(),
+            message_count: counts[*idx],
+            updated_at: h
+                .updated_at
+                .or_else(|| refs[*idx].as_ref().and_then(|r| r.updated_at.map(|t| t.timestamp()))),
+            size_bytes: sizes[*idx],
+        },
+        |harness, pid| {
+            if live_allowed {
+                cv_core::find(pid, cv_core::Harness::parse(harness))
+                    .ok()
+                    .flatten()
+                    .and_then(|(r, _)| r.derived_from())
+                    .or_else(|| state_lineage_parent(pid))
+            } else {
+                state_lineage_parent(pid)
+            }
+        },
+    );
+    found.total = found.total.saturating_sub(collapsed.len());
+    found.hits = kept.into_iter().map(|(_, h)| h).take(limit).collect();
 }
 
 #[derive(serde::Deserialize)]

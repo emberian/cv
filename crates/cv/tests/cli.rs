@@ -476,10 +476,92 @@ fn search_batch_pins_index_and_continues_after_invalid_or_oversized_requests() {
         vec!["search", "--batch", "--exact"],
         vec!["search", "--batch", "--scan"],
         vec!["search", "--batch", "--live-bytes", "0"],
+        vec!["search", "--batch", "--all"],
     ] {
         let (ok, _, _, _) = w.cv(&flags);
         assert!(!ok);
     }
+}
+
+#[test]
+fn search_collapses_derived_chains_by_default_and_all_keeps_every_copy() {
+    let w = World::new("search-lineage-collapse");
+    let orig_id = "11111111-1111-4111-8111-111111111111";
+    let fold1_id = "22222222-2222-4222-8222-222222222222";
+    let fold2_id = "33333333-3333-4333-8333-333333333333";
+    let other_id = "44444444-4444-4444-8444-444444444444";
+
+    let mut orig_rows = Vec::new();
+    for i in 0..8 {
+        orig_rows.push(user_line(
+            orig_id,
+            &format!("ou{i}"),
+            "2026-06-01T10:00:00Z",
+            &format!("zqchainneedle turn {i}"),
+        ));
+    }
+    w.write_session(orig_id, &orig_rows);
+
+    w.write_session(
+        fold1_id,
+        &[
+            serde_json::json!({
+                "type": "fork-context-ref",
+                "parentSessionId": orig_id,
+                "sessionId": fold1_id,
+            }),
+            user_line(fold1_id, "f1u0", "2026-06-01T11:00:00Z", "zqchainneedle folded once"),
+            user_line(fold1_id, "f1u1", "2026-06-01T11:01:00Z", "zqchainneedle follow-up"),
+        ],
+    );
+
+    // `fold2` repeats the query token heavily so BM25 ranks it ahead of `orig`, yet `orig` has
+    // 8 turns vs `fold2`'s 1 turn, so collapsing must promote `orig` and keep `--limit 1` on `orig`.
+    w.write_session(
+        fold2_id,
+        &[user_line(
+            fold2_id,
+            "f2u0",
+            "2026-06-01T12:00:00Z",
+            &format!("Continued from session {fold1_id}: zqchainneedle zqchainneedle zqchainneedle"),
+        )],
+    );
+
+    w.write_session(
+        other_id,
+        &[user_line(
+            other_id,
+            "otu0",
+            "2026-06-01T12:30:00Z",
+            "unrelated zqchainneedle conversation",
+        )],
+    );
+
+    w.cv_ok(&["index"]);
+
+    for extra in [&[][..], &["--scan"][..]] {
+        let mut default_args = vec!["search", "zqchainneedle", "--json"];
+        default_args.extend_from_slice(extra);
+        let (out, _) = w.cv_ok(&default_args);
+        let (rows, total) = search_json(&out);
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(total, 2, "{extra:?}: {out}");
+        assert_eq!(ids.len(), 2, "{extra:?}: {out}");
+        assert!(ids.contains(&orig_id), "fullest chain member kept: {ids:?}");
+        assert!(ids.contains(&other_id), "unrelated session kept: {ids:?}");
+        assert!(!ids.contains(&fold1_id) && !ids.contains(&fold2_id), "{ids:?}");
+
+        let mut all_args = vec!["search", "zqchainneedle", "--all", "--json"];
+        all_args.extend_from_slice(extra);
+        let (all_out, _) = w.cv_ok(&all_args);
+        let (all_rows, all_total) = search_json(&all_out);
+        assert_eq!((all_rows.len(), all_total), (4, 4), "{extra:?}: {all_out}");
+    }
+
+    let (lim1_out, _) = w.cv_ok(&["search", "zqchainneedle", "--limit", "1", "--json"]);
+    let (lim1_rows, lim1_total) = search_json(&lim1_out);
+    assert_eq!((lim1_rows.len(), lim1_total), (1, 2), "{lim1_out}");
+    assert_eq!(lim1_rows[0]["id"], orig_id, "{lim1_out}");
 }
 
 #[test]

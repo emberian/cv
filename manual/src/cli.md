@@ -350,7 +350,8 @@ fails naming [`cv index`](#cv-index); `--scan` is a slow live scan of every sess
 not read; `--exact` matches literal substrings through the trigram accelerator and revision-verified
 source text. It matches the exchange; `--kind context` matches injected context, `--kind all` both;
 `--cwd` and `-q` filter candidate sessions before ranking. `--limit` (default 20) bounds the
-hits shown, never the count: the footer says `N of M matches`, M every session that matched.
+hits shown, never the count: the footer says `N of M matches`, M every session that matched; derived
+fold, splice, distill, and rewind chains collapse to their fullest session unless `--all` is passed.
 `--json` prints `{"hits": [...],
 "total": M}`, each hit a session row plus `score` (`null` on a live scan), full `snippet`, and
 `agent_id`/`parent_id`/`workflow` (set for hits indexed with `--subagents`). `--stats` adds
