@@ -469,11 +469,34 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
         Some(3)
     );
 
-    // Inject a conflicting `seq = 4` first? Even better: test BOTH a conflict on a buffered/next
-    // slot (`seq = 4` committed vs forged `seq = 4`) so `F` stays frozen at `3` even after `1..=6`
-    // are all present!
-    // Step A: commit legitimate `seq = 4` -> `F` advances to `6`. Wait: let's test conflict at
-    // `seq = 4` where `seq = 4` was buffered out-of-order on `ep-2` AND conflict on `ep-1` at `seq = 4`!
+    // Part A: Uncommitted conflict on buffered `seq = 5` (`5 > F = 3`) sets `first_conflict_seq = 5`,
+    // so when `seq = 4` arrives, `F` advances to `4` and freezes below `5` until resolved!
+    let forged_5_env = json!({
+        "kind": "session_upsert",
+        "session_id": "forged-uncommitted-5",
+        "harness": "claude",
+        "title": "UNCOMMITTED CONFLICT",
+        "message_count": 99,
+    });
+    let forged_5 =
+        IngestEventRecord::new(EventId::new("prod-quar", "ep-1", 5), "op:forged:5", forged_5_env, None).unwrap();
+    let err_5 = shipper
+        .send_ingest_batch(&IngestBatchRequest {
+            events: vec![forged_5.clone()],
+        })
+        .unwrap_err();
+    match err_5 {
+        cv_core::state::hub::HubError::Transport { status, message } => {
+            assert_eq!(status, Some(409), "expected 409 Conflict: {message}");
+            let body: Value = serde_json::from_str(&message).unwrap();
+            assert_eq!(body["quarantined"], true, "{body}");
+            assert_eq!(body["event_id"]["seq"], 5);
+            assert_eq!(body["origin_frontier"]["prod-quar/ep-1"], 3);
+        }
+        other => panic!("expected Transport(409), got {other:?}"),
+    }
+
+    // Now deliver legitimate `seq = 4` -> `F` advances to `4` and freezes before uncommitted conflict `seq = 5`!
     let (r_ep1_4, _) = shipper
         .send_ingest_batch(&IngestBatchRequest {
             events: vec![events[3].clone()],
@@ -484,10 +507,35 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
             .origin_frontier
             .get(&("prod-quar".into(), "ep-1".into()))
             .copied(),
-        Some(6)
+        Some(4),
+        "frontier must advance to 4 and hold below uncommitted conflict seq=5"
     );
 
-    // Now send a forged conflicting event for `(prod-quar, ep-1, seq = 4)` with a different digest!
+    let (st_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
+    let st: HubStatusResponse = st_raw.json().unwrap();
+    assert_eq!(st.quarantine.count, 1);
+    assert_eq!(st.frontiers[0].contiguous_seq, 4);
+    assert_eq!(st.frontiers[0].first_conflict_seq, Some(5));
+    let quar_5_id = st.quarantine.entries[0].quarantine_id;
+
+    // Operator resolves `quar_5_id` via `accept_existing` -> `F` immediately unblocks and jumps to `6`!
+    let admin = HttpClient::new(&hub_url, Some("quar-token".into())).unwrap();
+    let (res_raw, _) = admin
+        .post_json(
+            "/api/hub/quarantine",
+            &json!({"quarantine_id": quar_5_id, "resolution": "accept_existing"}),
+        )
+        .unwrap();
+    assert_eq!(res_raw.status, 200, "{}", String::from_utf8_lossy(&res_raw.body));
+    let (st_after_resolve, _) = reader(&hub_url).get("/api/hub/status").unwrap();
+    let st_resolved: HubStatusResponse = st_after_resolve.json().unwrap();
+    assert_eq!(st_resolved.quarantine.count, 0);
+    assert_eq!(st_resolved.frontiers[0].contiguous_seq, 6);
+    assert_eq!(st_resolved.frontiers[0].first_conflict_seq, None);
+
+    // Part B: Non-Rewinding Quarantine on already-committed prefix (`seq = 1 <= F = 6` and `seq = 4 <= F = 6`)!
+    // Sending a conflicting packet at `seq = 1` MUST record evidence in `hub_quarantine` and return 409
+    // WITHOUT rewinding `contiguous_seq` back to `0` or erasing any of the 6 committed sessions!
     let forged_env = json!({
         "kind": "session_upsert",
         "session_id": "forged-hijack",
@@ -496,8 +544,8 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
         "message_count": 99,
     });
     let forged_ev =
-        IngestEventRecord::new(EventId::new("prod-quar", "ep-1", 4), "op:forged:4", forged_env, None).unwrap();
-    assert_ne!(forged_ev.digest, events[3].digest);
+        IngestEventRecord::new(EventId::new("prod-quar", "ep-1", 1), "op:forged:1", forged_env, None).unwrap();
+    assert_ne!(forged_ev.digest, events[0].digest);
 
     let err = shipper
         .send_ingest_batch(&IngestBatchRequest {
@@ -511,34 +559,134 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
             assert_eq!(body["quarantined"], true, "{body}");
             assert_eq!(body["event_id"]["producer_id"], "prod-quar");
             assert_eq!(body["event_id"]["epoch"], "ep-1");
-            assert_eq!(body["event_id"]["seq"], 4);
-            assert_eq!(body["existing_digest"], events[3].digest);
+            assert_eq!(body["event_id"]["seq"], 1);
+            assert_eq!(body["existing_digest"], events[0].digest);
             assert_eq!(body["conflicting_digest"], forged_ev.digest);
             assert_eq!(body["quarantine_count"], 1);
             assert_eq!(
-                body["origin_frontier"]["prod-quar/ep-1"], 3,
-                "frontier MUST freeze below conflict seq=4 (at 3): {body}"
+                body["origin_frontier"]["prod-quar/ep-1"], 6,
+                "already-committed frontier MUST NOT rewind on conflicting seq=1: {body}"
             );
         }
         other => panic!("expected Transport(409), got {other:?}"),
     }
 
-    // Verify `GET /api/hub/status`: quarantine recorded, `first_conflict_seq == Some(4)`,
-    // `contiguous_seq == 3`, and `"forged-hijack"` NEVER entered `hub_sessions`!
     let (st_raw, _) = reader(&hub_url).get("/api/hub/status").unwrap();
     let st: HubStatusResponse = st_raw.json().unwrap();
     assert_eq!(st.quarantine.count, 1);
-    assert_eq!(st.quarantine.entries[0].event_id, EventId::new("prod-quar", "ep-1", 4));
-    assert_eq!(st.quarantine.entries[0].existing_digest, events[3].digest);
+    assert_eq!(st.quarantine.entries[0].event_id, EventId::new("prod-quar", "ep-1", 1));
+    assert_eq!(st.quarantine.entries[0].existing_digest, events[0].digest);
     assert_eq!(st.quarantine.entries[0].conflicting_digest, forged_ev.digest);
-    assert_eq!(st.frontiers[0].contiguous_seq, 3);
-    assert_eq!(st.frontiers[0].first_conflict_seq, Some(4));
+    assert_eq!(st.frontiers[0].contiguous_seq, 6);
+    assert_eq!(st.frontiers[0].first_conflict_seq, None);
 
-    let (sess_raw, _) = reader(&hub_url).get("/api/hub/sessions").unwrap();
-    let page: HubSessionsPage = sess_raw.json().unwrap();
-    let ids: Vec<&str> = page.sessions.iter().map(|r| r.id.as_str()).collect();
-    assert!(!ids.contains(&"forged-hijack"), "forged event must never materialize");
-    assert_eq!(page.total, 3, "only conflict-free prefix 1..=3 remains visible");
+    let hub_local = HubStore::at_home(&hub_w.cv_home);
+    assert_eq!(
+        hub_local
+            .state_store()
+            .open_readonly()
+            .unwrap()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM hub_sessions WHERE producer_id = 'prod-quar'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        6,
+        "all 6 committed sessions must remain intact after seq=1 conflict quarantine"
+    );
+}
+
+/// 3b. Per-Producer Bound Capability Tokens (`cvp1.<producer_id>.<secret>`): 1:1 producer binding
+///     blocks cross-producer enrollment, pack upload/reference, batch spoofing, and admin escalation (`403`).
+#[test]
+fn fleet_hub_per_producer_bound_capability_tokens_enforce_isolation() {
+    let hub_w = World::new("hub-bound-tokens");
+    let scratch_packs = hub_w.base.join("packs");
+
+    // Mint a token via CLI `cv serve --hub --mint-producer prod-a`.
+    let (minted_a, _) = hub_w.cv_ok(&["serve", "--hub", "--mint-producer", "prod-a"]);
+    let tok_a = minted_a.trim().to_string();
+    assert!(tok_a.starts_with("cvp1.prod-a."), "unexpected token format: {tok_a}");
+
+    let (hub_url, _port, _reaper) = spawn_hub_serve(&hub_w, Some("admin-bootstrap-tok"));
+
+    // Admin bootstrap token can also mint a bound token for `prod-b` via `POST /api/hub/producers`.
+    let admin = HttpClient::new(&hub_url, Some("admin-bootstrap-tok".into())).unwrap();
+    let (mint_b_resp, _) = admin
+        .post_json(
+            "/api/hub/producers",
+            &json!({"producer_id": "prod-b", "host_label": "box-b"}),
+        )
+        .unwrap();
+    assert_eq!(
+        mint_b_resp.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&mint_b_resp.body)
+    );
+    let tok_b = mint_b_resp.json::<Value>().unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(tok_b.starts_with("cvp1.prod-b."), "{tok_b}");
+
+    // Bound token `tok_a` CANNOT mint tokens (`403`).
+    let client_a = HttpClient::new(&hub_url, Some(tok_a.clone())).unwrap();
+    let (esc_resp, _) = client_a
+        .post_json("/api/hub/producers", &json!({"producer_id": "prod-c"}))
+        .unwrap();
+    assert_eq!(esc_resp.status, 403, "{}", String::from_utf8_lossy(&esc_resp.body));
+
+    // `tok_a` succeeds for `prod-a` (`200`), and is rejected `403` when spoofing `prod-b` or `local`!
+    let ship_a = Shipper::new(ShipConfig::new("hub", &hub_url, "prod-a").with_token(&tok_a)).unwrap();
+    ship_a.enroll().unwrap();
+
+    let spoof_b = Shipper::new(ShipConfig::new("hub", &hub_url, "prod-b").with_token(&tok_a)).unwrap();
+    match spoof_b.enroll().unwrap_err() {
+        cv_core::state::hub::HubError::Transport { status, .. } => assert_eq!(status, Some(403)),
+        other => panic!("expected 403 Forbidden on enroll spoof, got {other:?}"),
+    }
+    let spoof_local = Shipper::new(ShipConfig::new("hub", &hub_url, "local").with_token(&tok_a)).unwrap();
+    match spoof_local.enroll().unwrap_err() {
+        cv_core::state::hub::HubError::Transport { status, .. } => assert_eq!(status, Some(403)),
+        other => panic!("expected 403 Forbidden on local spoof, got {other:?}"),
+    }
+
+    // Pack uploaded by `prod-b` using `tok_b` cannot be referenced in `ingest_batch` by `prod-a` (`403`)!
+    let ship_b = Shipper::new(ShipConfig::new("hub", &hub_url, "prod-b").with_token(&tok_b)).unwrap();
+    let sess_b = make_session("sb-1", "/work/b", "Secret B", "u-b", "a-b", 1);
+    let packed_b = build_pack_with_sessions(&scratch_packs, "pack-prod-b-1", std::slice::from_ref(&sess_b));
+    ship_b.upload_pack_files(&scratch_packs, "pack-prod-b-1").unwrap();
+
+    let cross_pack_ev = make_event("prod-a", "ep-a", 1, &sess_b, Some(packed_b[0].1.clone()));
+    match ship_a
+        .send_ingest_batch(&IngestBatchRequest {
+            events: vec![cross_pack_ev],
+        })
+        .unwrap_err()
+    {
+        cv_core::state::hub::HubError::Transport { status, .. } => assert_eq!(status, Some(403)),
+        other => panic!("expected 403 Forbidden referencing prod-b pack from prod-a, got {other:?}"),
+    }
+
+    // Event for `prod-b` inside `ship_a.send_ingest_batch` is rejected `403`.
+    let spoof_ev = make_event("prod-b", "ep-b", 1, &sess_b, Some(packed_b[0].1.clone()));
+    match ship_a
+        .send_ingest_batch(&IngestBatchRequest { events: vec![spoof_ev] })
+        .unwrap_err()
+    {
+        cv_core::state::hub::HubError::Transport { status, .. } => assert_eq!(status, Some(403)),
+        other => panic!("expected 403 Forbidden spoofing prod-b event from prod-a, got {other:?}"),
+    }
+
+    // Legitimate `prod-b` ingest with `tok_b` succeeds `200`!
+    let ok_ev_b = make_event("prod-b", "ep-b", 1, &sess_b, Some(packed_b[0].1.clone()));
+    let (ok_resp, _) = ship_b
+        .send_ingest_batch(&IngestBatchRequest { events: vec![ok_ev_b] })
+        .unwrap();
+    assert_eq!(ok_resp.accepted_count, 1);
 }
 
 /// 4. Multi-producer live hub: sleeping/offline laptop hydration from mirrored Zstd-Seekable
@@ -1146,14 +1294,16 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
     .unwrap();
     let ev_b5 = make_event("prod-b", "ep-1", 5, &b_packed[2].0, Some(b_packed[2].1.clone()));
 
+    // Buffer `seq = 5` above missing `seq = 4` (`F == 3`), then inject an uncommitted conflict at
+    // `(prod-b, ep-1, seq = 4)` (`4 > F = 3`) -> freezes `prod-b` frontier at `3` (`seq = 5` stays
+    // buffered above the conflict and excluded!), AND inject a late conflict on already-committed
+    // `(prod-a, ep-1, seq = 1 <= 4)` -> quarantined WITHOUT rewinding `prod-a` or erasing `a-sess-1`!
     shipper_b
         .send_ingest_batch(&IngestBatchRequest {
-            events: vec![ev_b1, ev_b2, ev_b3, ev_b4_orig, ev_b5],
+            events: vec![ev_b1, ev_b2, ev_b3, ev_b5],
         })
         .unwrap();
 
-    // Inject conflict at `(prod-b, ep-1, seq = 4)` -> freezes `prod-b` frontier at `3` (`seq = 5`
-    // stays above the conflict and excluded!).
     let ev_b4_conflict = IngestEventRecord::new(
         EventId::new("prod-b", "ep-1", 4),
         "op:prod-b:4:conflict",
@@ -1162,9 +1312,22 @@ fn fleet_hub_rebuild_from_raw_matches_incremental_bit_for_bit() {
     )
     .unwrap();
     let conflict_res = shipper_b.send_ingest_batch(&IngestBatchRequest {
-        events: vec![ev_b4_conflict],
+        events: vec![ev_b4_orig, ev_b4_conflict],
     });
     assert!(conflict_res.is_err());
+
+    let ev_a1_late_conflict = IngestEventRecord::new(
+        EventId::new("prod-a", "ep-1", 1),
+        "op:prod-a:1:late-conflict",
+        json!({"kind": "session_upsert", "session_id": "forged-late", "harness": "claude"}),
+        None,
+    )
+    .unwrap();
+    assert!(shipper_a
+        .send_ingest_batch(&IngestBatchRequest {
+            events: vec![ev_a1_late_conflict],
+        })
+        .is_err());
 
     let client = reader(&hub_url);
 

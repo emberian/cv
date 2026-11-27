@@ -113,6 +113,39 @@ pub struct QuarantineSummary {
     pub entries: Vec<QuarantineRecord>,
 }
 
+/// Operator resolution strategy for an active quarantine record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineResolution {
+    AcceptExisting,
+    AcceptIncoming,
+}
+
+impl QuarantineResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptExisting => "accept_existing",
+            Self::AcceptIncoming => "accept_incoming",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "accept_existing" => Some(Self::AcceptExisting),
+            "accept_incoming" => Some(Self::AcceptIncoming),
+            _ => None,
+        }
+    }
+}
+
+/// Response returned after resolving a quarantine entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineResolveResponse {
+    pub quarantine_id: i64,
+    pub resolution: QuarantineResolution,
+    pub snapshot: Option<SnapshotPublicationManifest>,
+}
+
 /// Response payload for `GET /api/hub/status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubStatusResponse {
@@ -335,18 +368,21 @@ pub(crate) fn advance_frontier_in_tx(
         )
         .optional()?;
 
-    let first_conflict_seq: Option<u64> = match prev {
-        Some((_, _, Some(c), _)) => Some(c),
-        _ => tx
-            .query_row(
-                "SELECT MIN(seq) FROM hub_quarantine WHERE producer_id = ?1 AND epoch = ?2",
-                rusqlite::params![producer_id, epoch],
-                |r| r.get::<_, Option<i64>>(0),
-            )?
-            .map(|v| v as u64),
-    };
-
     let (old_contiguous_seq, old_max_seq, was_seeded) = prev.map(|(c, m, _, s)| (c, m, s)).unwrap_or((0, 0, true));
+
+    let first_conflict_seq: Option<u64> = tx
+        .query_row(
+            "SELECT MIN(seq)
+             FROM hub_quarantine
+             WHERE producer_id = ?1
+               AND epoch = ?2
+               AND resolved_at IS NULL
+               AND committed_at_quarantine = 0
+               AND seq > ?3",
+            rusqlite::params![producer_id, epoch, old_contiguous_seq as i64],
+            |r| r.get::<_, Option<i64>>(0),
+        )?
+        .map(|v| v as u64);
 
     let mut stmt = tx.prepare(
         "SELECT seq FROM hub_ingested_events
@@ -435,7 +471,12 @@ pub(crate) fn recompute_frontier_in_tx(
 ) -> Result<u64, HubError> {
     let first_conflict_seq: Option<u64> = tx
         .query_row(
-            "SELECT MIN(seq) FROM hub_quarantine WHERE producer_id = ?1 AND epoch = ?2",
+            "SELECT MIN(seq)
+             FROM hub_quarantine
+             WHERE producer_id = ?1
+               AND epoch = ?2
+               AND resolved_at IS NULL
+               AND committed_at_quarantine = 0",
             rusqlite::params![producer_id, epoch],
             |r| r.get::<_, Option<i64>>(0),
         )?
@@ -1011,7 +1052,11 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
         }
     }
 
-    let quarantine_count: u64 = tx.query_row("SELECT COUNT(*) FROM hub_quarantine", [], |r| r.get::<_, i64>(0))? as u64;
+    let quarantine_count: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM hub_quarantine WHERE resolved_at IS NULL",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? as u64;
 
     if origin_frontier.is_empty() && quarantine_count == 0 {
         return latest_snapshot_in_conn(tx);
@@ -1296,11 +1341,16 @@ fn read_quarantine_in_conn(conn: &Connection) -> Result<QuarantineSummary, HubEr
             entries: Vec::new(),
         });
     }
-    let count: u64 = conn.query_row("SELECT COUNT(*) FROM hub_quarantine", [], |r| r.get::<_, i64>(0))? as u64;
+    let count: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM hub_quarantine WHERE resolved_at IS NULL",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? as u64;
     let mut stmt = conn.prepare(
         "SELECT quarantine_id, producer_id, epoch, seq, op_id,
                 existing_digest, conflicting_digest, quarantined_at
          FROM hub_quarantine
+         WHERE resolved_at IS NULL
          ORDER BY quarantine_id ASC",
     )?;
     let entries = stmt
@@ -1798,6 +1848,183 @@ impl HubStore {
             session: Box::new(session),
         };
         Ok((manifest, hydrated))
+    }
+
+    /// Return active quarantine records.
+    pub fn quarantine_summary(&self) -> Result<QuarantineSummary, HubError> {
+        let Some(conn) = self.store.open_readonly()? else {
+            return Ok(QuarantineSummary {
+                count: 0,
+                entries: Vec::new(),
+            });
+        };
+        read_quarantine_in_conn(&conn)
+    }
+
+    /// Resolve a quarantine conflict entry via operator choice (`accept_existing` or `accept_incoming`).
+    pub fn resolve_quarantine(
+        &self,
+        quarantine_id: i64,
+        resolution: QuarantineResolution,
+    ) -> Result<QuarantineResolveResponse, HubError> {
+        if crate::env::frozen() {
+            return Err(HubError::State(crate::state::StateError::Frozen));
+        }
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = Utc::now().timestamp_millis();
+
+        type QuarRow = (String, String, u64, String, String, String, Option<String>, Option<i64>);
+        let row: Option<QuarRow> = tx
+            .query_row(
+                "SELECT producer_id, epoch, seq, op_id, conflicting_digest,
+                        conflicting_envelope, conflicting_payload, resolved_at
+                 FROM hub_quarantine
+                 WHERE quarantine_id = ?1",
+                [quarantine_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            producer_id,
+            epoch,
+            seq,
+            op_id,
+            conflicting_digest,
+            conflicting_envelope,
+            conflicting_payload,
+            resolved_at,
+        )) = row
+        else {
+            return Err(HubError::NotFound(format!(
+                "quarantine entry #{quarantine_id} not found"
+            )));
+        };
+        if resolved_at.is_some() {
+            let snapshot = latest_snapshot_in_conn(&tx)?;
+            tx.commit()?;
+            return Ok(QuarantineResolveResponse {
+                quarantine_id,
+                resolution,
+                snapshot,
+            });
+        }
+
+        match resolution {
+            QuarantineResolution::AcceptExisting => {
+                tx.execute(
+                    "UPDATE hub_quarantine
+                     SET resolved_at = ?2, resolution = ?3
+                     WHERE quarantine_id = ?1",
+                    rusqlite::params![quarantine_id, now_ms, resolution.as_str()],
+                )?;
+                let (fold_after, new_frontier) = advance_frontier_in_tx(&tx, &producer_id, &epoch, now_ms)?;
+                let touched = fold_origin_range_in_tx(&tx, &producer_id, &epoch, fold_after, new_frontier)?;
+                if !touched.is_empty() {
+                    resolve_producer_sessions_in_tx(&tx, &producer_id, &touched)?;
+                }
+            }
+            QuarantineResolution::AcceptIncoming => {
+                if let Some(ref addr_json) = conflicting_payload {
+                    let addr: PayloadAddr = serde_json::from_str(addr_json)?;
+                    let manifest_str: Option<String> = tx
+                        .query_row(
+                            "SELECT manifest_json FROM hub_packs WHERE pack_id = ?1",
+                            [&addr.pack_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(manifest_str) = manifest_str else {
+                        return Err(HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: "quarantined incoming payload references unmirrored pack".into(),
+                        });
+                    };
+                    let zst_path =
+                        pack_zst_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: e.to_string(),
+                        })?;
+                    let idx_path =
+                        pack_idx_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: e.to_string(),
+                        })?;
+                    if !zst_path.is_file() || !idx_path.is_file() {
+                        return Err(HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: "mirrored pack files missing on disk".into(),
+                        });
+                    }
+                    let manifest = PackManifest::from_json_slice(manifest_str.as_bytes()).map_err(|e| {
+                        HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: format!("corrupt stored pack manifest: {e:#}"),
+                        }
+                    })?;
+                    let span_matches = manifest.record_index.records().iter().any(|span| {
+                        span.decoded_offset == addr.decoded_offset
+                            && span.length == addr.length
+                            && span.blake3_digest == addr.blake3_digest
+                    });
+                    if !span_matches {
+                        return Err(HubError::MissingPackDependency {
+                            pack_id: addr.pack_id,
+                            detail: "quarantined PayloadAddr span not present in pack manifest".into(),
+                        });
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO hub_ingested_events(
+                         producer_id, epoch, seq, op_id, event_digest,
+                         envelope_json, payload_addr_json, ingested_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(producer_id, epoch, seq) DO UPDATE SET
+                         op_id = excluded.op_id,
+                         event_digest = excluded.event_digest,
+                         envelope_json = excluded.envelope_json,
+                         payload_addr_json = excluded.payload_addr_json,
+                         ingested_at = excluded.ingested_at",
+                    rusqlite::params![
+                        producer_id,
+                        epoch,
+                        seq as i64,
+                        op_id,
+                        conflicting_digest,
+                        conflicting_envelope,
+                        conflicting_payload,
+                        now_ms,
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE hub_quarantine
+                     SET resolved_at = ?2, resolution = ?3
+                     WHERE quarantine_id = ?1",
+                    rusqlite::params![quarantine_id, now_ms, resolution.as_str()],
+                )?;
+                recompute_frontier_in_tx(&tx, &producer_id, &epoch, now_ms)?;
+                recompute_producer_sessions_in_tx(&tx, &producer_id)?;
+            }
+        }
+
+        let snapshot = maybe_publish_snapshot_in_tx(&tx, now_ms)?;
+        tx.commit()?;
+        Ok(QuarantineResolveResponse {
+            quarantine_id,
+            resolution,
+            snapshot,
+        })
     }
 
     /// Pin or unpin a published snapshot (`publication_id`) so retention pruning never evicts it.

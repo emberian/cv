@@ -2422,19 +2422,21 @@ fn stream_lane_and_file_pushes_need_the_same_token_as_their_routes() {
         let raw = raw_request(port, "GET", path, &bearer);
         assert_eq!(raw_status(&raw), 200, "{path}: {raw}");
     }
+    let same_origin = format!("http://127.0.0.1:{port}");
     let auth = raw_request(
         port,
         "GET",
         "/api/auth",
         &[
             ("Authorization", "Bearer lane-secret"),
-            ("Origin", "http://localhost:5173"),
+            ("Origin", &same_origin),
+            ("Sec-Fetch-Site", "same-origin"),
         ],
     );
     assert_eq!(raw_status(&auth), 200, "{auth}");
     assert_eq!(
         header_of(&auth, "Access-Control-Allow-Origin").as_deref(),
-        Some("http://localhost:5173")
+        Some(same_origin.as_str())
     );
     assert_eq!(
         header_of(&auth, "Access-Control-Allow-Credentials").as_deref(),
@@ -2446,18 +2448,69 @@ fn stream_lane_and_file_pushes_need_the_same_token_as_their_routes() {
         port,
         "GET",
         follow,
-        &[("Cookie", cookie), ("Origin", "http://localhost:5173")],
+        &[
+            ("Cookie", cookie),
+            ("Origin", &same_origin),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
     );
     assert_eq!(raw_status(&streamed), 200, "{streamed}");
     assert_eq!(
         header_of(&streamed, "Access-Control-Allow-Origin").as_deref(),
-        Some("http://localhost:5173")
+        Some(same_origin.as_str())
     );
     assert_eq!(
         header_of(&streamed, "Access-Control-Allow-Credentials").as_deref(),
         Some("true")
     );
     assert!(streamed.contains("asking-lane"), "{streamed}");
+
+    // Cross-port localhost dashboards (`http://localhost:5173`) NEVER get ambient Cookie auth or
+    // `Access-Control-Allow-Credentials: true`, and `Sec-Fetch-Site: same-site`/`cross-site`
+    // rejects Cookie auth even without an `Origin` header; cross-port dashboards must present
+    // `Authorization: Bearer`.
+    let cross_port_cookie = raw_request(
+        port,
+        "GET",
+        follow,
+        &[("Cookie", cookie), ("Origin", "http://localhost:5173")],
+    );
+    assert_eq!(raw_status(&cross_port_cookie), 401, "{cross_port_cookie}");
+    assert_eq!(
+        header_of(&cross_port_cookie, "Access-Control-Allow-Credentials"),
+        None,
+        "{cross_port_cookie}"
+    );
+    assert!(!cross_port_cookie.contains("asking-lane"), "{cross_port_cookie}");
+
+    let cross_site_sfs = raw_request(
+        port,
+        "GET",
+        follow,
+        &[("Cookie", cookie), ("Sec-Fetch-Site", "same-site")],
+    );
+    assert_eq!(raw_status(&cross_site_sfs), 401, "{cross_site_sfs}");
+    assert!(!cross_site_sfs.contains("asking-lane"), "{cross_site_sfs}");
+
+    let cross_port_bearer = raw_request(
+        port,
+        "GET",
+        "/api/lanes?session=betasess",
+        &[
+            ("Authorization", "Bearer lane-secret"),
+            ("Origin", "http://localhost:5173"),
+        ],
+    );
+    assert_eq!(raw_status(&cross_port_bearer), 200, "{cross_port_bearer}");
+    assert_eq!(
+        header_of(&cross_port_bearer, "Access-Control-Allow-Origin").as_deref(),
+        Some("http://localhost:5173")
+    );
+    assert_eq!(
+        header_of(&cross_port_bearer, "Access-Control-Allow-Credentials"),
+        None,
+        "cross-port origin must not emit Allow-Credentials"
+    );
 
     let evil_origin = raw_request(
         port,
@@ -2467,6 +2520,61 @@ fn stream_lane_and_file_pushes_need_the_same_token_as_their_routes() {
     );
     assert_eq!(raw_status(&evil_origin), 401, "{evil_origin}");
     assert!(!evil_origin.contains("asking-lane"), "{evil_origin}");
+}
+
+#[test]
+fn serve_operator_token_authorizes_inbox_writes_while_restricted_reader_stays_readonly() {
+    let w = world("serve-operator-vs-reader");
+    let (out, _) = w.cv_ok(&["task", "open", "inbox button target"]);
+    let task_id = out.lines().last().unwrap().trim().to_string();
+
+    // 1. `--token` (without CV_TASK_WRITE_TOKEN or read tier restriction) authorizes `/inbox` POST writes.
+    let (port, reaper) = spawn_serve_cfg(&w, &["--token", "op-secret", "--who", "ember"], &[]);
+    let ok_post = raw_post(
+        port,
+        &format!("/api/task/{task_id}/note"),
+        r#"{"text":"clicked from inbox"}"#,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer op-secret"),
+        ],
+    );
+    assert_eq!(raw_status(&ok_post), 200, "{ok_post}");
+    drop(reaper);
+
+    // 2. Restricted `CV_SERVE_READ_TOKEN` / `CV_SERVE_READ_TIER` keeps writes 401 while allowing
+    //    `/api/health` and bare `/api/stream` (without leaking `?lanes=` pushes or `X-Cv-Snapshot`).
+    let (port_ro, _reaper_ro) = spawn_serve_cfg(
+        &w,
+        &["--who", "ember"],
+        &[("CV_SERVE_READ_TOKEN", "ro-secret"), ("CV_SERVE_READ_TIER", "presence")],
+    );
+    let ro_post = raw_post(
+        port_ro,
+        &format!("/api/task/{task_id}/note"),
+        r#"{"text":"forbidden write"}"#,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer ro-secret"),
+        ],
+    );
+    assert_eq!(raw_status(&ro_post), 401, "{ro_post}");
+
+    let health = raw_request(port_ro, "GET", "/api/health", &[("Authorization", "Bearer ro-secret")]);
+    assert_eq!(raw_status(&health), 200, "{health}");
+    assert_eq!(header_of(&health, "X-Cv-Snapshot"), None);
+
+    let bare_stream = raw_request(port_ro, "GET", "/api/stream", &[("Authorization", "Bearer ro-secret")]);
+    assert_eq!(raw_status(&bare_stream), 200, "{bare_stream}");
+    assert_eq!(header_of(&bare_stream, "X-Cv-Snapshot"), None);
+
+    let lanes_stream = raw_request(
+        port_ro,
+        "GET",
+        "/api/stream?lanes=any",
+        &[("Authorization", "Bearer ro-secret")],
+    );
+    assert_eq!(raw_status(&lanes_stream), 403, "{lanes_stream}");
 }
 
 #[test]

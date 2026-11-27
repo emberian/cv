@@ -35,6 +35,8 @@ pub(crate) struct ServeOpts {
     pub who: Option<String>,
     /// Open the page in the default browser once the server is up.
     pub open: bool,
+    /// Mint a bound per-producer capability token (`cvp1.<id>.<secret>`) and exit.
+    pub mint_producer: Option<String>,
 }
 
 impl ServeOpts {
@@ -47,11 +49,14 @@ impl ServeOpts {
 /// Fleet Hub routes answered when `hub` mode is enabled (`--hub` / `CV_SERVE_HUB=1`).
 #[allow(dead_code)]
 pub(crate) const HUB_ROUTES: &[&str] = &[
+    "POST /api/hub/producers",
     "POST /api/hub/enroll",
     "POST /api/hub/upload_pack",
     "PUT /api/hub/packs/{pack_id}",
     "POST /api/hub/ingest_batch",
     "GET /api/hub/status",
+    "GET /api/hub/quarantine",
+    "POST /api/hub/quarantine",
     "GET /api/hub/snapshot",
     "GET /api/hub/sessions",
     "GET /api/hub/session/{producer}/{id}",
@@ -61,6 +66,8 @@ pub(crate) const HUB_ROUTES: &[&str] = &[
 struct Ctx {
     /// The configured bind host, accepted in `Host`/`Origin` checks alongside the loopback names.
     bind_host: String,
+    /// Exact TCP port this server instance bound (`80` in socketless unit tests).
+    bound_port: u16,
     web_root: Option<PathBuf>,
     auth: Credentials,
     default_who: Option<String>,
@@ -70,9 +77,30 @@ struct Ctx {
     stream: std::sync::Arc<StreamHub>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HubWriteGrant {
+    AdminBootstrap,
+    BoundProducer(String),
+}
+
+#[derive(Clone, Copy)]
+struct Cors<'a> {
+    origin: Option<&'a str>,
+    allow_credentials: bool,
+}
+
+impl<'a> Cors<'a> {
+    const NONE: Self = Self {
+        origin: None,
+        allow_credentials: false,
+    };
+}
+
 struct Credentials {
     reader: Option<String>,
-    producer: Option<String>,
+    operator_token: Option<String>,
+    producer_bootstrap: Option<String>,
+    producer_map: std::collections::BTreeMap<String, String>,
     task_writer: Option<String>,
     cookie: String,
     tier: Option<cv_core::disclose::DisclosureTier>,
@@ -80,20 +108,69 @@ struct Credentials {
 }
 
 impl Credentials {
-    fn load(reader: Option<String>) -> Result<Self> {
+    fn load(cli_token: Option<String>) -> Result<Self> {
         let configured = |name| cv_core::env::var(name).ok().filter(|s| !s.is_empty());
-        let reader = reader
-            .or_else(|| configured("CV_SERVE_READ_TOKEN"))
-            .or_else(|| configured("CV_SERVE_TOKEN"));
-        let producer = configured("CV_HUB_PRODUCER_TOKEN");
-        let task_writer = configured("CV_TASK_WRITE_TOKEN");
+        let env_read_token = configured("CV_SERVE_READ_TOKEN");
+        let env_serve_token = configured("CV_SERVE_TOKEN");
+        let from_operator_flag = cli_token.is_some() || (env_read_token.is_none() && env_serve_token.is_some());
+        let reader = cli_token.or(env_read_token).or(env_serve_token);
+        let producer_raw = configured("CV_HUB_PRODUCER_TOKEN");
+        let explicit_task_writer = configured("CV_TASK_WRITE_TOKEN");
+
         let mut values = std::collections::HashSet::new();
-        for value in [&reader, &producer, &task_writer].into_iter().flatten() {
+        for value in [&reader, &producer_raw, &explicit_task_writer].into_iter().flatten() {
             anyhow::ensure!(
-                !value.is_empty() && values.insert(value),
+                !value.is_empty() && values.insert(value.as_str()),
                 "each serve capability needs a distinct nonempty credential"
             );
         }
+
+        let mut producer_map = std::collections::BTreeMap::new();
+        let mut producer_bootstrap = None;
+        if let Some(raw) = producer_raw {
+            if !raw.starts_with("cvp1.") && raw.contains('=') {
+                let mut seen_secrets = std::collections::HashSet::new();
+                for entry in raw.split(',') {
+                    let entry = entry.trim();
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let Some((prod_id, secret)) = entry.split_once('=') else {
+                        anyhow::bail!("invalid CV_HUB_PRODUCER_TOKEN map entry {entry:?}; expected producer_id=token");
+                    };
+                    let prod_id = prod_id.trim();
+                    let secret = secret.trim();
+                    anyhow::ensure!(
+                        !prod_id.is_empty() && !secret.is_empty() && !prod_id.eq_ignore_ascii_case("local"),
+                        "invalid CV_HUB_PRODUCER_TOKEN map entry {entry:?}"
+                    );
+                    anyhow::ensure!(
+                        seen_secrets.insert(secret.to_string()),
+                        "each producer in CV_HUB_PRODUCER_TOKEN map needs a distinct nonempty credential"
+                    );
+                    if let Some(ref r) = reader {
+                        anyhow::ensure!(
+                            r != secret,
+                            "each serve capability needs a distinct nonempty credential"
+                        );
+                    }
+                    if let Some(ref w) = explicit_task_writer {
+                        anyhow::ensure!(
+                            w != secret,
+                            "each serve capability needs a distinct nonempty credential"
+                        );
+                    }
+                    producer_map.insert(prod_id.to_string(), secret.to_string());
+                }
+                anyhow::ensure!(
+                    !producer_map.is_empty(),
+                    "CV_HUB_PRODUCER_TOKEN map must define at least one producer_id=token pair"
+                );
+            } else {
+                producer_bootstrap = Some(raw);
+            }
+        }
+
         let tier = configured("CV_SERVE_READ_TIER").map(|s| s.parse()).transpose()?;
         let scope = configured("CV_SERVE_READ_SCOPE").map(PathBuf::from);
         anyhow::ensure!(
@@ -102,14 +179,97 @@ impl Credentials {
                 .is_none_or(|p| p.is_absolute() && !p.components().any(|c| c == std::path::Component::ParentDir)),
             "reader scope must be an absolute directory"
         );
+
+        let unrestricted = tier.is_none() && scope.is_none();
+        let operator_token = if from_operator_flag && unrestricted {
+            reader.clone()
+        } else {
+            None
+        };
+        let task_writer = explicit_task_writer.or_else(|| operator_token.clone());
+
         Ok(Self {
             reader,
-            producer,
+            operator_token,
+            producer_bootstrap,
+            producer_map,
             task_writer,
             tier,
             scope,
             cookie: uuid::Uuid::new_v4().to_string(),
         })
+    }
+
+    fn configured(&self) -> bool {
+        self.reader.is_some()
+            || self.producer_bootstrap.is_some()
+            || !self.producer_map.is_empty()
+            || self.task_writer.is_some()
+    }
+
+    fn representative_token(&self, hub: bool) -> Option<&str> {
+        if let Some(t) = self
+            .reader
+            .as_deref()
+            .or(self.producer_bootstrap.as_deref())
+            .or(self.task_writer.as_deref())
+            .or_else(|| self.producer_map.values().next().map(String::as_str))
+        {
+            return Some(t);
+        }
+        if hub
+            && cv_core::state::hub::HubStore::default_hub()
+                .ok()
+                .and_then(|h| h.has_active_producer_credentials().ok())
+                .unwrap_or(false)
+        {
+            return Some("cvp1-configured");
+        }
+        None
+    }
+
+    fn verify_hub_bearer(&self, bearer: &str) -> Option<HubWriteGrant> {
+        if bearer.starts_with("cvp1.") {
+            return cv_core::state::hub::HubStore::default_hub()
+                .ok()
+                .and_then(|h| h.verify_producer_token(bearer).ok().flatten())
+                .map(HubWriteGrant::BoundProducer);
+        }
+        if !self.producer_map.is_empty() {
+            for (prod_id, secret) in &self.producer_map {
+                if token_matches(bearer, secret) {
+                    return Some(HubWriteGrant::BoundProducer(prod_id.clone()));
+                }
+            }
+            return None;
+        }
+        if let Some(ref boot) = self.producer_bootstrap {
+            return token_matches(bearer, boot).then_some(HubWriteGrant::AdminBootstrap);
+        }
+        if let Some(ref op) = self.operator_token {
+            return token_matches(bearer, op).then_some(HubWriteGrant::AdminBootstrap);
+        }
+        None
+    }
+
+    fn any_bearer_matches(&self, bearer: &str, hub: bool) -> bool {
+        if self.reader.as_deref().is_some_and(|s| token_matches(bearer, s)) {
+            return true;
+        }
+        if self.task_writer.as_deref().is_some_and(|s| token_matches(bearer, s)) {
+            return true;
+        }
+        if self
+            .producer_bootstrap
+            .as_deref()
+            .is_some_and(|s| token_matches(bearer, s))
+        {
+            return true;
+        }
+        if self.producer_map.values().any(|s| token_matches(bearer, s)) {
+            return true;
+        }
+        hub && bearer.starts_with("cvp1.") && self.verify_hub_bearer(bearer).is_some()
     }
 
     fn restricted(&self) -> bool {
@@ -122,10 +282,11 @@ impl Credentials {
         })
     }
 
-    fn projected_read(&self, parts: &[&str]) -> Result<(u16, Value)> {
+    fn projected_read(&self, parts: &[&str], q: &cv_core::api::Query) -> Result<(u16, Value)> {
         use cv_core::disclose::{disclose, DisclosureTier};
         let tier = self.tier.unwrap_or(DisclosureTier::Full);
         match parts {
+            ["api", "health"] => Ok(cv_core::api::route_json(&["api", "health"], "")),
             ["api", "sessions"] => {
                 let tier = if tier == DisclosureTier::Presence {
                     tier
@@ -166,6 +327,48 @@ impl Credentials {
                     return Ok(missing());
                 }
                 Ok((200, serde_json::to_value(disclose(tier, &session)?)?))
+            }
+            ["api", "session", harness, id, "messages"]
+                if matches!(tier, DisclosureTier::Conversation | DisclosureTier::Full) =>
+            {
+                let missing = || (404, json!({"error":"session not found"}));
+                let Some(harness) = cv_core::Harness::parse(harness) else {
+                    return Ok(missing());
+                };
+                let Some((r, adapter)) = cv_core::find(id, Some(harness))? else {
+                    return Ok(missing());
+                };
+                if !self.in_scope(r.cwd.as_deref()) {
+                    return Ok(missing());
+                }
+                let mut session = adapter.parse(&r)?;
+                session.id = r.session_selector();
+                if !self.in_scope(session.cwd.as_deref()) {
+                    return Ok(missing());
+                }
+                let projected = serde_json::to_value(disclose(tier, &session)?)?;
+                let msgs = projected["messages"].as_array().cloned().unwrap_or_default();
+                let total = msgs.len();
+                let start = match q.unsigned("start") {
+                    Ok(v) => v.unwrap_or(0).min(total),
+                    Err(e) => return Ok((400, json!({"error": e}))),
+                };
+                let end = match q.unsigned("end") {
+                    Ok(v) => v.unwrap_or(total).min(total),
+                    Err(e) => return Ok((400, json!({"error": e}))),
+                };
+                let slice = if start <= end { &msgs[start..end] } else { &[][..] };
+                Ok((
+                    200,
+                    json!({
+                        "id": session.id,
+                        "harness": harness.as_str(),
+                        "total": total,
+                        "start": start,
+                        "end": end.max(start),
+                        "messages": slice,
+                    }),
+                ))
             }
             _ => Ok((403, json!({"error":"route outside reader grant"}))),
         }
@@ -209,14 +412,18 @@ pub(crate) fn cmd_serve(opts: ServeOpts) -> Result<()> {
 
 /// Like [`cmd_serve`], with an explicit Fleet Hub enablement flag (for `--hub` CLI wiring).
 pub(crate) fn cmd_serve_with_hub(opts: ServeOpts, hub: bool) -> Result<()> {
+    if let Some(producer_id) = opts.mint_producer.as_deref() {
+        anyhow::ensure!(hub, "--mint-producer requires --hub");
+        let hub_store = cv_core::state::hub::HubStore::default_hub()?;
+        let token = hub_store.issue_producer_token(producer_id)?;
+        println!("{token}");
+        return Ok(());
+    }
     let auth = Credentials::load(opts.token)?;
     validate_bind_exposure(
         &opts.host,
         opts.port,
-        auth.reader
-            .as_deref()
-            .or(auth.producer.as_deref())
-            .or(auth.task_writer.as_deref()),
+        auth.representative_token(hub),
         opts.insecure_expose,
         hub,
     )?;
@@ -278,6 +485,7 @@ fn run(
     }
     let ctx = Ctx {
         bind_host: host.to_string(),
+        bound_port: port,
         web_root,
         auth,
         default_who: who,
@@ -288,6 +496,54 @@ fn run(
     crate::http::serve(listener, limits, move |request| handle(request, &ctx))
 }
 
+/// Whether `request` originates from the exact `(host, bound_port)` authority this server bound,
+/// with `Sec-Fetch-Site: same-origin` whenever the browser attached `Sec-Fetch-Site`.
+///
+/// RFC 6265 cookies ignore port on `localhost`, so cross-port callers (`http://localhost:5173`,
+/// `Sec-Fetch-Site: same-site`/`cross-site`) must authenticate via `Authorization: Bearer` and are
+/// never granted `Cookie: cv_reader` or `Access-Control-Allow-Credentials: true`.
+fn is_same_origin_authority(
+    raw_host: Option<&str>,
+    raw_origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    bind_host: &str,
+    bound_port: u16,
+) -> bool {
+    let Some(host_hdr) = raw_host else {
+        return false;
+    };
+    if !host_allowed(Some(host_hdr), bind_host) {
+        return false;
+    }
+    let Some((req_host, req_port)) = authority_host_port(host_hdr, 80) else {
+        return false;
+    };
+    if req_port != bound_port {
+        return false;
+    }
+    if let Some(sfs) = sec_fetch_site {
+        if !sfs.trim().eq_ignore_ascii_case("same-origin") {
+            return false;
+        }
+    }
+    if let Some(orig) = raw_origin {
+        let Some((default_port, authority)) = orig
+            .strip_prefix("http://")
+            .map(|r| (80u16, r))
+            .or_else(|| orig.strip_prefix("https://").map(|r| (443u16, r)))
+        else {
+            return false;
+        };
+        let Some((orig_host, orig_port)) = authority_host_port(authority, default_port) else {
+            return false;
+        };
+        if !orig_host.eq_ignore_ascii_case(req_host) || orig_port != bound_port {
+            return false;
+        }
+    }
+    true
+}
+
 /// Handle one request: any error becomes a JSON error response.
 fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     let raw_host = header_value(request, "Host");
@@ -296,29 +552,33 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     // Non-browser API/Hub callers presenting a valid `Authorization: Bearer <token>` header (never
     // `?token=`, HTML pages, or `OPTIONS` preflights) may use reverse-proxy or container aliases.
     let authorization = header_value(request, "Authorization");
-    if ![
-        ctx.auth.reader.as_deref(),
-        ctx.auth.task_writer.as_deref(),
-        ctx.auth.producer.as_deref(),
-    ]
-    .into_iter()
-    .any(|expected| {
-        host_allowed_for_request(
-            raw_host.as_deref(),
-            &ctx.bind_host,
-            request.method(),
-            request.url(),
-            authorization.as_deref(),
-            expected,
-        )
-    }) {
-        request.respond(json_response(403, &json!({"error": "forbidden host"}), None, &[]));
+    let bearer_token = authorization.as_deref().and_then(|v| v.strip_prefix("Bearer "));
+    let host_ok = host_allowed(raw_host.as_deref(), &ctx.bind_host)
+        || (request.method() != "OPTIONS"
+            && is_api_request_url(request.url())
+            && raw_host.as_deref().and_then(host_name).is_some()
+            && bearer_token.is_some_and(|b| ctx.auth.any_bearer_matches(b, ctx.hub)));
+    if !host_ok {
+        request.respond(json_response(403, &json!({"error": "forbidden host"}), Cors::NONE, &[]));
         return;
     }
     // Echoed on API responses only when the Origin is on the local allow-list (or same-origin on
-    // an explicit non-loopback bind); never `*`.
+    // an explicit non-loopback bind); never `*`. `Access-Control-Allow-Credentials` is restricted
+    // strictly to exact same-origin `(host, bound_port)` + `Sec-Fetch-Site: same-origin`.
     let raw_origin = header_value(request, "Origin");
+    let sec_fetch_site = header_value(request, "Sec-Fetch-Site");
+    let same_origin = is_same_origin_authority(
+        raw_host.as_deref(),
+        raw_origin.as_deref(),
+        sec_fetch_site.as_deref(),
+        &ctx.bind_host,
+        ctx.bound_port,
+    );
     let origin = allowed_origin(raw_origin.as_deref(), raw_host.as_deref(), &ctx.bind_host);
+    let cors = Cors {
+        origin: origin.as_deref(),
+        allow_credentials: origin.is_some() && same_origin,
+    };
 
     let method = request.method().to_string();
     let raw_url = request.url().to_string();
@@ -326,7 +586,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     // CORS preflight: a 204, CORS-tagged only for allowed origins. Unauthenticated by design —
     // browsers strip credentials from preflights, and it discloses nothing.
     if method == "OPTIONS" {
-        request.respond(no_content(origin.as_deref()));
+        request.respond(no_content(cors));
         return;
     }
 
@@ -350,19 +610,18 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         && ((post
             && matches!(
                 parts.as_slice(),
-                ["api", "hub", "enroll" | "upload_pack" | "ingest_batch"]
+                [
+                    "api",
+                    "hub",
+                    "producers" | "enroll" | "upload_pack" | "ingest_batch" | "quarantine"
+                ]
             ))
             || (put && matches!(parts.as_slice(), ["api", "hub", "packs", _])));
 
     // GET reads anything; POST is an inbox write (`/api/task/<id>/<verb>`) or (when hub mode is
     // enabled) a Fleet Hub replication write (`/api/hub/*`, plus `PUT /api/hub/packs/<id>`).
     if !(method == "GET" || is_task_post || is_hub_write) {
-        request.respond(json_response(
-            405,
-            &json!({"error": "method not allowed"}),
-            origin.as_deref(),
-            &[],
-        ));
+        request.respond(json_response(405, &json!({"error": "method not allowed"}), cors, &[]));
         return;
     }
 
@@ -385,31 +644,40 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         request.respond(json_response(
             401,
             &json!({"error":"URL credentials are unsupported"}),
-            origin.as_deref(),
+            cors,
             &[],
         ));
         return;
     }
     let auth = &ctx.auth;
-    let expected = if is_hub_write {
-        &auth.producer
+    let configured = auth.configured()
+        || (is_hub_write
+            && cv_core::state::hub::HubStore::default_hub()
+                .ok()
+                .and_then(|h| h.has_active_producer_credentials().ok())
+                .unwrap_or(false));
+    let mut hub_grant: Option<HubWriteGrant> = None;
+    let header_ok = if is_hub_write {
+        if let Some(provided) = bearer_token {
+            hub_grant = auth.verify_hub_bearer(provided);
+            hub_grant.is_some()
+        } else {
+            false
+        }
     } else if is_task_post {
-        &auth.task_writer
+        auth.task_writer
+            .as_ref()
+            .is_some_and(|secret| bearer_token.is_some_and(|provided| token_matches(provided, secret)))
     } else {
-        &auth.reader
+        auth.reader
+            .as_ref()
+            .is_some_and(|secret| bearer_token.is_some_and(|provided| token_matches(provided, secret)))
     };
-    let configured = auth.reader.is_some() || auth.producer.is_some() || auth.task_writer.is_some();
-    let header_ok = expected.as_ref().is_some_and(|secret| {
-        authorization
-            .as_deref()
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|provided| token_matches(provided, secret))
-    });
     let cookie_ok = !is_hub_write
         && !is_task_post
         && auth.reader.is_some()
         && authorization.is_none()
-        && (raw_origin.is_none() || origin.is_some())
+        && same_origin
         && header_value(request, "Cookie").is_some_and(|cookies| {
             cookies.split(';').any(|pair| {
                 pair.trim()
@@ -417,27 +685,31 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                     .is_some_and(|provided| token_matches(provided, &auth.cookie))
             })
         });
-    let local = !configured && is_loopback_host(&ctx.bind_host);
-    if !(header_ok || cookie_ok || local || (!configured && !is_hub_write && !is_task_post)) {
+    let local = !configured && authorization.is_none() && is_loopback_host(&ctx.bind_host);
+    if local && is_hub_write {
+        hub_grant = Some(HubWriteGrant::AdminBootstrap);
+    }
+    if !(header_ok || cookie_ok || local || (!configured && authorization.is_none() && !is_hub_write && !is_task_post))
+    {
         request.respond(json_response(
             401,
             &json!({"error":"missing or invalid credential for this route"}),
-            origin.as_deref(),
+            cors,
             &[],
         ));
         return;
     }
     if parts.as_slice() == ["api", "auth"] && method == "GET" {
-        if !header_ok || (raw_origin.is_some() && origin.is_none()) {
+        if !header_ok || !same_origin {
             request.respond(json_response(
                 401,
-                &json!({"error":"reader bearer required"}),
-                None,
+                &json!({"error":"same-origin reader bearer required"}),
+                Cors::NONE,
                 &[],
             ));
         } else {
             let mut response = Response::bytes(200, br#"{"ok":true}"#.to_vec());
-            cors_headers(&mut response, origin.as_deref());
+            cors_headers(&mut response, cors);
             response.add_header("Content-Type", "application/json");
             response.add_header("Cache-Control", "no-store");
             response.add_header(
@@ -449,45 +721,51 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         return;
     }
     if !is_hub_write && !is_task_post && auth.restricted() {
+        if parts.as_slice() == ["api", "stream"] {
+            if q.raw("lanes").is_some() || q.raw("files").is_some() {
+                let mut response = Response::bytes(
+                    403,
+                    serde_json::to_vec(&json!({"error":"route outside reader grant"})).unwrap_or_default(),
+                );
+                response.add_header("Content-Type", "application/json");
+                response.add_header("Cache-Control", "no-store");
+                cors_headers(&mut response, cors);
+                request.respond(response);
+            } else {
+                serve_stream_with_options(request, &q, cors, &ctx.stream, true);
+            }
+            return;
+        }
         let (status, body) = auth
-            .projected_read(&parts)
+            .projected_read(&parts, &q)
             .unwrap_or_else(|_| (500, json!({"error":"session read failed"})));
         // Snapshot identifiers reflect above-tier activity. Omit them from a projected read.
         let mut response = Response::bytes(status, serde_json::to_vec(&body).unwrap_or_default());
         response.add_header("Content-Type", "application/json");
         response.add_header("Cache-Control", "no-store");
-        cors_headers(&mut response, origin.as_deref());
+        cors_headers(&mut response, cors);
         request.respond(response);
         return;
     }
 
     if is_hub_write {
         if raw_origin.is_some() && origin.is_none() {
-            request.respond(json_response(
-                403,
-                &json!({"error": "forbidden origin"}),
-                origin.as_deref(),
-                &[],
-            ));
+            request.respond(json_response(403, &json!({"error": "forbidden origin"}), cors, &[]));
             return;
         }
-        let resp = handle_hub_write(request, &parts, origin.as_deref(), ctx);
+        let grant = hub_grant.unwrap_or(HubWriteGrant::AdminBootstrap);
+        let resp = handle_hub_write(request, &parts, cors, ctx, &grant);
         request.respond(resp);
         return;
     }
 
     if matches!(parts.as_slice(), ["api", "hub", ..]) {
         if !ctx.hub {
-            request.respond(json_response(
-                404,
-                &json!({"error": "not found"}),
-                origin.as_deref(),
-                &[],
-            ));
+            request.respond(json_response(404, &json!({"error": "not found"}), cors, &[]));
             return;
         }
         let (status, body, extra) = handle_hub_get(&parts, &q);
-        request.respond(json_response(status, &body, origin.as_deref(), &extra));
+        request.respond(json_response(status, &body, cors, &extra));
         return;
     }
 
@@ -507,7 +785,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
             request.respond(json_response(
                 403,
                 &json!({"error": "a write must be application/json from a local origin"}),
-                origin.as_deref(),
+                cors,
                 &[],
             ));
             return;
@@ -516,19 +794,14 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
         let mut buf = String::new();
         const BODY_LIMIT: u64 = 1 << 20;
         if request.by_ref().take(BODY_LIMIT + 1).read_to_string(&mut buf).is_err() {
-            request.respond(json_response(
-                400,
-                &json!({"error": "unreadable body"}),
-                origin.as_deref(),
-                &[],
-            ));
+            request.respond(json_response(400, &json!({"error": "unreadable body"}), cors, &[]));
             return;
         }
         if buf.len() as u64 > BODY_LIMIT {
             request.respond(json_response(
                 413,
                 &json!({"error": "body exceeds 1 MiB limit"}),
-                origin.as_deref(),
+                cors,
                 &[],
             ));
             return;
@@ -540,7 +813,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                     request.respond(json_response(
                         400,
                         &json!({"error": format!("body is not JSON: {e}")}),
-                        origin.as_deref(),
+                        cors,
                         &[],
                     ));
                     return;
@@ -554,31 +827,21 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
             if post && status < 400 {
                 ctx.stream.bump(&["tasks"]);
             }
-            request.respond(json_response(
-                status,
-                &v,
-                origin.as_deref(),
-                &[("Cache-Control", "no-store".into())],
-            ));
+            request.respond(json_response(status, &v, cors, &[("Cache-Control", "no-store".into())]));
         }
         Some(serve_tasks::Answer::Ndjson(lines)) => {
             let mut resp = text_response(200, "application/x-ndjson; charset=utf-8", lines.into_bytes());
-            cors_headers(&mut resp, origin.as_deref());
+            cors_headers(&mut resp, cors);
             resp.add_header("Cache-Control", "no-store");
             stamp_latest_snapshot(&mut resp, false);
             request.respond(resp);
         }
         None if post => {
-            request.respond(json_response(
-                404,
-                &json!({"error": "no such route"}),
-                origin.as_deref(),
-                &[],
-            ));
+            request.respond(json_response(404, &json!({"error": "no such route"}), cors, &[]));
         }
         None => {
             if parts.as_slice() == ["api", "stream"] {
-                serve_stream(request, &q, origin.as_deref(), &ctx.stream);
+                serve_stream_with_options(request, &q, cors, &ctx.stream, false);
                 return;
             }
             if let Some(result) = download_export(false, &parts, &q) {
@@ -592,21 +855,16 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                                 &format!("attachment; filename=\"{}\"", download.filename),
                             );
                             response.add_header("Cache-Control", "no-store");
-                            cors_headers(&mut response, origin.as_deref());
+                            cors_headers(&mut response, cors);
                             stamp_latest_snapshot(&mut response, false);
                             request.respond(response);
                         }
                         Err(error) => {
-                            request.respond(json_response(
-                                500,
-                                &json!({"error":error.to_string()}),
-                                origin.as_deref(),
-                                &[],
-                            ));
+                            request.respond(json_response(500, &json!({"error":error.to_string()}), cors, &[]));
                         }
                     },
                     Err((status, error)) => {
-                        request.respond(json_response(status, &error, origin.as_deref(), &[]));
+                        request.respond(json_response(status, &error, cors, &[]));
                     }
                 }
                 return;
@@ -615,14 +873,14 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                 Ok(Some(stage)) => {
                     match stage.body.reader() {
                         Ok(reader) => {
-                            let response = staged_response(&stage, reader, origin.as_deref());
+                            let response = staged_response(&stage, reader, cors);
                             request.respond(response);
                         }
                         Err(error) => {
                             request.respond(json_response(
                                 500,
                                 &json!({"error":format!("staged response failed: {error}")}),
-                                origin.as_deref(),
+                                cors,
                                 &[],
                             ));
                         }
@@ -633,7 +891,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                     request.respond(json_response(
                         500,
                         &json!({"error":format!("staged response failed: {error:#}")}),
-                        origin.as_deref(),
+                        cors,
                         &[],
                     ));
                     return;
@@ -641,7 +899,7 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                 Ok(None) => {}
             }
             let (status, body, extra) = route(false, &parts, query, &q, &ctx.searcher);
-            request.respond(json_response(status, &body, origin.as_deref(), &extra));
+            request.respond(json_response(status, &body, cors, &extra));
         }
     }
 }
@@ -764,6 +1022,7 @@ fn is_api_request_url(raw_url: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
+#[allow(dead_code)]
 fn host_allowed_for_request(
     host_header: Option<&str>,
     bind_host: &str,
@@ -1166,15 +1425,10 @@ fn stamp_latest_snapshot(response: &mut Response<'_>, already_stamped: bool) {
 /// Build a JSON response, CORS-tagged for `origin` when one was allowed, plus any route-specific
 /// headers (see [`EXPOSED_HEADERS`] — a header a cross-origin dashboard cannot read is not a
 /// channel).
-fn json_response(
-    status: u16,
-    body: &Value,
-    origin: Option<&str>,
-    extra: &[(&'static str, String)],
-) -> Response<'static> {
+fn json_response(status: u16, body: &Value, cors: Cors<'_>, extra: &[(&'static str, String)]) -> Response<'static> {
     let data = serde_json::to_vec(body).unwrap_or_else(|_| b"{\"error\":\"serialize failed\"}".to_vec());
     let mut resp = Response::bytes(status, data);
-    cors_headers(&mut resp, origin);
+    cors_headers(&mut resp, cors);
     let mut has_snapshot_hdr = false;
     for (field, value) in extra {
         if field.eq_ignore_ascii_case("X-Cv-Snapshot") {
@@ -1229,25 +1483,25 @@ fn read_json_body(
     request: &mut Request<'_>,
     limit: u64,
     limit_label: &str,
-    origin: Option<&str>,
+    cors: Cors<'_>,
 ) -> std::result::Result<Value, Response<'static>> {
     if media_type_of(request) != "application/json" {
         return Err(json_response(
             403,
             &json!({"error": "a write must be application/json from a local origin"}),
-            origin,
+            cors,
             &[],
         ));
     }
     let mut buf = String::new();
     if request.by_ref().take(limit + 1).read_to_string(&mut buf).is_err() {
-        return Err(json_response(400, &json!({"error": "unreadable body"}), origin, &[]));
+        return Err(json_response(400, &json!({"error": "unreadable body"}), cors, &[]));
     }
     if buf.len() as u64 > limit {
         return Err(json_response(
             413,
             &json!({"error": format!("body exceeds {limit_label} limit")}),
-            origin,
+            cors,
             &[],
         ));
     }
@@ -1255,7 +1509,7 @@ fn read_json_body(
         return Ok(Value::Null);
     }
     serde_json::from_str::<Value>(&buf)
-        .map_err(|e| json_response(400, &json!({"error": format!("body is not JSON: {e}")}), origin, &[]))
+        .map_err(|e| json_response(400, &json!({"error": format!("body is not JSON: {e}")}), cors, &[]))
 }
 
 fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
@@ -1279,6 +1533,7 @@ fn hub_error_reply(err: cv_core::state::hub::HubError) -> Reply {
     use cv_core::state::hub::HubError;
     match err {
         HubError::InvalidArgument(msg) => (400, json!({"error": msg}), Vec::new()),
+        HubError::Forbidden(msg) => (403, json!({"error": msg}), Vec::new()),
         HubError::NotFound(msg) => (404, json!({"error": msg}), Vec::new()),
         HubError::MissingPackDependency { pack_id, detail } => (
             424,
@@ -1341,22 +1596,122 @@ fn hub_error_reply(err: cv_core::state::hub::HubError) -> Reply {
     }
 }
 
-fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&str>, ctx: &Ctx) -> Response<'static> {
+fn handle_hub_write(
+    request: &mut Request<'_>,
+    parts: &[&str],
+    cors: Cors<'_>,
+    ctx: &Ctx,
+    grant: &HubWriteGrant,
+) -> Response<'static> {
     use cv_core::state::hub::{
-        EnrollRequest, EnrollResponse, HubError, HubStore, IngestBatchRequest, PACK_STREAM_CONTENT_TYPE,
+        EnrollRequest, EnrollResponse, HubError, HubStore, IngestBatchRequest, QuarantineResolution,
+        PACK_STREAM_CONTENT_TYPE,
     };
 
     let hub = match HubStore::default_hub() {
         Ok(h) => h,
         Err(e) => {
             let (status, body, extra) = hub_error_reply(e);
-            return json_response(status, &body, origin, &extra);
+            return json_response(status, &body, cors, &extra);
         }
     };
 
+    let bound_producer = match grant {
+        HubWriteGrant::BoundProducer(id) => Some(id.as_str()),
+        HubWriteGrant::AdminBootstrap => None,
+    };
+
     match parts {
+        ["api", "hub", "producers"] => {
+            if bound_producer.is_some() {
+                return json_response(
+                    403,
+                    &json!({"error": "bound producer credentials cannot mint producer tokens"}),
+                    cors,
+                    &[],
+                );
+            }
+            let val = match read_json_body(request, HUB_ENROLL_LIMIT, "1 MiB", cors) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let Some(producer_id) = val.get("producer_id").and_then(Value::as_str) else {
+                return json_response(400, &json!({"error": "missing producer_id"}), cors, &[]);
+            };
+            if let Some(host_label) = val.get("host_label").and_then(Value::as_str) {
+                let meta = val.get("metadata").cloned().unwrap_or_else(|| json!({}));
+                if let Err(e) = hub.enroll_producer(producer_id, host_label, &meta) {
+                    let (status, body, extra) = hub_error_reply(e);
+                    return json_response(status, &body, cors, &extra);
+                }
+            }
+            let scopes: Vec<String> = val
+                .get("scopes")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match hub.issue_producer_token_with_scopes(producer_id, &scopes) {
+                Ok((token, meta)) => {
+                    ctx.stream.bump(&["hub"]);
+                    json_response(
+                        200,
+                        &json!({
+                            "producer_id": meta.producer_id,
+                            "token": token,
+                            "scopes": meta.scopes,
+                            "created_at": meta.created_at,
+                        }),
+                        cors,
+                        &[("Cache-Control", "no-store".into())],
+                    )
+                }
+                Err(e) => {
+                    let (status, body, extra) = hub_error_reply(e);
+                    json_response(status, &body, cors, &extra)
+                }
+            }
+        }
+        ["api", "hub", "quarantine"] => {
+            if bound_producer.is_some() {
+                return json_response(
+                    403,
+                    &json!({"error": "bound producer credentials cannot resolve quarantine entries"}),
+                    cors,
+                    &[],
+                );
+            }
+            let val = match read_json_body(request, HUB_ENROLL_LIMIT, "1 MiB", cors) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            let Some(quarantine_id) = val.get("quarantine_id").and_then(Value::as_i64) else {
+                return json_response(400, &json!({"error": "missing integer quarantine_id"}), cors, &[]);
+            };
+            let Some(res_raw) = val.get("resolution").and_then(Value::as_str) else {
+                return json_response(400, &json!({"error": "missing resolution"}), cors, &[]);
+            };
+            let Some(resolution) = QuarantineResolution::parse(res_raw) else {
+                return json_response(
+                    400,
+                    &json!({"error": "resolution must be accept_existing or accept_incoming"}),
+                    cors,
+                    &[],
+                );
+            };
+            match hub.resolve_quarantine(quarantine_id, resolution) {
+                Ok(resolved) => {
+                    ctx.stream.bump(&["hub", "sessions"]);
+                    let out = serde_json::to_value(resolved).unwrap_or_else(|_| json!({"error": "serialize failed"}));
+                    json_response(200, &out, cors, &[("Cache-Control", "no-store".into())])
+                }
+                Err(e) => {
+                    let (status, body, extra) = hub_error_reply(e);
+                    json_response(status, &body, cors, &extra)
+                }
+            }
+        }
         ["api", "hub", "enroll"] => {
-            let val = match read_json_body(request, HUB_ENROLL_LIMIT, "1 MiB", origin) {
+            let val = match read_json_body(request, HUB_ENROLL_LIMIT, "1 MiB", cors) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
@@ -1366,24 +1721,36 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                     return json_response(
                         400,
                         &json!({"error": format!("invalid enroll payload: {e}")}),
-                        origin,
+                        cors,
                         &[],
                     );
                 }
             };
             if req.producer_id.trim().is_empty() {
-                return json_response(400, &json!({"error": "producer_id must not be empty"}), origin, &[]);
+                return json_response(400, &json!({"error": "producer_id must not be empty"}), cors, &[]);
+            }
+            if let Some(bound) = bound_producer {
+                if req.producer_id != bound {
+                    return json_response(
+                        403,
+                        &json!({
+                            "error": format!("credential bound to producer `{bound}` cannot enroll `{}`", req.producer_id)
+                        }),
+                        cors,
+                        &[],
+                    );
+                }
             }
             match hub.enroll_producer(&req.producer_id, &req.host_label, &req.metadata) {
                 Ok(producer) => {
                     ctx.stream.bump(&["hub"]);
                     let out = serde_json::to_value(EnrollResponse { producer })
                         .unwrap_or_else(|_| json!({"error": "serialize failed"}));
-                    json_response(200, &out, origin, &[("Cache-Control", "no-store".into())])
+                    json_response(200, &out, cors, &[("Cache-Control", "no-store".into())])
                 }
                 Err(e) => {
                     let (status, body, extra) = hub_error_reply(e);
-                    json_response(status, &body, origin, &extra)
+                    json_response(status, &body, cors, &extra)
                 }
             }
         }
@@ -1400,31 +1767,31 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                         return json_response(
                             400,
                             &json!({"error": format!("URL pack_id {u:?} disagrees with X-Cv-Pack-Id {h:?}")}),
-                            origin,
+                            cors,
                             &[],
                         );
                     }
                     (Some(u), _) => u.to_string(),
                     (None, Some(h)) if !h.trim().is_empty() => h.trim().to_string(),
                     (None, _) => {
-                        return json_response(400, &json!({"error": "missing X-Cv-Pack-Id header"}), origin, &[]);
+                        return json_response(400, &json!({"error": "missing X-Cv-Pack-Id header"}), cors, &[]);
                     }
                 };
                 let expected_digest = header_value(request, "X-Cv-Pack-Digest");
                 let producer_id = header_value(request, "X-Cv-Producer-Id");
                 let Some(idx_len_raw) = header_value(request, "X-Cv-Pack-Idx-Len") else {
-                    return json_response(400, &json!({"error": "missing X-Cv-Pack-Idx-Len header"}), origin, &[]);
+                    return json_response(400, &json!({"error": "missing X-Cv-Pack-Idx-Len header"}), cors, &[]);
                 };
                 let Ok(idx_len) = idx_len_raw.trim().parse::<usize>() else {
-                    return json_response(400, &json!({"error": "invalid X-Cv-Pack-Idx-Len header"}), origin, &[]);
+                    return json_response(400, &json!({"error": "invalid X-Cv-Pack-Idx-Len header"}), cors, &[]);
                 };
                 if idx_len > HUB_PACK_IDX_LIMIT {
-                    return json_response(413, &json!({"error": "pack index exceeds 16 MiB limit"}), origin, &[]);
+                    return json_response(413, &json!({"error": "pack index exceeds 16 MiB limit"}), cors, &[]);
                 }
 
                 let mut idx_bytes = vec![0u8; idx_len];
                 if request.read_exact(&mut idx_bytes).is_err() {
-                    return json_response(400, &json!({"error": "truncated pack index stream"}), origin, &[]);
+                    return json_response(400, &json!({"error": "truncated pack index stream"}), cors, &[]);
                 }
 
                 let mut bounded = BoundedReader {
@@ -1433,29 +1800,30 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                     read_so_far: 0,
                     exceeded: false,
                 };
-                let result = hub.upload_pack_stream(
+                let result = hub.upload_pack_stream_for_producer(
                     &pack_id,
                     producer_id.as_deref(),
+                    bound_producer,
                     expected_digest.as_deref(),
                     &idx_bytes,
                     &mut bounded,
                 );
                 if bounded.exceeded {
-                    return json_response(413, &json!({"error": "pack body exceeds 256 MiB limit"}), origin, &[]);
+                    return json_response(413, &json!({"error": "pack body exceeds 256 MiB limit"}), cors, &[]);
                 }
                 match result {
                     Ok(resp) => {
                         ctx.stream.bump(&["hub"]);
                         let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
-                        json_response(200, &out, origin, &[("Cache-Control", "no-store".into())])
+                        json_response(200, &out, cors, &[("Cache-Control", "no-store".into())])
                     }
                     Err(e) => {
                         let (status, body, extra) = hub_error_reply(e);
-                        json_response(status, &body, origin, &extra)
+                        json_response(status, &body, cors, &extra)
                     }
                 }
             } else if ct == "application/json" {
-                let val = match read_json_body(request, HUB_PACK_JSON_LIMIT, "64 MiB", origin) {
+                let val = match read_json_body(request, HUB_PACK_JSON_LIMIT, "64 MiB", cors) {
                     Ok(v) => v,
                     Err(resp) => return resp,
                 };
@@ -1465,51 +1833,53 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                         return json_response(
                             400,
                             &json!({"error": format!("URL pack_id {u:?} disagrees with body pack_id {b:?}")}),
-                            origin,
+                            cors,
                             &[],
                         );
                     }
                     (Some(u), _) => u.to_string(),
                     (None, Some(b)) if !b.trim().is_empty() => b.trim().to_string(),
                     (None, _) => {
-                        return json_response(400, &json!({"error": "missing pack_id"}), origin, &[]);
+                        return json_response(400, &json!({"error": "missing pack_id"}), cors, &[]);
                     }
                 };
                 let producer_id = val.get("producer_id").and_then(Value::as_str);
                 let expected_digest = val.get("blake3_digest").and_then(Value::as_str);
                 let Some(idx_val) = val.get("idx") else {
-                    return json_response(400, &json!({"error": "missing idx field"}), origin, &[]);
+                    return json_response(400, &json!({"error": "missing idx field"}), cors, &[]);
                 };
                 let idx_bytes = match idx_val {
                     Value::String(s) => s.as_bytes().to_vec(),
                     other => match serde_json::to_vec(other) {
                         Ok(b) => b,
-                        Err(e) => return json_response(400, &json!({"error": e.to_string()}), origin, &[]),
+                        Err(e) => return json_response(400, &json!({"error": e.to_string()}), cors, &[]),
                     },
                 };
                 let Some(hex_str) = val.get("pack_zst_hex").and_then(Value::as_str) else {
-                    return json_response(400, &json!({"error": "missing pack_zst_hex field"}), origin, &[]);
+                    return json_response(400, &json!({"error": "missing pack_zst_hex field"}), cors, &[]);
                 };
                 let zst_bytes = match decode_hex(hex_str) {
                     Ok(b) => b,
                     Err(e) => {
-                        return json_response(
-                            400,
-                            &json!({"error": format!("invalid pack_zst_hex: {e}")}),
-                            origin,
-                            &[],
-                        )
+                        return json_response(400, &json!({"error": format!("invalid pack_zst_hex: {e}")}), cors, &[])
                     }
                 };
-                match hub.upload_pack_bytes(&pack_id, producer_id, expected_digest, &idx_bytes, &zst_bytes) {
+                match hub.upload_pack_bytes_for_producer(
+                    &pack_id,
+                    producer_id,
+                    bound_producer,
+                    expected_digest,
+                    &idx_bytes,
+                    &zst_bytes,
+                ) {
                     Ok(resp) => {
                         ctx.stream.bump(&["hub"]);
                         let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
-                        json_response(200, &out, origin, &[("Cache-Control", "no-store".into())])
+                        json_response(200, &out, cors, &[("Cache-Control", "no-store".into())])
                     }
                     Err(e) => {
                         let (status, body, extra) = hub_error_reply(e);
-                        json_response(status, &body, origin, &extra)
+                        json_response(status, &body, cors, &extra)
                     }
                 }
             } else {
@@ -1518,13 +1888,13 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                     &json!({
                         "error": "pack upload must be application/vnd.cv.pack+octet-stream, application/octet-stream, or application/json"
                     }),
-                    origin,
+                    cors,
                     &[],
                 )
             }
         }
         ["api", "hub", "ingest_batch"] => {
-            let val = match read_json_body(request, HUB_INGEST_BATCH_LIMIT, "32 MiB", origin) {
+            let val = match read_json_body(request, HUB_INGEST_BATCH_LIMIT, "32 MiB", cors) {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
@@ -1535,7 +1905,7 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                         return json_response(
                             400,
                             &json!({"error": format!("invalid ingest_batch events array: {e}")}),
-                            origin,
+                            cors,
                             &[],
                         );
                     }
@@ -1547,14 +1917,14 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                         return json_response(
                             400,
                             &json!({"error": format!("invalid ingest_batch request: {e}")}),
-                            origin,
+                            cors,
                             &[],
                         );
                     }
                 }
             };
 
-            match hub.ingest_batch(&batch_req) {
+            match hub.ingest_batch_for_producer(&batch_req, bound_producer) {
                 Ok(resp) => {
                     ctx.stream.bump(&["hub", "sessions"]);
                     let mut extra = vec![("Cache-Control", "no-store".to_string())];
@@ -1563,18 +1933,18 @@ fn handle_hub_write(request: &mut Request<'_>, parts: &[&str], origin: Option<&s
                         extra.push(("X-Cv-Hub-Generation", snap.hub_generation.to_string()));
                     }
                     let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
-                    json_response(200, &out, origin, &extra)
+                    json_response(200, &out, cors, &extra)
                 }
                 Err(e) => {
                     if matches!(e, HubError::EventConflict(_)) {
                         ctx.stream.bump(&["hub"]);
                     }
                     let (status, body, extra) = hub_error_reply(e);
-                    json_response(status, &body, origin, &extra)
+                    json_response(status, &body, cors, &extra)
                 }
             }
         }
-        _ => json_response(404, &json!({"error": "not found"}), origin, &[]),
+        _ => json_response(404, &json!({"error": "not found"}), cors, &[]),
     }
 }
 
@@ -1599,6 +1969,13 @@ fn handle_hub_get(parts: &[&str], q: &Query) -> Reply {
                     Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
                 }
             }
+            Err(e) => hub_error_reply(e),
+        },
+        ["api", "hub", "quarantine"] => match hub.quarantine_summary() {
+            Ok(summary) => match serde_json::to_value(summary) {
+                Ok(val) => (200, val, vec![("Cache-Control", "no-store".to_string())]),
+                Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
+            },
             Err(e) => hub_error_reply(e),
         },
         ["api", "hub", "snapshot"] => {
@@ -1735,19 +2112,19 @@ fn export(harness: &str, id: &str, query: &Query) -> Result<Download, (u16, Valu
 fn staged_response<'a>(
     stage: &cv_core::api::StagedJson,
     reader: Box<dyn std::io::Read + 'a>,
-    origin: Option<&str>,
+    cors: Cors<'_>,
 ) -> Response<'a> {
     let mut response = Response::stream(stage.status, reader, stage.bytes);
     response.add_header("Content-Type", "application/json");
-    cors_headers(&mut response, origin);
+    cors_headers(&mut response, cors);
     stamp_latest_snapshot(&mut response, false);
     response
 }
 
 /// A 204 No Content, CORS-tagged for `origin` when one was allowed — for `OPTIONS` preflight.
-fn no_content(origin: Option<&str>) -> Response<'static> {
+fn no_content(cors: Cors<'_>) -> Response<'static> {
     let mut resp = Response::empty(204);
-    cors_headers(&mut resp, origin);
+    cors_headers(&mut resp, cors);
     resp
 }
 
@@ -1758,12 +2135,15 @@ const EXPOSED_HEADERS: &str =
     "X-Cv-Search-Source, X-Cv-Search-Note, X-Cv-Search-Total, Content-Disposition, X-Cv-Snapshot, X-Cv-Hub-Generation";
 
 /// CORS headers echoing the one allowed `origin` — an unlisted origin gets none (the browser then
-/// refuses to share the response with it). `Vary: Origin` keeps caches from mixing the two.
-fn cors_headers(response: &mut Response<'_>, origin: Option<&str>) {
+/// refuses to share the response with it). `Access-Control-Allow-Credentials` is emitted ONLY when
+/// `cors.allow_credentials` holds (exact `(host, bound_port)` + `Sec-Fetch-Site: same-origin`).
+fn cors_headers(response: &mut Response<'_>, cors: Cors<'_>) {
     response.add_header("Vary", "Origin");
-    if let Some(o) = origin {
+    if let Some(o) = cors.origin {
         response.add_header("Access-Control-Allow-Origin", o);
-        response.add_header("Access-Control-Allow-Credentials", "true");
+        if cors.allow_credentials {
+            response.add_header("Access-Control-Allow-Credentials", "true");
+        }
         response.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
         response.add_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
         response.add_header("Access-Control-Expose-Headers", EXPOSED_HEADERS);
@@ -2114,7 +2494,13 @@ fn change_data(id: &str, kinds: &[&str], follow: &StreamFollow) -> String {
     v.to_string()
 }
 
-fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub: &std::sync::Arc<StreamHub>) {
+fn serve_stream_with_options(
+    request: &mut Request<'_>,
+    q: &Query,
+    cors: Cors<'_>,
+    hub: &std::sync::Arc<StreamHub>,
+    restricted_reader: bool,
+) {
     use axum::response::sse::Event;
     let last_event_id = header_value(request, "Last-Event-ID");
     let after = q.get("after").or_else(|| last_event_id.clone());
@@ -2126,7 +2512,21 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
     let live = q.flag("follow")
         || last_event_id.is_some()
         || header_value(request, "Accept").is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
-    let follow = StreamFollow::parse(q);
+    let follow = if restricted_reader {
+        StreamFollow::default()
+    } else {
+        StreamFollow::parse(q)
+    };
+    let filter_kinds = move |kinds: &[&'static str]| -> Vec<&'static str> {
+        if !restricted_reader {
+            return kinds.to_vec();
+        }
+        kinds
+            .iter()
+            .copied()
+            .filter(|k| matches!(*k, "ready" | "reset" | "sessions"))
+            .collect()
+    };
     let hub = hub.clone();
     let env = cv_core::env::Env::scoped();
     let started = std::time::Instant::now();
@@ -2145,12 +2545,13 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                     let (first, cur, init_emitted, init_done) = tokio::task::spawn_blocking(move || {
                         let _env = init_env.map(cv_core::env::Env::reenter);
                         let cur = init_hub.refresh();
-                        let change = |offset, kinds: &[&str]| {
+                        let change = |offset, kinds: &[&'static str]| {
                             let id = init_hub.cursor_id(offset);
+                            let allowed = filter_kinds(kinds);
                             Event::default()
                                 .id(&id)
                                 .event("change")
-                                .data(change_data(&id, kinds, &init_follow))
+                                .data(change_data(&id, &allowed, &init_follow))
                         };
                         let (first, init_emitted, init_done) = match init_hub.resume_point(after.as_deref(), cur) {
                             StreamResume::Fresh => (Some(change(cur, &["ready"])), 0, !live || max_events == Some(0)),
@@ -2159,11 +2560,28 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                                 1,
                                 !live || max_events.is_some_and(|n| n <= 1),
                             ),
-                            StreamResume::At(prev) if cur > prev => (
-                                Some(change(cur, &init_hub.changes_after(prev).1)),
-                                1,
-                                !live || max_events.is_some_and(|n| n <= 1),
-                            ),
+                            StreamResume::At(prev) if cur > prev => {
+                                let allowed = filter_kinds(&init_hub.changes_after(prev).1);
+                                if allowed.is_empty() {
+                                    if !live {
+                                        (
+                                            Some(
+                                                Event::default().comment(format!("cursor {}", init_hub.cursor_id(cur))),
+                                            ),
+                                            0,
+                                            true,
+                                        )
+                                    } else {
+                                        (None, 0, false)
+                                    }
+                                } else {
+                                    (
+                                        Some(change(cur, &allowed)),
+                                        1,
+                                        !live || max_events.is_some_and(|n| n <= 1),
+                                    )
+                                }
+                            }
                             StreamResume::At(_) if !live => (
                                 Some(Event::default().comment(format!("cursor {}", init_hub.cursor_id(cur)))),
                                 0,
@@ -2205,8 +2623,9 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                     })
                     .await
                     .ok()?;
-                    let (next, kinds) = hub.changes_after(seen);
-                    let event = if next > seen {
+                    let (next, raw_kinds) = hub.changes_after(seen);
+                    let kinds = filter_kinds(&raw_kinds);
+                    let event = if next > seen && !kinds.is_empty() {
                         seen = next;
                         emitted += 1;
                         done = max_events.is_some_and(|n| emitted >= n);
@@ -2225,10 +2644,15 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
                             change_data(&id, &kinds, &follow)
                         };
                         Some(Event::default().id(&id).event("change").data(data))
-                    } else if last_write.elapsed() >= SSE_KEEPALIVE {
-                        Some(Event::default().comment("keepalive"))
                     } else {
-                        None
+                        if next > seen {
+                            seen = next;
+                        }
+                        if last_write.elapsed() >= SSE_KEEPALIVE {
+                            Some(Event::default().comment("keepalive"))
+                        } else {
+                            None
+                        }
                     };
                     if let Some(event) = event {
                         last_write = std::time::Instant::now();
@@ -2239,8 +2663,10 @@ fn serve_stream(request: &mut Request<'_>, q: &Query, origin: Option<&str>, hub:
         },
     );
     let mut response = Response::events(stream);
-    cors_headers(&mut response, origin);
-    stamp_latest_snapshot(&mut response, false);
+    cors_headers(&mut response, cors);
+    if !restricted_reader {
+        stamp_latest_snapshot(&mut response, false);
+    }
     request.respond(response);
 }
 
@@ -2268,12 +2694,12 @@ mod staged_tests {
                     if staged {
                         let stage = cv_core::api::route_staged(&parts, "start=0&end=1").unwrap().unwrap();
                         let reader = stage.body.reader().unwrap();
-                        staged_response(&stage, reader, None)
+                        staged_response(&stage, reader, Cors::NONE)
                             .write_body_to(std::io::sink())
                             .unwrap();
                     } else {
                         let (status, value) = cv_core::api::route_json(&parts, "start=0&end=1");
-                        json_response(status, &value, None, &[])
+                        json_response(status, &value, Cors::NONE, &[])
                             .write_body_to(std::io::sink())
                             .unwrap();
                     }
@@ -2301,6 +2727,7 @@ mod search_service_tests {
         world.scope.set("CV_SERVE_READ_TIER", "presence");
         let ctx = Ctx {
             bind_host: "127.0.0.1".into(),
+            bound_port: 80,
             web_root: None,
             auth: Credentials::load(Some("reader".into())).unwrap(),
             default_who: None,
@@ -2331,9 +2758,29 @@ mod search_service_tests {
         let cookie_value = cookie.next().unwrap();
         assert!(cookie.any(|s| s.trim() == "HttpOnly"));
         let cookie_header = [("Cookie", cookie_value)];
+        assert_eq!(request("GET", "/api/health", &cookie_header).status(), 200);
         assert_eq!(request("GET", "/api/sessions", &cookie_header).status(), 200);
         assert_eq!(request("GET", "/api/search?q=secret", &cookie_header).status(), 403);
         assert_eq!(request("POST", "/api/task/x/note", &cookie_header).status(), 401);
+        // Cross-port localhost Origin or non-same-origin Sec-Fetch-Site must reject Cookie auth.
+        assert_eq!(
+            request(
+                "GET",
+                "/api/sessions",
+                &[("Cookie", cookie_value), ("Origin", "http://localhost:5173")]
+            )
+            .status(),
+            401
+        );
+        assert_eq!(
+            request(
+                "GET",
+                "/api/sessions",
+                &[("Cookie", cookie_value), ("Sec-Fetch-Site", "same-site")]
+            )
+            .status(),
+            401
+        );
     }
 
     #[test]

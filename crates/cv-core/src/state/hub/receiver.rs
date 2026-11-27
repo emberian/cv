@@ -4,8 +4,7 @@
 
 use super::snapshot::{
     advance_frontier_in_tx, fold_origin_range_in_tx, latest_snapshot_in_conn, maybe_publish_snapshot_in_tx,
-    recompute_frontier_in_tx, recompute_producer_sessions_in_tx, resolve_producer_sessions_in_tx,
-    SnapshotPublicationManifest,
+    resolve_producer_sessions_in_tx, SnapshotPublicationManifest,
 };
 use super::{canonical_json_bytes, compute_event_digest, EventId, HubError, HubStore, Producer};
 use crate::packs::{
@@ -218,6 +217,27 @@ impl HubStore {
         producer_id: Option<&str>,
         expected_blake3_digest: Option<&str>,
         idx_bytes: &[u8],
+        zst_reader: impl Read,
+    ) -> Result<UploadPackResponse, HubError> {
+        self.upload_pack_stream_for_producer(
+            pack_id,
+            producer_id,
+            None,
+            expected_blake3_digest,
+            idx_bytes,
+            zst_reader,
+        )
+    }
+
+    /// Like [`Self::upload_pack_stream`], enforcing 1:1 producer ownership when authenticated by
+    /// a bound producer credential (`authenticated_producer = Some(id)`).
+    pub fn upload_pack_stream_for_producer(
+        &self,
+        pack_id: &str,
+        producer_id: Option<&str>,
+        authenticated_producer: Option<&str>,
+        expected_blake3_digest: Option<&str>,
+        idx_bytes: &[u8],
         mut zst_reader: impl Read,
     ) -> Result<UploadPackResponse, HubError> {
         // Refuse before creating `hub/packs/` or staging the upload: the first `state.db` write
@@ -225,6 +245,25 @@ impl HubStore {
         if crate::env::frozen() {
             return Err(HubError::State(crate::state::StateError::Frozen));
         }
+        let effective_producer: Option<String> = match authenticated_producer {
+            Some(bound) => {
+                let bound = bound.trim();
+                if bound.is_empty() || bound.eq_ignore_ascii_case("local") {
+                    return Err(HubError::Forbidden(format!(
+                        "bound producer `{bound}` is not authorized to upload hub packs"
+                    )));
+                }
+                if let Some(claimed) = producer_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    if claimed != bound {
+                        return Err(HubError::Forbidden(format!(
+                            "credential bound to producer `{bound}` cannot upload pack for `{claimed}`"
+                        )));
+                    }
+                }
+                Some(bound.to_string())
+            }
+            None => producer_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        };
         publish::validate_output_id(pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
         let zst_dest = pack_zst_path(&self.packs_dir, pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
         let idx_dest = pack_idx_path(&self.packs_dir, pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
@@ -296,6 +335,13 @@ impl HubStore {
                 .optional()?;
 
             if let Some(record) = existing {
+                if let Some(ref bound) = effective_producer {
+                    if record.producer_id.as_deref() != Some(bound.as_str()) {
+                        return Err(HubError::Forbidden(format!(
+                            "pack `{pack_id}` belongs to another producer and cannot be claimed by `{bound}`"
+                        )));
+                    }
+                }
                 if record.pack_id != pack_id || record.blake3_digest != actual_zst_digest {
                     return Err(HubError::PackConflict {
                         pack_id: pack_id.to_string(),
@@ -434,20 +480,34 @@ impl HubStore {
             .map_err(|e| HubError::Pack(format!("publishing pack `{pack_id}`: {e:#}")))?;
 
         let now_ms = Utc::now().timestamp_millis();
-        let prod_opt = producer_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let prod_opt = effective_producer;
 
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        if let Some((existing_id, existing_dig, existing_idx_dig)) = tx
+        if let Some((existing_id, existing_owner, existing_dig, existing_idx_dig)) = tx
             .query_row(
-                "SELECT pack_id, blake3_digest, idx_blake3_digest
+                "SELECT pack_id, producer_id, blake3_digest, idx_blake3_digest
                  FROM hub_packs WHERE pack_id = ?1 COLLATE NOCASE",
                 [pack_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
             )
             .optional()?
         {
+            if let Some(ref bound) = prod_opt {
+                if existing_owner.as_deref() != Some(bound.as_str()) {
+                    return Err(HubError::Forbidden(format!(
+                        "pack `{pack_id}` belongs to another producer and cannot be claimed by `{bound}`"
+                    )));
+                }
+            }
             if existing_id != pack_id || existing_dig != actual_zst_digest {
                 return Err(HubError::PackConflict {
                     pack_id: pack_id.to_string(),
@@ -530,9 +590,23 @@ impl HubStore {
         idx_bytes: &[u8],
         zst_bytes: &[u8],
     ) -> Result<UploadPackResponse, HubError> {
-        self.upload_pack_stream(
+        self.upload_pack_bytes_for_producer(pack_id, producer_id, None, expected_blake3_digest, idx_bytes, zst_bytes)
+    }
+
+    /// Like [`Self::upload_pack_bytes`], enforcing 1:1 producer ownership when `authenticated_producer` is set.
+    pub fn upload_pack_bytes_for_producer(
+        &self,
+        pack_id: &str,
+        producer_id: Option<&str>,
+        authenticated_producer: Option<&str>,
+        expected_blake3_digest: Option<&str>,
+        idx_bytes: &[u8],
+        zst_bytes: &[u8],
+    ) -> Result<UploadPackResponse, HubError> {
+        self.upload_pack_stream_for_producer(
             pack_id,
             producer_id,
+            authenticated_producer,
             expected_blake3_digest,
             idx_bytes,
             io::Cursor::new(zst_bytes),
@@ -542,11 +616,41 @@ impl HubStore {
     /// Ingest a batch of replicated events under strict `publish-before-reference`, out-of-order
     /// gap-free frontier progression, idempotency, and loud `409 Conflict` quarantine.
     pub fn ingest_batch(&self, req: &IngestBatchRequest) -> Result<IngestBatchResponse, HubError> {
+        self.ingest_batch_for_producer(req, None)
+    }
+
+    /// Like [`Self::ingest_batch`], enforcing 1:1 producer binding on every event and referenced
+    /// pack when `authenticated_producer` is `Some(bound_id)`.
+    pub fn ingest_batch_for_producer(
+        &self,
+        req: &IngestBatchRequest,
+        authenticated_producer: Option<&str>,
+    ) -> Result<IngestBatchResponse, HubError> {
+        let bound_producer = match authenticated_producer {
+            Some(bound) => {
+                let bound = bound.trim();
+                if bound.is_empty() || bound.eq_ignore_ascii_case("local") {
+                    return Err(HubError::Forbidden(format!(
+                        "bound producer `{bound}` is not authorized to ingest hub batches"
+                    )));
+                }
+                Some(bound)
+            }
+            None => None,
+        };
         for rec in &req.events {
             if rec.event_id.producer_id.trim().is_empty() {
                 return Err(HubError::InvalidArgument(
                     "event_id.producer_id must not be empty".into(),
                 ));
+            }
+            if let Some(bound) = bound_producer {
+                if rec.event_id.producer_id != bound {
+                    return Err(HubError::Forbidden(format!(
+                        "credential bound to producer `{bound}` cannot ingest event for `{}`",
+                        rec.event_id.producer_id
+                    )));
+                }
             }
             if rec.event_id.epoch.trim().is_empty() {
                 return Err(HubError::InvalidArgument("event_id.epoch must not be empty".into()));
@@ -592,19 +696,27 @@ impl HubStore {
                 continue;
             };
             if !loaded_manifests.contains_key(&addr.pack_id) {
-                let row: Option<(String, String)> = tx
+                let row: Option<(Option<String>, String, String)> = tx
                     .query_row(
-                        "SELECT blake3_digest, manifest_json FROM hub_packs WHERE pack_id = ?1",
+                        "SELECT producer_id, blake3_digest, manifest_json FROM hub_packs WHERE pack_id = ?1",
                         [&addr.pack_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
-                let Some((pack_digest, manifest_str)) = row else {
+                let Some((pack_owner, pack_digest, manifest_str)) = row else {
                     return Err(HubError::MissingPackDependency {
                         pack_id: addr.pack_id.clone(),
                         detail: "pack not yet uploaded to hub (`publish-before-reference` violation)".into(),
                     });
                 };
+                if let Some(bound) = bound_producer {
+                    if pack_owner.as_deref() != Some(bound) {
+                        return Err(HubError::Forbidden(format!(
+                            "credential bound to producer `{bound}` cannot reference pack `{}` owned by another producer",
+                            addr.pack_id
+                        )));
+                    }
+                }
                 let zst_path =
                     pack_zst_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
                         pack_id: addr.pack_id.clone(),
@@ -881,11 +993,22 @@ impl HubStore {
              ON CONFLICT(producer_id) DO NOTHING",
             rusqlite::params![event_id.producer_id, now_ms],
         )?;
+        let current_contiguous_seq: u64 = tx
+            .query_row(
+                "SELECT contiguous_seq FROM hub_frontiers WHERE producer_id = ?1 AND epoch = ?2",
+                rusqlite::params![event_id.producer_id, event_id.epoch],
+                |r| Ok(r.get::<_, i64>(0)? as u64),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let was_committed = event_id.seq <= current_contiguous_seq;
+
         tx.execute(
             "INSERT INTO hub_quarantine(
                  producer_id, epoch, seq, op_id, existing_digest,
-                 conflicting_digest, conflicting_envelope, conflicting_payload, quarantined_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 conflicting_digest, conflicting_envelope, conflicting_payload,
+                 quarantined_at, committed_at_quarantine, resolved_at, resolution
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)
              ON CONFLICT(producer_id, epoch, seq, conflicting_digest) DO NOTHING",
             rusqlite::params![
                 event_id.producer_id,
@@ -897,16 +1020,25 @@ impl HubStore {
                 env_json,
                 payload_json,
                 now_ms,
+                i64::from(was_committed),
             ],
         )?;
 
-        recompute_frontier_in_tx(&tx, &event_id.producer_id, &event_id.epoch, now_ms)?;
-        recompute_producer_sessions_in_tx(&tx, &event_id.producer_id)?;
+        // Committed prefix (`seq <= contiguous_seq`) is immutable: record quarantine evidence and
+        // reject 409 WITHOUT rewinding `contiguous_seq` or erasing committed sessions. Uncommitted
+        // future conflicts (`seq > contiguous_seq`) update `first_conflict_seq` to hold frontier
+        // progression below `seq` until resolved.
+        if !was_committed {
+            let _ = advance_frontier_in_tx(&tx, &event_id.producer_id, &event_id.epoch, now_ms)?;
+        }
         let _ = maybe_publish_snapshot_in_tx(&tx, now_ms)?;
 
         let origin_frontier = current_origin_frontier_in_tx(&tx)?;
-        let quarantine_count: u64 =
-            tx.query_row("SELECT COUNT(*) FROM hub_quarantine", [], |r| r.get::<_, i64>(0))? as u64;
+        let quarantine_count: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM hub_quarantine WHERE resolved_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as u64;
 
         tx.commit()?;
 

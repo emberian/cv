@@ -1174,6 +1174,9 @@ enum Cmd {
         /// Enable fleet replication hub receiver & pinned snapshot routes (/api/hub/*).
         #[arg(long)]
         hub: bool,
+        /// Mint a bound capability credential (`cvp1.<id>.<secret>`) for a hub producer and exit.
+        #[arg(long = "mint-producer", value_name = "PRODUCER", requires = "hub")]
+        mint_producer: Option<String>,
     },
     /// Redact a session and emit a single self-contained HTML artifact anyone can open.
     Share {
@@ -1871,6 +1874,7 @@ fn run() -> Result<()> {
             who,
             open,
             hub,
+            mint_producer,
         } => {
             let opts = serve::ServeOpts {
                 host,
@@ -1880,6 +1884,7 @@ fn run() -> Result<()> {
                 insecure_expose,
                 who: who.or_else(cv_core::task::default_endpoint),
                 open,
+                mint_producer,
             };
             if hub {
                 serve::cmd_serve_with_hub(opts, true)

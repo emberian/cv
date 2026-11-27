@@ -22,9 +22,19 @@ pub use shipper::{
 };
 pub use snapshot::{
     FrontierStatus, HubSessionRow, HubSessionsPage, HubSnapshotResponse, HubStatusResponse, HydratedHubSession,
-    QuarantineRecord, QuarantineSummary, SessionRevisionEntry, SnapshotPublicationManifest,
-    HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
+    QuarantineRecord, QuarantineResolution, QuarantineResolveResponse, QuarantineSummary, SessionRevisionEntry,
+    SnapshotPublicationManifest, HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
 };
+
+/// Metadata for a per-producer capability token stored in `hub_producer_credentials`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProducerCredentialMeta {
+    pub producer_id: String,
+    pub scopes: Vec<String>,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<i64>,
+}
 
 /// Relative subdirectory under `$CLUSTERVISION_HOME` holding mirrored hub packs.
 pub const HUB_PACKS_REL_DIR: &str = "hub/packs";
@@ -64,6 +74,9 @@ pub enum HubError {
 
     #[error("invalid hub request: {0}")]
     InvalidArgument(String),
+
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     #[error("{0}")]
     NotFound(String),
@@ -142,6 +155,175 @@ impl HubStore {
     /// Enroll or update a producer identity in `producers`.
     pub fn enroll_producer(&self, producer_id: &str, host_label: &str, metadata: &Value) -> Result<Producer, HubError> {
         Ok(self.store.enroll_producer(producer_id, host_label, metadata)?)
+    }
+
+    /// Issue (or rotate) a per-producer capability token (`cvp1.<producer_id>.<secret>`) bound
+    /// 1:1 to `producer_id`, persisting only its BLAKE3 commitment in `hub_producer_credentials`.
+    pub fn issue_producer_token(&self, producer_id: &str) -> Result<String, HubError> {
+        let (token, _) = self.issue_producer_token_with_scopes(producer_id, &[])?;
+        Ok(token)
+    }
+
+    /// Issue (or rotate) a per-producer capability token with explicit scope labels.
+    pub fn issue_producer_token_with_scopes(
+        &self,
+        producer_id: &str,
+        scopes: &[String],
+    ) -> Result<(String, ProducerCredentialMeta), HubError> {
+        use rusqlite::TransactionBehavior;
+        if crate::env::frozen() {
+            return Err(HubError::State(StateError::Frozen));
+        }
+        let pid = producer_id.trim();
+        if pid.is_empty() {
+            return Err(HubError::InvalidArgument("producer_id must not be empty".into()));
+        }
+        if pid.eq_ignore_ascii_case("local") {
+            return Err(HubError::InvalidArgument(
+                "producer_id `local` is reserved for local store custody and cannot hold a remote token".into(),
+            ));
+        }
+        if pid.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(HubError::InvalidArgument(
+                "producer_id must not contain whitespace or control characters".into(),
+            ));
+        }
+        let secret = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let token = format!("cvp1.{pid}.{secret}");
+        let token_blake3 = blake3::hash(token.as_bytes()).to_hex().to_string();
+        let scopes_vec: Vec<String> = scopes
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let scopes_json = serde_json::to_string(&scopes_vec)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)
+             VALUES (?1, ?1, '{}', ?2, ?2)
+             ON CONFLICT(producer_id) DO NOTHING",
+            rusqlite::params![pid, now_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO hub_producer_credentials(producer_id, token_blake3, scopes_json, created_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(producer_id) DO UPDATE SET
+                 token_blake3 = excluded.token_blake3,
+                 scopes_json = excluded.scopes_json,
+                 created_at = excluded.created_at,
+                 revoked_at = NULL",
+            rusqlite::params![pid, token_blake3, scopes_json, now_ms],
+        )?;
+        tx.commit()?;
+        Ok((
+            token,
+            ProducerCredentialMeta {
+                producer_id: pid.to_string(),
+                scopes: scopes_vec,
+                created_at: now_ms,
+                revoked_at: None,
+            },
+        ))
+    }
+
+    /// Revoke an active capability token for `producer_id`.
+    pub fn revoke_producer_token(&self, producer_id: &str) -> Result<bool, HubError> {
+        use rusqlite::TransactionBehavior;
+        if crate::env::frozen() {
+            return Err(HubError::State(StateError::Frozen));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE hub_producer_credentials
+             SET revoked_at = ?2
+             WHERE producer_id = ?1 AND revoked_at IS NULL",
+            rusqlite::params![producer_id.trim(), now_ms],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Verify a `cvp1.<producer_id>.<secret>` bearer token against `hub_producer_credentials`,
+    /// returning the bound `producer_id` iff active and matching in constant time.
+    pub fn verify_producer_token(&self, presented_token: &str) -> Result<Option<String>, HubError> {
+        use rusqlite::OptionalExtension;
+        let Some(rest) = presented_token.strip_prefix("cvp1.") else {
+            return Ok(None);
+        };
+        let Some((producer_id, secret)) = rest.rsplit_once('.') else {
+            return Ok(None);
+        };
+        if producer_id.is_empty()
+            || producer_id.eq_ignore_ascii_case("local")
+            || secret.is_empty()
+            || !secret.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Ok(None);
+        }
+        let Some(conn) = self.store.open_readonly()? else {
+            return Ok(None);
+        };
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_producer_credentials')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_table {
+            return Ok(None);
+        }
+        let row: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT token_blake3, revoked_at
+                 FROM hub_producer_credentials
+                 WHERE producer_id = ?1",
+                [producer_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_hex, revoked_at)) = row else {
+            return Ok(None);
+        };
+        if revoked_at.is_some() {
+            return Ok(None);
+        }
+        let presented_hex = blake3::hash(presented_token.as_bytes()).to_hex();
+        let a = presented_hex.as_bytes();
+        let b = stored_hex.as_bytes();
+        let mut diff = u8::from(a.len() != b.len());
+        for (i, &byte) in a.iter().enumerate() {
+            diff |= byte ^ b.get(i % b.len().max(1)).copied().unwrap_or(0);
+        }
+        if std::hint::black_box(diff) == 0 {
+            Ok(Some(producer_id.to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Return `true` when at least one non-revoked producer credential exists in `state.db`.
+    pub fn has_active_producer_credentials(&self) -> Result<bool, HubError> {
+        let Some(conn) = self.store.open_readonly()? else {
+            return Ok(false);
+        };
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_producer_credentials')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_table {
+            return Ok(false);
+        }
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM hub_producer_credentials WHERE revoked_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
     }
 }
 

@@ -11,7 +11,7 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 5;
+pub const STATE_SCHEMA_VERSION: i64 = 6;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -20,6 +20,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (3, "v3_hub_delta_and_snapshot_bounds", MIGRATION_V3),
     (4, "v4_hook_observations", MIGRATION_V4),
     (5, "v5_file_observations", MIGRATION_V5),
+    (6, "v6_hub_producer_credentials", MIGRATION_V6),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -365,6 +366,20 @@ CREATE TABLE IF NOT EXISTS horizons (
 DELETE FROM task_folds;
 "#;
 
+const MIGRATION_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS hub_producer_credentials (
+    producer_id  TEXT PRIMARY KEY,
+    token_blake3 TEXT NOT NULL,
+    scopes_json  TEXT NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL,
+    revoked_at   INTEGER
+);
+
+ALTER TABLE hub_quarantine ADD COLUMN committed_at_quarantine INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE hub_quarantine ADD COLUMN resolved_at INTEGER;
+ALTER TABLE hub_quarantine ADD COLUMN resolution TEXT;
+"#;
+
 /// Tables that converge by presence rather than by `user_version`: every writable open creates
 /// what is missing, whatever version numbering other migrations use, so a store at any version
 /// (including one whose numbers another branch of migrations claimed) gains them exactly once.
@@ -385,6 +400,13 @@ CREATE TABLE IF NOT EXISTS custody_heads_through (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     manifests INTEGER NOT NULL,
     through   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hub_producer_credentials (
+    producer_id  TEXT PRIMARY KEY,
+    token_blake3 TEXT NOT NULL,
+    scopes_json  TEXT NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL,
+    revoked_at   INTEGER
 );
 "#;
 
