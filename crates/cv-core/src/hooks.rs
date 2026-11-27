@@ -27,7 +27,7 @@ pub fn valid_id(s: &str) -> bool {
 
 impl Baggage {
     pub fn parse(raw: &str) -> Option<Self> {
-        if raw.len() > 128 {
+        if raw.len() > 4 * 128 + 3 {
             return None;
         }
         let mut ids = raw.split(',');
@@ -382,14 +382,24 @@ mod tests {
 mod baggage_tests {
     use super::Baggage;
 
-    /// #tooth: accept an exact-budget tuple, reject truncation and metacharacters.
+    /// #tooth: accept four UUIDs and an exact-budget tuple, reject truncation and metacharacters.
     #[test]
     fn hooks_baggage_validates_all_four_fields_and_the_wire_budget() {
-        let full = format!("root,parent,spawn,{}", "x".repeat(110));
-        assert_eq!(full.len(), 128);
-        assert_eq!(Baggage::parse(&full).unwrap().parent_session_id, "parent");
+        let uuids = "01966e5a-4f12-7b3c-9a01-112233445566,550e8400-e29b-41d4-a716-446655440000,01966e5a-4f12-7b3c-9a01-abcdef012345,f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        assert_eq!(uuids.len(), 147);
+        let parsed = Baggage::parse(uuids).expect("four standard UUIDv4/v7 strings must parse");
+        assert_eq!(parsed.root_task_id, "01966e5a-4f12-7b3c-9a01-112233445566");
+        assert_eq!(parsed.parent_session_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(parsed.spawn_tool_use_id, "01966e5a-4f12-7b3c-9a01-abcdef012345");
+        assert_eq!(parsed.branch_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
+
+        let max_field = "x".repeat(128);
+        let full = format!("{max_field},{max_field},{max_field},{max_field}");
+        assert_eq!(full.len(), 4 * 128 + 3);
+        assert_eq!(Baggage::parse(&full).unwrap().parent_session_id, max_field);
         for bad in [
-            full + "x",
+            format!("{full}x"),
+            format!("root,parent,spawn,{}", "x".repeat(129)),
             "a,b,c".into(),
             "a,b,c,d,e".into(),
             "a,,c,d".into(),
