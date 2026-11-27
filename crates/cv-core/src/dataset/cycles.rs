@@ -968,9 +968,17 @@ mod tests {
         let adapter = crate::harness::claude::Claude::with_config_dir(&world.proj);
         let r = crate::ir::SessionRef::new("d", Harness::Claude, &path);
 
-        let (staged, count) = stage_cycles(&adapter, &r, None, 2, None, &Default::default(), &DatasetOptions::default())
-            .unwrap()
-            .expect("cycles staged");
+        let (staged, count) = stage_cycles(
+            &adapter,
+            &r,
+            None,
+            2,
+            None,
+            &Default::default(),
+            &DatasetOptions::default(),
+        )
+        .unwrap()
+        .expect("cycles staged");
         let mut out = Vec::new();
         staged.publish(&mut out).unwrap();
         let rows: Vec<serde_json::Value> = std::str::from_utf8(&out)

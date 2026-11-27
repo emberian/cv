@@ -1042,14 +1042,22 @@ fn unwrap_delivered(s: &str) -> Option<(&str, bool)> {
     if is_notification_body(s) {
         return None;
     }
-    let (mut body, mut framed) = match s.strip_prefix("<system-reminder") {
-        Some(rest) => {
-            let inner = rest.split_once('>').map(|(_, after)| after).unwrap_or(rest);
-            let inner = inner.strip_suffix("</system-reminder>").unwrap_or(inner).trim();
-            (inner, true)
+    let outer = s
+        .strip_prefix("<system-reminder")
+        .and_then(|rest| rest.split_once('>'))
+        .and_then(|(_, after)| after.strip_suffix("</system-reminder>"))
+        .filter(|inner| !inner.contains("</system-reminder>"))
+        .map(str::trim);
+    if let Some(inner) = outer {
+        if is_notification_body(inner) {
+            return None;
         }
-        None => (s, false),
-    };
+    }
+    let outer_framed = outer.filter(|inner| {
+        DELIVERED_HEADS.iter().any(|h| inner.starts_with(h)) || DELIVERED_TAILS.iter().any(|t| inner.ends_with(t))
+    });
+    let mut body = outer_framed.unwrap_or_else(|| typed_after_app_notes(s));
+    let mut framed = outer_framed.is_some();
     if is_notification_body(body) {
         return None;
     }
@@ -4129,5 +4137,26 @@ mod app_note_tests {
     fn the_mid_turn_surfacing_tail_is_delivery_framing() {
         let delivered = "<system-reminder>\nThe user sent a new message while you were working:\nstop, use widget_table\n\nThis is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.\n</system-reminder>";
         assert_eq!(unwrap_delivered(delivered), Some(("stop, use widget_table", true)));
+    }
+
+    #[test]
+    fn desktop_sdk_prompt_with_leading_app_note_is_not_marked_queued() {
+        let raw = r#"{"type":"user","sessionId":"d","cwd":"/repo","uuid":"u1","timestamp":"2026-11-01T00:00:00Z","entrypoint":"claude-desktop","promptSource":"sdk","turnOrigin":"human","origin":{"kind":"human"},"message":{"role":"user","content":"<system-reminder>\nThe session \"Build widgets\" you started finished.\n</system-reminder>\n\nordinary typed prompt"}}"#;
+        let session = parse_str("d", raw, None);
+        assert_eq!(session.messages.len(), 1);
+        let msg = &session.messages[0];
+        let text = msg.text().unwrap();
+        assert_eq!(ROOTLESS.delivered_body(msg, &text), None);
+        let turn = ROOTLESS.human_turn(msg, &text).expect("typed human turn");
+        assert_eq!(turn.text, "ordinary typed prompt");
+        assert!(!turn.queued, "leading desktop app note must not mark prompt queued");
+        assert_eq!(turn.proof, crate::harness::TurnProof::Record);
+
+        // A desktop record holding ONLY a `<system-reminder>` app note is not a human turn at all.
+        let note_only = r#"{"type":"user","sessionId":"d","cwd":"/repo","uuid":"u2","timestamp":"2026-11-01T00:00:01Z","entrypoint":"claude-desktop","promptSource":"sdk","turnOrigin":"human","origin":{"kind":"human"},"message":{"role":"user","content":"<system-reminder>\nThe session \"Build widgets\" you started finished.\n</system-reminder>"}}"#;
+        let note_session = parse_str("d", note_only, None);
+        let note_msg = &note_session.messages[0];
+        let note_text = note_msg.text().unwrap();
+        assert_eq!(ROOTLESS.human_turn(note_msg, &note_text), None);
     }
 }
