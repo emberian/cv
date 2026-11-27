@@ -86,7 +86,7 @@ pub(crate) mod utf8;
 pub mod watch;
 
 pub use emit::{emit, EmitOptions, SidechainOf};
-pub use harness::{Adapter, Discovered, EmitResult, Skipped};
+pub use harness::{Adapter, Discovered, EmitResult, Skipped, UnreadableAgent};
 pub use ir::*;
 pub use json::{Json, JsonRange, JsonView};
 pub use lazy::{Resolver, Span, Text, INLINE_MAX};
@@ -818,6 +818,13 @@ pub fn subagent_tree_filtered_of(
     select: impl Fn(&str, Option<&str>) -> bool + Sync,
 ) -> Result<Vec<AgentRef>> {
     harness::rootless(r.harness).map_or_else(|| Ok(Vec::new()), |a| a.forest(r, demand, workflow, &select))
+}
+
+/// Tolerant sub-agent forest enumeration for indexers (`cv index --subagents`): collects readable
+/// agents and per-agent failures separately so one broken symlink or unreadable child transcript
+/// does not abort sibling agents or other sessions.
+pub fn subagent_tree_lossy_of(r: &SessionRef, demand: SubagentDemand) -> (Vec<AgentRef>, Vec<UnreadableAgent>) {
+    harness::rootless(r.harness).map_or_else(|| (Vec::new(), Vec::new()), |a| a.forest_lossy(r, demand))
 }
 
 /// The full sub-agent **forest** a session spawned: directly-spawned (`Agent`/`Task`) sub-agents

@@ -488,3 +488,103 @@ fn git_and_python_dash_c_and_chained_git_dir_facets_index_accurately() {
     assert_eq!(ids("kingfisher"), ["dashcsess"], "chained git -C -c switch -c branch");
     assert_eq!(ids("7a3f91e"), ["dashcsess"], "git -C -c commit summary SHA");
 }
+
+/// #tooth Issue #41: a dangling symlink in `subagents/agent-adead.jsonl` (paired with a valid
+/// `agent-adead.meta.json`) does not abort `cv index --subagents`: the parent and healthy sibling
+/// `agent-good.jsonl` are indexed across FTS, trigram (`--exact`), and events, stderr names the
+/// unreadable sub-agent path, and `cv index --subagents --strict` exits 1 naming `agent-adead.jsonl`.
+#[cfg(unix)]
+#[test]
+fn subagent_dangling_symlink_warns_with_path_and_indexes_siblings_unless_strict() {
+    let w = World::new("index-dangling-subagent");
+    w.write_session(
+        "parent41",
+        &[claude::user("parent41", "u1", TS, "zqparentorchestrator41 top-level")],
+    );
+    w.write_agent(
+        "parent41",
+        "good",
+        &serde_json::json!({"agentType": "general-purpose", "description": "healthy sibling"}),
+        &[
+            claude::user("parent41", "g1", TS, "zqgoodsubagent41 healthy lane"),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "g2",
+                "timestamp": TS,
+                "sessionId": "parent41",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tg1",
+                        "name": "Edit",
+                        "input": {"file_path": "src/good_lane.rs", "old_string": "a", "new_string": "b"}
+                    }]
+                }
+            }),
+        ],
+    );
+    let subagents_dir = w.proj.join("parent41").join("subagents");
+    let dead_jsonl = subagents_dir.join("agent-adead.jsonl");
+    std::os::unix::fs::symlink("/nonexistent/agent-adead.jsonl", &dead_jsonl).unwrap();
+    fs::write(
+        subagents_dir.join("agent-adead.meta.json"),
+        r#"{"agentType":"general-purpose","description":"dangling lane"}"#,
+    )
+    .unwrap();
+
+    // `cv lanes` continues to fail on a broken symlink, and now names `agent-adead.jsonl`.
+    let (lanes_ok, _, _, lanes_err) = w.cv(&["lanes", "parent41"]);
+    assert!(!lanes_ok, "lanes must still fail on broken symlink");
+    assert!(
+        lanes_err.contains("agent-adead.jsonl"),
+        "lanes error must name the broken symlink path: {lanes_err}"
+    );
+
+    // Non-strict `cv index --subagents --exact --json` exits 0, indexes parent + agent-good,
+    // and warns naming `agent-adead` and `agent-adead.jsonl`.
+    let (ok, code, out, err) = w.cv(&["index", "--subagents", "--exact", "--json"]);
+    assert!(ok && code == 0, "expected exit 0, got code={code}:\n{out}\n{err}");
+    assert!(
+        err.contains("agent-adead.jsonl"),
+        "stderr warning must name the unreadable subagent path:\n{err}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert_eq!(parsed["indexed"].as_u64(), Some(1));
+    assert_eq!(parsed["changed"].as_u64(), Some(2), "parent + agent-good indexed: {parsed}");
+    assert_eq!(parsed["errors"].as_u64(), Some(1));
+    let unread = parsed["unreadable"].as_array().unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0]["id"].as_str(), Some("agent-adead"));
+    assert!(
+        unread[0]["reason"].as_str().unwrap_or_default().contains("agent-adead.jsonl"),
+        "JSON unreadable reason must name path: {unread:?}"
+    );
+
+    // Both parent and healthy sibling subagent are searchable in FTS and exact trigram, and
+    // `agent-good`'s file_edit event was ingested into the catalog (`cv touched`).
+    assert_eq!(frozen_total(&w, "zqparentorchestrator41"), 1);
+    assert_eq!(frozen_total(&w, "zqgoodsubagent41"), 1);
+    let (exact_out, _) = w.cv_ok(&["--frozen", "search", "--exact", "zqgoodsubagent41", "--json"]);
+    let exact_found: serde_json::Value = serde_json::from_str(&exact_out).unwrap();
+    assert_eq!(exact_found["total"].as_u64(), Some(1));
+    let (touched_out, _) = w.cv_ok(&["touched", "good_lane.rs", "--json"]);
+    let touched_rows: serde_json::Value = serde_json::from_str(&touched_out).unwrap();
+    assert!(
+        touched_rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["session_id"].as_str() == Some("agent-good") && r["parent_id"].as_str() == Some("parent41")),
+        "healthy sibling sub-agent file_edit event must be ingested during index --subagents: {touched_out}"
+    );
+
+    // `cv index --subagents --strict` exits 1 and names `agent-adead.jsonl` in stderr (even when
+    // healthy sessions are already fresh on the second pass!).
+    let (strict_ok, strict_code, _, strict_err) = w.cv(&["index", "--subagents", "--strict"]);
+    assert!(!strict_ok && strict_code == 1, "expected exit 1, got {strict_code}:\n{strict_err}");
+    assert!(
+        strict_err.contains("agent-adead.jsonl"),
+        "strict stderr must name agent-adead.jsonl:\n{strict_err}"
+    );
+}

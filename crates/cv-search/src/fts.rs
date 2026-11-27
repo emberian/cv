@@ -890,6 +890,8 @@ fn sweep_refs_after(
                 copies,
                 unchanged: plan.unchanged,
                 absent: plan.absent,
+                errors: plan.unreadable.len(),
+                unreadable: plan.unreadable,
                 ..Default::default()
             });
         }
@@ -906,6 +908,7 @@ fn sweep_refs_after(
         absent,
         retained,
         consumer,
+        mut unreadable,
     } = plan;
     let mut ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
 
@@ -930,6 +933,7 @@ fn sweep_refs_after(
     cv_core::resume::update(&ran.marks);
     publish_dependencies(&mut ran, &consumer);
     compact(dir, &index, &mut writer)?;
+    unreadable.extend(ran.unreadable);
     Ok(Swept {
         total,
         copies,
@@ -938,9 +942,9 @@ fn sweep_refs_after(
         removed,
         absent,
         resumed: ran.resumed,
-        errors: ran.errors + ran.unreadable.len(),
+        errors: ran.errors + unreadable.len(),
         first_error: ran.first_error,
-        unreadable: ran.unreadable,
+        unreadable,
         #[cfg(test)]
         observed: ran.observed.finished(&writer.admission),
     })
@@ -962,6 +966,7 @@ struct SweepPlan {
     absent: Vec<AbsentStore>,
     retained: HashSet<String>,
     consumer: String,
+    unreadable: Vec<Unreadable>,
 }
 
 struct SweepPlanner<'a> {
@@ -1003,18 +1008,33 @@ impl SweepPlanner<'_> {
         // Seal owned folded entries before taking pointers into them. Top-level metadata
         // and provenance stay borrowed until a real Job needs ownership.
         let mut folded_candidates = Vec::new();
+        let mut unreadable: Vec<Unreadable> = Vec::new();
+        let mut unreadable_seen: HashSet<(cv_core::Harness, PathBuf)> = HashSet::new();
         if subagents {
             for r in refs {
                 // The fold needs each agent's identity and workflow only; the `Sessions` demand
                 // answers from the stat-keyed scan cache instead of re-parsing every transcript.
-                for sub in cv_core::subagent_tree_filtered_of(r, cv_core::SubagentDemand::Sessions, None, |_, _| true)?
-                {
+                let (subs, errs) = cv_core::subagent_tree_lossy_of(r, cv_core::SubagentDemand::Sessions);
+                for sub in subs {
                     let prov = cv_core::events::Provenance {
                         parent_id: Some(r.id.clone()),
                         agent_id: Some(sub.agent_id().to_string()),
                         workflow: sub.workflow.clone(),
                     };
                     folded_candidates.push((sub.session, prov));
+                }
+                for err in errs {
+                    // Retain any last-good indexed revision of an unreadable sub-agent rather
+                    // than mistaking it for a vanished file.
+                    let sel = cv_core::SessionRef::new(&err.id, err.harness, &err.path).session_selector();
+                    seen.insert(sel);
+                    if unreadable_seen.insert((err.harness, err.path)) {
+                        unreadable.push(Unreadable {
+                            id: err.id,
+                            harness: err.harness.to_string(),
+                            reason: cv_core::ir::truncate(&err.reason, 512),
+                        });
+                    }
                 }
             }
         }
@@ -1072,6 +1092,7 @@ impl SweepPlanner<'_> {
             absent,
             retained: seen,
             consumer: state.consumer,
+            unreadable,
         })
     }
 }

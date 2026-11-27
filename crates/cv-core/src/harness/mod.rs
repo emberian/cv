@@ -204,6 +204,16 @@ impl Unparsed {
     }
 }
 
+/// A sub-agent transcript or forest directory that could not be opened or scanned during
+/// tolerant forest discovery ([`Adapter::forest_lossy`]).
+#[derive(Debug, Clone)]
+pub struct UnreadableAgent {
+    pub id: String,
+    pub harness: Harness,
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 /// A source [`Adapter::discover`] found but could not open (a locked or corrupt database, an
 /// unreadable directory, a file that fails to decode at open): its sessions are absent from the
 /// listing, and this says why. The skip policy is one rule in three channels: a record that
@@ -1083,6 +1093,28 @@ pub trait Adapter: Send + Sync {
         _select: &(dyn Fn(&str, Option<&str>) -> bool + Sync),
     ) -> Result<Vec<crate::AgentRef>> {
         Ok(Vec::new())
+    }
+
+    /// Tolerant forest enumeration for indexers (`cv index --subagents`): returns every readable
+    /// sub-agent alongside per-agent or per-directory failures without aborting sibling agents or
+    /// other sessions.
+    fn forest_lossy(
+        &self,
+        r: &SessionRef,
+        demand: crate::SubagentDemand,
+    ) -> (Vec<crate::AgentRef>, Vec<UnreadableAgent>) {
+        match self.forest(r, demand, None, &|_, _| true) {
+            Ok(agents) => (agents, Vec::new()),
+            Err(error) => (
+                Vec::new(),
+                vec![UnreadableAgent {
+                    id: r.id.clone(),
+                    harness: r.harness,
+                    path: r.path.clone(),
+                    reason: format!("{error:#}"),
+                }],
+            ),
+        }
     }
 
     /// The `Workflow`-tool runs this store records beside a session, when it records any.

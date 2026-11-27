@@ -1308,14 +1308,20 @@ impl ColumnarEventStore {
             refs.iter().cloned().map(|r| (r, Provenance::default())).collect();
         if subagents {
             for r in refs {
-                for sub in cv_core::subagent_tree_filtered_of(r, cv_core::SubagentDemand::Sessions, None, |_, _| true)?
-                {
+                let (subs, errs) = cv_core::subagent_tree_lossy_of(r, cv_core::SubagentDemand::Sessions);
+                for sub in subs {
                     let prov = Provenance {
                         parent_id: Some(r.id.clone()),
                         agent_id: Some(sub.agent_id().to_string()),
                         workflow: sub.workflow.clone(),
                     };
                     candidates.push((sub.session, prov));
+                }
+                for err in errs {
+                    eprintln!(
+                        "cv: warning: skipping unreadable sub-agent {} ({}): {}",
+                        err.id, err.harness, err.reason
+                    );
                 }
             }
         }

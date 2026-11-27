@@ -466,6 +466,14 @@ impl Adapter for Claude {
         subagent_tree_filtered(&r.path, demand, workflow, &select)
     }
 
+    fn forest_lossy(
+        &self,
+        r: &SessionRef,
+        demand: crate::SubagentDemand,
+    ) -> (Vec<crate::AgentRef>, Vec<super::UnreadableAgent>) {
+        subagent_tree_lossy(&r.path, demand)
+    }
+
     /// The `workflows/` state files and the agent transcripts their runs left.
     fn workflows(&self) -> Option<&'static dyn super::Workflows> {
         Some(&super::claude_workflow::RUNS)
@@ -1240,6 +1248,82 @@ fn subagent_tree_inner(
     forest
 }
 
+fn subagent_tree_lossy(
+    parent_path: &Path,
+    demand: crate::SubagentDemand,
+) -> (Vec<AgentRef>, Vec<super::UnreadableAgent>) {
+    let out = subagent_forest_lossy(parent_path, demand);
+    crate::discover_cache::persist(false);
+    out
+}
+
+fn unreadable_agent_at(path: PathBuf, err: anyhow::Error) -> super::UnreadableAgent {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.display().to_string());
+    let mut reason = format!("{err:#}");
+    let display = path.display().to_string();
+    if !reason.contains(&display) {
+        reason = format!("{display}: {reason}");
+    }
+    super::UnreadableAgent {
+        id,
+        harness: Harness::Claude,
+        path,
+        reason,
+    }
+}
+
+fn subagent_forest_lossy(
+    parent_path: &Path,
+    demand: crate::SubagentDemand,
+) -> (Vec<AgentRef>, Vec<super::UnreadableAgent>) {
+    let Some(base) = sidecar::subagents_dir(parent_path) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut out: Vec<AgentRef> = Vec::new();
+    let mut unreadable: Vec<super::UnreadableAgent> = Vec::new();
+    let beside: std::sync::OnceLock<chain::Beside> = std::sync::OnceLock::new();
+
+    let (tier1, tier1_err) = agents_in_dir_lossy(&base, None, parent_path, &beside, demand);
+    out.extend(tier1);
+    unreadable.extend(tier1_err);
+
+    if let Some(dir) = sidecar::workflow_runs_dir(parent_path) {
+        match super::side_entries(&dir) {
+            Ok(rd) => {
+                let wf_dirs: Vec<PathBuf> = rd
+                    .into_iter()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                let groups = crate::par_flat_map(wf_dirs, |wf_dir| {
+                    let run_id = wf_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    vec![agents_in_dir_lossy(
+                        &wf_dir,
+                        Some(&run_id),
+                        parent_path,
+                        &beside,
+                        demand,
+                    )]
+                });
+                for (agents, errs) in groups {
+                    out.extend(agents);
+                    unreadable.extend(errs);
+                }
+            }
+            Err(err) => unreadable.push(unreadable_agent_at(dir, err)),
+        }
+    }
+
+    out.sort_by_key(|s| std::cmp::Reverse(s.session.created_at));
+    (out, unreadable)
+}
+
 fn subagent_forest(
     parent_path: &Path,
     demand: crate::SubagentDemand,
@@ -1306,6 +1390,135 @@ fn record_forest_read(kind: &'static str, path: &Path) {
     }
 }
 
+fn agent_paths_in_dir(
+    dir: &Path,
+    wf: Option<&str>,
+    select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
+) -> Result<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for e in super::side_entries(dir)? {
+        let p = e.path();
+        // Only `agent-*.jsonl`; skip `journal.jsonl`, the `.meta.json` sidecars and the
+        // `agent-<id>.flat.jsonl` payload sidecar `cv distill`/`cv prune` write beside a
+        // transcript (neither a running lane nor an `--agent` target).
+        let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("agent-") && !n.ends_with(".flat.jsonl"));
+        if is_agent
+            && p.file_stem()
+                .and_then(|id| id.to_str())
+                .is_some_and(|id| select(id, wf))
+        {
+            paths.push(p);
+        }
+    }
+    Ok(paths)
+}
+
+fn inspect_agent(
+    p: &Path,
+    wf: Option<&str>,
+    beside: &chain::Beside,
+    demand: crate::SubagentDemand,
+    journal: &JournalResults,
+) -> Result<Option<AgentRef>> {
+    let p = beside.tip(p);
+    #[cfg(test)]
+    record_forest_read("transcript", &p);
+    // Every demand reads the agent's metadata through the per-file scan cache: a Rich
+    // forest (`show --tree`, `--subagents`, the sessions API, lanes) rescanned every
+    // agent transcript on every call. An unopenable transcript fails the forest even on a
+    // cache hit, while a child genuinely unlinked after directory listing is skipped.
+    if let Err(err) = fs::File::open(&p).with_context(|| format!("opening {}", p.display())) {
+        if super::vanished_at(&p, &err) {
+            return Ok(None);
+        }
+        return Err(err);
+    }
+    let session = match cached_metadata(&p) {
+        Ok(Some(session)) => session,
+        Ok(None) => return Ok(None),
+        Err(err) if super::vanished_at(&p, &err) => return Ok(None),
+        Err(err) => {
+            return if format!("{err:#}").contains(&p.display().to_string()) {
+                Err(err)
+            } else {
+                Err(err.context(format!("scanning {}", p.display())))
+            };
+        }
+    };
+    let meta_path = chain::meta(&p);
+    let meta = match demand {
+        crate::SubagentDemand::Rich => read_meta(&meta_path)?,
+        crate::SubagentDemand::Tools => (read_agent_type(&meta_path)?, None, None),
+        crate::SubagentDemand::Sessions => (None, None, None),
+    };
+    let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
+    let (status, summary) = wf
+        .and_then(|_| journal.get(&agent_id))
+        .map(sidecar::result_summary)
+        .unwrap_or((None, None));
+    Ok(Some(AgentRef {
+        session,
+        agent_type: meta.0,
+        description: meta.1,
+        tool_use_id: meta.2,
+        workflow: wf.map(str::to_owned),
+        result_status: status,
+        result_summary: summary,
+    }))
+}
+
+fn agents_in_dir_lossy(
+    dir: &Path,
+    wf: Option<&str>,
+    parent_path: &Path,
+    beside: &std::sync::OnceLock<chain::Beside>,
+    demand: crate::SubagentDemand,
+) -> (Vec<AgentRef>, Vec<super::UnreadableAgent>) {
+    let paths = match agent_paths_in_dir(dir, wf, &|_, _| true) {
+        Ok(paths) => paths,
+        Err(err) => return (Vec::new(), vec![unreadable_agent_at(dir.to_path_buf(), err)]),
+    };
+    if paths.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let beside = beside.get_or_init(|| chain::Beside::of(parent_path));
+    let rich = demand == crate::SubagentDemand::Rich;
+    let mut unreadable = Vec::new();
+    let journal = if rich && wf.is_some() {
+        let journal_path = dir.join("journal.jsonl");
+        #[cfg(test)]
+        record_forest_read("journal", &journal_path);
+        match sidecar::journal_results_checked(dir) {
+            Ok(j) => j,
+            Err(err) => {
+                unreadable.push(unreadable_agent_at(journal_path, err));
+                JournalResults::new()
+            }
+        }
+    } else {
+        JournalResults::new()
+    };
+    let outcomes = crate::par_discovery_filter_map(paths, |p| {
+        let tip = beside.tip(&p);
+        match inspect_agent(&p, wf, beside, demand, &journal) {
+            Ok(Some(agent)) => Some(Ok(agent)),
+            Ok(None) => None,
+            Err(err) => Some(Err(unreadable_agent_at(tip, err))),
+        }
+    });
+    let mut agents = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Ok(agent) => agents.push(agent),
+            Err(err) => unreadable.push(err),
+        }
+    }
+    (agents, unreadable)
+}
+
 /// Scan one directory for `agent-*.jsonl` transcripts, pairing each with its `*.meta.json` sidecar
 /// and (for workflow dirs) the journaled result for its agentId. `wf` is `Some(run_id)`
 /// for a workflow dir, `None` for the top-level `subagents/` dir. An agent that continued under
@@ -1318,26 +1531,7 @@ fn agents_in_dir(
     demand: crate::SubagentDemand,
     select: &(impl Fn(&str, Option<&str>) -> bool + Sync),
 ) -> Result<Vec<AgentRef>> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    {
-        for e in super::side_entries(dir)? {
-            let p = e.path();
-            // Only `agent-*.jsonl`; skip `journal.jsonl`, the `.meta.json` sidecars and the
-            // `agent-<id>.flat.jsonl` payload sidecar `cv distill`/`cv prune` write beside a
-            // transcript (neither a running lane nor an `--agent` target).
-            let is_agent = p.extension().and_then(|x| x.to_str()) == Some("jsonl")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("agent-") && !n.ends_with(".flat.jsonl"));
-            if is_agent
-                && p.file_stem()
-                    .and_then(|id| id.to_str())
-                    .is_some_and(|id| select(id, wf))
-            {
-                paths.push(p);
-            }
-        }
-    }
+    let paths = agent_paths_in_dir(dir, wf, select)?;
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -1350,51 +1544,10 @@ fn agents_in_dir(
     } else {
         JournalResults::new()
     };
-    crate::par_discovery_filter_map(paths, |p| {
-        Some((|| -> Result<Option<AgentRef>> {
-            let p = beside.tip(&p);
-            #[cfg(test)]
-            record_forest_read("transcript", &p);
-            // Every demand reads the agent's metadata through the per-file scan cache: a Rich
-            // forest (`show --tree`, `--subagents`, the sessions API, lanes) rescanned every
-            // agent transcript on every call. An unopenable transcript fails the forest even on a
-            // cache hit, while a child genuinely unlinked after directory listing is skipped.
-            if let Err(err) = fs::File::open(&p).map_err(anyhow::Error::from) {
-                if super::vanished_at(&p, &err) {
-                    return Ok(None);
-                }
-                return Err(err);
-            }
-            let session = match cached_metadata(&p) {
-                Ok(Some(session)) => session,
-                Ok(None) => return Ok(None),
-                Err(err) if super::vanished_at(&p, &err) => return Ok(None),
-                Err(err) => return Err(err),
-            };
-            let meta = match demand {
-                crate::SubagentDemand::Rich => read_meta(&chain::meta(&p))?,
-                crate::SubagentDemand::Tools => (read_agent_type(&chain::meta(&p))?, None, None),
-                crate::SubagentDemand::Sessions => (None, None, None),
-            };
-            let agent_id = session.id.strip_prefix("agent-").unwrap_or(&session.id).to_string();
-            let (status, summary) = wf
-                .and_then(|_| journal.get(&agent_id))
-                .map(sidecar::result_summary)
-                .unwrap_or((None, None));
-            Ok(Some(AgentRef {
-                session,
-                agent_type: meta.0,
-                description: meta.1,
-                tool_use_id: meta.2,
-                workflow: wf.map(str::to_owned),
-                result_status: status,
-                result_summary: summary,
-            }))
-        })())
-    })
-    .into_iter()
-    .collect::<Result<Vec<_>>>()
-    .map(|rows| rows.into_iter().flatten().collect())
+    crate::par_discovery_filter_map(paths, |p| Some(inspect_agent(&p, wf, beside, demand, &journal)))
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
 }
 
 /// Tool analytics demand the agent type, not the task description or spawning-call metadata.
@@ -1404,11 +1557,25 @@ fn read_agent_type(path: &Path) -> Result<Option<String>> {
     let source = match JsonSource::capture(path) {
         Ok(source) => source,
         Err(error) if super::is_not_found(&error) => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => {
+            return if format!("{error:#}").contains(&path.display().to_string()) {
+                Err(error)
+            } else {
+                Err(error.context(format!("reading {}", path.display())))
+            };
+        }
     };
-    source.read(ReadInput::Document, Validation::Value, |view| {
-        crate::affordance::input::field_string(view, "agentType")
-    })
+    source
+        .read(ReadInput::Document, Validation::Value, |view| {
+            crate::affordance::input::field_string(view, "agentType")
+        })
+        .map_err(|error| {
+            if format!("{error:#}").contains(&path.display().to_string()) {
+                error
+            } else {
+                error.context(format!("decoding {}", path.display()))
+            }
+        })
 }
 
 /// Missing metadata is optional; corrupt or unreadable metadata is an error.

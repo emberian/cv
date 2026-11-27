@@ -1574,9 +1574,14 @@ fn verify_session_exact(
 fn expand_sessions(
     refs: &[cv_core::SessionRef],
     subagents: bool,
-) -> Result<Vec<(cv_core::SessionRef, cv_core::events::Provenance)>> {
+) -> (
+    Vec<(cv_core::SessionRef, cv_core::events::Provenance)>,
+    Vec<cv_core::UnreadableAgent>,
+) {
     let mut chosen: HashMap<String, (cv_core::SessionRef, cv_core::events::Provenance)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
+    let mut unreadable: Vec<cv_core::UnreadableAgent> = Vec::new();
+    let mut unreadable_seen: HashSet<(cv_core::Harness, PathBuf)> = HashSet::new();
 
     let mut insert = |r: cv_core::SessionRef, prov: cv_core::events::Provenance| match chosen.get_mut(&r.id) {
         None => {
@@ -1599,7 +1604,8 @@ fn expand_sessions(
     for r in refs {
         insert(r.clone(), cv_core::events::Provenance::default());
         if subagents {
-            for sub in cv_core::subagent_tree_filtered_of(r, cv_core::SubagentDemand::Sessions, None, |_, _| true)? {
+            let (subs, errs) = cv_core::subagent_tree_lossy_of(r, cv_core::SubagentDemand::Sessions);
+            for sub in subs {
                 let prov = cv_core::events::Provenance {
                     parent_id: Some(r.id.clone()),
                     agent_id: Some(sub.agent_id().to_string()),
@@ -1607,10 +1613,18 @@ fn expand_sessions(
                 };
                 insert(sub.session, prov);
             }
+            for err in errs {
+                if unreadable_seen.insert((err.harness, err.path.clone())) {
+                    unreadable.push(err);
+                }
+            }
         }
     }
 
-    Ok(order.into_iter().filter_map(|id| chosen.remove(&id)).collect())
+    (
+        order.into_iter().filter_map(|id| chosen.remove(&id)).collect(),
+        unreadable,
+    )
 }
 
 fn acquire_trigram_writer_lock(dir: &Path) -> Result<std::fs::File> {
@@ -1647,9 +1661,10 @@ pub fn pass_needed(dir: &Path, subagents: bool) -> Option<bool> {
         return Some(true);
     }
     let refs = cv_core::sessions();
-    let candidates = expand_sessions(&refs, subagents).ok()?;
+    let (candidates, unreadable_subs) = expand_sessions(&refs, subagents);
     let mut probe = cv_core::source::Probe::default();
-    let mut seen_ids = HashSet::with_capacity(candidates.len());
+    let mut seen_ids: HashSet<String> = unreadable_subs.into_iter().map(|u| u.id).collect();
+    seen_ids.reserve(candidates.len());
     for (r, _) in candidates {
         seen_ids.insert(r.id.clone());
         let is_fresh = manifest.sessions.get(&r.id).is_some_and(|ptr| {
@@ -1721,10 +1736,21 @@ pub fn sync_sessions(
         Manifest::load(dir)?.unwrap_or_default()
     };
 
-    let candidates = expand_sessions(refs, subagents)?;
+    let (candidates, unreadable_subs) = expand_sessions(refs, subagents);
     let total = candidates.len();
     let mut probe = cv_core::source::Probe::default();
-    let mut seen_ids = HashSet::with_capacity(candidates.len());
+    let mut seen_ids = HashSet::with_capacity(candidates.len() + unreadable_subs.len());
+    let mut unreadable: Vec<Unreadable> = unreadable_subs
+        .into_iter()
+        .map(|err| {
+            seen_ids.insert(err.id.clone());
+            Unreadable {
+                id: err.id,
+                harness: err.harness.as_str().to_string(),
+                reason: cv_core::ir::truncate(&err.reason, 512),
+            }
+        })
+        .collect();
     let mut to_index = Vec::new();
     let mut unchanged = 0usize;
 
@@ -1769,7 +1795,6 @@ pub fn sync_sessions(
     }
 
     let mut extracted = Vec::with_capacity(to_index.len());
-    let mut unreadable = Vec::new();
     for (r, prov) in to_index {
         match extract_session_grams(&r, &prov) {
             Ok(doc) => {
@@ -2087,7 +2112,14 @@ pub fn search(
     // 1. Identify stale / unindexed sessions in `refs` (widening folded subagents when the
     //    manifest holds `--subagents`) against `manifest`.
     let fold_subagents = manifest.as_ref().is_some_and(|m| m.has_subagents);
-    let candidates = expand_sessions(refs, fold_subagents)?;
+    let (candidates, unreadable_subs) = expand_sessions(refs, fold_subagents);
+    for err in unreadable_subs {
+        if harness_filter.is_some_and(|h| err.harness.as_str() != h) {
+            continue;
+        }
+        suffix.stale += 1;
+        suffix.failed += 1;
+    }
     let newest_indexed = manifest
         .as_ref()
         .and_then(|m| m.sessions.values().filter(|p| p.size >= 0).map(|p| p.mtime).max())
