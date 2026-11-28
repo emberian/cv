@@ -63,14 +63,7 @@ fn resolve_allowed_ids(
         candidates.retain(|r| r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)));
     }
     if let Some(scope) = place_scope {
-        let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
-            if let Ok(heads) = hub.heads_at_generation(None) {
-                for e in heads {
-                    selector_places.insert(e.selector_string(), e.producer_id);
-                }
-            }
-        }
+        let selector_places = crate::cmd::place::current_head_producers();
         candidates.retain(|r| {
             let p = selector_places.get(&r.id).map_or("local", String::as_str);
             scope.includes(p)
@@ -184,7 +177,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         );
     }
     let live_allowed = !cv_core::env::frozen() && live_bytes != Some(0);
-    let auth_envelope = crate::cmd::browse::evaluate_cli_authority(
+    let auth_envelope = crate::cmd::place::evaluate_cli_authority(
         &authority,
         cwd.as_deref(),
         Some(query),

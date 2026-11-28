@@ -1301,59 +1301,40 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
     let place = params.get("place").or_else(|| params.get("producer"));
     let as_of_spec = params.get("as_of").or_else(|| params.get("snapshot"));
     let want_authority = flag("authority");
-    let resolved_as_of_gen = match as_of_spec.as_deref() {
-        Some(spec) => {
-            let Ok(hub) = cv_core::state::hub::HubStore::default_hub() else {
-                return bad(404, &format!("snapshot `{spec}` not found"));
-            };
-            match hub.resolve_generation(Some(spec)) {
-                Ok(Some(g)) => Some(g.generation),
-                Ok(None) | Err(cv_core::state::hub::HubError::NotFound(_)) => {
-                    return bad(404, &format!("snapshot `{spec}` not found"))
-                }
-                Err(e) => return bad(400, &e.to_string()),
+    let unpinned_index_only = flag("index_only") || cv_core::env::frozen();
+    let authority_active =
+        params.get("max_staleness").is_some() || want_authority || place.is_some() || as_of_spec.is_some();
+    let (resolved_as_of_gen, auth_envelope) = if authority_active {
+        match cv_core::custody::evaluate_authority(
+            place.as_deref(),
+            as_of_spec.as_deref(),
+            params.get("max_staleness").as_deref(),
+            cwd.as_deref(),
+            Some(&q),
+            false,
+            unpinned_index_only && as_of_spec.is_none(),
+        ) {
+            Ok(evaluated) => (evaluated.0, Some(evaluated.1)),
+            Err(cv_core::custody::AuthorityEvalError::BadDuration(message)) => return bad(400, &message),
+            Err(cv_core::custody::AuthorityEvalError::GenerationNotFound(spec)) => {
+                return bad(404, &format!("snapshot `{spec}` not found"))
+            }
+            Err(cv_core::custody::AuthorityEvalError::Hub(e)) if as_of_spec.is_some() => {
+                return bad(400, &e.to_string())
+            }
+            Err(cv_core::custody::AuthorityEvalError::Hub(_)) => return bad(503, "place authority unavailable"),
+            Err(cv_core::custody::AuthorityEvalError::Staleness(v)) => {
+                return (
+                    503,
+                    json!({ "error": v.message, "authority": v.authority }),
+                    vec![("X-Cv-Authority-Status", "partial".to_string())],
+                );
             }
         }
-        None => None,
+    } else {
+        (None, None)
     };
-
-    let index_only = flag("index_only") || cv_core::env::frozen() || resolved_as_of_gen.is_some();
-    let auth_envelope: Option<cv_core::state::hub::AuthorityEnvelope> =
-        if params.get("max_staleness").is_some() || want_authority || place.is_some() || resolved_as_of_gen.is_some() {
-            let max_ms = match params.get("max_staleness") {
-                Some(raw) => match cv_core::state::hub::parse_duration_ms(&raw) {
-                    Ok(ms) => Some(ms),
-                    Err(e) => return bad(400, &e),
-                },
-                None => None,
-            };
-            if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
-                let ctx = cv_core::state::hub::AuthorityQueryContext {
-                    place_glob: place.as_deref(),
-                    as_of_gen: resolved_as_of_gen,
-                    max_staleness_ms: max_ms,
-                    cwd_filter: cwd.as_deref(),
-                    query_str: Some(&q),
-                    has_negation: false,
-                    indexed_only: index_only && resolved_as_of_gen.is_none(),
-                    include_local: resolved_as_of_gen.is_none(),
-                };
-                match hub.check_authority(&ctx) {
-                    Ok(env) => Some(env),
-                    Err(v) => {
-                        return (
-                            503,
-                            json!({ "error": v.message, "authority": v.authority }),
-                            vec![("X-Cv-Authority-Status", "partial".to_string())],
-                        );
-                    }
-                }
-            } else {
-                return bad(503, "place authority unavailable");
-            }
-        } else {
-            None
-        };
+    let index_only = unpinned_index_only || resolved_as_of_gen.is_some();
 
     let mut allowed_ids: Option<std::collections::HashSet<String>> = None;
     if let Some(scope) = auth_envelope.as_ref().filter(|_| place.is_some()) {

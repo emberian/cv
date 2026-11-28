@@ -17,14 +17,7 @@ pub(crate) fn cmd_events(
 ) -> Result<()> {
     use cv_core::events;
     let want = parse_harness(&harness)?;
-    let auth_envelope = crate::cmd::browse::evaluate_cli_authority(&authority, None, None, false, false)?;
-    let scoped_view = match auth_envelope {
-        Some(env) => {
-            let hub = cv_core::state::hub::HubStore::default_hub()?;
-            Some(cv_core::custody::ScopedView::new(hub, env, authority.as_of.is_some()))
-        }
-        None => None,
-    };
+    let scoped_view = crate::cmd::place::evaluate_scoped_view(&authority, None, None, false, false)?;
 
     let mut scoped_children: Vec<cv_core::custody::ScopedSource> = Vec::new();
     let (r, rows): (cv_core::SessionRef, Vec<events::EventRow>) = if let Some(ref view) = scoped_view {
@@ -357,7 +350,7 @@ fn print_event_row(
 }
 
 pub(crate) fn cmd_touched(path: &str, edits_only: bool, json: bool, authority: crate::AuthorityArgs) -> Result<()> {
-    let auth_envelope = crate::cmd::browse::evaluate_cli_authority(&authority, None, None, false, false)?;
+    let auth_envelope = crate::cmd::place::evaluate_cli_authority(&authority, None, None, false, false)?;
     let mut rows = if let Some(gen) = authority.as_of {
         cv_core::api::touched_at_generation(gen, path, edits_only, auth_envelope.as_ref().expect("pinned scope"))?
     } else {

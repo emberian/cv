@@ -234,36 +234,6 @@ pub(crate) struct LsArgs<'a> {
     pub authority: crate::AuthorityArgs,
 }
 
-pub(crate) fn evaluate_cli_authority(
-    authority: &crate::AuthorityArgs,
-    cwd_filter: Option<&str>,
-    query_str: Option<&str>,
-    has_negation: bool,
-    indexed_only: bool,
-) -> Result<Option<cv_core::state::hub::AuthorityEnvelope>> {
-    if !authority.is_active() {
-        return Ok(None);
-    }
-    let as_of_str = authority.as_of.map(|g| g.to_string());
-    match cv_core::custody::evaluate_authority(
-        authority.place.as_deref(),
-        as_of_str.as_deref(),
-        authority.max_staleness.as_deref(),
-        cwd_filter,
-        query_str,
-        has_negation,
-        indexed_only,
-    ) {
-        Ok((_, env)) => Ok(Some(env)),
-        Err(cv_core::custody::AuthorityEvalError::BadDuration(msg)) => crate::util::usage(msg),
-        Err(cv_core::custody::AuthorityEvalError::GenerationNotFound(spec)) => {
-            crate::util::usage(format!("hub generation `{spec}` not found"))
-        }
-        Err(cv_core::custody::AuthorityEvalError::Staleness(v)) => crate::util::usage(v.message),
-        Err(cv_core::custody::AuthorityEvalError::Hub(e)) => Err(e.into()),
-    }
-}
-
 pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
     let LsArgs {
         harness,
@@ -281,7 +251,7 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
     let raw_query_str = query.clone();
     let mut query = crate::cmd::query::build(query)?;
     let has_negation = query.as_ref().is_some_and(cv_core::SessionQuery::has_negation);
-    let auth_envelope = evaluate_cli_authority(
+    let auth_envelope = crate::cmd::place::evaluate_cli_authority(
         &authority,
         cwd.as_deref(),
         raw_query_str.as_deref(),
@@ -320,13 +290,7 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
         refs
     } else {
         if authority.place.is_some() {
-            if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
-                if let Ok(heads) = hub.heads_at_generation(None) {
-                    for e in heads {
-                        selector_places.insert(e.selector_string(), e.producer_id);
-                    }
-                }
-            }
+            selector_places = crate::cmd::place::current_head_producers();
         }
         if fresh {
             cv_core::discover_all()

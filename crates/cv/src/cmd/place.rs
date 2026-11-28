@@ -1,7 +1,7 @@
 //! CLI report guard over [`cv_core::custody::ScopedView`].
 use anyhow::{Context, Result};
 use cv_core::custody::{ScopedSource, ScopedView};
-use cv_core::state::hub::HubStore;
+use cv_core::state::hub::{AuthorityEnvelope, HubStore};
 use cv_core::{Adapter, Harness, SessionRef};
 use std::{cell::RefCell, rc::Rc};
 
@@ -40,12 +40,70 @@ impl Drop for Guard {
     }
 }
 
+pub(crate) fn evaluate_cli_authority(
+    authority: &crate::AuthorityArgs,
+    cwd_filter: Option<&str>,
+    query_str: Option<&str>,
+    has_negation: bool,
+    indexed_only: bool,
+) -> Result<Option<AuthorityEnvelope>> {
+    if !authority.is_active() {
+        return Ok(None);
+    }
+    let as_of_str = authority.as_of.map(|g| g.to_string());
+    match cv_core::custody::evaluate_authority(
+        authority.place.as_deref(),
+        as_of_str.as_deref(),
+        authority.max_staleness.as_deref(),
+        cwd_filter,
+        query_str,
+        has_negation,
+        indexed_only,
+    ) {
+        Ok((_, env)) => Ok(Some(env)),
+        Err(cv_core::custody::AuthorityEvalError::BadDuration(msg)) => crate::util::usage(msg),
+        Err(cv_core::custody::AuthorityEvalError::GenerationNotFound(spec)) => {
+            crate::util::usage(format!("hub generation `{spec}` not found"))
+        }
+        Err(cv_core::custody::AuthorityEvalError::Staleness(v)) => crate::util::usage(v.message),
+        Err(cv_core::custody::AuthorityEvalError::Hub(e)) => Err(e.into()),
+    }
+}
+
+pub(crate) fn scoped_view(args: &crate::AuthorityArgs, envelope: AuthorityEnvelope) -> Result<ScopedView> {
+    Ok(ScopedView::new(
+        HubStore::default_hub()?,
+        envelope,
+        args.as_of.is_some(),
+    ))
+}
+
+pub(crate) fn evaluate_scoped_view(
+    args: &crate::AuthorityArgs,
+    cwd: Option<&str>,
+    query: Option<&str>,
+    has_negation: bool,
+    indexed_only: bool,
+) -> Result<Option<ScopedView>> {
+    evaluate_cli_authority(args, cwd, query, has_negation, indexed_only)?
+        .map(|envelope| scoped_view(args, envelope))
+        .transpose()
+}
+
+pub(crate) fn current_head_producers() -> std::collections::HashMap<String, String> {
+    HubStore::default_hub()
+        .ok()
+        .and_then(|hub| hub.heads_at_generation(None).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (entry.selector_string(), entry.producer_id))
+        .collect()
+}
+
 pub(crate) fn enter(args: &crate::AuthorityArgs, cwd: Option<&str>, query: Option<&str>, human: bool) -> Result<Guard> {
-    let authority =
-        super::browse::evaluate_cli_authority(args, cwd, query, false, false)?.context("missing place scope")?;
-    let hub = HubStore::default_hub()?;
+    let authority = evaluate_cli_authority(args, cwd, query, false, false)?.context("missing place scope")?;
     let view = Rc::new(View {
-        inner: ScopedView::new(hub, authority, args.as_of.is_some()),
+        inner: scoped_view(args, authority)?,
         args: args.clone(),
     });
     Ok(Guard(CURRENT.with(|c| c.replace(Some(view))), human))
