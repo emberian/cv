@@ -1125,8 +1125,8 @@ fn bound_command_with_redact(raw: &str, redact: bool) -> (String, bool, usize) {
             } else {
                 (std::borrow::Cow::Borrowed(head_cap), 0)
             };
-            if head.len() > MAX_COMMAND_BYTES || head_raw.len() > head_cap.len() {
-                let cut = head[..floor_char(&head, head.len().min(MAX_COMMAND_BYTES))].trim_end();
+            if head.len() + " …".len() > MAX_COMMAND_BYTES || head_raw.len() > head_cap.len() {
+                let cut = head[..head.floor_char_boundary(MAX_COMMAND_BYTES - '…'.len_utf8())].trim_end();
                 return (format!("{cut}…"), true, redactions);
             }
             return (format!("{head} …"), true, redactions);
@@ -1163,10 +1163,16 @@ fn bound_command_with_redact(raw: &str, redact: bool) -> (String, bool, usize) {
         out.push(ch);
     }
     if truncated {
-        let cut = out.trim_end();
+        let cut = out[..out.floor_char_boundary(MAX_COMMAND_BYTES - '…'.len_utf8())].trim_end();
         (format!("{cut}…"), true, redactions)
     } else {
-        (out, false, redactions)
+        // Targets persisted by the event reader already summarize omitted bytes.
+        let summarized = trimmed
+            .strip_suffix(" bytes]")
+            .and_then(|s| s.rsplit_once(" … [+"))
+            .and_then(|(_, digits)| digits.parse::<usize>().ok())
+            .is_some_and(|n| n > 0);
+        (out, summarized, redactions)
     }
 }
 
@@ -2222,7 +2228,12 @@ mod tests {
         let (bounded, cut) = bound_command(&long_utf8);
         assert!(cut);
         assert!(bounded.ends_with('…'));
-        assert!(bounded.strip_suffix('…').unwrap().len() <= MAX_COMMAND_BYTES);
+        assert!(bounded.len() <= MAX_COMMAND_BYTES);
+        let head = format!("cat <<EOF {}", "λ".repeat(94));
+        let (bounded, cut) = bound_command(&format!("{head}\nbody\nEOF"));
+        assert!(cut && bounded.len() <= MAX_COMMAND_BYTES);
+        assert!(bound_command("cat <<EOF … [+10 bytes]").1);
+        assert!(!bound_command("echo ' … [+10 bytes]'").1);
     }
 
     #[test]

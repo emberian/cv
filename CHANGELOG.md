@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Context packs count commands shortened during event extraction and include the truncation marker within the 200-byte command limit.
+
 - Place-scoped CLI and HTTP file/blame views resolve single sessions via B-tree indexes, deduplicate self-shipped echoes, preserve sub-agents, and whisper disconnected peers once.
 - Incremental hub indexing compacts Tantivy segments, commits deletes once, preserves watermarks across retention, and validates native extents and pack ownership on quarantine resolution.
 - `cv distill --session=<harness>` writes to every harness with a verified emitter (Codex, Gemini, Devin, …), sidecar and resume command included; `--delivery=live` stays Antigravity's.
