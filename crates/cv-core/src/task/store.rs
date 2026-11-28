@@ -154,7 +154,7 @@ impl TaskStore {
         self.dir.join("events.lock")
     }
 
-    /// Authoritative `state.db` backing this task store (`$CLUSTERVISION_HOME/state.db` when rooted
+    /// Derived fold cache for this task log (`$CLUSTERVISION_HOME/state.db` when rooted
     /// at `<home>/tasks`, or `<dir>/state.db` for standalone directories).
     #[cfg(feature = "sqlite")]
     pub fn state_store(&self) -> crate::state::StateStore {
@@ -201,9 +201,10 @@ impl TaskStore {
     pub fn fold(&self) -> Result<Folded> {
         let path = self.events_path();
         let state = self.state_store_for_fold();
-        let start = Fold::stored(&path, state.as_ref());
+        let mut file = self.open_log()?;
+        let start = Fold::stored(&path, file.as_ref(), state.as_ref());
         let from = start.as_ref().map(Fold::boundary).unwrap_or_default();
-        let read = self.read_events_from(from)?;
+        let read = self.read_events_from(file.as_mut(), from)?;
         let (mut reducer, mut garbage, mut refused) = match start {
             Some(fold) => (
                 TaskReducer::resume(fold.model, fold.applied),
@@ -240,7 +241,7 @@ impl TaskStore {
                 garbage,
                 refused,
             }
-            .store(&path, state.as_ref());
+            .store(&path, file.as_ref(), state.as_ref());
         }
         garbage.extend(new_garbage);
         let quarantined = refused.len();
@@ -290,12 +291,13 @@ impl TaskStore {
         // Replay under the lock: the candidate is validated against the exact state it will
         // land after. A clean stored fold stands for the log's prefix; only what follows is read.
         let path = self.events_path();
-        let path_existed = path.exists();
+        let mut file = self.open_log()?;
+        let path_existed = file.is_some();
         let state_ref = self.state_store_for_fold();
-        let start =
-            Fold::stored(&path, state_ref.as_ref()).filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
+        let start = Fold::stored(&path, file.as_ref(), state_ref.as_ref())
+            .filter(|fold| fold.garbage.is_empty() && fold.refused.is_empty());
         let from = start.as_ref().map(Fold::boundary).unwrap_or_default();
-        let read = self.read_events_from(from)?;
+        let read = self.read_events_from(file.as_mut(), from)?;
         let tail = read.tail;
         if let LogTail::Unrecognized { line_no } = tail {
             bail!(
@@ -389,24 +391,29 @@ impl TaskStore {
     /// other unrecognized final rows refuse append. Valid unterminated records need a newline.
     /// A format header is skipped when current, and refused loudly for a newer format version.
     fn read_events(&self) -> Result<RawRead> {
-        self.read_events_from(Committed0::default())
+        self.read_events_from(self.open_log()?.as_mut(), Committed0::default())
+    }
+
+    fn open_log(&self) -> Result<Option<File>> {
+        let path = self.events_path();
+        match File::open(&path) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("opening task log {}", path.display())),
+        }
     }
 
     /// [`Self::read_events`] of the lines after `from` (a [`Fold`]'s boundary), numbered on.
-    fn read_events_from(&self, from: Committed0) -> Result<RawRead> {
+    fn read_events_from(&self, file: Option<&mut File>, from: Committed0) -> Result<RawRead> {
         use std::io::{Seek, SeekFrom};
         let path = self.events_path();
-        let mut file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RawRead {
-                    events: Vec::new(),
-                    warnings: Vec::new(),
-                    tail: LogTail::Terminated,
-                    committed: Committed0::default(),
-                });
-            }
-            Err(e) => return Err(e).with_context(|| format!("opening task log {}", path.display())),
+        let Some(file) = file else {
+            return Ok(RawRead {
+                events: Vec::new(),
+                warnings: Vec::new(),
+                tail: LogTail::Terminated,
+                committed: Committed0::default(),
+            });
         };
         file.seek(SeekFrom::Start(from.offset))
             .with_context(|| format!("reading task log {}", path.display()))?;
@@ -556,8 +563,7 @@ pub struct Folded {
 
 /// The log's first `offset` bytes, folded: the reducer's state (the model and each applied
 /// event's digest) and the warnings so far, unparseable lines apart from refused events because
-/// a replay lists every unparseable line first. Kept in the catalog under [`crate::source::VERSION`]
-/// as a `task-fold` record keyed by the log's path, and admitted only while the log is the same
+/// a replay lists every unparseable line first. Kept in state.db at the log's path and admitted only while the log is the same
 /// file, at least `offset` long, its prefix sampling as it did ([`crate::source::Prefix`]: an
 /// edit outside the samples is not seen, the limit every resume mark has).
 const STATE_FOLD_VERSION: u32 = 2;
@@ -592,7 +598,7 @@ impl Fold {
     }
 
     #[cfg(feature = "sqlite")]
-    fn stored(path: &Path, state: Option<&crate::state::StateStore>) -> Option<Fold> {
+    fn stored(path: &Path, file: Option<&File>, state: Option<&crate::state::StateStore>) -> Option<Fold> {
         let conn = state?.open_readonly().ok()??;
         let raw: String = conn
             .query_row("SELECT model_json FROM task_folds WHERE slot = 1", [], |row| row.get(0))
@@ -605,27 +611,24 @@ impl Fold {
         (fold.version == STATE_FOLD_VERSION
             && stored_path == path.to_string_lossy()
             && prefix.len == fold.offset
-            && prefix.holds(path))
+            && crate::source::Prefix::of(file?, fold.offset) == Some(prefix))
         .then_some(fold)
     }
 
     #[cfg(not(feature = "sqlite"))]
-    fn stored(_path: &Path, _state: Option<&()>) -> Option<Fold> {
+    fn stored(_path: &Path, _file: Option<&File>, _state: Option<&()>) -> Option<Fold> {
         None
     }
 
     /// Best effort: persisted inside `state.db` (`task_folds`), independent of `catalog.db` and
     /// `source::VERSION`, and skipped completely under `--frozen`.
     #[cfg(feature = "sqlite")]
-    fn store(self, path: &Path, state: Option<&crate::state::StateStore>) {
+    fn store(self, path: &Path, file: Option<&File>, state: Option<&crate::state::StateStore>) {
         if crate::env::frozen() {
             return;
         }
         let Some(state) = state else { return };
-        let Some(prefix) = File::open(path)
-            .ok()
-            .and_then(|file| crate::source::Prefix::of(&file, self.offset))
-        else {
+        let Some(prefix) = file.and_then(|file| crate::source::Prefix::of(file, self.offset)) else {
             return;
         };
         let upto_seq = self.applied.len() as i64;
@@ -653,7 +656,7 @@ impl Fold {
     }
 
     #[cfg(not(feature = "sqlite"))]
-    fn store(self, _path: &Path, _state: Option<&()>) {}
+    fn store(self, _path: &Path, _file: Option<&File>, _state: Option<&()>) {}
 }
 
 /// If `line` is a log-format header record, its declared version (`v` missing reads as 0, which
@@ -1476,6 +1479,16 @@ mod tests {
             .unwrap();
         assert_eq!(store.fold().unwrap().model.tasks[&task_id].state, TaskState::Claimed);
         assert!(base.join("state.db").exists());
+
+        // #tooth A lost fold database rebuilds from the authoritative task log.
+        fs::remove_file(store.state_store().path()).unwrap();
+        assert_eq!(store.fold().unwrap().model, store.replay().unwrap().model);
+        assert!(Fold::stored(
+            &store.events_path(),
+            store.open_log().unwrap().as_ref(),
+            Some(&store.state_store())
+        )
+        .is_some());
 
         // Frozen reads over an existing fold cache succeed without mutating disk.
         {
