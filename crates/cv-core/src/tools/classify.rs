@@ -297,7 +297,7 @@ pub fn visit_tool_ops<'a>(
     opts: ClassifyOpts,
     mut emit: impl FnMut(ToolSemantic<'a>),
 ) -> Result<()> {
-    visit_tool_ops_internal(harness, name, input, opts, false, |sem, _| emit(sem))
+    visit_tool_ops_internal(harness, name, input, opts, false, |sem, _, _| emit(sem))
 }
 
 /// Streaming visitor that also extracts normalized 64-bit line-hunk fingerprints for every
@@ -307,9 +307,26 @@ pub fn visit_tool_ops_with_hunks<'a>(
     name: &'a str,
     input: JsonView<'a>,
     opts: ClassifyOpts,
-    emit: impl FnMut(ToolSemantic<'a>, Vec<u64>),
+    mut emit: impl FnMut(ToolSemantic<'a>, Vec<u64>),
 ) -> Result<()> {
-    visit_tool_ops_internal(harness, name, input, opts, true, emit)
+    visit_tool_ops_internal(harness, name, input, opts, true, |sem, hunks, _| emit(sem, hunks))
+}
+
+/// Visit operations together with the arguments of the call that produced each one.
+pub(crate) fn visit_tool_inputs(
+    harness: Harness,
+    name: &str,
+    input: JsonView<'_>,
+    opts: ClassifyOpts,
+    mut visit: impl FnMut(ToolSemantic<'_>, JsonView<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut result = Ok(());
+    visit_tool_ops_internal(Some(harness), name, input, opts, false, |sem, _, args| {
+        if result.is_ok() {
+            result = visit(sem, args);
+        }
+    })?;
+    result
 }
 
 fn is_swarm_add(bare: &str, input: JsonView<'_>) -> Result<bool> {
@@ -330,7 +347,7 @@ fn visit_tool_ops_internal<'a>(
     input: JsonView<'a>,
     opts: ClassifyOpts,
     extract_hunks: bool,
-    mut emit: impl FnMut(ToolSemantic<'a>, Vec<u64>),
+    mut emit: impl FnMut(ToolSemantic<'a>, Vec<u64>, JsonView<'_>),
 ) -> Result<()> {
     let bare = bare_tool_name(name);
 
@@ -347,13 +364,18 @@ fn visit_tool_ops_internal<'a>(
             None
         };
         if let Some(script) = script {
-            scan_codex_exec(exec_harness, &script, opts, extract_hunks, &mut |sem, hunks| {
-                emit(sem.into_owned(), hunks)
-            });
-            return Ok(());
+            return scan_codex_exec(
+                exec_harness,
+                &script,
+                input,
+                opts,
+                extract_hunks,
+                &mut |sem, hunks, args| emit(sem.into_owned(), hunks, args),
+            );
         }
     }
 
+    let mut emit = |sem, hunks| emit(sem, hunks, input);
     let workdir = file_key(input, &["workdir", "cwd", "Cwd"])?;
 
     // 2. Orchestration tools: sub-agent spawns, peer/child messages, and background polling/stopping.
@@ -2104,18 +2126,21 @@ struct JsToolCall {
     plan_items: Vec<Item>,
 }
 
+pub(crate) fn first_string_field(view: JsonView<'_>, keys: &[&str]) -> Result<Option<String>> {
+    for &key in keys {
+        if let Some(text) = input::field_string(view, key)? {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
+}
+
 /// Extract the first string argument matching `keys` from a structured JSON view or from
 /// `tools.<method>({ ... })` calls inside a Codex Code Mode `exec` script (with variable
 /// bindings and JS string escapes resolved).
 pub fn tool_string_arg(view: JsonView<'_>, keys: &[&str]) -> Result<Option<String>> {
-    if !view.is_string()? {
-        for &key in keys {
-            if let Some(val) = view.get(key)? {
-                if val.is_string()? {
-                    return Ok(val.resolve()?.as_str().map(str::to_owned));
-                }
-            }
-        }
+    if let Some(text) = first_string_field(view, keys)? {
+        return Ok(Some(text));
     }
     let script = if view.is_string()? {
         input::string(view)?
@@ -2143,10 +2168,11 @@ pub fn tool_string_arg(view: JsonView<'_>, keys: &[&str]) -> Result<Option<Strin
 fn scan_codex_exec(
     exec_harness: Harness,
     script: &str,
+    outer: JsonView<'_>,
     opts: ClassifyOpts,
     extract_hunks: bool,
-    emit: &mut dyn FnMut(ToolSemantic<'_>, Vec<u64>),
-) {
+    emit: &mut dyn FnMut(ToolSemantic<'_>, Vec<u64>, JsonView<'_>),
+) -> Result<()> {
     let mut scanner = JsScanner::new(script);
     scanner.scan_all();
 
@@ -2158,8 +2184,9 @@ fn scan_codex_exec(
                 op: ToolOp::Other { path: None, summary },
             },
             Vec::new(),
+            outer,
         );
-        return;
+        return Ok(());
     }
 
     // Lazily computed script-wide patch header fallback for variable-bound `tools.apply_patch(patch)`.
@@ -2167,8 +2194,8 @@ fn scan_codex_exec(
 
     for call in scanner.calls {
         let view = JsonView::from(&call.input);
-        if call.tool == "apply_patch" && patch_rows(view, false).unwrap_or_default().is_empty() {
-            let workdir = file_key(view, &["workdir", "cwd"]).ok().flatten();
+        if call.tool == "apply_patch" && patch_rows(view, false)?.is_empty() {
+            let workdir = file_key(view, &["workdir", "cwd"])?;
             let edits = fallback_patch_edits
                 .get_or_insert_with(|| {
                     let mut patch = Patch::new(extract_hunks);
@@ -2190,19 +2217,20 @@ fn scan_codex_exec(
                             },
                         },
                         hunks,
+                        view,
                     );
                 }
                 continue;
             }
         }
         let plan_items = call.plan_items;
-        let _ = visit_tool_ops_internal(
+        visit_tool_ops_internal(
             Some(exec_harness),
             &call.tool,
             view,
             opts,
             extract_hunks,
-            |mut sem, hunks| {
+            |mut sem, hunks, args| {
                 if let ToolOp::Affordance {
                     kind: Kind::Plan,
                     summary,
@@ -2225,10 +2253,11 @@ fn scan_codex_exec(
                         *items = plan_items.clone();
                     }
                 }
-                emit(sem.into_owned(), hunks);
+                emit(sem.into_owned(), hunks, args);
             },
-        );
+        )?;
     }
+    Ok(())
 }
 
 struct JsScanner<'s> {
