@@ -1573,11 +1573,6 @@ fn read_frame() -> Option<Vec<u8>> {
 /// terminal on stdin means no harness is calling: usage, exit 2, instead of waiting for JSON.
 pub(crate) fn cmd_hook(name: HookName, harness: Option<String>) -> Result<()> {
     let started = std::time::Instant::now();
-    // A recorder closing its FIFO between open and write is normal pressure.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-    }
     let result = handle_hook(name, harness);
     if std::env::var_os("CV_HOOK_TIMING").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!("hook_handler_us={}", started.elapsed().as_micros());

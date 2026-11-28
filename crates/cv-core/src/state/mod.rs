@@ -223,8 +223,21 @@ impl StateStore {
 
     #[cfg(unix)]
     pub(crate) fn socket_path_with_temp_dir(&self, temp_dir: &Path) -> PathBuf {
+        self.runtime_socket(sibling_with_suffix(&self.db_path, "sock"), "s", temp_dir)
+    }
+
+    /// Datagram socket path the hook bodies send observations to
+    /// ([`observations::HookReceiver`]), with [`Self::socket_path`]'s fallback for a long home.
+    #[cfg(unix)]
+    pub fn hook_socket_path(&self) -> PathBuf {
+        self.runtime_socket(self.db_path.with_file_name("hooks-v1.sock"), "h", &std::env::temp_dir())
+    }
+
+    /// `direct` when it fits a socket address, else `<tag>-<hash of this store>.sock` in the
+    /// per-UID runtime directory under `temp_dir` (or `/tmp` when that is too long as well).
+    #[cfg(unix)]
+    fn runtime_socket(&self, direct: PathBuf, tag: &str, temp_dir: &Path) -> PathBuf {
         use std::os::unix::ffi::OsStrExt;
-        let direct = sibling_with_suffix(&self.db_path, "sock");
         if direct.as_os_str().as_bytes().len() <= 96 {
             return direct;
         }
@@ -232,7 +245,7 @@ impl StateStore {
         let hash = crate::digest::sha256_hex(canonical_key.as_bytes());
         let uid = unsafe { libc::geteuid() };
         let sub_dir = format!("cv-usock-{uid}");
-        let file_name = format!("s-{}.sock", &hash[..24]);
+        let file_name = format!("{tag}-{}.sock", &hash[..24]);
         let candidate = temp_dir.join(&sub_dir).join(&file_name);
         if candidate.as_os_str().as_bytes().len() <= 96 {
             return candidate;

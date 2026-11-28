@@ -1448,6 +1448,7 @@ fn hooks_observation_budgets() {
     conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
         .unwrap();
     // A live receiver whose owner cannot currently commit.
+    let socket = store.hook_socket_path();
     let _rx = cv_core::state::observations::HookReceiver::bind(store).unwrap();
     let huge = vec![b' '; 20 * 1024 * 1024];
     let normal = br#"{"session_id":"quiet","hook_event_name":"SessionStart"}"#;
@@ -1455,20 +1456,15 @@ fn hooks_observation_budgets() {
     let mut launch = Vec::new();
     for i in 0..104 {
         if i == 103 {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut fifo = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(w.cv_home.join("hooks-v1.fifo"))
-                .unwrap();
-            loop {
-                match fifo.write(&[0; 512]) {
-                    Ok(n) => assert_eq!(n, 512),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("{e}"),
-                }
+            // The last hook finds the receive queue full.
+            let filler = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            filler.connect(&socket).unwrap();
+            filler.set_nonblocking(true).unwrap();
+            let mut queued = 0;
+            while filler.send(&[0; 512]).is_ok_and(|n| n == 512) {
+                queued += 1;
             }
-            while fifo.write(&[0]).is_ok() {}
+            assert!(queued > 0, "the queue took nothing");
         }
         let bytes: &[u8] = match i {
             0 => b"{",
@@ -1985,4 +1981,81 @@ fn hook_edit_reports_only_stale_peers_of_the_same_checkout() {
         "{out}"
     );
     assert!(!out.contains("permissionDecision"), "{out}");
+}
+
+/// #tooth Hooks firing at once, each with an observation larger than a pipe writes atomically
+/// (and than the default datagram size), all arrive whole; a datagram that is no observation
+/// costs only itself.
+#[test]
+#[cfg(unix)]
+fn concurrent_large_hook_observations_arrive_whole_over_the_datagram_socket() {
+    use std::io::Write;
+    use std::process::Stdio;
+    const LANES: usize = 12;
+
+    let w = World::in_process("hooks-datagram", cv_core::env::Env::enter_isolated);
+    let store = cv_core::state::StateStore::at_dir(&w.cv_home);
+    let mut rx = cv_core::state::observations::HookReceiver::bind(store.clone()).unwrap();
+    w.write_session(
+        "dgramsess",
+        &[user("dgramsess", "u0", "2026-10-01T10:00:00Z", "spawn the lanes")],
+    );
+    // A working directory no compressor shrinks under a pipe's 512 atomic bytes.
+    let cwd = |lane: usize| -> String {
+        let noise: String = (0..40)
+            .map(|k| cv_core::digest::sha256_hex(format!("{lane}/{k}").as_bytes()))
+            .collect();
+        format!("/work/{noise}")
+    };
+
+    let junk = std::os::unix::net::UnixDatagram::unbound().unwrap();
+    junk.connect(store.hook_socket_path()).unwrap();
+    assert_eq!(junk.send(b"{\"hook\":").unwrap(), 8);
+
+    let children: Vec<_> = (0..LANES)
+        .map(|lane| {
+            let payload = with(
+                common(&w, "dgramsess", "SubagentStart"),
+                json!({"agent_id": format!("agent-big{lane:02}"), "agent_type": "general-purpose", "cwd": cwd(lane)}),
+            )
+            .to_string();
+            assert!(payload.len() > 2560);
+            let mut child = w
+                .cv_command()
+                .args(["hook", "lane"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+            child
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let (mut folded, mut refused) = (0, 0);
+    loop {
+        match rx.read_one() {
+            Ok(()) => folded += 1,
+            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => {
+                break
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    assert_eq!((folded, refused), (LANES, 1), "every observation whole, the stray datagram alone refused");
+    let runs = store.list_lane_runs_for_session("dgramsess").unwrap();
+    assert_eq!(runs.len(), LANES);
+    for lane in 0..LANES {
+        let agent = format!("big{lane:02}");
+        let run = runs
+            .iter()
+            .find(|run| run.agent_id.as_deref() == Some(agent.as_str()))
+            .unwrap_or_else(|| panic!("{agent} was not recorded"));
+        assert_eq!(run.cwd, Some(cwd(lane)));
+    }
 }

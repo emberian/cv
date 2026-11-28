@@ -1,5 +1,7 @@
 //! Best-effort hook transport. Only the resident recorder opens SQLite or decodes
-//! lane transcripts. A FIFO write no larger than PIPE_BUF is atomic across writers.
+//! lane transcripts. A hook sends one observation as one datagram on a Unix socket: the kernel
+//! keeps each whole and apart from every other sender's, up to [`MAX_FRAME`], and a hook that
+//! finds no receiver or a full queue drops it and returns.
 use super::StateStore;
 use crate::hooks::valid_id;
 use crate::ir::Harness;
@@ -7,9 +9,11 @@ use crate::lanes::LaneEvent;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -115,14 +119,15 @@ pub fn observe(hook: &str, harness: Harness, payload: &Value) -> Option<String> 
         return None;
     }
     let store = StateStore::default_store().ok()?;
-    let mut fifo = OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(store.path().with_file_name("hooks-v1.fifo"))
-        .ok()?;
-    if !fifo.metadata().ok()?.file_type().is_fifo() {
+    let path = store.hook_socket_path();
+    if !std::fs::symlink_metadata(&path).ok()?.file_type().is_socket() {
         return None;
     }
+    // Connecting is what tells a live receiver from a socket file a dead one left behind.
+    let socket = UnixDatagram::unbound().ok()?;
+    socket.connect(&path).ok()?;
+    socket.set_nonblocking(true).ok()?;
+    buffer(&socket, libc::SO_SNDBUF, MAX_FRAME);
     let actor = crate::task::default_endpoint().unwrap_or_default();
     let ts = chrono::Utc::now().timestamp_millis();
     let emitted = matches!(hook, "start" | "decisions" | "compact")
@@ -205,84 +210,73 @@ pub fn observe(hook: &str, harness: Harness, payload: &Value) -> Option<String> 
     if bytes.len() > MAX_FRAME {
         return None;
     }
-    use std::os::fd::AsRawFd;
-    let atomic = usize::try_from(unsafe { libc::fpathconf(fifo.as_raw_fd(), libc::_PC_PIPE_BUF) }).ok()?;
-    // macOS guarantees 512 bytes. Long native paths often share prefixes.
-    let compressed = bytes.len() + 2 > atomic;
-    let bytes = if compressed {
-        zstd::bulk::compress(&bytes, 1).ok()?
-    } else {
-        bytes
-    };
-    if bytes.len() + 2 > atomic {
-        return None;
-    }
-    let header = bytes.len() as u16 | if compressed { COMPRESSED } else { 0 };
-    let mut frame = Vec::with_capacity(2 + bytes.len());
-    frame.extend_from_slice(&header.to_le_bytes());
-    frame.extend_from_slice(&bytes);
-    (fifo.write(&frame).ok()? == frame.len()).then_some(hint).flatten()
+    (socket.send(&bytes).ok()? == bytes.len()).then_some(hint).flatten()
 }
 
+/// The largest observation, and so the largest datagram.
 const MAX_FRAME: usize = 8192;
-const COMPRESSED: u16 = 1 << 15;
+/// Receive queue: a burst of hooks while the recorder is busy committing.
+const QUEUE_BYTES: usize = 256 * 1024;
+
+/// Ask for a socket buffer of at least `bytes`. The default send buffer caps a datagram's size
+/// (2048 bytes on macOS) and the default receive buffer holds few of them; where the system
+/// grants less, larger observations are dropped by the send, never cut.
+fn buffer(socket: &UnixDatagram, which: libc::c_int, bytes: usize) {
+    let size = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            which,
+            std::ptr::from_ref(&size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
 
 /// Bound reader attached to the recorder's ownership lifetime.
 pub struct HookReceiver {
-    file: BufReader<File>,
+    socket: UnixDatagram,
+    path: PathBuf,
     store: StateStore,
 }
 
 impl HookReceiver {
     pub fn bind(store: StateStore) -> Result<Self> {
-        use std::os::unix::ffi::OsStrExt;
-        let path = store.path().with_file_name("hooks-v1.fifo");
-        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-        if unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) } < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(err.into());
-            }
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(path)?;
-        anyhow::ensure!(file.metadata()?.file_type().is_fifo(), "invalid observation FIFO");
-        Ok(Self {
-            file: BufReader::new(file),
-            store,
-        })
+        let path = store.hook_socket_path();
+        let socket = super::recorder::bind_restrictive_0600::<UnixDatagram>(&path)?;
+        socket.set_nonblocking(true)?;
+        buffer(&socket, libc::SO_RCVBUF, QUEUE_BYTES);
+        Ok(Self { socket, path, store })
     }
 
     pub(super) fn run(mut self, stop: Arc<AtomicBool>) {
-        use std::os::fd::AsRawFd;
         let mut poll = libc::pollfd {
-            fd: self.file.get_ref().as_raw_fd(),
+            fd: self.socket.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         while !stop.load(Ordering::Acquire) {
-            if self.file.buffer().is_empty() && unsafe { libc::poll(&mut poll, 1, 50) } <= 0 {
+            if unsafe { libc::poll(&mut poll, 1, 50) } <= 0 {
                 continue;
             }
             let _ = self.read_one();
         }
     }
-    /// Fold one already enqueued observation. A quiet queue returns WouldBlock.
+
+    /// Fold one already enqueued observation. A quiet queue returns WouldBlock. A datagram that
+    /// is not one observation is dropped whole: it cannot shift where the next one starts.
     pub fn read_one(&mut self) -> Result<()> {
-        let mut header = [0; 2];
-        self.file.read_exact(&mut header)?;
-        let header = u16::from_le_bytes(header);
-        let n = usize::from(header & !COMPRESSED);
+        let mut bytes = [0; MAX_FRAME + 1];
+        let n = self.socket.recv(&mut bytes)?;
         anyhow::ensure!(n <= MAX_FRAME, "invalid observation length");
-        let mut bytes = vec![0; n];
-        self.file.read_exact(&mut bytes)?;
-        if header & COMPRESSED != 0 {
-            bytes = zstd::bulk::decompress(&bytes, MAX_FRAME)?;
-        }
-        consume(&self.store, serde_json::from_slice(&bytes)?)
+        consume(&self.store, serde_json::from_slice(&bytes[..n])?)
+    }
+}
+
+impl Drop for HookReceiver {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

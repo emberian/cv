@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `cv distill --session=<harness>` writes to every harness with a verified emitter (Codex, Gemini, Devin, …), sidecar and resume command included; `--delivery=live` stays Antigravity's.
+- A distilled seed attests its pack's human instructions (count, digest, length) and Claude transcripts keep that record, so a second distill demotes entries it cannot vouch for.
+- `cv doctor` reports `compaction_laundering` (a summary directive that repeats a tool result and no human prompt) and `diary_ledger_divergence` (a final "tests pass" against the recorded runs and edits); `cv lanes --json` carries the latter, and the post-compaction hook points at the former.
+- Hooks send observations as datagrams on a Unix socket (`hooks-v1.sock`) instead of a FIFO: whole up to 8 KiB each, where a pipe dropped anything over 512 bytes on macOS.
 - Blame, file views, tools, context packs and worker reports support place and generation selection. Edit hooks identify disconnected peers in the same checkout.
 - Hub ingest, spool import and SSH pull index changed sessions and their file events, with a durable generation watermark and retryable deletions.
 

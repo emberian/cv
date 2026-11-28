@@ -467,7 +467,7 @@ impl RecorderServer {
         #[cfg(unix)]
         {
             let sock_path = store.socket_path();
-            let listener = bind_restrictive_0600(&sock_path)?;
+            let listener = bind_restrictive_0600::<UnixListener>(&sock_path)?;
             listener.set_nonblocking(true)?;
 
             let hooks = super::observations::HookReceiver::bind(store.clone()).map_err(std::io::Error::other)?;
@@ -698,9 +698,28 @@ fn activate_owner_epoch(conn: &Connection, producer_id: &str) -> Result<String, 
     Ok(epoch)
 }
 
+/// A Unix socket bound to a filesystem path: the recorder's stream listener, the hook
+/// receiver's datagram socket.
+#[cfg(unix)]
+pub(super) trait PathSocket: Sized {
+    fn bind_at(path: &Path) -> std::io::Result<Self>;
+}
+#[cfg(unix)]
+impl PathSocket for UnixListener {
+    fn bind_at(path: &Path) -> std::io::Result<Self> {
+        Self::bind(path)
+    }
+}
+#[cfg(unix)]
+impl PathSocket for std::os::unix::net::UnixDatagram {
+    fn bind_at(path: &Path) -> std::io::Result<Self> {
+        Self::bind(path)
+    }
+}
+
 /// Bind `sock_path` with `0600` permissions without exposing a world-accessible socket inode.
 #[cfg(unix)]
-fn bind_restrictive_0600(sock_path: &Path) -> Result<UnixListener, StateError> {
+pub(super) fn bind_restrictive_0600<S: PathSocket>(sock_path: &Path) -> Result<S, StateError> {
     use std::os::unix::fs::PermissionsExt;
     let parent = sock_path
         .parent()
@@ -732,7 +751,7 @@ fn bind_restrictive_0600(sock_path: &Path) -> Result<UnixListener, StateError> {
     };
 
     if use_stage {
-        if let Ok(listener) = UnixListener::bind(&stage_sock) {
+        if let Ok(listener) = S::bind_at(&stage_sock) {
             std::fs::set_permissions(&stage_sock, std::fs::Permissions::from_mode(0o600))?;
             if std::fs::rename(&stage_sock, sock_path).is_ok() {
                 let _ = std::fs::remove_dir(&stage_dir);
@@ -744,7 +763,7 @@ fn bind_restrictive_0600(sock_path: &Path) -> Result<UnixListener, StateError> {
         let _ = std::fs::remove_dir_all(&stage_dir);
     }
 
-    let listener = UnixListener::bind(sock_path)?;
+    let listener = S::bind_at(sock_path)?;
     std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
