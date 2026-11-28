@@ -566,6 +566,21 @@ fn stamp_archive_source(mut s: Session, raw_name: &str) -> Session {
     s
 }
 
+/// Report one entry that failed to parse. The first such error is what [`ingest_files`] returns
+/// when nothing parsed.
+fn record_parse_err(
+    path: String,
+    err: anyhow::Error,
+    skipped: &mut Vec<SkippedEntry>,
+    first: &mut Option<anyhow::Error>,
+) {
+    let reason = format!("parse error: {err:#}");
+    if first.is_none() {
+        *first = Some(err);
+    }
+    skipped.push(SkippedEntry { path, reason });
+}
+
 /// Ingest `(relative_path, bytes)` pairs and return both parsed sessions and structured
 /// diagnostics for skipped entries.
 pub fn ingest_files_with_report(files: Vec<(String, Vec<u8>)>) -> anyhow::Result<IngestReport> {
@@ -597,15 +612,6 @@ fn ingest_files_inner_with_zst_caps(
     let mut agy_pbtxt_titles: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut pending_unknown: Vec<PendingEntry> = Vec::new();
     let mut zst_total_decoded: u64 = 0;
-
-    let record_parse_err =
-        |raw_name: String, err: anyhow::Error, skipped: &mut Vec<SkippedEntry>, first: &mut Option<anyhow::Error>| {
-            let reason = format!("parse error: {err:#}");
-            if first.is_none() {
-                *first = Some(err);
-            }
-            skipped.push(SkippedEntry { path: raw_name, reason });
-        };
 
     for (idx, (raw_name, raw_bytes)) in files.into_iter().enumerate() {
         let (name, bytes) = if is_zst_entry(&raw_name, &raw_bytes) {
@@ -664,22 +670,18 @@ fn ingest_files_inner_with_zst_caps(
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
-        match sniff(&name, &text) {
-            Sniff::Codex { is_jsonl } => {
-                let id = codex_id(&name, &text);
-                match codex::parse_str(&id, &text, is_jsonl, None) {
-                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
-                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-                }
-            }
-            Sniff::Claude => {
-                let id = file_stem(&name).to_string();
-                out.push(stamp_archive_source(claude::parse_str(&id, &text, None), &raw_name));
-            }
-            Sniff::Gemini => match gemini::parse_all_str(&text, None) {
-                Ok(sessions) => out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, &raw_name))),
-                Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-            },
+        let stem = file_stem(&name);
+        let one = |parsed: anyhow::Result<Session>| parsed.map(|s| vec![s]);
+        let parsed = match sniff(&name, &text) {
+            Sniff::Codex { is_jsonl } => one(codex::parse_str(&codex_id(&name, &text), &text, is_jsonl, None)),
+            Sniff::Claude => Ok(vec![claude::parse_str(stem, &text, None)]),
+            Sniff::Gemini => gemini::parse_all_str(&text, None),
+            Sniff::Qwen => one(qwen::parse_str(stem, &text)),
+            Sniff::OpenClaw => one(openclaw::parse_str(stem, &text)),
+            Sniff::Pi => one(pi::parse_str(stem, &text)),
+            Sniff::OpenSession => one(opensession::from_str(&text)),
+            Sniff::Export => export::parse_all_str(&text),
+            Sniff::Continue => one(continuedev::parse_str(stem, &text)),
             Sniff::Antigravity => {
                 let (id, rank) = antigravity_id_and_rank(&name);
                 let replace = agy_candidates
@@ -688,46 +690,16 @@ fn ingest_files_inner_with_zst_caps(
                 if replace {
                     agy_candidates.insert(id, (rank, idx, raw_name, text.into_owned()));
                 }
-            }
-            Sniff::Qwen => {
-                let id = file_stem(&name).to_string();
-                match qwen::parse_str(&id, &text) {
-                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
-                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-                }
-            }
-            Sniff::OpenClaw => {
-                let id = file_stem(&name).to_string();
-                match openclaw::parse_str(&id, &text) {
-                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
-                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-                }
-            }
-            Sniff::Pi => {
-                let id = file_stem(&name).to_string();
-                match pi::parse_str(&id, &text) {
-                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
-                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-                }
-            }
-            Sniff::OpenSession => match opensession::from_str(&text) {
-                Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
-                Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-            },
-            Sniff::Export => match export::parse_all_str(&text) {
-                Ok(sessions) => out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, &raw_name))),
-                Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-            },
-            Sniff::Continue => {
-                let id = file_stem(&name).to_string();
-                match continuedev::parse_str(&id, &text) {
-                    Ok(s) => out.push(stamp_archive_source(s, &raw_name)),
-                    Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
-                }
+                continue;
             }
             Sniff::Unknown => {
                 pending_unknown.push(PendingEntry { raw_name, name, bytes });
+                continue;
             }
+        };
+        match parsed {
+            Ok(sessions) => out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, &raw_name))),
+            Err(e) => record_parse_err(raw_name, e, &mut skipped, &mut first_parse_err),
         }
     }
     for ((id, rank), group) in agy_chunks {
@@ -814,135 +786,6 @@ fn cline_task_id_from_rel(parent_rel: &str) -> String {
         .find(|s| !s.is_empty() && *s != "tasks")
         .unwrap_or("cline-task");
     seg.to_string()
-}
-
-fn parse_cline_history_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]) -> Option<Session> {
-    use crate::ir::{Block, Message, MessageKind, Origin, Role};
-    let items: Vec<serde_json::Value> = serde_json::from_slice(bytes).ok()?;
-    let mut session = Session::new(id.to_string(), harness);
-    for item in &items {
-        let role_str = item.get("role").and_then(serde_json::Value::as_str)?;
-        let mut blocks = Vec::new();
-        match item.get("content") {
-            Some(serde_json::Value::String(s)) => {
-                blocks.push(Block::from_text(s.clone().into()));
-            }
-            Some(serde_json::Value::Array(arr)) => {
-                for part in arr {
-                    match part.get("type").and_then(serde_json::Value::as_str).unwrap_or("") {
-                        "text" => {
-                            if let Some(t) = part.get("text").and_then(serde_json::Value::as_str) {
-                                blocks.push(Block::from_text(t.to_owned().into()));
-                            }
-                        }
-                        "thinking" => {
-                            let text = part
-                                .get("thinking")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_owned();
-                            let signature = part
-                                .get("signature")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned);
-                            blocks.push(Block::Thinking {
-                                text: text.into(),
-                                signature,
-                                encrypted: None,
-                                redacted: false,
-                                extensions: Default::default(),
-                            });
-                        }
-                        "redacted_thinking" => {
-                            blocks.push(Block::Thinking {
-                                text: String::new().into(),
-                                signature: None,
-                                encrypted: part.get("data").and_then(serde_json::Value::as_str).map(str::to_owned),
-                                redacted: true,
-                                extensions: Default::default(),
-                            });
-                        }
-                        "tool_use" => {
-                            let call_id = part
-                                .get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_owned();
-                            let name = part
-                                .get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_owned();
-                            let input = part
-                                .get("input")
-                                .cloned()
-                                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-                            blocks.push(Block::ToolUse {
-                                id: call_id,
-                                name,
-                                input: input.into(),
-                                namespace: None,
-                                extensions: Default::default(),
-                            });
-                        }
-                        "tool_result" => {
-                            let tool_use_id = part
-                                .get("tool_use_id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_owned();
-                            let content = match part.get("content") {
-                                Some(serde_json::Value::String(s)) => s.clone(),
-                                Some(serde_json::Value::Array(parts)) => parts
-                                    .iter()
-                                    .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                                _ => String::new(),
-                            };
-                            let is_error = part
-                                .get("is_error")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false);
-                            blocks.push(Block::ToolResult {
-                                tool_use_id,
-                                content: content.into(),
-                                is_error,
-                                tool_name: None,
-                                status: None,
-                                details: None,
-                                extensions: Default::default(),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => continue,
-        }
-        if blocks.is_empty() {
-            continue;
-        }
-        let only_tool_results = role_str == "user" && blocks.iter().all(|b| matches!(b, Block::ToolResult { .. }));
-        let (role, kind, origin) = if only_tool_results {
-            (Role::Tool, MessageKind::ToolResult, Origin::Harness)
-        } else {
-            match role_str {
-                "user" => (Role::User, MessageKind::Prompt, Origin::Human),
-                "assistant" => (Role::Assistant, MessageKind::Reply, Origin::Model),
-                "system" => (Role::System, MessageKind::SystemPrompt, Origin::Harness),
-                _ => continue,
-            }
-        };
-        let mut m = Message::of_kind(role, kind, origin);
-        m.timestamp = item
-            .get("ts")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(crate::harness::ts_from_epoch);
-        m.content = blocks;
-        session.messages.push(m);
-    }
-    Some(session)
 }
 
 fn parse_cline_ui_messages_bytes(id: &str, harness: crate::ir::Harness, bytes: &[u8]) -> Option<Session> {
@@ -1045,7 +888,7 @@ fn ingest_pending_entries(
         let harness = cline_or_roo_harness(&dir.hint);
         let id = cline_task_id_from_rel(&parent);
         if let Some(bytes) = dir.history {
-            if let Some(s) = parse_cline_history_bytes(&id, harness, &bytes) {
+            if let Some(s) = crate::harness::cline::parse_history(&id, &bytes, harness) {
                 out.push(stamp_archive_source(s, &dir.raw_hint));
                 continue;
             }
@@ -1218,6 +1061,38 @@ fn finalize_staged_with_hint(
     Ok(s)
 }
 
+/// Parse everything `adapter` discovers under its staged root into `out`, each session named for
+/// the archive entry behind `hint` (else behind its own staged path).
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_staged(
+    adapter: &dyn crate::harness::Adapter,
+    staged_paths: &[(String, std::path::PathBuf, bool)],
+    hint: Option<&std::path::Path>,
+    out: &mut Vec<Session>,
+) -> anyhow::Result<()> {
+    for r in &adapter.discover()?.refs {
+        out.push(finalize_staged_with_hint(adapter.parse(r)?, staged_paths, hint)?);
+    }
+    Ok(())
+}
+
+/// The sessions of a store staged alone under a private root; the caller names their source.
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+fn parse_restaged(adapter: &dyn crate::harness::Adapter) -> anyhow::Result<Vec<Session>> {
+    let mut sessions = Vec::new();
+    parse_staged(adapter, &[], None, &mut sessions)?;
+    Ok(sessions)
+}
+
+/// The directory name a re-rooted session keeps; the archive root itself has none.
+#[cfg(not(target_arch = "wasm32"))]
+fn staged_dir_name<'a>(dir: &'a std::path::Path, temp_root: &std::path::Path, fallback: &'a str) -> &'a str {
+    if dir == temp_root {
+        return fallback;
+    }
+    dir.file_name().and_then(|n| n.to_str()).unwrap_or(fallback)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn create_private_staging_dir(path: &std::path::Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
@@ -1342,17 +1217,11 @@ fn ingest_pending_entries(
                 // an empty `SqliteFlavor::Unknown` database.
                 let _: i64 = raw.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
                 let has_table = |t: &str| crate::harness::store::sqlite::table_exists(raw, t);
-                let has_agy_steps = has_table("steps")
-                    && raw
-                        .prepare("PRAGMA table_info(steps)")
-                        .and_then(|mut st| {
-                            let cols: Vec<String> = st
-                                .query_map([], |row| row.get::<_, String>(1))?
-                                .filter_map(Result::ok)
-                                .collect();
-                            Ok(cols.iter().any(|c| c == "step_payload") && cols.iter().any(|c| c == "step_format"))
-                        })
-                        .unwrap_or(false);
+                let has_columns = |t: &str, names: &[&str]| {
+                    let columns = crate::harness::store::sqlite::columns(raw, t);
+                    names.iter().all(|name| columns.contains(*name))
+                };
+                let has_agy_steps = has_table("steps") && has_columns("steps", &["step_payload", "step_format"]);
                 let has_agy_summaries = has_table("conversation_summaries");
                 let has_agy_meta = has_table("trajectory_metadata_blob");
                 if has_table("session_windows") && has_table("transcript_events") {
@@ -1360,17 +1229,7 @@ fn ingest_pending_entries(
                 } else if has_table("sessions") && has_table("message_nodes") {
                     Ok(SqliteFlavor::Devin)
                 } else if has_table("sessions") && has_table("messages") {
-                    let is_goose = raw
-                        .prepare("PRAGMA table_info(messages)")
-                        .and_then(|mut st| {
-                            let cols: Vec<String> = st
-                                .query_map([], |row| row.get::<_, String>(1))?
-                                .filter_map(Result::ok)
-                                .collect();
-                            Ok(cols.iter().any(|c| c == "content_json"))
-                        })
-                        .unwrap_or(false);
-                    Ok(if is_goose {
+                    Ok(if has_columns("messages", &["content_json"]) {
                         SqliteFlavor::Goose
                     } else {
                         SqliteFlavor::Hermes
@@ -1401,79 +1260,32 @@ fn ingest_pending_entries(
             Ok(flavor)
         })();
 
-        let parsed_sqlite: anyhow::Result<Option<Vec<Session>>> = match flavor_res {
-            Err(err) => Err(err),
-            Ok(flavor) => (|| match flavor {
-                SqliteFlavor::OpenClaw => {
-                    let oc_state = temp_root.join(format!("_oc_{}", uuid::Uuid::new_v4()));
-                    let target_db = oc_state.join("agents/main/agent/openclaw-agent.sqlite");
-                    copy_sqlite_with_sidecars(full_path, &target_db)?;
-                    let adapter = crate::harness::openclaw::OpenClaw::with_state_dir(&oc_state);
-                    let disc = adapter.discover()?;
-                    let mut sessions = Vec::new();
-                    for r in &disc.refs {
-                        sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                    }
-                    Ok(Some(sessions))
-                }
-                SqliteFlavor::Devin => {
-                    let d_dir = temp_root.join(format!("_devin_{}", uuid::Uuid::new_v4()));
-                    let target_db = d_dir.join("sessions.db");
-                    copy_sqlite_with_sidecars(full_path, &target_db)?;
-                    let adapter = crate::harness::devin::Devin::with_root(&d_dir);
-                    let disc = adapter.discover()?;
-                    let mut sessions = Vec::new();
-                    for r in &disc.refs {
-                        sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                    }
-                    Ok(Some(sessions))
-                }
+        // The database alone under a private root, at the path its adapter reads it from.
+        let restage = |tag: &str, rel: &str| -> anyhow::Result<std::path::PathBuf> {
+            let root = temp_root.join(format!("_{tag}_{}", uuid::Uuid::new_v4()));
+            copy_sqlite_with_sidecars(full_path, &root.join(rel))?;
+            Ok(root)
+        };
+        use crate::harness::{cursor::Cursor, devin, goose, hermes, opencode, zed};
+        let parsed_sqlite: anyhow::Result<Option<Vec<Session>>> = flavor_res.and_then(|flavor| {
+            Ok(Some(match flavor {
+                SqliteFlavor::Unknown => return Ok(None),
+                SqliteFlavor::OpenClaw => parse_restaged(&openclaw::OpenClaw::with_state_dir(&restage(
+                    "oc",
+                    "agents/main/agent/openclaw-agent.sqlite",
+                )?))?,
+                SqliteFlavor::Devin => parse_restaged(&devin::Devin::with_root(&restage("devin", "sessions.db")?))?,
                 SqliteFlavor::Goose => {
-                    let g_dir = temp_root.join(format!("_goose_{}", uuid::Uuid::new_v4()));
-                    let target_db = g_dir.join("sessions.db");
-                    copy_sqlite_with_sidecars(full_path, &target_db)?;
-                    let adapter = crate::harness::goose::Goose::with_sessions_dir(&g_dir);
-                    let disc = adapter.discover()?;
-                    let mut sessions = Vec::new();
-                    for r in &disc.refs {
-                        sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                    }
-                    Ok(Some(sessions))
+                    parse_restaged(&goose::Goose::with_sessions_dir(&restage("goose", "sessions.db")?))?
                 }
-                SqliteFlavor::Hermes => {
-                    let adapter = crate::harness::hermes::Hermes::with_db(full_path.clone());
-                    let disc = adapter.discover()?;
-                    let mut sessions = Vec::new();
-                    for r in &disc.refs {
-                        sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                    }
-                    Ok(Some(sessions))
-                }
-                SqliteFlavor::OpenCode => {
-                    let adapter = crate::harness::opencode::OpenCode::with_db(full_path.clone());
-                    let disc = adapter.discover()?;
-                    let mut sessions = Vec::new();
-                    for r in &disc.refs {
-                        sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                    }
-                    Ok(Some(sessions))
-                }
-                SqliteFlavor::Zed => {
-                    let z_dir = temp_root.join(format!("_zed_{}", uuid::Uuid::new_v4()));
-                    let target_db = z_dir.join("threads.db");
-                    copy_sqlite_with_sidecars(full_path, &target_db)?;
-                    let adapter = crate::harness::zed::Zed::with_root(&z_dir);
-                    let disc = adapter.discover()?;
-                    let mut sessions = Vec::new();
-                    for r in &disc.refs {
-                        sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                    }
-                    Ok(Some(sessions))
-                }
+                SqliteFlavor::Hermes => parse_restaged(&hermes::Hermes::with_db(full_path.clone()))?,
+                SqliteFlavor::OpenCode => parse_restaged(&opencode::OpenCode::with_db(full_path.clone()))?,
+                SqliteFlavor::Zed => parse_restaged(&zed::Zed::with_root(&restage("zed", "threads.db")?))?,
                 SqliteFlavor::Antigravity {
                     has_steps,
                     has_summaries,
                 } => {
+                    let agy_harness = antigravity::ROOTLESS.harness();
                     let existing_app_dir = full_path.parent().and_then(|parent| {
                         if parent.file_name().and_then(|n| n.to_str()) == Some("conversations") {
                             parent.parent().map(std::path::Path::to_path_buf)
@@ -1484,9 +1296,7 @@ fn ingest_pending_entries(
                         }
                     });
                     if let Some(app_dir) = existing_app_dir {
-                        if !visited_antigravity_dirs.insert(app_dir.clone()) {
-                            Ok(Some(Vec::new()))
-                        } else {
+                        if visited_antigravity_dirs.insert(app_dir.clone()) {
                             for sub in ["conversations", "annotations", "brain"] {
                                 let d = app_dir.join(sub);
                                 if d.is_dir() {
@@ -1494,7 +1304,6 @@ fn ingest_pending_entries(
                                 }
                             }
                             claimed_files.insert(app_dir.join("conversation_summaries.db"));
-                            let agy_harness = antigravity::ROOTLESS.harness();
                             let mut existing_ids = std::collections::HashSet::new();
                             for s in out.iter_mut() {
                                 if s.harness == agy_harness {
@@ -1516,23 +1325,12 @@ fn ingest_pending_entries(
                                 let archive_path = staged_archive_name(&sk.path, &staged_paths)
                                     .map(str::to_owned)
                                     .unwrap_or_else(|| orig_name.clone());
-                                let err = anyhow::anyhow!("{}", sk.why);
-                                let reason = format!("parse error: {err:#}");
-                                if first_parse_err.is_none() {
-                                    *first_parse_err = Some(err);
-                                }
-                                skipped.push(SkippedEntry {
-                                    path: archive_path,
-                                    reason,
-                                });
+                                record_parse_err(archive_path, anyhow::anyhow!("{}", sk.why), skipped, first_parse_err);
                             }
-                            Ok(Some(Vec::new()))
                         }
+                        Vec::new()
                     } else if has_steps {
-                        let agy_dir = temp_root.join(format!("_agy_{}", uuid::Uuid::new_v4()));
-                        let stem = file_stem(orig_name);
-                        let dst = agy_dir.join("conversations").join(format!("{stem}.db"));
-                        copy_sqlite_with_sidecars(full_path, &dst)?;
+                        let agy_dir = restage("agy", &format!("conversations/{}.db", file_stem(orig_name)))?;
                         if let Some(parent) = full_path.parent() {
                             let sibling_sum = parent.join("conversation_summaries.db");
                             if sibling_sum.is_file() {
@@ -1540,22 +1338,18 @@ fn ingest_pending_entries(
                                 claimed_files.insert(sibling_sum);
                             }
                         }
-                        let agy_harness = antigravity::ROOTLESS.harness();
                         let adapter = antigravity::Antigravity::with_home(&agy_dir);
-                        let disc = adapter.discover()?;
                         let mut sessions = Vec::new();
-                        for r in &disc.refs {
+                        for r in &adapter.discover()?.refs {
                             if out.iter().any(|s| s.harness == agy_harness && s.id == r.id) {
                                 continue;
                             }
                             sessions.push(finalize_staged_session(adapter.parse(r)?)?);
                         }
-                        Ok(Some(sessions))
+                        sessions
                     } else {
                         if has_summaries {
-                            let agy_harness = antigravity::ROOTLESS.harness();
-                            let agy_dir = temp_root.join(format!("_agy_sum_{}", uuid::Uuid::new_v4()));
-                            copy_sqlite_with_sidecars(full_path, &agy_dir.join("conversation_summaries.db"))?;
+                            let agy_dir = restage("agy_sum", "conversation_summaries.db")?;
                             for s in out.iter_mut() {
                                 if s.harness == agy_harness {
                                     let has_pbtxt = agy_pbtxt_titles.contains_key(&s.id);
@@ -1563,7 +1357,7 @@ fn ingest_pending_entries(
                                 }
                             }
                         }
-                        Ok(Some(Vec::new()))
+                        Vec::new()
                     }
                 }
                 SqliteFlavor::Cursor {
@@ -1571,103 +1365,55 @@ fn ingest_pending_entries(
                     has_item_table,
                     is_cli_store,
                 } => {
-                    if is_cli_store && !has_disk_kv && !has_item_table {
-                        let cli_home = full_path
-                            .ancestors()
-                            .find(|p| p.join("chats").is_dir())
-                            .map(std::path::Path::to_path_buf)
-                            .map(Ok::<_, anyhow::Error>)
-                            .unwrap_or_else(|| {
-                                let root = temp_root.join(format!("_curcli_{}", uuid::Uuid::new_v4()));
-                                let stem = file_stem(orig_name);
-                                let dst = root.join("chats/default").join(stem).join("store.db");
-                                copy_sqlite_with_sidecars(full_path, &dst)?;
-                                Ok(root)
-                            })?;
-                        let adapter = crate::harness::cursor::Cursor::with_cli_home(&cli_home);
-                        let disc = adapter.discover()?;
-                        let mut sessions = Vec::new();
-                        for r in &disc.refs {
-                            sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                        }
-                        Ok(Some(sessions))
-                    } else {
-                        // Detect if already staged inside a Cursor/User layout (`globalStorage/state.vscdb`
-                        // or `workspaceStorage/<ws>/state.vscdb`) so companion workspace DBs & `workspace.json` pair up.
-                        let existing_user_dir = full_path.parent().and_then(|parent| {
-                            let pname = parent.file_name()?.to_str()?;
-                            if pname == "globalStorage" {
-                                parent.parent().map(std::path::Path::to_path_buf)
-                            } else {
-                                let gp = parent.parent()?;
-                                (gp.file_name()?.to_str()? == "workspaceStorage")
-                                    .then(|| gp.parent().map(std::path::Path::to_path_buf))
-                                    .flatten()
-                            }
-                        });
-                        if let Some(user_dir) = existing_user_dir {
-                            if !visited_cursor_user_dirs.insert(user_dir.clone()) {
-                                Ok(Some(Vec::new()))
-                            } else {
-                                claim_dir_files(&user_dir, false, &mut claimed_files);
-                                let adapter = crate::harness::cursor::Cursor::with_user_dir(&user_dir);
-                                let disc = adapter.discover()?;
-                                let mut sessions = Vec::new();
-                                for r in &disc.refs {
-                                    sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                                }
-                                Ok(Some(sessions))
-                            }
+                    // Detect if already staged inside a Cursor/User layout (`globalStorage/state.vscdb`
+                    // or `workspaceStorage/<ws>/state.vscdb`) so companion workspace DBs & `workspace.json` pair up.
+                    let existing_user_dir = full_path.parent().and_then(|parent| {
+                        let pname = parent.file_name()?.to_str()?;
+                        if pname == "globalStorage" {
+                            parent.parent().map(std::path::Path::to_path_buf)
                         } else {
-                            let mut sessions = Vec::new();
-                            if has_disk_kv {
-                                let c_dir = temp_root.join(format!("_cursor_{}", uuid::Uuid::new_v4()));
-                                copy_sqlite_with_sidecars(full_path, &c_dir.join("globalStorage/state.vscdb"))?;
-                                let adapter = crate::harness::cursor::Cursor::with_user_dir(&c_dir);
-                                let disc = adapter.discover()?;
-                                for r in &disc.refs {
-                                    sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                                }
-                            }
-                            if sessions.is_empty() && has_item_table {
-                                let c_dir = temp_root.join(format!("_cursor_ws_{}", uuid::Uuid::new_v4()));
-                                copy_sqlite_with_sidecars(full_path, &c_dir.join("workspaceStorage/ws0/state.vscdb"))?;
-                                let adapter = crate::harness::cursor::Cursor::with_user_dir(&c_dir);
-                                let disc = adapter.discover()?;
-                                for r in &disc.refs {
-                                    sessions.push(finalize_staged_session(adapter.parse(r)?)?);
-                                }
-                            }
-                            Ok(Some(sessions))
+                            let gp = parent.parent()?;
+                            (gp.file_name()?.to_str()? == "workspaceStorage")
+                                .then(|| gp.parent().map(std::path::Path::to_path_buf))
+                                .flatten()
                         }
+                    });
+                    if is_cli_store && !has_disk_kv && !has_item_table {
+                        let cli_home = match full_path.ancestors().find(|p| p.join("chats").is_dir()) {
+                            Some(home) => home.to_path_buf(),
+                            None => restage("curcli", &format!("chats/default/{}/store.db", file_stem(orig_name)))?,
+                        };
+                        parse_restaged(&Cursor::with_cli_home(&cli_home))?
+                    } else if let Some(user_dir) = existing_user_dir {
+                        if visited_cursor_user_dirs.insert(user_dir.clone()) {
+                            claim_dir_files(&user_dir, false, &mut claimed_files);
+                            parse_restaged(&Cursor::with_user_dir(&user_dir))?
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        let mut sessions = Vec::new();
+                        if has_disk_kv {
+                            let user_dir = restage("cursor", "globalStorage/state.vscdb")?;
+                            sessions = parse_restaged(&Cursor::with_user_dir(&user_dir))?;
+                        }
+                        if sessions.is_empty() && has_item_table {
+                            let user_dir = restage("cursor_ws", "workspaceStorage/ws0/state.vscdb")?;
+                            sessions = parse_restaged(&Cursor::with_user_dir(&user_dir))?;
+                        }
+                        sessions
                     }
                 }
-                SqliteFlavor::Unknown => Ok(None),
-            })(),
-        };
+            }))
+        });
+        claimed_files.insert(full_path.clone());
         match parsed_sqlite {
-            Ok(Some(sessions)) => {
-                claimed_files.insert(full_path.clone());
-                out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, orig_name)));
-            }
-            Ok(None) => {
-                claimed_files.insert(full_path.clone());
-                skipped.push(SkippedEntry {
-                    path: orig_name.clone(),
-                    reason: "unrecognized SQLite schema".into(),
-                });
-            }
-            Err(err) => {
-                claimed_files.insert(full_path.clone());
-                let reason = format!("parse error: {err:#}");
-                if first_parse_err.is_none() {
-                    *first_parse_err = Some(err);
-                }
-                skipped.push(SkippedEntry {
-                    path: orig_name.clone(),
-                    reason,
-                });
-            }
+            Ok(Some(sessions)) => out.extend(sessions.into_iter().map(|s| stamp_archive_source(s, orig_name))),
+            Ok(None) => skipped.push(SkippedEntry {
+                path: orig_name.clone(),
+                reason: "unrecognized SQLite schema".into(),
+            }),
+            Err(err) => record_parse_err(orig_name.clone(), err, skipped, first_parse_err),
         }
     }
 
@@ -1700,70 +1446,53 @@ fn ingest_pending_entries(
         let archive_path = staged_archive_name(path_hint, &staged_paths)
             .map(str::to_owned)
             .unwrap_or_else(|| path_hint.to_string_lossy().into_owned());
-        let reason = format!("parse error: {err:#}");
-        if first_parse_err.is_none() {
-            *first_parse_err = Some(err);
-        }
-        skipped.push(SkippedEntry {
-            path: archive_path,
-            reason,
-        });
+        record_parse_err(archive_path, err, skipped, first_parse_err);
     };
+    let claim_path = |path: &std::path::Path, claimed: &mut std::collections::HashSet<std::path::PathBuf>| {
+        if path.is_dir() {
+            claim_dir_files(path, false, claimed);
+        } else {
+            claimed.insert(path.to_path_buf());
+        }
+    };
+    let file_named = |path: &std::path::Path, name: &str| path.file_name().and_then(|n| n.to_str()) == Some(name);
 
     let grok = crate::harness::grok::Grok::with_home(&temp_root);
     if let Ok(disc) = grok.discover() {
         for r in &disc.refs {
+            claim_grok_dir(&r.path, &mut claimed_files);
             match grok
                 .parse(r)
                 .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(&r.path)))
             {
-                Ok(sess) => {
-                    claim_grok_dir(&r.path, &mut claimed_files);
-                    out.push(sess);
-                }
-                Err(err) => {
-                    claim_grok_dir(&r.path, &mut claimed_files);
-                    record_staged_err(&r.path, err);
-                }
+                Ok(sess) => out.push(sess),
+                Err(err) => record_staged_err(&r.path, err),
             }
         }
     }
     for (_, full_path, _) in &staged_paths {
-        if claimed_files.contains(full_path) {
+        if claimed_files.contains(full_path) || !file_named(full_path, "summary.json") {
             continue;
         }
-        if full_path.file_name().and_then(|n| n.to_str()) == Some("summary.json") {
-            if let Some(src_dir) = full_path.parent() {
-                if src_dir.join("chat_history.jsonl").is_file() {
-                    let res: anyhow::Result<()> = (|| {
-                        let g_home = temp_root.join(format!("_grok_{}", uuid::Uuid::new_v4()));
-                        let slug = if src_dir == temp_root {
-                            "grok-session".to_string()
-                        } else {
-                            src_dir
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("grok-session")
-                                .to_string()
-                        };
-                        let dst_dir = g_home.join("sessions").join(slug);
-                        copy_tree_skipping_temp_subdirs(src_dir, &dst_dir, src_dir == temp_root)?;
-                        let adapter = crate::harness::grok::Grok::with_home(&g_home);
-                        let disc = adapter.discover()?;
-                        for r in &disc.refs {
-                            let s = adapter.parse(r)?;
-                            let finalized = finalize_staged_with_hint(s, &staged_paths, Some(src_dir))?;
-                            claim_grok_dir(src_dir, &mut claimed_files);
-                            out.push(finalized);
-                        }
-                        Ok(())
-                    })();
-                    if let Err(err) = res {
-                        claim_grok_dir(src_dir, &mut claimed_files);
-                        record_staged_err(full_path, err);
-                    }
-                }
-            }
+        let Some(src_dir) = full_path.parent().filter(|d| d.join("chat_history.jsonl").is_file()) else {
+            continue;
+        };
+        let g_home = temp_root.join(format!("_grok_{}", uuid::Uuid::new_v4()));
+        let dst_dir = g_home
+            .join("sessions")
+            .join(staged_dir_name(src_dir, &temp_root, "grok-session"));
+        let before = out.len();
+        let res = copy_tree_skipping_temp_subdirs(src_dir, &dst_dir, src_dir == temp_root)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                let adapter = crate::harness::grok::Grok::with_home(&g_home);
+                parse_staged(&adapter, &staged_paths, Some(src_dir), out)
+            });
+        if res.is_err() || out.len() > before {
+            claim_grok_dir(src_dir, &mut claimed_files);
+        }
+        if let Err(err) = res {
+            record_staged_err(full_path, err);
         }
     }
 
@@ -1771,18 +1500,13 @@ fn ingest_pending_entries(
     let lm = crate::harness::lmstudio::LmStudio::with_root(&temp_root);
     if let Ok(disc) = lm.discover() {
         for r in &disc.refs {
+            claimed_files.insert(r.path.clone());
             match lm
                 .parse(r)
                 .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(&r.path)))
             {
-                Ok(sess) => {
-                    claimed_files.insert(r.path.clone());
-                    out.push(sess);
-                }
-                Err(err) => {
-                    claimed_files.insert(r.path.clone());
-                    record_staged_err(&r.path, err);
-                }
+                Ok(sess) => out.push(sess),
+                Err(err) => record_staged_err(&r.path, err),
             }
         }
         for sk in &disc.skipped {
@@ -1798,10 +1522,7 @@ fn ingest_pending_entries(
         if claimed_files.contains(full_path) {
             continue;
         }
-        let Some(fname) = full_path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if matches!(fname, "api_conversation_history.json" | "ui_messages.json") {
+        if file_named(full_path, "api_conversation_history.json") || file_named(full_path, "ui_messages.json") {
             if let Some(dir) = full_path.parent() {
                 if !cline_task_dirs.iter().any(|(d, _)| d == dir) {
                     cline_task_dirs.push((dir.to_path_buf(), orig_name.clone()));
@@ -1810,88 +1531,56 @@ fn ingest_pending_entries(
         }
     }
     for (dir, orig_hint) in cline_task_dirs {
+        use crate::harness::cline;
         let harness = cline_or_roo_harness(&orig_hint);
         let parent_rel = orig_hint.rsplit_once(['/', '\\']).map(|(p, _)| p).unwrap_or("");
         let task_id = cline_task_id_from_rel(parent_rel);
-        let mut parsed_any = false;
-        let mut finalize_err: Option<anyhow::Error> = None;
-        if dir.join("api_conversation_history.json").is_file() {
+        let history = dir.join("api_conversation_history.json");
+        let parsed = if history.is_file() {
             let mut sink = crate::stream::CollectSink::default();
-            if let Ok(mut s) =
-                crate::harness::cline::stream_task_dir(&dir, &task_id, harness, &crate::Demand::RICH, &mut sink)
-            {
-                s.messages = sink.messages;
-                match finalize_staged_with_hint(s, &staged_paths, Some(&dir)) {
-                    Ok(sess) => {
-                        out.push(sess);
-                        parsed_any = true;
-                    }
-                    Err(e) => finalize_err = Some(e),
+            match cline::stream_task_dir(&dir, &task_id, harness, &crate::Demand::RICH, &mut sink) {
+                Ok(mut s) => {
+                    s.messages = sink.messages;
+                    Some(s)
                 }
-            } else if let Ok(bytes) = std::fs::read(dir.join("api_conversation_history.json")) {
-                if let Some(s) = parse_cline_history_bytes(&task_id, harness, &bytes) {
-                    match finalize_staged_with_hint(s, &staged_paths, Some(&dir)) {
-                        Ok(sess) => {
-                            out.push(sess);
-                            parsed_any = true;
-                        }
-                        Err(e) => finalize_err = Some(e),
-                    }
-                }
+                Err(_) => std::fs::read(&history)
+                    .ok()
+                    .and_then(|bytes| cline::parse_history(&task_id, &bytes, harness)),
             }
-        } else if let Ok(bytes) = std::fs::read(dir.join("ui_messages.json")) {
-            if let Some(s) = parse_cline_ui_messages_bytes(&task_id, harness, &bytes) {
-                match finalize_staged_with_hint(s, &staged_paths, Some(&dir)) {
-                    Ok(sess) => {
-                        out.push(sess);
-                        parsed_any = true;
-                    }
-                    Err(e) => finalize_err = Some(e),
-                }
-            }
+        } else {
+            std::fs::read(dir.join("ui_messages.json"))
+                .ok()
+                .and_then(|bytes| parse_cline_ui_messages_bytes(&task_id, harness, &bytes))
+        };
+        let Some(s) = parsed else { continue };
+        for side in [
+            "api_conversation_history.json",
+            "ui_messages.json",
+            "task_metadata.json",
+            "history_item.json",
+        ] {
+            claimed_files.insert(dir.join(side));
         }
-        if parsed_any || finalize_err.is_some() {
-            for side in [
-                "api_conversation_history.json",
-                "ui_messages.json",
-                "task_metadata.json",
-                "history_item.json",
-            ] {
-                claimed_files.insert(dir.join(side));
-            }
-        }
-        if let Some(err) = finalize_err {
-            record_staged_err(&dir, err);
+        match finalize_staged_with_hint(s, &staged_paths, Some(&dir)) {
+            Ok(sess) => out.push(sess),
+            Err(err) => record_staged_err(&dir, err),
         }
     }
 
     let cline_home = crate::harness::cline::Cline::with_home(&temp_root);
     if let Ok(disc) = cline_home.discover() {
         for r in &disc.refs {
-            if !claimed_files.contains(&r.path)
-                && !claimed_files.contains(&r.path.join("api_conversation_history.json"))
+            if claimed_files.contains(&r.path) || claimed_files.contains(&r.path.join("api_conversation_history.json"))
             {
-                match cline_home
-                    .parse(r)
-                    .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(&r.path)))
-                {
-                    Ok(sess) => {
-                        if r.path.is_dir() {
-                            claim_dir_files(&r.path, false, &mut claimed_files);
-                        } else {
-                            claimed_files.insert(r.path.clone());
-                        }
-                        out.push(sess);
-                    }
-                    Err(err) => {
-                        if r.path.is_dir() {
-                            claim_dir_files(&r.path, false, &mut claimed_files);
-                        } else {
-                            claimed_files.insert(r.path.clone());
-                        }
-                        record_staged_err(&r.path, err);
-                    }
-                }
+                continue;
+            }
+            claim_path(&r.path, &mut claimed_files);
+            match cline_home
+                .parse(r)
+                .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(&r.path)))
+            {
+                Ok(sess) => out.push(sess),
+                Err(err) => record_staged_err(&r.path, err),
             }
         }
     }
@@ -1905,63 +1594,37 @@ fn ingest_pending_entries(
             claimed_files.insert(temp_root.join("config.toml"));
         }
         for r in &disc.refs {
+            claim_path(&r.path, &mut claimed_files);
             match kimi
                 .parse(r)
                 .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(&r.path)))
             {
-                Ok(sess) => {
-                    if r.path.is_dir() {
-                        claim_dir_files(&r.path, false, &mut claimed_files);
-                    } else {
-                        claimed_files.insert(r.path.clone());
-                    }
-                    out.push(sess);
-                }
-                Err(err) => {
-                    if r.path.is_dir() {
-                        claim_dir_files(&r.path, false, &mut claimed_files);
-                    } else {
-                        claimed_files.insert(r.path.clone());
-                    }
-                    record_staged_err(&r.path, err);
-                }
+                Ok(sess) => out.push(sess),
+                Err(err) => record_staged_err(&r.path, err),
             }
         }
     }
     for (_, full_path, _) in &staged_paths {
-        if claimed_files.contains(full_path) {
+        if claimed_files.contains(full_path) || !file_named(full_path, "context.jsonl") {
             continue;
         }
-        if full_path.file_name().and_then(|n| n.to_str()) == Some("context.jsonl") {
-            if let Some(src_dir) = full_path.parent() {
-                let res: anyhow::Result<()> = (|| {
-                    let k_home = temp_root.join(format!("_kimi_{}", uuid::Uuid::new_v4()));
-                    let sid = if src_dir == temp_root {
-                        "kimi-session".to_string()
-                    } else {
-                        src_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("kimi-session")
-                            .to_string()
-                    };
-                    let dst_dir = k_home.join("sessions/ingest_hash").join(&sid);
-                    copy_tree_skipping_temp_subdirs(src_dir, &dst_dir, src_dir == temp_root)?;
-                    let adapter = crate::harness::kimi::Kimi::with_home(&k_home);
-                    let disc = adapter.discover()?;
-                    for r in &disc.refs {
-                        let s = adapter.parse(r)?;
-                        let finalized = finalize_staged_with_hint(s, &staged_paths, Some(src_dir))?;
-                        claim_dir_files(src_dir, src_dir == temp_root, &mut claimed_files);
-                        out.push(finalized);
-                    }
-                    Ok(())
-                })();
-                if let Err(err) = res {
-                    claim_dir_files(src_dir, src_dir == temp_root, &mut claimed_files);
-                    record_staged_err(full_path, err);
-                }
-            }
+        let Some(src_dir) = full_path.parent() else { continue };
+        let k_home = temp_root.join(format!("_kimi_{}", uuid::Uuid::new_v4()));
+        let dst_dir = k_home
+            .join("sessions/ingest_hash")
+            .join(staged_dir_name(src_dir, &temp_root, "kimi-session"));
+        let before = out.len();
+        let res = copy_tree_skipping_temp_subdirs(src_dir, &dst_dir, src_dir == temp_root)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                let adapter = crate::harness::kimi::Kimi::with_home(&k_home);
+                parse_staged(&adapter, &staged_paths, Some(src_dir), out)
+            });
+        if res.is_err() || out.len() > before {
+            claim_dir_files(src_dir, src_dir == temp_root, &mut claimed_files);
+        }
+        if let Err(err) = res {
+            record_staged_err(full_path, err);
         }
     }
 
@@ -1973,89 +1636,64 @@ fn ingest_pending_entries(
             claimed_files.insert(temp_root.join("workspaces.json"));
         }
         for r in &disc.refs {
+            claim_dir_files(&r.path, false, &mut claimed_files);
             match kc
                 .parse(r)
                 .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(&r.path)))
             {
-                Ok(sess) => {
-                    claim_dir_files(&r.path, false, &mut claimed_files);
-                    out.push(sess);
-                }
-                Err(err) => {
-                    claim_dir_files(&r.path, false, &mut claimed_files);
-                    record_staged_err(&r.path, err);
-                }
+                Ok(sess) => out.push(sess),
+                Err(err) => record_staged_err(&r.path, err),
             }
         }
     }
     for (_, full_path, _) in &staged_paths {
-        if claimed_files.contains(full_path) {
+        if claimed_files.contains(full_path) || !file_named(full_path, "wire.jsonl") {
             continue;
         }
-        if full_path.file_name().and_then(|n| n.to_str()) == Some("wire.jsonl") {
-            let kc_home = temp_root.join(format!("_kc_{}", uuid::Uuid::new_v4()));
-            // Detect `<sdir>/agents/<agent>/wire.jsonl` vs flat `<sdir>/wire.jsonl`.
-            let in_agents = full_path
-                .parent()
-                .and_then(|a| a.parent().map(|g| (a, g)))
-                .filter(|(_, g)| g.file_name().and_then(|n| n.to_str()) == Some("agents"))
-                .and_then(|(_, g)| g.parent());
-            if let Some(sdir) = in_agents {
-                let res: anyhow::Result<()> = (|| {
-                    let raw_name = if sdir == temp_root {
-                        "kc-session"
-                    } else {
-                        sdir.file_name().and_then(|n| n.to_str()).unwrap_or("kc-session")
-                    };
-                    let bare_id = raw_name.strip_prefix("session_").unwrap_or(raw_name);
-                    let dst_sdir = kc_home.join("sessions/wd_ingest").join(format!("session_{bare_id}"));
-                    copy_tree_skipping_temp_subdirs(sdir, &dst_sdir, sdir == temp_root)?;
-                    let adapter = crate::harness::kimi_code::KimiCode::with_home(&kc_home);
-                    let disc = adapter.discover()?;
-                    for r in &disc.refs {
-                        let s = adapter.parse(r)?;
-                        let finalized = finalize_staged_with_hint(s, &staged_paths, Some(sdir))?;
-                        claim_dir_files(sdir, sdir == temp_root, &mut claimed_files);
-                        out.push(finalized);
-                    }
-                    Ok(())
-                })();
-                if let Err(err) = res {
-                    claim_dir_files(sdir, sdir == temp_root, &mut claimed_files);
-                    record_staged_err(full_path, err);
-                }
-            } else if let Some(parent_dir) = full_path.parent() {
-                let res: anyhow::Result<()> = (|| {
-                    let raw_name = if parent_dir == temp_root {
-                        "kc-session"
-                    } else {
-                        parent_dir.file_name().and_then(|n| n.to_str()).unwrap_or("kc-session")
-                    };
-                    let bare_id = raw_name.strip_prefix("session_").unwrap_or(raw_name);
-                    let dst_sdir = kc_home.join("sessions/wd_ingest").join(format!("session_{bare_id}"));
-                    let dst_wire = dst_sdir.join("agents/main/wire.jsonl");
-                    std::fs::create_dir_all(dst_wire.parent().unwrap())?;
-                    std::fs::copy(full_path, &dst_wire)?;
-                    let src_state = parent_dir.join("state.json");
-                    if src_state.is_file() {
-                        std::fs::copy(&src_state, dst_sdir.join("state.json"))?;
-                    }
-                    let adapter = crate::harness::kimi_code::KimiCode::with_home(&kc_home);
-                    let disc = adapter.discover()?;
-                    for r in &disc.refs {
-                        let s = adapter.parse(r)?;
-                        let finalized = finalize_staged_with_hint(s, &staged_paths, Some(full_path))?;
-                        claimed_files.insert(full_path.clone());
-                        claimed_files.insert(src_state.clone());
-                        out.push(finalized);
-                    }
-                    Ok(())
-                })();
-                if let Err(err) = res {
-                    claimed_files.insert(full_path.clone());
-                    record_staged_err(full_path, err);
-                }
+        let Some(parent_dir) = full_path.parent() else { continue };
+        // Detect `<sdir>/agents/<agent>/wire.jsonl` vs flat `<sdir>/wire.jsonl`.
+        let in_agents = parent_dir
+            .parent()
+            .filter(|agents| file_named(agents, "agents"))
+            .and_then(std::path::Path::parent);
+        let sdir = in_agents.unwrap_or(parent_dir);
+        let name = staged_dir_name(sdir, &temp_root, "kc-session");
+        let kc_home = temp_root.join(format!("_kc_{}", uuid::Uuid::new_v4()));
+        let dst_sdir = kc_home
+            .join("sessions/wd_ingest")
+            .join(format!("session_{}", name.strip_prefix("session_").unwrap_or(name)));
+        let src_state = parent_dir.join("state.json");
+        let copied = if in_agents.is_some() {
+            copy_tree_skipping_temp_subdirs(sdir, &dst_sdir, sdir == temp_root)
+        } else {
+            let dst_wire = dst_sdir.join("agents/main/wire.jsonl");
+            std::fs::create_dir_all(dst_sdir.join("agents/main"))
+                .and_then(|()| std::fs::copy(full_path, &dst_wire))
+                .and_then(|_| match src_state.is_file() {
+                    true => std::fs::copy(&src_state, dst_sdir.join("state.json")).map(drop),
+                    false => Ok(()),
+                })
+        };
+        let hint = if in_agents.is_some() { sdir } else { full_path };
+        let before = out.len();
+        let res = copied.map_err(anyhow::Error::from).and_then(|()| {
+            let adapter = crate::harness::kimi_code::KimiCode::with_home(&kc_home);
+            parse_staged(&adapter, &staged_paths, Some(hint), out)
+        });
+        if in_agents.is_some() {
+            if res.is_err() || out.len() > before {
+                claim_dir_files(sdir, sdir == temp_root, &mut claimed_files);
             }
+        } else {
+            if out.len() > before {
+                claimed_files.insert(src_state);
+            }
+            if res.is_err() || out.len() > before {
+                claimed_files.insert(full_path.clone());
+            }
+        }
+        if let Err(err) = res {
+            record_staged_err(full_path, err);
         }
     }
 
@@ -2071,7 +1709,7 @@ fn ingest_pending_entries(
         if fname.starts_with("ses_") && fname.ends_with(".json") {
             let storage_root = full_path
                 .ancestors()
-                .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("session"))
+                .find(|p| file_named(p, "session"))
                 .and_then(std::path::Path::parent)
                 .map(std::path::Path::to_path_buf);
             if let Some(sr) = storage_root {
@@ -2102,19 +1740,14 @@ fn ingest_pending_entries(
                     }
                 }
                 for r in &disc.refs {
-                    let hint_path = hint.as_deref().or(Some(&r.path));
+                    let hint_path = hint.as_deref().unwrap_or(&r.path);
+                    claimed_files.insert(r.path.clone());
                     match adapter
                         .parse(r)
-                        .and_then(|s| finalize_staged_with_hint(s, &staged_paths, hint_path))
+                        .and_then(|s| finalize_staged_with_hint(s, &staged_paths, Some(hint_path)))
                     {
-                        Ok(sess) => {
-                            claimed_files.insert(r.path.clone());
-                            out.push(sess);
-                        }
-                        Err(err) => {
-                            claimed_files.insert(r.path.clone());
-                            record_staged_err(hint_path.unwrap_or(&r.path), err);
-                        }
+                        Ok(sess) => out.push(sess),
+                        Err(err) => record_staged_err(hint_path, err),
                     }
                 }
                 for sk in &disc.skipped {
@@ -2671,10 +2304,10 @@ mod tests {
     fn parses_cline_and_roo_bytes_in_memory() {
         let history = br#"[{"role":"user","content":"hi cline mem"}]"#;
         let cline_rel = "tasks/1717000000000";
-        let cline = parse_cline_history_bytes(
+        let cline = crate::harness::cline::parse_history(
             &cline_task_id_from_rel(cline_rel),
-            cline_or_roo_harness(cline_rel),
             history,
+            cline_or_roo_harness(cline_rel),
         )
         .unwrap();
         assert_eq!(cline.harness, Harness::Cline);

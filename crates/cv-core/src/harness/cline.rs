@@ -569,23 +569,27 @@ pub fn stream_task_dir(
     Ok(session)
 }
 
-/// Test helper: an `api_conversation_history.json` array text through the same record codec as
-/// [`stream_task_dir`], over an owned view.
-#[cfg(test)]
-pub(crate) fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
-    let mut session = Session {
-        source_path,
-        ..Session::new(id.to_string(), harness)
+/// An `api_conversation_history.json` array held in memory (an uploaded archive entry), through
+/// the same record codec as [`stream_task_dir`] over an owned view. `None` unless it is an array.
+pub(crate) fn parse_history(id: &str, bytes: &[u8], harness: Harness) -> Option<Session> {
+    let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(bytes) else {
+        return None;
     };
-    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) else {
-        return session;
-    };
+    let mut session = Session::new(id.to_string(), harness);
     for item in &items {
         if let Ok((boundary, message)) = record(item.into(), &mut session, false) {
             session.messages.extend(boundary.into_iter().chain(message));
         }
     }
-    session
+    Some(session)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_history_str(id: &str, text: &str, harness: Harness, source_path: Option<PathBuf>) -> Session {
+    Session {
+        source_path,
+        ..parse_history(id, text.as_bytes(), harness).unwrap_or_else(|| Session::new(id.to_string(), harness))
+    }
 }
 
 fn message_with_blocks(
