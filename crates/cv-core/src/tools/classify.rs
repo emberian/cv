@@ -2611,13 +2611,20 @@ impl<'s> JsScanner<'s> {
                     if self.pos < self.bytes.len() && self.bytes[self.pos] == b'}' {
                         self.pos += 1;
                     }
-                } else if self.pos + 4 <= self.bytes.len() {
-                    if let Ok(code) = u32::from_str_radix(self.src.get(self.pos..self.pos + 4).unwrap_or(""), 16) {
-                        if let Some(ch) = char::from_u32(code) {
-                            buf.push(ch);
+                } else if let Some(unit) = self.hex_unit() {
+                    let scalar = if (0xd800..=0xdbff).contains(&unit) && self.bytes[self.pos..].starts_with(br"\u") {
+                        let end = self.pos;
+                        self.pos += 2;
+                        if let Some(low @ 0xdc00..=0xdfff) = self.hex_unit() {
+                            0x10000 + (u32::from(unit - 0xd800) << 10) + u32::from(low - 0xdc00)
+                        } else {
+                            self.pos = end;
+                            u32::from(unit)
                         }
-                        self.pos += 4;
-                    }
+                    } else {
+                        u32::from(unit)
+                    };
+                    buf.push(char::from_u32(scalar).unwrap_or(char::REPLACEMENT_CHARACTER));
                 }
             }
             _ => {
@@ -2628,6 +2635,16 @@ impl<'s> JsScanner<'s> {
                 }
             }
         }
+    }
+
+    fn hex_unit(&mut self) -> Option<u16> {
+        let digits = self.src.get(self.pos..self.pos + 4)?;
+        if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let unit = u16::from_str_radix(digits, 16).ok()?;
+        self.pos += 4;
+        Some(unit)
     }
 
     fn read_template_literal(&mut self) -> String {
@@ -3365,6 +3382,11 @@ mod tests {
         let mut scanner = JsScanner::new(r"'\x41\u0042\u{1F980}'");
         scanner.scan_all();
         assert_eq!(scanner.literals, ["AB🦀"]);
+        for quote in ["'", "\"", "`"] {
+            let script = format!(r"tools.exec_command({{cmd: {quote}a\uD83E\uDD80\uD800\u0042\uDC00{quote}}})");
+            let ops = collect_ops(Some(Harness::Codex), "exec", &json!(script));
+            assert!(matches!(&ops[0].1, ToolOp::Command { cmd: Some(cmd), .. } if cmd == "a🦀�B�"));
+        }
     }
 
     #[test]

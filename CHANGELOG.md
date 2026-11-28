@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Codex command extraction preserves non-BMP characters written as UTF-16 surrogate pairs in scripts.
 - Distillation attributes messages and written file contents to their own tool calls inside batched Codex scripts.
 - Derived search hits retain profile identity, and index-only lineage lookups use recorded metadata without rediscovering live sessions.
 - Context packs count commands shortened during event extraction and include the truncation marker within the 200-byte command limit.
