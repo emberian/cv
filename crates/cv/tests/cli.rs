@@ -2310,7 +2310,7 @@ fn error_paths_exit_nonzero_with_stderr() {
     let (ok, code, out, err) = w.cv(&["events", ""]);
     assert!(!ok, "an ambiguous id must not be silently resolved:\n{out}");
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("ambiguous id"), "{err}");
+    assert!(err.contains("ambiguous session id"), "{err}");
     assert!(err.contains("2 candidates"), "{err}");
     assert!(
         err.contains("claude:alphasess") && err.contains("claude:betasess"),

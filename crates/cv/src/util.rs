@@ -163,26 +163,42 @@ pub(crate) fn require_session_file(r: &cv_core::SessionRef, adapter: &dyn cv_cor
     Ok(())
 }
 
-/// Split an optional `<harness>:<id>` prefix off an id. Only treats the part before the first `:`
-/// as a harness when it actually names one; otherwise the whole string is the id and `fallback`
-/// (a `--harness` flag) applies. Every command that takes an id accepts this form.
-pub(crate) fn split_harness_id(spec: &str, fallback: Option<Harness>) -> (Option<Harness>, &str) {
-    cv_core::custody::split_harness_id(spec, fallback)
-}
+pub(crate) use cv_core::resolve::split_harness_id;
 
 /// The one way a command turns an id into a session: `harness:id` or a unique id prefix, optionally
-/// constrained by `--harness`. An unknown id is a [`UsageError`] (exit 2); an ambiguous prefix lists
-/// every candidate as a `harness:full-id` line and exits 2 too, so the caller can paste one back.
+/// constrained by `--harness`. An unknown id and an ambiguous prefix (which lists every candidate
+/// as a `harness:full-id` line to paste back) are both [`cv_core::ResolveError`]s: exit 2.
 pub(crate) fn resolve(spec: &str, harness: Option<Harness>) -> Result<(SessionRef, Box<dyn Adapter>)> {
-    let (r, adapter) = resolve_quiet(spec, harness)?;
-    warn_if_shadowed(&r);
-    Ok((r, adapter))
+    let found = cv_core::resolve::session(spec, harness)?;
+    warn_if_shadowed(&found.0);
+    Ok(found)
 }
 
-/// [`resolve`] without emitting the stderr shadowed-copy note (used by HTTP polling handlers).
-pub(crate) fn resolve_quiet(spec: &str, harness: Option<Harness>) -> Result<(SessionRef, Box<dyn Adapter>)> {
-    let (want, id) = split_harness_id(spec, harness);
-    resolve_found(cv_core::find(id, want), id, want)
+/// [`cv_core::resolve::target`] for a command: any selector it accepts, with the stderr notes
+/// about what was picked (a shadowed copy, the spawning session, an adopted copy) unless `quiet`.
+pub(crate) fn resolve_target(spec: &str, harness: Option<Harness>, quiet: bool) -> Result<cv_core::resolve::Target> {
+    use cv_core::resolve::Via;
+    let target = cv_core::resolve::target(spec, harness)?;
+    match &target.via {
+        _ if quiet => {}
+        Via::File => {}
+        Via::Session => warn_if_shadowed(&target.session),
+        Via::Child(parent) => warn_if_shadowed(parent),
+        Via::Fleet { parent, holders } => {
+            if *holders > 1 {
+                eprintln!(
+                    "✦ {holders} sessions hold a copy of this agent (adopted); reading the newest — `cv show <session> --agent {}` for another",
+                    target.session.id
+                );
+            }
+            eprintln!(
+                "✦ sub-agent of session {} ({})",
+                short_id(&parent.id),
+                parent.title.as_deref().unwrap_or("untitled"),
+            );
+        }
+    }
+    Ok(target)
 }
 
 /// Count distinct live transcript paths across roots that share `(r.harness, &r.id)` besides
@@ -231,47 +247,6 @@ pub(crate) fn warn_if_shadowed(r: &SessionRef) {
     if let Some(msg) = shadowed_copy_caveat(r) {
         eprintln!("✦ note: {msg}");
     }
-}
-
-/// Map a `find`/`find_cheap` outcome to the CLI contract: `None` → unknown (exit 2), the core's
-/// ambiguity error → candidate lines (exit 2), anything else → a real error (exit 1).
-pub(crate) fn resolve_found(
-    found: Result<Option<(SessionRef, Box<dyn Adapter>)>>,
-    id: &str,
-    want: Option<Harness>,
-) -> Result<(SessionRef, Box<dyn Adapter>)> {
-    match found {
-        Ok(Some(hit)) => Ok(hit),
-        Ok(None) => usage(format!("no session matching {id:?}")),
-        Err(e) if is_ambiguity(&e) => usage(ambiguous_message(id, want, &e)),
-        Err(e) => Err(e),
-    }
-}
-
-fn is_ambiguity(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.starts_with("ambiguous session id") || s.contains("sessions have a sub-agent matching")
-}
-
-/// `harness:full-id` candidate lines for an ambiguous prefix, from the probed catalog. Falls back
-/// to the core's own message when the candidates aren't catalog sessions (e.g. sub-agent ids).
-fn ambiguous_message(id: &str, want: Option<Harness>, core_err: &anyhow::Error) -> String {
-    let mut rows: Vec<String> = cv_core::sessions()
-        .into_iter()
-        .filter(|r| want.is_none_or(|h| r.harness == h))
-        .filter(|r| r.id.starts_with(id))
-        .map(|r| format!("{}:{}", r.harness.as_str(), r.id))
-        .collect();
-    rows.sort();
-    rows.dedup();
-    if rows.len() < 2 {
-        return core_err.to_string();
-    }
-    format!(
-        "ambiguous id {id:?} — {} candidates (pass a longer prefix or harness:id):\n{}",
-        rows.len(),
-        rows.join("\n")
-    )
 }
 
 // ---------- read windows ----------
@@ -493,19 +468,7 @@ pub(crate) use cv_core::rows::session_row;
 
 // ---------- display ----------
 
-pub(crate) fn short_id(id: &str) -> String {
-    short_id_len(id, 8)
-}
-
-/// Shorten an id while keeping `"agent-"` intact (`"agent-"` + at least `min_bare` chars, so
-/// `"agent-ae84249a…"` becomes `"agent-ae84249a"`, never 2-hex `"agent-ae"`).
-pub(crate) fn short_id_len(id: &str, min_bare: usize) -> String {
-    let take = min_bare.max(8);
-    match id.strip_prefix("agent-") {
-        Some(bare) => format!("agent-{}", bare.chars().take(take).collect::<String>()),
-        None => id.chars().take(take).collect(),
-    }
-}
+pub(crate) use cv_core::resolve::{short_id, short_id_len};
 
 /// Format a UTC instant in the **local** timezone. Every human-facing time cv prints goes through
 /// here (or [`fmt_local_ts`]): transcripts store UTC, but the user's other clocks — `git log`,

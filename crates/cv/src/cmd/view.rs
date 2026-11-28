@@ -3,11 +3,11 @@
 
 use super::frames::Frames;
 use crate::util::{
-    continue_hint, home_rel, parse_harness, resolve, resolve_found, short_id, split_harness_id, usage, KindSelector,
-    StreamWindow, Window, WindowArgs,
+    continue_hint, home_rel, parse_harness, resolve, short_id, split_harness_id, usage, KindSelector, StreamWindow,
+    Window, WindowArgs,
 };
 use anyhow::{bail, Context, Result};
-use cv_core::ir::{truncate, Block, Harness, Message, MessageKind, Session, SessionRef};
+use cv_core::ir::{truncate, Block, Harness, Message, Session, SessionRef};
 use cv_core::render::turn_label;
 use cv_core::Adapter;
 use std::io::Write;
@@ -407,7 +407,7 @@ pub(crate) fn cmd_show(
     let (r, adapter, sub) = if let Some(scope) = super::place::current() {
         let parent = scope.resolve(id, parse_harness(&harness)?)?;
         if let Some(agent_id) = agent.as_deref().filter(|_| parent.entry.is_none()) {
-            let child = resolve_subagent(&parent.r, agent_id)?;
+            let child = cv_core::resolve::subagent(&parent.r, agent_id)?;
             let adapter = cv_core::harness::for_harness(child.session.harness).context("agent reader unavailable")?;
             (child.session.clone(), adapter, Some(child))
         } else {
@@ -477,7 +477,7 @@ pub(crate) fn cmd_show(
         if selector || window.max_bytes.is_some() {
             return usage("`--tree` renders the whole session; drop the window flags (or add `--json` for the IR)");
         }
-        return print_tree(&r, adapter.as_ref());
+        return cv_core::forest::write_tree(&r, adapter.as_ref(), &mut std::io::stdout().lock());
     }
 
     let range = show_range(&r, adapter.as_ref(), window, pre_compaction)?;
@@ -680,13 +680,6 @@ fn render_text(adapter: &dyn Adapter, r: &SessionRef, range: Option<Window>, max
     Ok(())
 }
 
-fn agent_parents_for_harness(parents: Vec<SessionRef>, want: Option<Harness>) -> Vec<SessionRef> {
-    parents
-        .into_iter()
-        .filter(|parent| want.is_none_or(|h| parent.harness == h))
-        .collect()
-}
-
 /// Resolve `cv show <id> [--agent <sub>]` across top-level sessions and sub-agents alike so
 /// transcript, `--json`, `--kind`, and `--tree` views share one addressing path.
 fn resolve_show_target(
@@ -694,304 +687,30 @@ fn resolve_show_target(
     want: Option<Harness>,
     agent: Option<&str>,
 ) -> Result<(SessionRef, Box<dyn Adapter>, Option<cv_core::AgentRef>)> {
-    if let Some(agent_id) = agent {
-        let (want, id) = split_harness_id(id, want);
-        let (parent, _parent_adapter) = crate::cmd::distill::resolve_source(id, want)?;
-        let sub = resolve_subagent(&parent, agent_id)?;
-        let adapter = cv_core::harness::for_harness(sub.session.harness)
-            .with_context(|| format!("no adapter for {}", sub.session.harness))?;
-        return Ok((sub.session.clone(), adapter, Some(sub)));
+    let mut target = crate::util::resolve_target(id, want, false)?;
+    match agent {
+        Some(agent) => target = target.child(agent)?,
+        None if matches!(target.via, cv_core::resolve::Via::File) => {
+            crate::util::require_session_file(&target.session, target.adapter.as_ref())?
+        }
+        None => {}
     }
-    let (want, id) = split_harness_id(id, want);
-    if std::path::Path::new(id).is_file() {
-        let (r, adapter) = crate::cmd::distill::resolve_source(id, want)?;
-        crate::util::require_session_file(&r, adapter.as_ref())?;
-        return Ok((r, adapter, None));
-    }
-    let found = if id.starts_with("agent-") {
-        if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
-            return Ok((sub.session.clone(), adapter, Some(sub)));
-        }
-        match cv_core::find_top_level_cheap(id, want) {
-            Ok((Some(hit), _)) => Ok(Some(hit)),
-            Ok((None, exhausted)) => match cv_core::find_top_level_escalate(id, want, exhausted) {
-                Ok(Some(hit)) => Ok(Some(hit)),
-                Ok(None) => {
-                    if !exhausted && want.is_none() && !cv_core::env::frozen() {
-                        if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
-                            return Ok((sub.session.clone(), adapter, Some(sub)));
-                        }
-                    }
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
-        }
-    } else {
-        match cv_core::find_top_level_cheap(id, want) {
-            Ok((Some(hit), _)) => Ok(Some(hit)),
-            Ok((None, exhausted)) => {
-                if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
-                    return Ok((sub.session.clone(), adapter, Some(sub)));
-                }
-                if let Some((parent_spec, agent_spec)) = id.split_once('/') {
-                    let (parent, _parent_adapter) = resolve(parent_spec, want)?;
-                    let sub = resolve_subagent(&parent, agent_spec)?;
-                    let adapter = cv_core::harness::for_harness(sub.session.harness)
-                        .with_context(|| format!("no adapter for {}", sub.session.harness))?;
-                    return Ok((sub.session.clone(), adapter, Some(sub)));
-                }
-                match cv_core::find_top_level_escalate(id, want, exhausted) {
-                    Ok(Some(hit)) => Ok(Some(hit)),
-                    Ok(None) => {
-                        if !exhausted && want.is_none() && !cv_core::env::frozen() {
-                            if let Some((sub, adapter)) = resolve_agent_fleetwide(id, want)? {
-                                return Ok((sub.session.clone(), adapter, Some(sub)));
-                            }
-                        }
-                        Ok(None)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    };
-    match found {
-        Ok(Some((r, adapter))) => {
-            crate::util::warn_if_shadowed(&r);
-            Ok((r, adapter, None))
-        }
-        Ok(None) => usage(format!("no session (and no sub-agent) matching {id:?}")),
-        Err(e) => resolve_found(Err(e), id, want).map(|(r, a)| (r, a, None)),
-    }
+    Ok((target.session, target.adapter, target.agent))
 }
 
-pub(crate) struct FleetwideSubagent {
-    pub parent: SessionRef,
-    pub adapter: Box<dyn Adapter>,
-    pub sub: cv_core::AgentRef,
-}
-
-/// `cv show <agent-id>` with no parent given: find which session(s) spawned the agent (filename
-/// scan across the fleet) and resolve it through the one parent — or list the candidates when the
-/// prefix is ambiguous. Returns `Ok(None)` when nothing agent-shaped matched.
-pub(crate) fn resolve_agent_fleetwide(
-    agent_id: &str,
-    want: Option<Harness>,
-) -> Result<Option<(cv_core::AgentRef, Box<dyn Adapter>)>> {
-    let Some(hit) = resolve_agent_parent_fleetwide(agent_id, want)? else {
-        return Ok(None);
-    };
-    eprintln!(
-        "✦ sub-agent of session {} ({})",
-        short_id(&hit.parent.id),
-        hit.parent.title.as_deref().unwrap_or("untitled"),
-    );
-    Ok(Some((hit.sub, hit.adapter)))
-}
-
-pub(crate) fn resolve_agent_parent_fleetwide(
-    agent_id: &str,
-    want: Option<Harness>,
-) -> Result<Option<FleetwideSubagent>> {
-    let parents = agent_parents_for_harness(cv_core::find_subagent_parents(agent_id), want);
-    // Copies of one agent across sessions (`cv adopt`) read through the newest parent's copy; a
-    // single agent split across sessions by `/resume` resolves to one tip and needs no copy note.
-    let parents = match (parents.len() > 1)
-        .then(|| cv_core::shared_agent_copies(&parents, agent_id))
-        .transpose()?
-        .flatten()
-    {
-        Some(copies) => {
-            if copies > 1 {
-                eprintln!(
-                    "✦ {} sessions hold a copy of this agent (adopted); reading the newest — `cv show <session> --agent {agent_id}` for another",
-                    parents.len()
-                );
-            }
-            parents[..1].to_vec()
-        }
-        None => parents,
-    };
-    match parents.as_slice() {
-        [] => Ok(None),
-        [parent] => {
-            let sub = resolve_subagent(parent, agent_id)?;
-            let adapter = cv_core::harness::for_harness(sub.session.harness)
-                .with_context(|| format!("no adapter for {}", sub.session.harness))?;
-            Ok(Some(FleetwideSubagent {
-                parent: parent.clone(),
-                adapter,
-                sub,
-            }))
-        }
-        many => {
-            // Ambiguous: every candidate as a pasteable `harness:id` line, exit 2.
-            let mut lines: Vec<String> = many
-                .iter()
-                .map(|p| {
-                    format!(
-                        "{}:{}   # cv show {} --agent {agent_id} ({})",
-                        p.harness.as_str(),
-                        p.id,
-                        short_id(&p.id),
-                        p.title.as_deref().unwrap_or("untitled")
-                    )
-                })
-                .collect();
-            lines.sort();
-            usage(format!(
-                "ambiguous sub-agent id {agent_id:?} — {} sessions spawned a match:\n{}",
-                many.len(),
-                lines.join("\n")
-            ))
-        }
-    }
-}
-
-/// Extract a sub-agent's final return value across any harness: the last non-empty assistant text
-/// turn in its transcript, streamed lazily with `Demand::LEAN.with_spans()`.
-fn subagent_final_return(r: &SessionRef) -> Result<Option<String>> {
-    let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
-        return Ok(None);
-    };
-    struct LastAssistantText {
-        resolver: cv_core::Resolver,
-        last: Option<String>,
-        error: Option<anyhow::Error>,
-    }
-    impl cv_core::MessageSink for LastAssistantText {
-        fn tier(&self) -> cv_core::stream::Tier {
-            cv_core::stream::Tier::Facts
-        }
-        fn meta(&mut self, session: &Session) {
-            self.resolver = session.resolver();
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
-        }
-        fn message(&mut self, m: Message) -> cv_core::Flow {
-            if m.role != cv_core::ir::Role::Assistant {
-                return cv_core::Flow::Continue;
-            }
-            let mut buf = String::new();
-            for b in &m.content {
-                if let Block::Text { text, .. } = b {
-                    match text.try_resolve(&self.resolver) {
-                        Ok(s) => {
-                            if !buf.is_empty() {
-                                buf.push('\n');
-                            }
-                            buf.push_str(&s);
-                        }
-                        Err(err) => {
-                            self.error = Some(err);
-                            return cv_core::Flow::Stop;
-                        }
-                    }
-                }
-            }
-            if !buf.trim().is_empty() {
-                self.last = Some(buf);
-            }
-            cv_core::Flow::Continue
-        }
-    }
-    let mut sink = LastAssistantText {
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        last: None,
-        error: None,
-    };
-    adapter.try_stream(r, &cv_core::Demand::LEAN.with_spans(), &mut sink)?;
-    Ok(sink.last)
-}
-
-/// List the sub-agent forest a session spawned (the `--subagents` view): every direct/`Workflow`
-/// sub-agent with its type, journaled outcome, and final return value. `json` emits the structured
-/// [`AgentRef`] forest (each annotated with its return) for machine consumption.
+/// The `--subagents` view ([`cv_core::forest`]): `json` is the structured forest, each agent with
+/// its return.
 fn show_subagents(r: &SessionRef, json: bool) -> Result<()> {
-    let subs = cv_core::subagent_tree_of(r)?;
-
+    let mut out = std::io::stdout().lock();
     if json {
-        // Enrich each with its final return value (direct agents report via the parent tool_result;
-        // workflow agents via the journal summary already on the struct).
-        let enriched: Vec<serde_json::Value> = subs
-            .iter()
-            .map(|s| {
-                let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
-                if let Some(obj) = v.as_object_mut() {
-                    // Surface the bare agent id (the journal/transcript key) so consumers don't have
-                    // to know the `agent-` stripping convention.
-                    obj.insert("agent_id".into(), serde_json::Value::String(s.agent_id().to_string()));
-                    // Direct agents have no journaled summary — attach their final return value.
-                    if s.result_summary.is_none() {
-                        if let Some(ret) = subagent_final_return(&s.session)? {
-                            obj.insert("return".into(), serde_json::Value::String(ret));
-                        }
-                    }
-                }
-                Ok(v)
-            })
-            .collect::<Result<_>>()?;
-        println!("{}", serde_json::to_string_pretty(&enriched)?);
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&cv_core::forest::agents_json(r)?)?
+        )?;
         return Ok(());
     }
-
-    if subs.is_empty() {
-        println!("no sub-agents spawned by {}", short_id(&r.id));
-        return Ok(());
-    }
-
-    println!("# sub-agents of {}\n", short_id(&r.id));
-    for s in &subs {
-        let wf = s.workflow.as_deref().map(|w| format!("  ⟐{w}")).unwrap_or_default();
-        println!("• {}{wf}", subagent_line(s));
-        // A direct agent has no journaled summary (the line showed its task): add its real return,
-        // the last text turn of its transcript. Transcript-derived, so sanitized at the seam (G5);
-        // the `--json` path stays raw.
-        if s.result_summary.is_none() {
-            if let Some(ret) = subagent_final_return(&s.session)? {
-                println!("  ↩ {}", truncate(&cv_core::sanitize::sanitize_line(&ret), 400));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One sub-agent of `parent` by its `agent-…` id, bare agentId, or a unique prefix of either — the
-/// resolution `cv show --agent` and `cv rewind --agent` share. No match / several → exit 2.
-pub(crate) fn resolve_subagent(parent: &SessionRef, agent_id: &str) -> Result<cv_core::AgentRef> {
-    // A member id is the agent's own (Claude's `agent-<id>`) or `<parent>/<agent>` (Kimi, Kimi
-    // Code): either spelling's agent part is what a caller types.
-    let subs = cv_core::subagent_tree_filtered_of(parent, cv_core::SubagentDemand::Rich, None, |id, _| {
-        [id, id.rsplit('/').next().unwrap_or(id)].into_iter().any(|id| {
-            id.starts_with(agent_id) || id.strip_prefix("agent-").is_some_and(|bare| bare.starts_with(agent_id))
-        })
-    })?;
-    let matches: Vec<&cv_core::AgentRef> = subs.iter().collect();
-    match matches.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => usage(format!(
-            "no sub-agent matching {agent_id:?} under {} (try `cv show {} --subagents`)",
-            short_id(&parent.id),
-            short_id(&parent.id),
-        )),
-        many => {
-            let mut lines: Vec<String> = many
-                .iter()
-                .map(|s| format!("{}:{}", s.session.harness.as_str(), s.session.id))
-                .collect();
-            lines.sort();
-            usage(format!(
-                "ambiguous sub-agent id {agent_id:?} — {} candidates under {}:\n{}",
-                many.len(),
-                short_id(&parent.id),
-                lines.join("\n")
-            ))
-        }
-    }
+    cv_core::forest::write_agents(r, &mut out)
 }
 
 /// Provenance banner printed above a plain text sub-agent transcript.
@@ -1269,271 +988,6 @@ pub(crate) fn redaction_summary(st: &cv_core::redact::RedactStats) -> String {
 }
 
 // ---------- show --tree ----------
-
-struct TreeRow {
-    id: Option<String>,
-    parent: Option<String>,
-    line: String,
-}
-
-fn read_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<(Session, Vec<TreeRow>, Option<String>)> {
-    struct TreeSink {
-        rows: Vec<TreeRow>,
-        resolver: cv_core::Resolver,
-        first_prompt: Option<String>,
-        error: Option<anyhow::Error>,
-    }
-    impl cv_core::MessageSink for TreeSink {
-        fn meta(&mut self, session: &Session) {
-            self.resolver = session.resolver();
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
-        }
-        fn message(&mut self, m: Message) -> cv_core::Flow {
-            let result = (|| -> Result<()> {
-                if self.first_prompt.is_none() {
-                    self.first_prompt = m.prompt_title(&self.resolver)?;
-                }
-                let preview = cv_core::render::message_text_preview(&m, &self.resolver, 80)?;
-                let line = tree_line_with_preview(&m, preview);
-                self.rows.push(TreeRow {
-                    id: m.id,
-                    parent: m.parent_id,
-                    line,
-                });
-                Ok(())
-            })();
-            if let Err(error) = result {
-                self.error = Some(error);
-                return cv_core::Flow::Stop;
-            }
-            cv_core::Flow::Continue
-        }
-    }
-    let mut sink = TreeSink {
-        rows: Vec::new(),
-        resolver: cv_core::Resolver::new(Some(r.path.clone())),
-        first_prompt: None,
-        error: None,
-    };
-    let pass = cv_core::stream::Pass {
-        guard: true,
-        ..cv_core::stream::Pass::RECORD
-    };
-    let read = cv_core::stream::stream_counted(adapter, r, &cv_core::Demand::FACTS.with_spans(), &mut sink, pass)?;
-    let session = read.session;
-    if let Some(error) = sink.error {
-        return Err(error);
-    }
-    read.guard.expect("guarded pass").verify(r)?;
-    Ok((session, sink.rows, sink.first_prompt))
-}
-
-fn format_lineage(lineage: &cv_core::ir::Lineage) -> Option<String> {
-    if lineage.is_empty() {
-        return None;
-    }
-    let mut parts = Vec::new();
-    if let Some(p) = &lineage.parent {
-        parts.push(format!("parent {}", short_id(p)));
-    }
-    if let Some(f) = &lineage.forked_from {
-        parts.push(format!("forked from {}", short_id(f)));
-    }
-    if let Some(c) = &lineage.continues {
-        parts.push(format!("continues {}", short_id(c)));
-    }
-    if let Some(c) = &lineage.continued_in {
-        parts.push(format!("continued in {}", short_id(c)));
-    }
-    if let Some(ap) = &lineage.agent_path {
-        parts.push(format!("agent {}", cv_core::sanitize::sanitize_line(ap)));
-    }
-    if let Some(t) = &lineage.spawned_by_tool_use {
-        parts.push(format!("tool {}", short_id(t)));
-    }
-    (!parts.is_empty()).then(|| format!("lineage: {}", parts.join(" · ")))
-}
-
-fn print_tree(r: &SessionRef, adapter: &dyn Adapter) -> Result<()> {
-    let (session, rows, first_prompt) = read_tree(r, adapter)?;
-    println!(
-        "# {}",
-        cv_core::label_from(session.title.as_deref(), first_prompt.as_deref())
-    );
-    println!("{} · {} · {} msg", session.harness, session.id, rows.len());
-    if let Some(lineage) = format_lineage(&session.lineage) {
-        println!("{lineage}");
-    }
-    println!();
-    if rows.iter().any(|row| row.parent.is_some()) {
-        walk_tree(&rows, |index, depth| {
-            println!("{}• {}", "  ".repeat(depth), rows[index].line)
-        });
-    } else {
-        for (i, row) in rows.iter().enumerate() {
-            println!("{:>4}. {}", i + 1, row.line);
-        }
-    }
-    render_subagent_forest(r)?;
-    Ok(())
-}
-
-/// Print the sub-agent forest under a session: directly-spawned sub-agents, then each workflow's
-/// agents grouped together with the journaled `status: summary` outcome. Reads only the cheap
-/// metadata/journal sidecars (no transcript bodies).
-fn render_subagent_forest(r: &SessionRef) -> Result<()> {
-    use std::collections::BTreeMap;
-    let subs = cv_core::subagent_tree_of(r)?;
-    if subs.is_empty() {
-        return Ok(());
-    }
-
-    let direct: Vec<&cv_core::AgentRef> = subs.iter().filter(|s| s.workflow.is_none()).collect();
-    // Workflow agents grouped by run id (BTreeMap → stable run order).
-    let mut by_wf: BTreeMap<&str, Vec<&cv_core::AgentRef>> = BTreeMap::new();
-    for s in subs.iter().filter(|s| s.workflow.is_some()) {
-        by_wf.entry(s.workflow.as_deref().unwrap_or("")).or_default().push(s);
-    }
-
-    println!();
-    println!(
-        "## sub-agents ({} direct, {} workflow agent(s) across {} workflow(s))",
-        direct.len(),
-        subs.len() - direct.len(),
-        by_wf.len()
-    );
-
-    if !direct.is_empty() {
-        println!();
-        for s in &direct {
-            println!("• {}", subagent_line(s));
-        }
-    }
-    for (wf, agents) in &by_wf {
-        println!("\n  ⟐ workflow {wf}  ({} agent(s))", agents.len());
-        for s in agents {
-            println!("    • {}", subagent_line(s));
-        }
-    }
-    Ok(())
-}
-
-/// One line describing a sub-agent — `cv show --tree`'s forest and `cv show --subagents` share it: short
-/// id, type, the journaled status (workflow agents), message count, and the journaled summary or,
-/// failing that, the task description — capped and sanitized (both are transcript-derived).
-fn subagent_line(s: &cv_core::AgentRef) -> String {
-    let id = short_id(s.agent_id());
-    let kind = s.agent_type.as_deref().unwrap_or("agent");
-    let status = s
-        .result_status
-        .as_deref()
-        .map(|st| format!(" [{st}]"))
-        .unwrap_or_default();
-    // Prefer the journaled summary (the real outcome); fall back to the task description or session title.
-    let blurb = s
-        .result_summary
-        .as_deref()
-        .or(s.description.as_deref())
-        .or(s.session.title.as_deref())
-        .map(|t| truncate(&cv_core::sanitize::sanitize_line(t), 88))
-        .unwrap_or_default();
-    format!(
-        "{id}  {kind}{status}  {} msg  {blurb}",
-        s.session.message_count.map_or("–".to_string(), |n| n.to_string())
-    )
-}
-
-/// Render messages as a DAG by `parent_id`, indented by the forks above each row: an only child
-/// keeps its parent's depth and each child of a fork sits one deeper, so a straight chain is flat
-/// and the output stays linear in the session. Roots (no/unknown parent) sit at depth 0.
-fn walk_tree(rows: &[TreeRow], mut visit: impl FnMut(usize, usize)) {
-    let mut by_id = std::collections::HashMap::new();
-    for (i, row) in rows.iter().enumerate() {
-        if let Some(id) = &row.id {
-            by_id.insert(id.as_str(), i);
-        }
-    }
-    let mut children = vec![Vec::new(); rows.len()];
-    let mut roots = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
-        let parent = row
-            .parent
-            .as_deref()
-            .and_then(|id| by_id.get(id).copied())
-            .filter(|&p| p != i);
-        match parent {
-            Some(parent) => children[parent].push(i),
-            None => roots.push(i),
-        }
-    }
-    let mut visited = vec![false; rows.len()];
-    let mut stack = Vec::new();
-    // Preserve ordinary root order; then cover disconnected parent cycles in transcript order.
-    for root in roots.into_iter().chain(0..rows.len()) {
-        if visited[root] {
-            continue;
-        }
-        stack.push((root, 0));
-        while let Some((index, depth)) = stack.pop() {
-            if std::mem::replace(&mut visited[index], true) {
-                continue;
-            }
-            visit(index, depth);
-            let below = depth + usize::from(children[index].len() > 1);
-            stack.extend(children[index].iter().rev().map(|&child| (child, below)));
-        }
-    }
-}
-
-/// One-line preview of a message for the tree: role (with its kind when that says more than the
-/// role), markers for tool turns and IR-typed sub-agent spawns/returns, and a text preview.
-fn tree_line_with_preview(m: &Message, preview: Option<String>) -> String {
-    let role = turn_label(m);
-    let mut tags = Vec::new();
-    let has_tool_use = m.content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
-    let has_tool_result = m.content.iter().any(|b| matches!(b, Block::ToolResult { .. }));
-    if has_tool_use {
-        tags.push("🔧 tool".to_string());
-    }
-    if m.kind == MessageKind::SubagentSpawn {
-        let spawn_tool = m.content.iter().find_map(|b| match b {
-            Block::ToolUse { name, .. } => Some(name.as_str()),
-            _ => None,
-        });
-        match spawn_tool {
-            Some(name) => tags.push(format!("↳ sub-agent ({name})")),
-            None => tags.push("↳ sub-agent".to_string()),
-        }
-    }
-    if m.kind == MessageKind::SubagentReturn {
-        tags.push("↩ sub-agent".to_string());
-    } else if has_tool_result {
-        tags.push("↩ result".to_string());
-    }
-
-    let preview = preview.unwrap_or_else(|| {
-        if has_tool_use {
-            m.content
-                .iter()
-                .find_map(|b| match b {
-                    Block::ToolUse { name, .. } => Some(format!("[{name}]")),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        } else {
-            String::new()
-        }
-    });
-
-    let tagstr = if tags.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", tags.join(", "))
-    };
-    format!("{role}{tagstr}  {preview}")
-}
 
 // ---------- rendering helpers ----------
 
@@ -2051,6 +1505,7 @@ fn md_message(m: &Message, resolver: &cv_core::Resolver) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cv_core::ir::MessageKind;
     use cv_core::ir::Role;
 
     #[test]
@@ -2133,93 +1588,11 @@ mod tests {
     }
 
     #[test]
-    fn fleetwide_agent_selection_honors_harness_and_zero_compaction_is_usage_error() {
-        let parents = vec![
-            SessionRef::new("claude-parent", Harness::Claude, "unused"),
-            SessionRef::new("codex-parent", Harness::Codex, "unused"),
-        ];
-        assert_eq!(agent_parents_for_harness(parents.clone(), None).len(), 2);
-        let selected = agent_parents_for_harness(parents, Some(Harness::Codex));
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].id, "codex-parent");
+    fn zero_compaction_is_usage_error() {
+        let parent = SessionRef::new("codex-parent", Harness::Codex, "unused");
         let adapter = cv_core::harness::for_harness(Harness::Codex).unwrap();
-        let error = show_range(&selected[0], adapter.as_ref(), &WindowArgs::default(), Some(0)).unwrap_err();
+        let error = show_range(&parent, adapter.as_ref(), &WindowArgs::default(), Some(0)).unwrap_err();
         assert!(error.downcast_ref::<crate::util::UsageError>().is_some());
-    }
-
-    #[test]
-    fn lazy_tree_rows_preserve_owned_previews_and_first_prompt_label() -> Result<()> {
-        let world = crate::test_world("tree-row-projection");
-        let text = "🌙\\\"\n".repeat(30000);
-        let path = world.write_session("tree-preview", &[
-            serde_json::json!({"type":"user","uuid":"empty","message":{"role":"user","content":""}}),
-            serde_json::json!({"type":"user","uuid":"blank","message":{"role":"user","content":" \n\t"}}),
-            serde_json::json!({"type":"user","uuid":"u","message":{"role":"user","content":text}}),
-            serde_json::json!({"type":"assistant","uuid":"a","parentUuid":"u","message":{"role":"assistant","content":[{"type":"text","text":text},{"type":"tool_use","id":"call","name":"Agent","input":{"prompt":text}}]}}),
-            serde_json::json!({"type":"user","uuid":"r","parentUuid":"a","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":text}]}}),
-        ]);
-        let r = SessionRef::new("tree-preview", Harness::Claude, path);
-        let adapter = cv_core::harness::for_harness(Harness::Claude).unwrap();
-        let owned = adapter.parse(&r)?;
-        let (session, rows, first_prompt) = read_tree(&r, adapter.as_ref())?;
-        assert_eq!(rows.len(), owned.messages.len());
-        assert_eq!(
-            cv_core::label_from(session.title.as_deref(), first_prompt.as_deref()),
-            owned.label()
-        );
-        for (row, message) in rows.iter().zip(&owned.messages) {
-            assert_eq!(row.id, message.id);
-            assert_eq!(row.parent, message.parent_id);
-            assert_eq!(
-                row.line,
-                tree_line_with_preview(message, message.text().map(|text| truncate(&text, 80)))
-            );
-            assert!(row.line.len() < 512);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn iterative_tree_walk_preserves_roots_and_covers_cycles_and_deep_chains() {
-        let row = |id: &str, parent: Option<&str>| TreeRow {
-            id: Some(id.into()),
-            parent: parent.map(str::to_owned),
-            line: String::new(),
-        };
-        let rows = vec![
-            row("root", None),
-            row("a", Some("root")),
-            row("b", Some("root")),
-            row("c", Some("a")),
-            row("self", Some("self")),
-            row("missing", Some("absent")),
-            row("cycle1", Some("cycle2")),
-            row("cycle2", Some("cycle1")),
-            row("tail", Some("cycle2")),
-        ];
-        let mut order = Vec::new();
-        walk_tree(&rows, |index, depth| order.push((index, depth)));
-        // `root` forks (a, b sit one deeper); `a`'s only child keeps its depth; `cycle2` forks
-        // into `cycle1` (already visited) and `tail`.
-        assert_eq!(
-            order,
-            [(0, 0), (1, 1), (3, 1), (2, 1), (4, 0), (5, 0), (6, 0), (7, 0), (8, 1)]
-        );
-        let rows = (0..5000)
-            .map(|i| TreeRow {
-                id: Some(i.to_string()),
-                parent: (i > 0).then(|| (i - 1).to_string()),
-                line: String::new(),
-            })
-            .collect::<Vec<_>>();
-        let mut count = 0;
-        // A straight chain is flat: no row is indented, so the output is linear in the chain.
-        walk_tree(&rows, |index, depth| {
-            assert_eq!(index, count);
-            assert_eq!(depth, 0);
-            count += 1;
-        });
-        assert_eq!(count, rows.len());
     }
 
     #[test]
@@ -3448,86 +2821,5 @@ mod tests {
 
         let adapter = cv_core::harness::for_harness(r.harness).unwrap();
         assert_json_windows(adapter.as_ref(), &r);
-    }
-
-    #[test]
-    fn tree_tags_follow_ir_message_kinds_and_lineage_instead_of_tool_name_substrings() {
-        let mut ordinary_task_tool = Message::new(Role::Assistant);
-        ordinary_task_tool.content.push(Block::ToolUse {
-            id: "t1".into(),
-            name: "TaskCreate".into(),
-            namespace: None,
-            input: serde_json::json!({"subject":"write tests"}).into(),
-            extensions: Default::default(),
-        });
-        let line = tree_line_with_preview(&ordinary_task_tool, None);
-        assert!(
-            line.contains("🔧 tool") && !line.contains("↳ sub-agent"),
-            "non-spawn tool named TaskCreate must not be tagged as a sub-agent spawn: {line}"
-        );
-
-        let mut spawn = Message::of_kind(Role::Assistant, MessageKind::SubagentSpawn, cv_core::ir::Origin::Model);
-        spawn.content.push(Block::ToolUse {
-            id: "t2".into(),
-            name: "run_worker".into(),
-            namespace: None,
-            input: serde_json::json!({}).into(),
-            extensions: Default::default(),
-        });
-        let spawn_line = tree_line_with_preview(&spawn, Some("delegate".into()));
-        assert!(spawn_line.contains("↳ sub-agent (run_worker)"), "{spawn_line}");
-
-        let mut ret = Message::of_kind(Role::Tool, MessageKind::SubagentReturn, cv_core::ir::Origin::Subagent);
-        ret.content.push(Block::ToolResult {
-            tool_use_id: "t2".into(),
-            content: "finished".into(),
-            is_error: false,
-            tool_name: None,
-            status: None,
-            details: None,
-            extensions: Default::default(),
-        });
-        let ret_line = tree_line_with_preview(&ret, Some("finished".into()));
-        assert!(ret_line.contains("↩ sub-agent"), "{ret_line}");
-
-        let lineage = cv_core::ir::Lineage {
-            parent: Some("parent-session-12345678".into()),
-            forked_from: Some("fork-origin-87654321".into()),
-            agent_path: Some("worker-1".into()),
-            ..Default::default()
-        };
-        let rendered = format_lineage(&lineage).expect("non-empty lineage");
-        assert!(
-            rendered.contains("parent parent-s")
-                && rendered.contains("forked from fork-ori")
-                && rendered.contains("agent worker-1"),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn subagent_final_return_streams_across_non_claude_harnesses() {
-        let world = cv_testkit::World::new("view-subagent-return");
-        let path = world.base.join("sub.opensession.json");
-        let h = Harness::parse("opensession").unwrap();
-        let mut session = Session::new("sub-1", h);
-        let mut prompt = Message::new(Role::User);
-        prompt.content.push(Block::from_text("investigate bug".into()));
-        let mut interim = Message::new(Role::Assistant);
-        interim.content.push(Block::from_text("checking files".into()));
-        let mut done = Message::new(Role::Assistant);
-        done.content
-            .push(Block::from_text("root cause found in parser.rs".into()));
-        session.messages = vec![prompt, interim, done];
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&cv_core::harness::opensession::document(&session)).unwrap(),
-        )
-        .unwrap();
-        let r = SessionRef::new("sub-1", h, &path);
-        assert_eq!(
-            subagent_final_return(&r).unwrap().as_deref(),
-            Some("root cause found in parser.rs")
-        );
     }
 }

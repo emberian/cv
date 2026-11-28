@@ -953,15 +953,7 @@ impl Backing {
     }
 }
 
-/// Split an optional `<harness>:<id>` prefix off an id when the head names a known [`Harness`].
-pub fn split_harness_id(spec: &str, fallback: Option<Harness>) -> (Option<Harness>, &str) {
-    if let Some((head, rest)) = spec.split_once(':') {
-        if let Some(h) = Harness::parse(head) {
-            return (Some(h), rest);
-        }
-    }
-    (fallback, spec)
-}
+pub use crate::resolve::split_harness_id;
 
 /// Next lexicographic UTF-8 string strictly greater than every string starting with `prefix`.
 fn prefix_upper_bound(prefix: &str) -> Option<String> {

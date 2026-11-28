@@ -70,11 +70,7 @@ pub(crate) fn cmd_workflow(args: WorkflowArgs<'_>) -> Result<()> {
     let (want, id) = crate::util::split_harness_id(id, crate::util::parse_harness(&harness)?);
     // find_cheap: don't pay a full fleet re-discovery before trying the id as a workflow name —
     // the name path escalates to a full `find` itself once every cheaper reading has missed.
-    let found = match cv_core::find_cheap(id, want) {
-        Ok(found) => found,
-        // An ambiguous prefix: the candidate lines, exit 2.
-        Err(e) => return crate::util::resolve_found(Err(e), id, want).map(|_| ()),
-    };
+    let found = cv_core::find_cheap(id, want)?;
     let Some((r, _adapter)) = found else {
         // Not a session id → maybe it's a workflow name ("the stark-kill session" problem).
         return workflow_by_name_fleetwide(id, want, render, &run_flags);
@@ -271,7 +267,7 @@ fn workflow_by_name_fleetwide(
                     return list_workflows(&r, render.json);
                 }
                 Ok(None) => {}
-                Err(e) => return crate::util::resolve_found(Err(e), name, want).map(|_| ()),
+                Err(e) => return Err(e),
             }
         } else {
             refuse_run_flags(run_flags, "ghost launches")?;

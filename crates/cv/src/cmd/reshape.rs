@@ -231,7 +231,7 @@ pub(crate) fn cmd_prune(args: PruneArgs<'_>) -> Result<()> {
         (Some(id), agent) => {
             let (parent, _) = crate::cmd::distill::resolve_source(id, want)?;
             match agent {
-                Some(agent) => crate::cmd::view::resolve_subagent(&parent, agent)?.session,
+                Some(agent) => cv_core::resolve::subagent(&parent, agent)?.session,
                 None => parent,
             }
         }
@@ -998,7 +998,7 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
     }
     let (r, _adapter) = crate::cmd::distill::resolve_source(id, parse_harness(&harness)?)?;
     let r = match &agent {
-        Some(a) => crate::cmd::view::resolve_subagent(&r, a)?.session,
+        Some(a) => cv_core::resolve::subagent(&r, a)?.session,
         None => r,
     };
     carry_source(carry_agents, &r)?;

@@ -1762,21 +1762,10 @@ fn pass(r: &SessionRef) -> Result<Pass> {
             }
             if m.role == Role::Assistant {
                 let calls_a_tool = m.content.iter().any(|b| matches!(b, Block::ToolUse { .. }));
-                let report = (m.kind == MessageKind::Reply)
-                    .then(|| -> Result<String> {
-                        let mut output = String::new();
-                        for block in &m.content {
-                            if let Block::Text { text, .. } = block {
-                                if !output.is_empty() {
-                                    output.push('\n');
-                                }
-                                output.push_str(&text.try_resolve(&resolver)?);
-                            }
-                        }
-                        Ok(output)
-                    })
-                    .transpose()?
-                    .filter(|text| !text.trim().is_empty());
+                let report = match m.kind {
+                    MessageKind::Reply => crate::forest::reply_text(&m, &resolver)?,
+                    _ => None,
+                };
                 let has_text = report.is_some();
                 if calls_a_tool {
                     p.ends_in_report = false;

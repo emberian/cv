@@ -16,7 +16,7 @@
 //! Neither command ever writes to the source session. Elided tool outputs go to a sidecar next to
 //! the new transcript (`<stem>.flat.jsonl`), which `cv cat <new> <tool_use_id>` reads.
 
-use crate::util::{parse_harness, report, resolve, resolve_found, short_id, split_harness_id, usage};
+use crate::util::{parse_harness, report, resolve, short_id, usage};
 use anyhow::{bail, Context, Result};
 use cv_core::distill::{distill_pack, findings, prepare_distill, DistillOptions, Distilled, PreparedDistillation};
 use cv_core::emit::Grown;
@@ -141,99 +141,19 @@ pub(crate) fn target_for(
     }
 }
 
+/// Any selector a command reads from ([`cv_core::resolve::target`]), with its stderr notes.
 pub(crate) fn resolve_source(
     spec: &str,
     harness: Option<Harness>,
 ) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
-    resolve_source_with_note(spec, harness, true)
+    crate::util::resolve_target(spec, harness, false).map(|t| (t.session, t.adapter))
 }
 
 pub(crate) fn resolve_source_quiet(
     spec: &str,
     harness: Option<Harness>,
 ) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
-    resolve_source_with_note(spec, harness, false)
-}
-
-fn resolve_source_with_note(
-    spec: &str,
-    harness: Option<Harness>,
-    warn_shadowed: bool,
-) -> Result<(SessionRef, Box<dyn cv_core::harness::Adapter>)> {
-    let p = Path::new(spec);
-    if p.is_file() {
-        if let Some(found) = cv_core::harness::resolve_file_source(p, harness) {
-            return Ok(found);
-        }
-        let h = harness.unwrap_or_else(cv_core::harness::derived_host);
-        let a = cv_core::harness::for_harness(h).with_context(|| format!("no adapter for {h}"))?;
-        return Ok((SessionRef::from_path(p, h), a));
-    }
-    let (want, id) = split_harness_id(spec, harness);
-    let found = if id.starts_with("agent-") {
-        if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
-            return Ok((sub.session, adapter));
-        }
-        match cv_core::find_top_level_cheap(id, want) {
-            Ok((Some(hit), _)) => Ok(Some(hit)),
-            Ok((None, exhausted)) => match cv_core::find_top_level_escalate(id, want, exhausted) {
-                Ok(Some(hit)) => Ok(Some(hit)),
-                Ok(None) => {
-                    if !exhausted && want.is_none() && !cv_core::env::frozen() {
-                        if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
-                            return Ok((sub.session, adapter));
-                        }
-                    }
-                    Ok(None)
-                }
-                Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
-        }
-    } else {
-        match cv_core::find_top_level_cheap(id, want) {
-            Ok((Some(hit), _)) => Ok(Some(hit)),
-            Ok((None, exhausted)) => {
-                if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
-                    return Ok((sub.session, adapter));
-                }
-                if !p.exists() {
-                    if let Some((parent_spec, agent_spec)) = id.split_once('/') {
-                        let (parent, adapter) = if warn_shadowed {
-                            resolve(parent_spec, want)?
-                        } else {
-                            crate::util::resolve_quiet(parent_spec, want)?
-                        };
-                        let sub = crate::cmd::view::resolve_subagent(&parent, agent_spec)?;
-                        return Ok((sub.session, adapter));
-                    }
-                }
-                match cv_core::find_top_level_escalate(id, want, exhausted) {
-                    Ok(Some(hit)) => Ok(Some(hit)),
-                    Ok(None) => {
-                        if !exhausted && want.is_none() && !cv_core::env::frozen() {
-                            if let Some((sub, adapter)) = crate::cmd::view::resolve_agent_fleetwide(id, want)? {
-                                return Ok((sub.session, adapter));
-                            }
-                        }
-                        Ok(None)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    };
-    match found {
-        Ok(Some((r, adapter))) => {
-            if warn_shadowed {
-                crate::util::warn_if_shadowed(&r);
-            }
-            Ok((r, adapter))
-        }
-        Ok(None) => usage(format!("no session (and no sub-agent) matching {id:?}")),
-        Err(e) => resolve_found(Err(e), id, want),
-    }
+    crate::util::resolve_target(spec, harness, true).map(|t| (t.session, t.adapter))
 }
 
 /// Resolve a session spec: an existing transcript path (read as the derived host's, Claude's,

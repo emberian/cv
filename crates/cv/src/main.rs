@@ -1386,7 +1386,10 @@ fn main() {
         // Caller mistakes (unknown/ambiguous id, removed command/flag, bad window, a taken output
         // name) exit 2 with the bare message; everything else is a real failure: the anyhow
         // chain, exit 1.
-        if e.downcast_ref::<UsageError>().is_some() || e.downcast_ref::<cv_core::publish::Exists>().is_some() {
+        if e.downcast_ref::<UsageError>().is_some()
+            || cv_core::ResolveError::of(&e).is_some()
+            || e.downcast_ref::<cv_core::publish::Exists>().is_some()
+        {
             eprintln!("{e:#}");
             std::process::exit(2);
         }

@@ -39,6 +39,7 @@ pub mod events;
 // Verifies touches against git and the checkout: native only, like `blame`.
 #[cfg(feature = "sqlite")]
 pub mod files;
+pub mod forest;
 pub mod formats;
 pub mod harness;
 pub mod hooks;
@@ -66,6 +67,7 @@ pub mod publish;
 pub mod query;
 pub mod redact;
 pub mod render;
+pub mod resolve;
 pub mod restamp;
 pub mod resume;
 pub mod retired;
@@ -91,6 +93,7 @@ pub use ir::*;
 pub use json::{Json, JsonRange, JsonView};
 pub use lazy::{Resolver, Span, Text, INLINE_MAX};
 pub use query::SessionQuery;
+pub use resolve::ResolveError;
 pub use restamp::{restamp, restamp_line, Restamped};
 pub use stream::{collect, CollectSink, Demand, Flow, MessageSink, TeeSink, Tier, TryFnSink};
 
@@ -1013,63 +1016,17 @@ pub fn find_top_level_escalate(id: &str, harness: Option<Harness>, exhausted: bo
 /// sidecars, never the main pool), so every front-end that resolves session ids — MCP
 /// `read_session`, `cv serve` routes, exports — can drill into an agent id directly.
 ///
-/// Cost discipline: gated on the literal `agent-` prefix (and a harness constraint whose adapter
-/// keeps no run store),
-/// so a normal session-id miss pays **zero** extra work; only agent-shaped ids pay the same
-/// parallel filename scan `cv show <agent-id>` already does. Multiple parent sessions — or
-/// several agents matching a prefix under the one parent — are an error listing the candidates,
-/// mirroring `cv show`'s ambiguity handling rather than a silent "first one wins".
+/// Cost discipline: gated on the literal `agent-` prefix, so a normal session-id miss pays
+/// **zero** extra work. Ambiguity is [`resolve::fleet_agent`]'s.
 fn find_subagent_session(id: &str, harness: Option<Harness>) -> Result<Option<FoundSession>> {
-    if !id.starts_with("agent-") || harness.is_some_and(|h| workflow_store(h).is_none()) {
+    if !id.starts_with("agent-") {
         return Ok(None);
     }
-    let parents = find_subagent_parents(id);
-    let parent = match parents.as_slice() {
-        [] => return Ok(None),
-        [one] => one,
-        // Copies of ONE agent under several sessions (`cv adopt` moved it into a live session):
-        // the newest parent's copy is the one that continues, so it wins.
-        many if one_agent_across(many, id)? => &many[0],
-        many => {
-            let mut names: Vec<String> = many
-                .iter()
-                .map(|p| format!("{} ({})", p.id, p.title.as_deref().unwrap_or("untitled")))
-                .collect();
-            names.sort();
-            anyhow::bail!(
-                "{} sessions have a sub-agent matching {id:?}: {} — pass a longer agent id",
-                names.len(),
-                names.join(", ")
-            );
-        }
+    let Some(found) = resolve::fleet_agent(id, harness)? else {
+        return Ok(None);
     };
-    // Within the one parent, mirror `resolve_id`'s contract: exact match wins, a unique prefix
-    // resolves, several distinct prefix hits are an ambiguity error.
-    let mut hits: Vec<SessionRef> = Vec::new();
-    for s in subagent_tree_filtered_of(parent, SubagentDemand::Sessions, None, |candidate, _| {
-        candidate.starts_with(id)
-    })? {
-        if s.session.id == id {
-            return Ok(harness::for_harness(s.session.harness).map(|a| (s.session, a)));
-        }
-        if s.session.id.starts_with(id) {
-            hits.push(s.session);
-        }
-    }
-    match hits.len() {
-        0 => Ok(None),
-        1 => {
-            let r = hits.pop().unwrap();
-            Ok(harness::for_harness(r.harness).map(|a| (r, a)))
-        }
-        _ => Err(ambiguous(id, hits.iter())),
-    }
-}
-
-/// Whether every sub-agent matching `id` (`agent-` optional) under `parents` is the same agent:
-/// copies of one agent in several sessions, as `cv adopt` leaves them.
-pub fn one_agent_across(parents: &[SessionRef], id: &str) -> Result<bool> {
-    Ok(shared_agent_copies(parents, id)?.is_some())
+    let session = found.agent.session;
+    Ok(harness::for_harness(session.harness).map(|a| (session, a)))
 }
 
 /// When every sub-agent matching `id` (`agent-` optional) under `parents` has the same agent id,
@@ -1175,12 +1132,11 @@ fn pick(mut hits: Vec<SessionRef>, id: &str) -> Result<Option<SessionRef>> {
 
 /// The "ambiguous prefix" error shared by `find`'s fast and slow paths.
 fn ambiguous<'a>(id: &str, hits: impl Iterator<Item = &'a SessionRef>) -> anyhow::Error {
-    let mut ids: Vec<String> = hits.map(|r| format!("{}:{}", r.harness.as_str(), r.id)).collect();
-    ids.sort();
-    anyhow::anyhow!(
-        "ambiguous session id {id:?} matches {} sessions: {} — pass a longer id or --harness",
-        ids.len(),
-        ids.join(", ")
+    resolve::ResolveError::ambiguous(
+        "session id",
+        id,
+        "candidates (pass a longer prefix or harness:id)",
+        hits.map(|r| format!("{}:{}", r.harness, r.id)).collect(),
     )
 }
 

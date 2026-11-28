@@ -83,7 +83,7 @@ routes! {
 
         GET ["api", "touched"] => touched(query),
 
-        GET ["api", "session", harness, id, "subagents"] => subagents(harness, id),
+        GET ["api", "session", harness, id, "subagents"] => subagents(harness, id, query),
 
         GET ["api", "session", harness, parent, "subagent", agent] => subagent(harness, parent, agent),
 
@@ -581,22 +581,18 @@ fn sessions(query: &str) -> (u16, Value) {
     ok(Value::Array(rows))
 }
 
+/// A resolution failure as a reply: 404 unknown, 400 ambiguous, 500 otherwise.
+fn resolve_reply(e: anyhow::Error) -> (u16, Value) {
+    err(crate::ResolveError::status(&e), &format!("{e:#}"))
+}
+
 /// Look up one session by harness name + id (or unique prefix), with each failure already a reply.
 fn lookup(harness: &str, id: &str) -> Result<(SessionRef, Box<dyn crate::Adapter>), (u16, Value)> {
     let h = Harness::parse(harness).ok_or_else(|| err(400, &format!("unknown harness {harness:?}")))?;
     match crate::find(id, Some(h)) {
         Ok(Some(found)) => Ok(found),
         Ok(None) => Err(err(404, "session not found")),
-        Err(e) => {
-            let msg = e.to_string();
-            let status =
-                if msg.starts_with("ambiguous session id") || msg.contains("sessions have a sub-agent matching") {
-                    400
-                } else {
-                    500
-                };
-            Err(err(status, &msg))
-        }
+        Err(e) => Err(resolve_reply(e)),
     }
 }
 
@@ -1297,7 +1293,8 @@ fn blame(query: &str) -> (u16, Value) {
 /// `GET /api/session/{harness}/{id}/subagents` — the sub-agent **forest** a session spawned
 /// (directly-spawned `Agent`/`Task` agents and the workflow tier one level deeper), each a §3
 /// session row plus the sidecar enrichment the forest view groups by. Empty array if none.
-fn subagents(harness: &str, id: &str) -> (u16, Value) {
+/// `?returns` adds `return`, the last text turn of each agent no workflow journal summarized.
+fn subagents(harness: &str, id: &str, query: &str) -> (u16, Value) {
     let (r, _) = match lookup(harness, id) {
         Ok(x) => x,
         Err(e) => return e,
@@ -1306,43 +1303,48 @@ fn subagents(harness: &str, id: &str) -> (u16, Value) {
         Ok(forest) => forest,
         Err(error) => return err(500, &format!("forest read failed: {error:#}")),
     };
+    let returns = Query::parse(query).flag("returns");
     const METADATA_BATCH_SIZE: usize = 256;
     let mut probe = crate::source::Probe::default();
-    let out: Vec<Value> = forest
+    let out: anyhow::Result<Vec<Value>> = forest
         .iter()
         .enumerate()
         .map(|(idx, s)| {
             if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
                 probe = crate::source::Probe::default();
             }
-            crate::rows::subagent_row(s, probe.ref_size(&s.session))
+            let mut row = crate::rows::subagent_row(s, probe.ref_size(&s.session));
+            if let Some(ret) = returns
+                .then(|| crate::forest::unjournaled_return(s))
+                .transpose()?
+                .flatten()
+            {
+                row["return"] = ret.into();
+            }
+            Ok(row)
         })
         .collect();
-    ok(json!(out))
+    match out {
+        Ok(out) => ok(json!(out)),
+        Err(error) => err(500, &format!("forest read failed: {error:#}")),
+    }
 }
 
 /// `GET /api/session/{harness}/{parent}/subagent/{agent}` — the full parsed transcript of one
 /// sub-agent (sub-agents aren't in the main pool, so they're loaded relative to their parent);
-/// `agent` may be the full transcript id or the bare `agentId` the journal uses.
+/// `agent` is any spelling [`crate::resolve::subagent`] takes: the transcript id, the bare
+/// `agentId` the journal uses, or a unique prefix of either.
 fn subagent(harness: &str, parent: &str, agent: &str) -> (u16, Value) {
     let (r, adapter) = match lookup(harness, parent) {
         Ok(x) => x,
         Err((404, _)) => return err(404, "parent session not found"),
         Err(e) => return e,
     };
-    // The full transcript id, Claude's bare `agentId`, or the agent part of a `<parent>/<agent>` id.
-    let forest = crate::subagent_tree_filtered_of(&r, crate::SubagentDemand::Sessions, None, |id, _| {
-        id == agent || id.strip_prefix("agent-") == Some(agent) || id.rsplit_once('/').is_some_and(|(_, a)| a == agent)
-    });
-    let forest = match forest {
-        Ok(forest) => forest,
-        Err(error) => return err(500, &format!("forest read failed: {error:#}")),
+    let sub = match crate::resolve::subagent(&r, agent) {
+        Ok(sub) => sub,
+        Err(e) => return resolve_reply(e),
     };
-    // The select closure kept only members whose transcript id names `agent`, so take the first.
-    let Some(sr) = forest.into_iter().next().map(|s| s.session) else {
-        return err(404, "subagent not found");
-    };
-    match complete_session_json(adapter.as_ref(), &sr) {
+    match complete_session_json(adapter.as_ref(), &sub.session) {
         Ok(value) => ok(value),
         Err(error) => err(500, &format!("session read failed: {error:#}")),
     }
@@ -1698,6 +1700,51 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("ambiguous session id"));
+    }
+
+    #[test]
+    fn subagent_route_takes_a_unique_stem_prefix_and_types_its_refusals() {
+        let world = crate::test_world("api-subagent-stem");
+        let proj = world.home.join(".claude/projects/-tmp");
+        let line = |session: &str, text: &str| {
+            let row = serde_json::json!({
+                "type": "user", "sessionId": session, "uuid": "u1",
+                "message": {"role": "user", "content": text}
+            });
+            format!("{row}\n")
+        };
+        let subs = proj.join("parent-1/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(proj.join("parent-1.jsonl"), line("parent-1", "root")).unwrap();
+        for stem in ["ab12cd", "ab99ef", "ff00"] {
+            std::fs::write(subs.join(format!("agent-{stem}.jsonl")), line("parent-1", stem)).unwrap();
+        }
+        let get = |agent: &str| route_json(&["api", "session", "claude", "parent-1", "subagent", agent], "");
+        for unique in ["agent-ab12cd", "ab12cd", "ab12", "agent-ff", "f"] {
+            let (status, body) = get(unique);
+            assert_eq!(status, 200, "{unique}: {body}");
+            let want = if unique.contains('f') && !unique.contains("ab") {
+                "agent-ff00"
+            } else {
+                "agent-ab12cd"
+            };
+            assert_eq!(body["id"], want, "{unique}");
+        }
+        let (status, body) = get("ab");
+        assert_eq!(status, 400, "{body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("claude:agent-ab12cd") && error.contains("claude:agent-ab99ef"),
+            "{error}"
+        );
+        assert_eq!(get("zz").0, 404);
+        let forest = |query| route_json(&["api", "session", "claude", "parent-1", "subagents"], query).1;
+        assert!(forest("")
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("return").is_none()));
+        assert_eq!(forest("returns").as_array().unwrap().len(), 3);
     }
 }
 
