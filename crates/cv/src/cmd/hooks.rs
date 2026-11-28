@@ -2305,13 +2305,13 @@ fn hook_edit(ev: &Event, payload: &Value) -> Result<Option<Value>> {
             "cv: {shown} was edited by live session {first} ({mins} min ago){more}. `cv show {first} --last 10` shows its hand; proceed only if the edits do not collide."
         ));
     }
-    let directories = ev
-        .cwd
-        .as_deref()
-        .into_iter()
-        .chain(edits.iter().filter_map(|p| Path::new(p).parent()))
-        .collect();
-    match cv_core::events::workspace::stale_peer_places(&directories) {
+    match cv_core::events::workspace::stale_peer_advisory(
+        ev.harness.as_str(),
+        &ev.session.id,
+        ev.agent.as_ref().map(|a| a.id.as_str()),
+        &edits,
+        ev.cwd.as_deref(),
+    ) {
         Ok(peers) if !peers.is_empty() => {
             let places = peers.iter().map(|id| sanitize_line(id)).collect::<Vec<_>>().join(", ");
             advice.insert(format!(
