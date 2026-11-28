@@ -20,6 +20,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod fallback;
 pub(crate) mod fidelity;
 mod prepare;
 pub(crate) mod stage;
@@ -567,7 +568,7 @@ pub fn emit_report_with_sidecar(
                 #[cfg(feature = "sqlite")]
                 stage::StagedSource::Sqlite { result, .. } => (result.path.as_path(), *result, true),
             };
-            if target == Harness::Antigravity {
+            if retractor_for(target).is_some() {
                 let sc = sidecar_beside(&staged.path, &staged.new_id);
                 crate::distill::write_sidecar(&sc, sidecar, crate::publish::Claim::New)?;
                 step = Some(SidecarStep::InStage);

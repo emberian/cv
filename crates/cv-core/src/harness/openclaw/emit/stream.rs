@@ -401,23 +401,18 @@ fn emit_after_stage_with_verify(
     let resume = Some(format!(
         "openclaw agent --session-id {new_id} --message \"<your prompt>\" --local"
     ));
-
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "openclaw")?;
+    let result = EmitResult {
+        path: file_path,
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
+    };
+    crate::emit::stage::verify_files(verify, out_dir, "openclaw", &result, |ws| {
         let rel_dir = Path::new("agents/main/sessions");
-        let staged_path = ws.write_source(rel_dir.join(format!("{new_id}.jsonl")), &lines_source)?;
+        let staged_path = ws.write_source(rel_dir.join(format!("{}.jsonl", result.new_id)), &lines_source)?;
         ws.write_source(rel_dir.join("sessions.json"), &index_source)?;
-        let staged_result = EmitResult {
-            path: staged_path,
-            new_id: new_id.clone(),
-            resume_hint: resume.clone(),
-            ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &file_path,
-        })?;
-    }
+        Ok(staged_path)
+    })?;
 
     // All source demands and staged verification complete before creating directories or opening
     // the destination transcript or its index.
@@ -425,7 +420,7 @@ fn emit_after_stage_with_verify(
     // The transcript and its index entry publish as one set, the index last: a crash between
     // leaves an unlisted transcript, never an entry naming a missing one.
     let mut set = crate::publish::Set::new();
-    crate::emit::stage::stage_source_into(&mut set, &lines_source, &file_path, opts.claim())?;
+    crate::emit::stage::stage_source_into(&mut set, &lines_source, &result.path, opts.claim())?;
     crate::emit::stage::stage_source_into(&mut set, &index_source, &index_path, crate::publish::Claim::Replace)?;
     after_stage()?;
     // Another writer's index update since the read would be lost under ours: refuse, publish nothing.
@@ -436,12 +431,7 @@ fn emit_after_stage_with_verify(
         );
     }
     set.publish()?;
-    Ok(EmitResult {
-        path: file_path,
-        new_id,
-        resume_hint: resume,
-        ..Default::default()
-    })
+    Ok(result)
 }
 
 fn canonical_session_key(session: &Session, new_id: &str) -> String {

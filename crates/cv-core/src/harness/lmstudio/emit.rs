@@ -61,11 +61,11 @@ fn part(w: &mut dyn Write, block: &Block, resolver: &Resolver) -> Result<()> {
             o.field("type", "text")?;
             o.field_with("text", |w| {
                 generate_string(w, |b| {
-                    b.push("[tool call: ")?;
+                    b.push(crate::emit::fallback::TOOL_CALL_PREFIX)?;
                     b.push(name)?;
-                    b.push(" ")?;
+                    b.push(crate::emit::fallback::TOOL_CALL_SEP)?;
                     input.with_view(|v| b.push_json(v))?;
-                    b.push("]")
+                    b.push(crate::emit::fallback::BRACKET_SUFFIX)
                 })
             })?;
             o.finish()?;
@@ -75,9 +75,9 @@ fn part(w: &mut dyn Write, block: &Block, resolver: &Resolver) -> Result<()> {
             o.field("type", "text")?;
             o.field_with("text", |w| {
                 generate_string(w, |b| {
-                    b.push("[tool result: ")?;
+                    b.push(crate::emit::fallback::TOOL_RESULT_PREFIX)?;
                     append_text(b, content, resolver)?;
-                    b.push("]")
+                    b.push(crate::emit::fallback::BRACKET_SUFFIX)
                 })
             })?;
             o.finish()?;
@@ -336,28 +336,20 @@ pub(super) fn emit(
     }
     let stage = stage.into_inner().map_err(|e| e.into_error())?;
     let source = stage.finish()?;
-    let resume = Some("open the chat in LM Studio".to_string());
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "lmstudio")?;
-        let staged_path = ws.write_source(Path::new("conversations").join(&file_name), &source)?;
-        let staged_result = EmitResult {
-            path: staged_path,
-            new_id: new_id.clone(),
-            resume_hint: resume.clone(),
+    crate::emit::stage::publish_verified_source(
+        &source,
+        out_dir,
+        "lmstudio",
+        Path::new("conversations").join(&file_name),
+        opts.claim(),
+        verify,
+        EmitResult {
+            path: file_path,
+            new_id,
+            resume_hint: Some("open the chat in LM Studio".to_string()),
             ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &file_path,
-        })?;
-    }
-    crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
-    Ok(EmitResult {
-        path: file_path,
-        new_id,
-        resume_hint: resume,
-        ..Default::default()
-    })
+        },
+    )
 }
 #[cfg(test)]
 mod tests {

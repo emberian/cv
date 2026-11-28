@@ -154,9 +154,12 @@ fn publish(writer: &mut dyn Write, b: &Block, q: &Quirks, user: bool, leaf: Leaf
             o.field("type", "text")?;
             o.field_with("text", |w| {
                 crate::harness::store::text::generate_string(w, |builder| {
-                    builder.push("[file: ")?;
-                    builder.push(path.as_deref().or(source.as_deref()).unwrap_or("?"))?;
-                    builder.push("]")
+                    builder.push(crate::emit::fallback::FILE_PREFIX)?;
+                    builder.push(crate::emit::fallback::degraded_file_label(
+                        path.as_deref(),
+                        source.as_deref(),
+                    ))?;
+                    builder.push(crate::emit::fallback::BRACKET_SUFFIX)
                 })
             })?;
         }

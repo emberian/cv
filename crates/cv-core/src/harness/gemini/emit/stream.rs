@@ -435,41 +435,29 @@ pub(super) fn emit(
         cwd.as_deref(),
         format!("gemini --resume {}", crate::harness::shell_quote(&new_id)),
     ));
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "gemini")?;
-        let staged_path = match &slug {
-            Some(slug) => {
-                ws.write_bytes(Path::new("tmp").join(slug).join(".project_root"), cwd_str.as_bytes())?;
-                let reg = serde_json::json!({ "projects": { &cwd_str: slug } });
-                ws.write_bytes("projects.json", serde_json::to_string_pretty(&reg)?.as_bytes())?;
-                ws.write_source(Path::new("tmp").join(slug).join("chats").join(&file_name), &source)?
-            }
-            None => ws.write_source(Path::new("chats").join(&file_name), &source)?,
-        };
-        let staged_result = EmitResult {
-            path: staged_path,
-            new_id: new_id.clone(),
-            resume_hint: resume.clone(),
-            ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &path,
-        })?;
-    }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut set = crate::publish::Set::new();
-    crate::emit::stage::stage_source_into(&mut set, &source, &path, opts.claim())?;
-    if let Some(slug) = &slug {
-        stage_project(out_dir, slug, &cwd_str, &mut set)?;
-    }
-    set.publish()?;
-    Ok(EmitResult {
+    let result = EmitResult {
         path,
         new_id,
         resume_hint: resume,
         ..Default::default()
-    })
+    };
+    crate::emit::stage::verify_files(verify, out_dir, "gemini", &result, |ws| match &slug {
+        Some(slug) => {
+            ws.write_bytes(Path::new("tmp").join(slug).join(".project_root"), cwd_str.as_bytes())?;
+            let reg = serde_json::json!({ "projects": { &cwd_str: slug } });
+            ws.write_bytes("projects.json", serde_json::to_string_pretty(&reg)?.as_bytes())?;
+            ws.write_source(Path::new("tmp").join(slug).join("chats").join(&file_name), &source)
+        }
+        None => ws.write_source(Path::new("chats").join(&file_name), &source),
+    })?;
+    if let Some(parent) = result.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut set = crate::publish::Set::new();
+    crate::emit::stage::stage_source_into(&mut set, &source, &result.path, opts.claim())?;
+    if let Some(slug) = &slug {
+        stage_project(out_dir, slug, &cwd_str, &mut set)?;
+    }
+    set.publish()?;
+    Ok(result)
 }

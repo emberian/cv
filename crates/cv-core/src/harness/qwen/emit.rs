@@ -521,43 +521,33 @@ pub(crate) fn emit_staged(
     ));
     let empty_lines = w.lines.is_empty();
     let source = (!empty_lines).then(|| w.lines.into_source()).transpose()?;
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "qwen")?;
-        let rel = Path::new("projects")
-            .join(sanitize_cwd(&cwd_str))
-            .join("chats")
-            .join(format!("{new_id}.jsonl"));
-        let staged_path = match &source {
-            Some(src) => ws.write_source(&rel, src)?,
-            None => ws.write_bytes(&rel, b"\n")?,
-        };
-        let staged_result = EmitResult {
-            path: staged_path,
-            new_id: new_id.clone(),
-            resume_hint: resume.clone(),
-            ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &path,
-        })?;
-    }
-    fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
-    match &source {
-        None => {
-            // The original Qwen writer emits one blank line even for an empty session.
-            crate::publish::publish_reader(&path, "stage", &b"\n"[..], opts.claim())?;
-        }
-        Some(src) => {
-            crate::emit::stage::publish_source(src, &path, opts.claim())?;
-        }
-    }
-    Ok(EmitResult {
+    let result = EmitResult {
         path,
         new_id,
         resume_hint: resume,
         ..Default::default()
-    })
+    };
+    crate::emit::stage::verify_files(verify, out_dir, "qwen", &result, |ws| {
+        let rel = Path::new("projects")
+            .join(sanitize_cwd(&cwd_str))
+            .join("chats")
+            .join(format!("{}.jsonl", result.new_id));
+        match &source {
+            Some(src) => ws.write_source(&rel, src),
+            None => ws.write_bytes(&rel, b"\n"),
+        }
+    })?;
+    fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
+    match &source {
+        None => {
+            // The original Qwen writer emits one blank line even for an empty session.
+            crate::publish::publish_reader(&result.path, "stage", &b"\n"[..], opts.claim())?;
+        }
+        Some(src) => {
+            crate::emit::stage::publish_source(src, &result.path, opts.claim())?;
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -936,26 +936,21 @@ pub(crate) fn emit_with_harness_staged(
         None => format!("open {} in {extension} (task {new_id})", task_dir.display()),
     };
 
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "cline")?;
-        let rel_task = Path::new("tasks").join(&new_id);
-        let staged_task_dir = ws.path(&rel_task);
+    let result = crate::harness::EmitResult {
+        path: task_dir,
+        new_id,
+        resume_hint: Some(resume),
+        ..Default::default()
+    };
+    crate::emit::stage::verify_files(verify, out_dir, "cline", &result, |ws| {
+        let rel_task = Path::new("tasks").join(&result.new_id);
         ws.write_bytes(rel_task.join("task_metadata.json"), meta.as_bytes())?;
         ws.write_bytes(rel_task.join("ui_messages.json"), ui.as_bytes())?;
         ws.write_source(rel_task.join("api_conversation_history.json"), &history_source)?;
-        let staged_result = crate::harness::EmitResult {
-            path: staged_task_dir,
-            new_id: new_id.clone(),
-            resume_hint: Some(resume.clone()),
-            ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &task_dir,
-        })?;
-    }
+        Ok(ws.path(rel_task))
+    })?;
 
-    fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;
+    fs::create_dir_all(&result.path).with_context(|| format!("creating {}", result.path.display()))?;
     // The three files publish as one set, the transcript last: discovery finds a task by its
     // transcript, so a crash midway leaves nothing listed.
     let mut set = crate::publish::Set::new();
@@ -964,12 +959,7 @@ pub(crate) fn emit_with_harness_staged(
     crate::emit::stage::stage_source_into(&mut set, &history_source, &history_path, opts.claim())?;
     set.publish()?;
 
-    Ok(crate::harness::EmitResult {
-        path: task_dir,
-        new_id,
-        resume_hint: Some(resume),
-        ..Default::default()
-    })
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

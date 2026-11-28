@@ -132,10 +132,7 @@ pub(crate) fn image_fields(
     media_type: Option<&str>,
     data_ref: Option<&str>,
 ) -> Result<()> {
-    if let Some((uri_mime, b64)) = data_ref
-        .and_then(|r| r.strip_prefix("data:"))
-        .and_then(|rest| rest.split_once(";base64,"))
-    {
+    if let Some((uri_mime, b64)) = crate::emit::fallback::parse_base64_data_uri(data_ref) {
         let mime = if !uri_mime.is_empty() {
             Some(uri_mime)
         } else {
@@ -150,13 +147,10 @@ pub(crate) fn image_fields(
             data.finish()
         });
     }
-    let label = data_ref
-        .filter(|s| !s.is_empty())
-        .or_else(|| media_type.filter(|s| !s.is_empty()));
-    match label {
-        Some(label) => object.field("text", format!("[image: {label}]")),
-        None => object.field("text", "[image]"),
-    }
+    object.field(
+        "text",
+        crate::emit::fallback::genai_degraded_image_text(media_type, data_ref),
+    )
 }
 pub(crate) fn file_fields(
     object: &mut ObjectWriter<'_>,

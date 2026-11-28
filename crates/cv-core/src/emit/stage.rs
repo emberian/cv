@@ -120,6 +120,52 @@ impl Drop for StageWorkspace {
     }
 }
 
+/// Invoke `verify` against an already-staged primary path while preserving `result`'s metadata
+/// (`new_id`, `resume_hint`, `skills`) and live `destination` (`result.path`).
+pub(crate) fn run_verify(verify: Option<VerifyFn<'_>>, result: &EmitResult, staged_path: PathBuf) -> Result<()> {
+    if let Some(verify_fn) = verify {
+        let mut staged = result.clone();
+        staged.path = staged_path;
+        verify_fn(StagedSource::Files {
+            result: &staged,
+            destination: &result.path,
+        })?;
+    }
+    Ok(())
+}
+
+/// When `verify` is `Some`, materialize staged files in an isolated [`StageWorkspace`] beside
+/// `beside` and run the pre-publication verifier before any live destination path is created.
+pub(crate) fn verify_files(
+    verify: Option<VerifyFn<'_>>,
+    beside: &Path,
+    tag: &str,
+    result: &EmitResult,
+    stage: impl FnOnce(&StageWorkspace) -> Result<PathBuf>,
+) -> Result<()> {
+    if let Some(verify_fn) = verify {
+        let ws = StageWorkspace::beside(beside, tag)?;
+        run_verify(Some(verify_fn), result, stage(&ws)?)?;
+    }
+    Ok(())
+}
+
+/// Verify a single-file [`ByteSource`] in an isolated [`StageWorkspace`] (when `verify` is `Some`),
+/// then publish it atomically to `result.path`.
+pub(crate) fn publish_verified_source(
+    source: &ByteSource,
+    beside: &Path,
+    tag: &str,
+    staged_rel: impl AsRef<Path>,
+    claim: Claim,
+    verify: Option<VerifyFn<'_>>,
+    result: EmitResult,
+) -> Result<EmitResult> {
+    verify_files(verify, beside, tag, &result, |ws| ws.write_source(staged_rel, source))?;
+    publish_source(source, &result.path, claim)?;
+    Ok(result)
+}
+
 /// Publish an already-finished [`ByteSource`] to `path` with `claim`, creating parent directories
 /// only at commit time.
 pub(crate) fn publish_source(source: &ByteSource, path: &Path, claim: Claim) -> Result<()> {

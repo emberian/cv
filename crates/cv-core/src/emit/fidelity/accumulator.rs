@@ -811,10 +811,7 @@ fn project_image(
             finish_image_media(media_type, data_ref, false, false)
         }
         Harness::Gemini | Harness::Qwen => {
-            if let Some((uri_mime, b64)) = data_ref
-                .and_then(|r| r.strip_prefix("data:"))
-                .and_then(|rest| rest.split_once(";base64,"))
-            {
+            if let Some((uri_mime, b64)) = crate::emit::fallback::parse_base64_data_uri(data_ref) {
                 let eff_mime = if !uri_mime.is_empty() {
                     uri_mime
                 } else {
@@ -826,14 +823,9 @@ fn project_image(
                 return media_pair(eff_mime, &canonical_uri);
             }
             if is_source {
-                let label = data_ref
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| media_type.filter(|s| !s.is_empty()));
-                let text = match label {
-                    Some(l) => format!("[image: {l}]"),
-                    None => "[image]".to_owned(),
-                };
-                return MediaProjection::DegradedText(text);
+                return MediaProjection::DegradedText(crate::emit::fallback::genai_degraded_image_text(
+                    media_type, data_ref,
+                ));
             }
             finish_image_media(media_type, data_ref, false, false)
         }
@@ -868,11 +860,10 @@ fn project_file(
     path: Option<&str>,
     source: Option<&str>,
 ) -> MediaProjection {
-    let label_fallback = || path.or(source).unwrap_or("?");
     match target {
         Harness::Codex | Harness::OpenClaw => {
             if is_source {
-                MediaProjection::DegradedText(format!("[file: {}]", label_fallback()))
+                MediaProjection::DegradedText(crate::emit::fallback::degraded_file_text(path, source))
             } else {
                 MediaProjection::Dropped
             }
@@ -894,7 +885,7 @@ fn project_file(
                     preview: prev,
                 }
             } else if is_source {
-                MediaProjection::DegradedText(format!("[file: {}]", label_fallback()))
+                MediaProjection::DegradedText(crate::emit::fallback::degraded_file_text(path, source))
             } else {
                 MediaProjection::Dropped
             }
@@ -1142,7 +1133,8 @@ impl Accumulator {
                     let lmstudio_text = if prof.renders_tools_as_text && written_from.is_some() {
                         let mut compact = Vec::new();
                         input.write_canonical(&mut compact)?;
-                        let rendered = format!("[tool call: {name} {}]", String::from_utf8_lossy(&compact));
+                        let rendered =
+                            crate::emit::fallback::format_tool_call_text(name, &String::from_utf8_lossy(&compact));
                         let mut preview = String::new();
                         append_preview(&mut preview, &rendered);
                         Some((hash_bytes(rendered.as_bytes()), rendered.len() as u64, preview))
@@ -1168,9 +1160,9 @@ impl Accumulator {
                 } => {
                     let lmstudio_text = if prof.renders_tools_as_text && written_from.is_some() {
                         let mut j = JoinedTextHasher::new();
-                        j.push_str("[tool result: ");
+                        j.push_str(crate::emit::fallback::TOOL_RESULT_PREFIX);
                         j.push_text(content, &self.resolver, "")?;
-                        j.push_str("]");
+                        j.push_str(crate::emit::fallback::BRACKET_SUFFIX);
                         let (h, len, _, prev) = j.finish();
                         Some((h, len, prev))
                     } else {
@@ -1722,12 +1714,7 @@ fn opencode_attachment_unavailable(label: &str, mime: Option<&str>, reference: O
         (Some(_), Some(r)) if r.starts_with("file:") || r.starts_with("http://") || r.starts_with("https://") => true,
         _ => false,
     };
-    (!valid).then(|| {
-        format!(
-            "[{label} attachment unavailable: {}]",
-            reference.unwrap_or("no embedded data")
-        )
-    })
+    (!valid).then(|| crate::emit::fallback::opencode_unavailable_attachment_text(label, reference))
 }
 
 /// Build the canonical ordered unit stream `π_B` for either the source (`written_from.is_some()`)
@@ -2548,8 +2535,8 @@ fn compute_joined_turn_text(
             Block::File { path, source, .. }
                 if is_source && prof.claude_non_user_file_text && message.role != Role::User =>
             {
-                let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
-                joiner.push_text(&Text::Inline(format!("[file: {label}]")), resolver, sep)?;
+                let text = crate::emit::fallback::degraded_file_text(path.as_deref(), source.as_deref());
+                joiner.push_text(&Text::Inline(text), resolver, sep)?;
             }
             _ => {}
         }

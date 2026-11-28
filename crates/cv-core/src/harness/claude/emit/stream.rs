@@ -909,31 +909,25 @@ pub(crate) fn emit_staged(
     // Stage the final post-transform bytes in an isolated workspace before creating or touching
     // anything in `out_dir`: both Claude's three resumability rules and `--strict` read-back
     // verification inspect the exact bytes that will be published.
-    {
-        let ws = crate::emit::stage::StageWorkspace::beside(&file_path, "claude")?;
-        let rel_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("staged.jsonl");
-        let staged_path = ws.write_source(rel_name, &source)?;
-        super::verify::verify_as(&staged_path, &file_path, c.agent.as_deref())?;
-        if let Some(verify_fn) = verify {
-            let staged_result = EmitResult {
-                path: staged_path,
-                new_id: new_id.clone(),
-                resume_hint: Some(resume.clone()),
-                skills: skills.clone(),
-            };
-            verify_fn(crate::emit::stage::StagedSource::Files {
-                result: &staged_result,
-                destination: &file_path,
-            })?;
-        }
-    }
-    crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
-    Ok(EmitResult {
+    let result = EmitResult {
         path: file_path,
         new_id,
         resume_hint: Some(resume),
         skills,
-    })
+    };
+    {
+        let ws = crate::emit::stage::StageWorkspace::beside(&result.path, "claude")?;
+        let rel_name = result
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("staged.jsonl");
+        let staged_path = ws.write_source(rel_name, &source)?;
+        super::verify::verify_as(&staged_path, &result.path, c.agent.as_deref())?;
+        crate::emit::stage::run_verify(verify, &result, staged_path)?;
+    }
+    crate::emit::stage::publish_source(&source, &result.path, opts.claim())?;
+    Ok(result)
 }
 
 #[cfg(test)]

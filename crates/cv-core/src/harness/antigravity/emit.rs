@@ -269,23 +269,17 @@ pub(crate) fn emit_staged(
     )?;
 
     let resume_cmd = format!("agy --conversation {new_id}");
-    let resume_hint = Some(crate::harness::resume_in(cwd, resume_cmd));
-    if let Some(verify) = verify {
-        let staged = EmitResult {
-            path: stage.path().join(&rel_db),
-            new_id: new_id.clone(),
-            resume_hint: resume_hint.clone(),
-            ..Default::default()
-        };
-        verify(crate::emit::stage::StagedSource::Files {
-            result: &staged,
-            destination: &out_dir.join(&rel_db),
-        })?;
-    }
+    let result = EmitResult {
+        path: out_dir.join(&rel_db),
+        new_id,
+        resume_hint: Some(crate::harness::resume_in(cwd, resume_cmd)),
+        ..Default::default()
+    };
+    crate::emit::stage::run_verify(verify, &result, stage.path().join(&rel_db))?;
 
     let claim = opts.claim();
     let spec = SummarySpec {
-        new_id: &new_id,
+        new_id: &result.new_id,
         trajectory_id: &trajectory_id,
         title,
         step_count: 1,
@@ -297,19 +291,19 @@ pub(crate) fn emit_staged(
         replace: matches!(claim, Claim::Replace),
     };
 
-    let db_out = out_dir.join(&rel_db);
     cold::publish_staged_app_root(stage, out_dir, &spec, claim, |root| {
         // Readback verification through the Antigravity adapter before publishing `stage` (when
         // `!out_dir.exists()`) or before committing `conversation_summaries.db` (existing roots).
         let agy = Antigravity::with_home(root);
-        let sref = SessionRef::new(&new_id, Harness::Antigravity, root.join(&rel_db));
+        let sref = SessionRef::new(&result.new_id, Harness::Antigravity, root.join(&rel_db));
         let reparsed = agy
             .parse(&sref)
             .context("re-parsing emitted Antigravity SQLite trajectory")?;
         ensure!(
-            reparsed.id == new_id,
-            "reparsed id mismatch ({} != {new_id})",
-            reparsed.id
+            reparsed.id == result.new_id,
+            "reparsed id mismatch ({} != {})",
+            reparsed.id,
+            result.new_id
         );
         ensure!(
             reparsed.messages.len() == 1,
@@ -336,12 +330,7 @@ pub(crate) fn emit_staged(
         Ok(())
     })?;
 
-    Ok(EmitResult {
-        path: db_out,
-        new_id,
-        resume_hint,
-        ..Default::default()
-    })
+    Ok(result)
 }
 
 /// Undo a fresh [`emit`] publication: the conversation database and its SQLite sidecars, its

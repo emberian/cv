@@ -329,16 +329,18 @@ pub(super) fn write_database_with_verify(
                         let unavailable = match block {
                             Block::Image {
                                 media_type, data_ref, ..
-                            } if attachment(media_type.as_deref(), data_ref.as_deref()).is_none() => Some(format!(
-                                "[Image attachment unavailable: {}]",
-                                data_ref.as_deref().unwrap_or("no embedded data")
-                            )),
+                            } if attachment(media_type.as_deref(), data_ref.as_deref()).is_none() => {
+                                Some(crate::emit::fallback::opencode_unavailable_attachment_text(
+                                    "Image",
+                                    data_ref.as_deref(),
+                                ))
+                            }
                             Block::File { mime, path, source, .. }
                                 if attachment(mime.as_deref(), source.as_deref().or(path.as_deref())).is_none() =>
                             {
-                                Some(format!(
-                                    "[File attachment unavailable: {}]",
-                                    source.as_deref().or(path.as_deref()).unwrap_or("no embedded data")
+                                Some(crate::emit::fallback::opencode_unavailable_attachment_text(
+                                    "File",
+                                    source.as_deref().or(path.as_deref()),
                                 ))
                             }
                             _ => None,

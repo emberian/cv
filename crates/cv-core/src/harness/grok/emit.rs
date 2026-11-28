@@ -257,40 +257,30 @@ pub(crate) fn emit_staged(
     let no_updates = updates.is_empty();
     let updates_source = (!no_updates).then(|| updates.into_source()).transpose()?;
     let resume = Some(format!("grok --resume {new_id}"));
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "grok")?;
-        let staged_dir = ws.path(&enc_cwd).join(&new_id);
-        ws.write_source(
-            Path::new(&enc_cwd).join(&new_id).join("chat_history.jsonl"),
-            &lines_source,
-        )?;
+    let result = EmitResult {
+        path: session_dir,
+        new_id,
+        resume_hint: resume,
+        ..Default::default()
+    };
+    crate::emit::stage::verify_files(verify, out_dir, "grok", &result, |ws| {
+        let rel_dir = Path::new(&enc_cwd).join(&result.new_id);
+        ws.write_source(rel_dir.join("chat_history.jsonl"), &lines_source)?;
         if let Some(upd) = &updates_source {
-            ws.write_source(Path::new(&enc_cwd).join(&new_id).join("updates.jsonl"), upd)?;
+            ws.write_source(rel_dir.join("updates.jsonl"), upd)?;
         }
-        ws.write_bytes(
-            Path::new(&enc_cwd).join(&new_id).join("summary.json"),
-            summary.as_bytes(),
-        )?;
-        let staged_result = EmitResult {
-            path: staged_dir,
-            new_id: new_id.clone(),
-            resume_hint: resume.clone(),
-            ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &session_dir,
-        })?;
-    }
-    fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
+        ws.write_bytes(rel_dir.join("summary.json"), summary.as_bytes())?;
+        Ok(ws.path(rel_dir))
+    })?;
+    fs::create_dir_all(&result.path).with_context(|| format!("creating {}", result.path.display()))?;
     let mut set = crate::publish::Set::new();
     crate::emit::stage::stage_source_into(
         &mut set,
         &lines_source,
-        &session_dir.join("chat_history.jsonl"),
+        &result.path.join("chat_history.jsonl"),
         opts.claim(),
     )?;
-    let updates_path = session_dir.join("updates.jsonl");
+    let updates_path = result.path.join("updates.jsonl");
     if let Some(upd) = &updates_source {
         crate::emit::stage::stage_source_into(&mut set, upd, &updates_path, opts.claim())?;
     }
@@ -304,12 +294,7 @@ pub(crate) fn emit_staged(
         }
     }
 
-    Ok(EmitResult {
-        path: session_dir,
-        new_id,
-        resume_hint: resume,
-        ..Default::default()
-    })
+    Ok(result)
 }
 
 /// Project each block once; retained text and all retained thinking blocks stay borrowed.

@@ -270,14 +270,13 @@ pub(crate) fn emit_staged(
                             })?;
                         }
                         Block::File { path, source, .. } => {
-                            let label = path.as_deref().or(source.as_deref()).unwrap_or("?");
                             writer::value(
                                 &mut lines,
                                 &ts,
                                 "event_msg",
                                 &json!({
                                     "type": "agent_message",
-                                    "message": format!("[file: {label}]"),
+                                    "message": crate::emit::fallback::degraded_file_text(path.as_deref(), source.as_deref()),
                                 }),
                             )?;
                         }
@@ -378,29 +377,20 @@ pub(crate) fn emit_staged(
     }
 
     let resume = Some(format!("codex resume {new_id}"));
-    let source = lines.into_source()?;
-    if let Some(verify_fn) = verify {
-        let ws = crate::emit::stage::StageWorkspace::beside(out_dir, "codex")?;
-        let staged_path = ws.write_source(&file_name, &source)?;
-        let staged_result = EmitResult {
-            path: staged_path,
-            new_id: new_id.clone(),
-            resume_hint: resume.clone(),
+    crate::emit::stage::publish_verified_source(
+        &lines.into_source()?,
+        out_dir,
+        "codex",
+        &file_name,
+        opts.claim(),
+        verify,
+        EmitResult {
+            path: file_path,
+            new_id,
+            resume_hint: resume,
             ..Default::default()
-        };
-        verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &file_path,
-        })?;
-    }
-    crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
-
-    Ok(EmitResult {
-        path: file_path,
-        new_id,
-        resume_hint: resume,
-        ..Default::default()
-    })
+        },
+    )
 }
 
 /// IR [`Usage`](crate::ir::Usage) → Codex's `last_token_usage` block, reversing
