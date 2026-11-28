@@ -4142,6 +4142,97 @@ fn prune_child_id_and_path_select_child_and_emit_discoverable_standalone() {
     assert_eq!(fs::read(&parent).unwrap(), parent_before);
 }
 
+/// #tooth A long worker lane is pruned by its bare `agent-<id>`: old thinking and its signatures
+/// leave the transcript, the new session stands alone beside its parent, and both the snipped
+/// output and the moved reasoning come back through `cv cat` on the new id.
+#[test]
+fn prune_by_bare_agent_id_drops_thinking_and_keeps_the_sidecar_readable() {
+    let w = World::new("prune-agent-id");
+    let parent = w.write_session(
+        "lane-parent",
+        &[user_line("lane-parent", "p0", "2026-01-01T00:00:00Z", "spawn the worker")],
+    );
+    let output = format!("WORKER-OUTPUT-HEAD\n{}", "worker output line\n".repeat(400));
+    let signature = "S".repeat(6000);
+    let row = |kind: &str, uuid: &str, parent_uuid: Option<&str>, message: serde_json::Value| {
+        serde_json::json!({"type": kind, "sessionId": "lane-parent", "isSidechain": true, "agentId": "a0b1c2d3e4f5a6b7",
+            "uuid": uuid, "parentUuid": parent_uuid, "timestamp": "2026-01-01T00:00:01Z", "cwd": "/work/proj", "message": message})
+    };
+    let rows = [
+        row("user", "w0", None, serde_json::json!({"role": "user", "content": "audit the worker queue"})),
+        row(
+            "assistant",
+            "w1",
+            Some("w0"),
+            serde_json::json!({"role": "assistant", "model": "claude-opus-5", "content": [
+                {"type": "thinking", "thinking": "WORKER-REASONING about the queue", "signature": signature},
+                {"type": "tool_use", "id": "toolu_worker", "name": "Bash", "input": {"command": "queue --dump"}}]}),
+        ),
+        row(
+            "user",
+            "w2",
+            Some("w1"),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_worker", "content": output}]}),
+        ),
+        row(
+            "assistant",
+            "w3",
+            Some("w2"),
+            serde_json::json!({"role": "assistant", "model": "claude-opus-5", "content": [{"type": "text", "text": "The queue is drained."}]}),
+        ),
+    ];
+    let agent = w.write_agent(
+        "lane-parent",
+        "a0b1c2d3e4f5a6b7",
+        &serde_json::json!({"agentType": "general-purpose", "description": "queue worker"}),
+        &rows,
+    );
+    let (parent_before, agent_before) = (fs::read(&parent).unwrap(), fs::read(&agent).unwrap());
+
+    let (out, _) = w.cv_ok(&[
+        "prune",
+        "agent-a0b1c2d3e4f5a6b7",
+        "--keep-last",
+        "0",
+        "--min-size",
+        "100",
+        "--drop-thinking",
+        "--json",
+    ]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["source_id"], "agent-a0b1c2d3e4f5a6b7", "{report}");
+    assert_eq!(report["parent_session_id"], "lane-parent");
+    let new_id = report["new_id"].as_str().unwrap();
+    let new_path = PathBuf::from(report["new_path"].as_str().unwrap());
+    let sidecar = PathBuf::from(report["sidecar_path"].as_str().unwrap());
+    assert_eq!(new_path.parent(), parent.parent(), "a standalone session beside the parent");
+    assert_eq!(sidecar, new_path.with_file_name(format!("{new_id}.flat.jsonl")));
+
+    let pruned = fs::read_to_string(&new_path).unwrap();
+    assert!(!pruned.contains(&signature) && !pruned.contains("WORKER-REASONING"), "thinking stayed");
+    assert!(!pruned.contains("worker output line\\nworker output line"), "the output stayed");
+    assert!(pruned.contains("The queue is drained."));
+    for line in pruned.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(record["sessionId"], new_id);
+        assert_eq!(record["isSidechain"], false);
+        assert!(record.get("agentId").is_none());
+    }
+
+    let (cat, _) = w.cv_ok(&["cat", new_id, "toolu_worker"]);
+    assert_eq!(cat.trim_end(), output.trim_end());
+    let stashed = fs::read_to_string(&sidecar).unwrap();
+    assert!(stashed.contains("WORKER-REASONING about the queue"), "the reasoning is in the sidecar");
+    let (shown, _) = w.cv_ok(&["show", &format!("claude:{new_id}")]);
+    assert!(shown.contains("audit the worker queue") && !shown.contains("spawn the worker"));
+
+    // The lane itself is untouched: still its parent's sub-agent, still addressable.
+    assert_eq!(fs::read(&parent).unwrap(), parent_before);
+    assert_eq!(fs::read(&agent).unwrap(), agent_before);
+    let (again, _) = w.cv_ok(&["cat", "agent-a0b1c2d3e4f5a6b7", "toolu_worker"]);
+    assert_eq!(again.trim_end(), output.trim_end());
+}
+
 #[test]
 fn rewind_validates_explicit_harness_for_direct_paths_before_writing() {
     let w = World::new("rewind-path-harness");
