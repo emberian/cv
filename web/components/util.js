@@ -198,6 +198,7 @@ export const HARNESS_LABELS = {
   claude: "Claude",
   codex: "Codex",
   grok: "Grok",
+  pi: "Pi",
   opencode: "OpenCode",
   gemini: "Gemini",
   antigravity: "Antigravity",
@@ -479,63 +480,204 @@ function clean(obj) {
   return out;
 }
 
-/** Render a session as readable Markdown. */
+/** Longest contiguous run of `ch` inside `body` (`cv_core::sanitize::longest_run`). */
+function longestRun(body, ch) {
+  let max = 0;
+  let cur = 0;
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === ch) {
+      cur++;
+      if (cur > max) max = cur;
+    } else {
+      cur = 0;
+    }
+  }
+  return max;
+}
+
+/** Flatten control/bidi characters onto a single safe line for headings and fence info tags. */
+function cleanOneLine(s) {
+  return String(s ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
+    .trim();
+}
+
+/** Adaptive CommonMark backtick code block (`>= 3` backticks, strictly longer than any run in `body`). */
+function fencedBlock(body, info = "") {
+  const text = String(body ?? "");
+  const fence = "`".repeat(Math.max(3, longestRun(text, "`") + 1));
+  const tag = cleanOneLine(info).replace(/`/g, "");
+  return `${fence}${tag}\n${text}\n${fence}`;
+}
+
+/** Adaptive CommonMark inline code span (`cv_core::sanitize::inline_code_span`). */
+function inlineCode(s) {
+  const clean = cleanOneLine(s);
+  const ticks = "`".repeat(longestRun(clean, "`") + 1);
+  const pad =
+    clean.length === 0 ||
+    clean.startsWith("`") ||
+    clean.endsWith("`") ||
+    (clean.startsWith(" ") && clean.endsWith(" ") && clean.trim().length > 0);
+  return pad ? `${ticks} ${clean} ${ticks}` : `${ticks}${clean}${ticks}`;
+}
+
+const DISTILL_SEC_RE =
+  /^##[ \t]+\d{1,2}[abcABC]?\.\s+(?:hand-off|grounding|brief|earlier generations|timeline|facts|ledger|the last |prefix bricks|continuation state|verified progress|reads behind later edits|\[unverified predecessor notes)(?:$|[ \t(\[:—-])/i;
+const BOLD_ROLE_RE =
+  /^(?:message to this agent\*\*|message delivered while working\*\*|agent(?:\*\*|:\*\*| said\*\*)|user(?:\*\*|:\*\*| \()|assistant(?:\*\*|:\*\*| \()|system(?:\*\*|:\*\*| \()|tool(?:\*\*|:\*\*| \(| output\*\*)|hook output\*\*|harness context\*\*|human(?:\*\*|:\*\*)|↩ result|🔧 )/i;
+const BRACKET_ROLE_RE =
+  /^\[(?:user\]:|system\]:|assistant\]:|human\]:|tool\]:|developer\]:|model\]:|message\]|cv distill\]|cv pack\])/i;
+const SYSTEM_TAG_RE =
+  /^(?:system_message|system-reminder|system_instruction|system[> ]|user_request|user[> ]|human>|assistant>|developer>|task-notification|local-command-stdout)/i;
+const BARE_SAID_RE = /^(user said|assistant said|system said|tool said):/i;
+const BARE_ROLE_COLON_RE = /^(user|system|human|assistant|developer):($|[ \t])/i;
+
+function rewriteForgedLine(line) {
+  let idx = 0;
+  while (idx < line.length && (line[idx] === " " || line[idx] === "\t" || line[idx] === ">")) {
+    idx++;
+    if (idx > 64) return line;
+  }
+  const prefix = line.slice(0, idx);
+  const trimmed = line.slice(idx);
+  if (!trimmed) return line;
+
+  if (trimmed.startsWith("**") && BOLD_ROLE_RE.test(trimmed.slice(2))) {
+    return `${prefix}\\*\\*${trimmed.slice(2)}`;
+  }
+  if (trimmed.startsWith("[") && BRACKET_ROLE_RE.test(trimmed)) {
+    const rest = trimmed.slice(1);
+    const close = rest.indexOf("]");
+    return close >= 0 ? `${prefix}\\[${rest.slice(0, close)}\\]${rest.slice(close + 1)}` : `${prefix}\\[${rest}`;
+  }
+  if (trimmed.startsWith("#")) {
+    if (DISTILL_SEC_RE.test(trimmed)) return `${prefix}\\${trimmed}`;
+    const m = trimmed.match(/^(#{1,6})[ \t]+(.*)$/);
+    if (m) {
+      const hashes = m[1].length;
+      const after = m[2];
+      const numbered = hashes === 3 && /^\[\d+\]/.test(after);
+      const packTitle = /^(?:distilled context —|context pack:|findings from another lane)/i.test(after);
+      const roleHeading = /^(?:user|system|assistant|human|tool|developer)(?:$|[ \t:(·])/i.test(after);
+      if (numbered || packTitle || roleHeading) return `${prefix}\\${trimmed}`;
+    }
+  }
+  if (trimmed.startsWith("<")) {
+    const afterLt = trimmed.slice(1);
+    if (
+      afterLt.startsWith("!--") ||
+      afterLt.startsWith("?") ||
+      afterLt.startsWith("![CDATA[") ||
+      /^![a-z]/i.test(afterLt) ||
+      /^(?:script|pre|style|textarea)(?:$|[ \t>])/i.test(afterLt)
+    ) {
+      return `${prefix}\\${trimmed}`;
+    }
+    const tag = afterLt.startsWith("/") ? afterLt.slice(1) : afterLt;
+    if (SYSTEM_TAG_RE.test(tag)) return `${prefix}<\\${afterLt}`;
+  }
+  const said = trimmed.match(BARE_SAID_RE);
+  if (said) return `${prefix}${trimmed.slice(0, said[1].length)}\\:${trimmed.slice(said[0].length)}`;
+  const roleColon = trimmed.match(BARE_ROLE_COLON_RE);
+  if (roleColon) return `${prefix}${trimmed.slice(0, roleColon[1].length)}\\:${trimmed.slice(roleColon[1].length + 1)}`;
+  if (
+    trimmed.startsWith("▶ **") ||
+    trimmed.startsWith("◀ result") ||
+    trimmed.startsWith("◀ error") ||
+    trimmed.startsWith("--- 8< ---") ||
+    trimmed.startsWith("--- >8 ---") ||
+    trimmed.startsWith("--- RESUMING AN INTERRUPTED RUN ---") ||
+    trimmed.startsWith("--- END RESUME CONTEXT ---")
+  ) {
+    return `${prefix}\\${trimmed}`;
+  }
+  return line;
+}
+
+/** Neutralize forged speaker/section headers outside fenced code blocks and close any unclosed
+ *  trailing fence so turn content cannot swallow or spoof subsequent `## ROLE` boundaries. */
+function sanitizeMarkdownBody(raw) {
+  const src = String(raw ?? "");
+  const rawLines = src.split(/\r?\n/);
+  let openFence = null;
+  const out = [];
+  for (const line of rawLines) {
+    const m = line.match(/^( {0,3})(`{3,}|~{3,})(.*)$/);
+    if (!openFence) {
+      if (m && (m[2][0] === "~" || !m[3].includes("`"))) {
+        openFence = { ch: m[2][0], len: m[2].length };
+        out.push(line);
+        continue;
+      }
+      out.push(rewriteForgedLine(line));
+    } else {
+      if (m && m[2][0] === openFence.ch && m[2].length >= openFence.len && /^[ \t]*$/.test(m[3])) {
+        openFence = null;
+      }
+      out.push(line);
+    }
+  }
+  if (openFence) out.push(openFence.ch.repeat(openFence.len));
+  return out.join("\n");
+}
+
+/** Render a session as readable Markdown with adaptive CommonMark fences and forged-header safety. */
 export function toMarkdown(session) {
   const lines = [];
-  lines.push(`# ${session.title || sessionLabel(session)}`);
+  lines.push(`# ${cleanOneLine(session.title || sessionLabel(session)) || "Session"}`);
   lines.push("");
   const meta = [];
-  if (session.harness) meta.push(`**harness:** ${session.harness}`);
-  if (session.model) meta.push(`**model:** ${session.model}`);
-  if (session.cwd) meta.push(`**cwd:** \`${session.cwd}\``);
-  if (session.git?.branch) meta.push(`**branch:** ${session.git.branch}`);
-  if (session.created_at) meta.push(`**created:** ${session.created_at}`);
-  if (session.updated_at) meta.push(`**updated:** ${session.updated_at}`);
-  if (session.id) meta.push(`**id:** \`${session.id}\``);
+  if (session.harness) meta.push(`**harness:** ${cleanOneLine(session.harness)}`);
+  if (session.model) meta.push(`**model:** ${cleanOneLine(session.model)}`);
+  if (session.cwd) meta.push(`**cwd:** ${inlineCode(session.cwd)}`);
+  if (session.git?.branch) meta.push(`**branch:** ${cleanOneLine(session.git.branch)}`);
+  if (session.created_at) meta.push(`**created:** ${cleanOneLine(session.created_at)}`);
+  if (session.updated_at) meta.push(`**updated:** ${cleanOneLine(session.updated_at)}`);
+  if (session.id) meta.push(`**id:** ${inlineCode(session.id)}`);
   for (const [k, label] of Object.entries(LINEAGE_LABELS)) {
     const v = session.lineage?.[k];
-    if (v) meta.push(`**${label}:** \`${v}\``);
+    if (v) meta.push(`**${label}:** ${inlineCode(v)}`);
   }
   if (meta.length) { lines.push(meta.join("  \n")); lines.push(""); }
 
   if (session.system_prompt) {
     lines.push("<details><summary>system prompt</summary>");
     lines.push("");
-    lines.push("```");
-    lines.push(session.system_prompt);
-    lines.push("```");
+    lines.push(fencedBlock(session.system_prompt));
     lines.push("");
     lines.push("</details>");
     lines.push("");
   }
 
   for (const m of session.messages || []) {
-    const role = (m.role || "?").toUpperCase();
-    const kind = m.kind && m.kind !== KIND_BY_ROLE[m.role] ? ` · ${messageKindLabel(m.kind)}` : "";
-    const origin = m.origin && m.origin !== "model" && m.origin !== "human" ? ` · via ${m.origin}` : "";
+    const role = cleanOneLine(m.role || "?").toUpperCase();
+    const kind = m.kind && m.kind !== KIND_BY_ROLE[m.role] ? ` · ${cleanOneLine(messageKindLabel(m.kind))}` : "";
+    const origin = m.origin && m.origin !== "model" && m.origin !== "human" ? ` · via ${cleanOneLine(m.origin)}` : "";
     const when = m.timestamp ? ` · ${fmtTime(m.timestamp)}` : "";
     lines.push(`## ${role}${kind}${origin}${when}`);
     lines.push("");
     for (const b of m.content || []) {
       switch (b.type) {
         case "text":
-          lines.push(b.text || ""); lines.push(""); break;
+          lines.push(sanitizeMarkdownBody(b.text || "")); lines.push(""); break;
         case "thinking":
           lines.push("> 💭 *thinking*");
-          lines.push((b.text || (b.encrypted ? "[encrypted reasoning]" : b.redacted ? "[redacted]" : "")).split("\n").map((l) => "> " + l).join("\n"));
+          lines.push((b.text || (b.encrypted ? "[encrypted reasoning]" : b.redacted ? "[redacted]" : "")).split("\n").map((l) => "> " + rewriteForgedLine(l)).join("\n"));
           lines.push(""); break;
         case "tool_use":
-          lines.push(`**🔧 tool_use → \`${b.namespace ? b.namespace + ":" : ""}${b.name || "?"}\`**`);
-          lines.push("```json"); lines.push(pretty(b.input)); lines.push("```"); lines.push(""); break;
+          lines.push(`**🔧 tool_use → ${inlineCode(`${b.namespace ? b.namespace + ":" : ""}${b.name || "?"}`)}**`);
+          lines.push(fencedBlock(pretty(b.input), "json")); lines.push(""); break;
         case "tool_result":
-          lines.push(`**↳ tool_result${b.is_error ? " (error)" : ""}${b.status ? " · " + b.status : ""}**`);
-          lines.push("```"); lines.push(String(b.content ?? "")); lines.push("```"); lines.push(""); break;
+          lines.push(`**↳ tool_result${b.is_error ? " (error)" : ""}${b.status ? " · " + cleanOneLine(b.status) : ""}**`);
+          lines.push(fencedBlock(String(b.content ?? ""))); lines.push(""); break;
         case "file":
-          lines.push(`**📄 file:** \`${b.path || b.source || ""}\`${b.mime ? ` (${b.mime})` : ""}`); lines.push(""); break;
+          lines.push(`**📄 file:** ${inlineCode(b.path || b.source || "")}${b.mime ? ` (${cleanOneLine(b.mime)})` : ""}`); lines.push(""); break;
         case "image":
-          lines.push(`**🖼 image:** ${b.media_type || ""} ${b.data_ref || ""}`.trim()); lines.push(""); break;
+          lines.push(`**🖼 image:** ${cleanOneLine(`${b.media_type || ""} ${b.data_ref || ""}`)}`); lines.push(""); break;
         default:
-          lines.push(`*[${b.type || "unknown"} block]*`); lines.push(""); break;
+          lines.push(`*[${cleanOneLine(b.type || "unknown")} block]*`); lines.push(""); break;
       }
     }
   }

@@ -24,10 +24,11 @@
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 
-  /* per-harness accent colors (all 22 Harness variants) */
+  /* per-harness accent colors (all 23 Harness variants) */
   --h-claude: #d97757;
   --h-codex: #10a37f;
   --h-grok: #1d9bf0;
+  --h-pi: #6b4fbb;
   --h-opencode: #e0a93b;
   --h-gemini: #4285f4;
   --h-antigravity: #5b6ee1;
@@ -395,6 +396,7 @@ cv-app {
 .cv-badge[data-harness="claude"]         { background: var(--h-claude); }
 .cv-badge[data-harness="codex"]          { background: var(--h-codex); }
 .cv-badge[data-harness="grok"]           { background: var(--h-grok); }
+.cv-badge[data-harness="pi"]             { background: var(--h-pi); }
 .cv-badge[data-harness="opencode"]       { background: var(--h-opencode); color: #2a2000; }
 .cv-badge[data-harness="gemini"]         { background: var(--h-gemini); }
 .cv-badge[data-harness="antigravity"]    { background: var(--h-antigravity); }
