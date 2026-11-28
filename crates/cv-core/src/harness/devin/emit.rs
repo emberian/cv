@@ -127,7 +127,35 @@ pub(crate) fn emit_staged(
     Ok(result)
 }
 
+/// Make the target a schema-17 store, or refuse it.
+///
+/// A new database gets the schema and its migration history. An existing Devin store is written
+/// as it stands and only at schema 17 or later: adding the columns or tables of a later migration
+/// to an older store, without the history rows that record them, makes Devin's own migration fail
+/// on the duplicate the next time it starts. A newer store whose columns this insert does not
+/// satisfy fails the insert and rolls back.
 fn ensure_schema_17(tx: &Connection) -> Result<()> {
+    let has_user_tables: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_user_tables {
+        let version: Option<i64> = if table_exists(tx, "refinery_schema_history") {
+            tx.query_row("SELECT MAX(version) FROM refinery_schema_history", [], |r| r.get(0))?
+        } else {
+            None
+        };
+        let newest = SCHEMA_17_MIGRATIONS.len() as i64;
+        match version {
+            Some(v) if v >= newest => return Ok(()),
+            Some(v) => anyhow::bail!(
+                "Devin store is at schema {v}, before {newest}: start Devin once so it migrates the store, \
+                 or pass --out for a separate one"
+            ),
+            None => anyhow::bail!("not a Devin store (no migration history): pass --out for a separate one"),
+        }
+    }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS refinery_schema_history(
              version int4 PRIMARY KEY,
@@ -195,39 +223,11 @@ fn ensure_schema_17(tx: &Connection) -> Result<()> {
     )
     .context("initializing devin schema 17")?;
 
-    let has_history: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM refinery_schema_history)", [], |r| r.get(0))?;
-    if !has_history {
-        let applied = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let mut ins = tx.prepare(
-            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum) VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for &(ver, name) in SCHEMA_17_MIGRATIONS {
-            ins.execute(params![ver, name, &applied, ver.to_string()])?;
-        }
-    }
-    Ok(())
-}
-
-/// Reconcile optional columns when emitting into a pre-v17 Devin database so INSERTs never fail on
-/// older stores.
-fn reconcile_older_columns(tx: &Connection) -> Result<()> {
-    let sess_cols = crate::harness::store::sqlite::columns(tx, "sessions");
-    for (col, ddl) in [
-        ("title", "TEXT"),
-        ("main_chain_id", "INTEGER"),
-        ("shell_last_seen_index", "INTEGER DEFAULT 0"),
-        ("cogs_json", "TEXT"),
-        ("workspace_dirs", "TEXT"),
-        ("hidden", "INTEGER NOT NULL DEFAULT 0"),
-        ("metadata", "TEXT"),
-    ] {
-        if !sess_cols.contains(col) {
-            tx.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {col} {ddl};"))?;
-        }
-    }
-    let node_cols = crate::harness::store::sqlite::columns(tx, "message_nodes");
-    if !node_cols.contains("metadata") {
-        tx.execute_batch("ALTER TABLE message_nodes ADD COLUMN metadata TEXT;")?;
+    let applied = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut ins = tx
+        .prepare("INSERT INTO refinery_schema_history (version, name, applied_on, checksum) VALUES (?1, ?2, ?3, ?4)")?;
+    for &(ver, name) in SCHEMA_17_MIGRATIONS {
+        ins.execute(params![ver, name, &applied, ver.to_string()])?;
     }
     Ok(())
 }
@@ -310,7 +310,6 @@ fn write_database_with_verify(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     ensure_schema_17(&tx)?;
-    reconcile_older_columns(&tx)?;
 
     let exists: bool = tx
         .query_row("SELECT 1 FROM sessions WHERE id = ?1", [new_id], |_| Ok(true))
@@ -1365,6 +1364,62 @@ mod tests {
         )
         .is_err());
         assert!(!fresh_fail.exists(), "aborted fresh emit must clean up empty db + dir");
+        Ok(())
+    }
+
+    // #tooth A store Devin has not migrated to this schema is refused as it stands: no column or
+    // table of a later migration is added behind its migration history.
+    #[test]
+    fn an_older_or_unrecognized_store_is_refused_and_left_as_it_was() -> Result<()> {
+        let world = crate::test_world("devin-older-store");
+        let mut session = Session::new("src", Harness::Claude);
+        let mut prompt = Message::new(Role::User);
+        prompt.content.push(Block::from_text("hello".into()));
+        session.messages.push(prompt);
+
+        let schema_of = |db: &Path| -> Result<Vec<String>> {
+            let conn = Connection::open(db)?;
+            let mut stmt = conn.prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        };
+        for (name, history) in [("at-16", Some(16)), ("empty-history", Some(0)), ("no-history", None)] {
+            let dir = world.base.join(name);
+            std::fs::create_dir_all(&dir)?;
+            let db = dir.join("sessions.db");
+            {
+                let conn = Connection::open(&db)?;
+                // Schema 16: `sessions.metadata` exists, `subagent_heads` does not yet.
+                conn.execute_batch(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT NOT NULL, \
+                     backend_type TEXT NOT NULL, model TEXT NOT NULL, agent_mode TEXT NOT NULL, \
+                     created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL, title TEXT, \
+                     main_chain_id INTEGER, hidden INTEGER NOT NULL DEFAULT 0);
+                     CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, \
+                     node_id INTEGER NOT NULL, parent_node_id INTEGER, chat_message TEXT NOT NULL, \
+                     created_at INTEGER NOT NULL);",
+                )?;
+                if let Some(versions) = history {
+                    conn.execute_batch(
+                        "CREATE TABLE refinery_schema_history(version int4 PRIMARY KEY, name VARCHAR(255), \
+                         applied_on VARCHAR(255), checksum VARCHAR(255));",
+                    )?;
+                    for &(version, name) in &SCHEMA_17_MIGRATIONS[..versions] {
+                        conn.execute(
+                            "INSERT INTO refinery_schema_history VALUES (?1, ?2, '', '')",
+                            params![version, name],
+                        )?;
+                    }
+                }
+            }
+            let before = schema_of(&db)?;
+            let err = emit(&session, &dir, &EmitOptions::default()).unwrap_err();
+            assert!(format!("{err:#}").contains("--out"), "{name}: {err:#}");
+            assert_eq!(schema_of(&db)?, before, "{name}: the refused store was altered");
+            let conn = Connection::open(&db)?;
+            let sessions: i64 = conn.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+            assert_eq!(sessions, 0, "{name}");
+        }
         Ok(())
     }
 }
