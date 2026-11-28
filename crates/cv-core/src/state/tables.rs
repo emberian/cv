@@ -180,7 +180,7 @@ impl StateStore {
     ) -> Result<bool, StateError> {
         // Keep the dedup keys for the recipient's lifetime. On saturation stop
         // offering instead of evicting a key that could cause repeat delivery.
-        Ok(self.open_writable()?.execute(
+        Ok(self.open_writable_core()?.execute(
             "INSERT INTO whispers(session_id,kind,subject_key,subject_rev,command,status,harness)
              SELECT ?1,?2,?3,?4,?5,'offered',?6
              WHERE (SELECT COUNT(*) FROM whispers WHERE session_id=?1) < 256
@@ -198,7 +198,7 @@ impl StateStore {
         revision: &str,
         emitted_at: Option<i64>,
     ) -> Result<(), StateError> {
-        let conn = self.open_writable()?;
+        let conn = self.open_writable_core()?;
         if let Some(ts) = emitted_at {
             conn.execute(
                 "UPDATE whispers SET status='emitted',emitted_at=?5
@@ -213,33 +213,34 @@ impl StateStore {
     }
 
     pub fn session_whispers(&self, harness: &str, session: &str) -> Result<Vec<Whisper>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        if super::current_schema_version(&conn)? < 4 {
-            return Ok(Vec::new());
-        }
-        let mut stmt = conn.prepare(
-            "SELECT kind, subject_key, subject_rev, command, emitted_at, followed_up_at, status
-            FROM whispers WHERE session_id=?1 AND harness=?2 AND emitted_at IS NOT NULL ORDER BY emitted_at",
-        )?;
-        let rows = stmt.query_map([session, harness], |r| {
-            Ok(Whisper {
-                session_id: session.to_owned(),
-                kind: r.get(0)?,
-                subject_key: r.get(1)?,
-                subject_rev: r.get(2)?,
-                command: r.get(3)?,
-                emitted_at: r.get(4)?,
-                followed_up_at: r.get(5)?,
-                unfollowed: r.get::<_, String>(6)? == "unfollowed",
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(self
+            .read_in(|conn| {
+                if super::current_schema_version(conn)? < 4 {
+                    return Ok(Vec::new());
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT kind, subject_key, subject_rev, command, emitted_at, followed_up_at, status
+                    FROM whispers WHERE session_id=?1 AND harness=?2 AND emitted_at IS NOT NULL ORDER BY emitted_at",
+                )?;
+                let rows = stmt.query_map([session, harness], |r| {
+                    Ok(Whisper {
+                        session_id: session.to_owned(),
+                        kind: r.get(0)?,
+                        subject_key: r.get(1)?,
+                        subject_rev: r.get(2)?,
+                        command: r.get(3)?,
+                        emitted_at: r.get(4)?,
+                        followed_up_at: r.get(5)?,
+                        unfollowed: r.get::<_, String>(6)? == "unfollowed",
+                    })
+                })?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     pub fn finish_whisper_window(&self, w: &Whisper) -> Result<(), StateError> {
-        self.open_writable()?.execute(
+        self.open_writable_core()?.execute(
             "UPDATE whispers SET status=?5, followed_up_at=?6
             WHERE session_id=?1 AND kind=?2 AND subject_key=?3 AND subject_rev=?4 AND status='emitted'",
             rusqlite::params![
@@ -259,20 +260,21 @@ impl StateStore {
     }
 
     pub fn session_baggage(&self, harness: &str, session: &str) -> Result<Option<crate::hooks::Baggage>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        if super::current_schema_version(&conn)? < 4 {
-            return Ok(None);
-        }
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT baggage FROM session_baggage WHERE harness=?1 AND session_id=?2",
-                [harness, session],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(raw.as_deref().and_then(crate::hooks::Baggage::parse))
+        Ok(self
+            .read_in(|conn| {
+                if super::current_schema_version(conn)? < 4 {
+                    return Ok(None);
+                }
+                let raw: Option<String> = conn
+                    .query_row(
+                        "SELECT baggage FROM session_baggage WHERE harness=?1 AND session_id=?2",
+                        [harness, session],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(raw.as_deref().and_then(crate::hooks::Baggage::parse))
+            })?
+            .flatten())
     }
 }
 
@@ -310,7 +312,7 @@ impl StateStore {
         } else {
             host_label.to_string()
         };
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let meta_json = serde_json::to_string(metadata)?;
@@ -327,16 +329,7 @@ impl StateStore {
             "SELECT producer_id, host_label, metadata_json, enrolled_at, updated_at
              FROM producers WHERE producer_id = ?1",
             [producer_id],
-            |r| {
-                let meta_str: String = r.get(2)?;
-                Ok(Producer {
-                    producer_id: r.get(0)?,
-                    host_label: r.get(1)?,
-                    metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                    enrolled_at: r.get(3)?,
-                    updated_at: r.get(4)?,
-                })
-            },
+            row_to_producer,
         )?;
         tx.commit()?;
         Ok(row)
@@ -344,34 +337,23 @@ impl StateStore {
 
     /// Look up an enrolled producer by `producer_id`.
     pub fn get_producer(&self, producer_id: &str) -> Result<Option<Producer>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        Ok(conn
-            .query_row(
-                "SELECT producer_id, host_label, metadata_json, enrolled_at, updated_at
-                 FROM producers WHERE producer_id = ?1",
-                [producer_id],
-                |r| {
-                    let meta_str: String = r.get(2)?;
-                    Ok(Producer {
-                        producer_id: r.get(0)?,
-                        host_label: r.get(1)?,
-                        metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                        enrolled_at: r.get(3)?,
-                        updated_at: r.get(4)?,
-                    })
-                },
-            )
-            .optional()?)
+        Ok(self
+            .read_in(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT producer_id, host_label, metadata_json, enrolled_at, updated_at
+                         FROM producers WHERE producer_id = ?1",
+                        [producer_id],
+                        row_to_producer,
+                    )
+                    .optional()?)
+            })?
+            .flatten())
     }
 
     /// List all enrolled producers ordered by `enrolled_at`.
     pub fn list_producers(&self) -> Result<Vec<Producer>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        Self::producers_in(&conn)
+        Ok(self.read_in(Self::producers_in)?.unwrap_or_default())
     }
 
     pub(super) fn producers_in(conn: &rusqlite::Connection) -> Result<Vec<Producer>, StateError> {
@@ -379,16 +361,7 @@ impl StateStore {
             "SELECT producer_id, host_label, metadata_json, enrolled_at, updated_at
              FROM producers ORDER BY enrolled_at ASC, producer_id ASC",
         )?;
-        let rows = stmt.query_map([], |r| {
-            let meta_str: String = r.get(2)?;
-            Ok(Producer {
-                producer_id: r.get(0)?,
-                host_label: r.get(1)?,
-                metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                enrolled_at: r.get(3)?,
-                updated_at: r.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map([], row_to_producer)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -397,7 +370,7 @@ impl StateStore {
         if producer_id.trim().is_empty() {
             return Err(StateError::InvalidArgument("producer_id must not be empty".into()));
         }
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         tx.execute(
@@ -427,7 +400,7 @@ impl StateStore {
 
     /// Mark an active writer epoch closed.
     pub fn close_epoch(&self, epoch: &str) -> Result<bool, StateError> {
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let updated = tx.execute(
@@ -440,58 +413,46 @@ impl StateStore {
 
     /// Read a single `writer_epochs` record by `epoch`.
     pub fn get_epoch(&self, epoch: &str) -> Result<Option<WriterEpoch>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        Ok(conn
-            .query_row(
-                "SELECT epoch, producer_id, mode, pid, proc_start_time, activated_at, closed_at
-                 FROM writer_epochs WHERE epoch = ?1",
-                [epoch],
-                |r| {
-                    Ok(WriterEpoch {
-                        epoch: r.get(0)?,
-                        producer_id: r.get(1)?,
-                        mode: r.get(2)?,
-                        pid: r.get(3)?,
-                        proc_start_time: r.get(4)?,
-                        activated_at: r.get(5)?,
-                        closed_at: r.get(6)?,
-                    })
-                },
-            )
-            .optional()?)
+        Ok(self
+            .read_in(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT epoch, producer_id, mode, pid, proc_start_time, activated_at, closed_at
+                         FROM writer_epochs WHERE epoch = ?1",
+                        [epoch],
+                        |r| {
+                            Ok(WriterEpoch {
+                                epoch: r.get(0)?,
+                                producer_id: r.get(1)?,
+                                mode: r.get(2)?,
+                                pid: r.get(3)?,
+                                proc_start_time: r.get(4)?,
+                                activated_at: r.get(5)?,
+                                closed_at: r.get(6)?,
+                            })
+                        },
+                    )
+                    .optional()?)
+            })?
+            .flatten())
     }
 
     // ───────────────────────── Operation Bindings & Capture Inbox ─────────────────────────
 
     /// Look up an idempotency binding by `op_id`.
     pub fn get_operation_binding(&self, op_id: &str) -> Result<Option<(String, DurableReceipt)>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        Ok(conn
-            .query_row(
-                "SELECT request_digest, producer_id, epoch, seq, local_commit_pos
-                 FROM operation_bindings WHERE op_id = ?1",
-                [op_id],
-                |r| {
-                    let digest: String = r.get(0)?;
-                    let prod: String = r.get(1)?;
-                    let epoch: String = r.get(2)?;
-                    let seq: i64 = r.get(3)?;
-                    let pos: i64 = r.get(4)?;
-                    Ok((
-                        digest,
-                        DurableReceipt {
-                            event_id: EventId::new(prod, epoch, seq as u64),
-                            local_commit_pos: pos,
-                            replayed: true,
-                        },
-                    ))
-                },
-            )
-            .optional()?)
+        Ok(self
+            .read_in(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT request_digest, producer_id, epoch, seq, local_commit_pos
+                         FROM operation_bindings WHERE op_id = ?1",
+                        [op_id],
+                        row_to_operation_binding,
+                    )
+                    .optional()?)
+            })?
+            .flatten())
     }
 
     /// List durable operation bindings in `[min_pos, max_pos]` ordered by `local_commit_pos`.
@@ -503,31 +464,18 @@ impl StateStore {
         if min_pos > max_pos {
             return Ok(Vec::new());
         }
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT op_id, producer_id, epoch, seq, local_commit_pos
-             FROM operation_bindings
-             WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
-             ORDER BY local_commit_pos ASC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![min_pos, max_pos], |r| {
-            let op_id: String = r.get(0)?;
-            let prod: String = r.get(1)?;
-            let epoch: String = r.get(2)?;
-            let seq: i64 = r.get(3)?;
-            let pos: i64 = r.get(4)?;
-            Ok((
-                op_id,
-                DurableReceipt {
-                    event_id: EventId::new(prod, epoch, seq as u64),
-                    local_commit_pos: pos,
-                    replayed: true,
-                },
-            ))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT op_id, producer_id, epoch, seq, local_commit_pos
+                     FROM operation_bindings
+                     WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
+                     ORDER BY local_commit_pos ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![min_pos, max_pos], row_to_operation_binding)?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Read retained rows in `capture_inbox` within `[min_pos, max_pos]` ordered by `local_commit_pos`.
@@ -535,39 +483,41 @@ impl StateStore {
         if min_pos > max_pos {
             return Ok(Vec::new());
         }
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT local_commit_pos, producer_id, epoch, seq, op_id, envelope_json, payload_ref, committed_at
-             FROM capture_inbox
-             WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
-             ORDER BY local_commit_pos ASC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![min_pos, max_pos], |r| {
-            let env_str: String = r.get(5)?;
-            let seq: i64 = r.get(3)?;
-            Ok(CaptureInboxRow {
-                local_commit_pos: r.get(0)?,
-                producer_id: r.get(1)?,
-                epoch: r.get(2)?,
-                seq: seq as u64,
-                op_id: r.get(4)?,
-                envelope: serde_json::from_str(&env_str).unwrap_or(Value::Null),
-                payload_ref: r.get(6)?,
-                committed_at: r.get(7)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT local_commit_pos, producer_id, epoch, seq, op_id, envelope_json, payload_ref, committed_at
+                     FROM capture_inbox
+                     WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
+                     ORDER BY local_commit_pos ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![min_pos, max_pos], |r| {
+                    let env_str: String = r.get(5)?;
+                    let seq: i64 = r.get(3)?;
+                    Ok(CaptureInboxRow {
+                        local_commit_pos: r.get(0)?,
+                        producer_id: r.get(1)?,
+                        epoch: r.get(2)?,
+                        seq: seq as u64,
+                        op_id: r.get(4)?,
+                        envelope: serde_json::from_str(&env_str).unwrap_or(Value::Null),
+                        payload_ref: r.get(6)?,
+                        committed_at: r.get(7)?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Count unpacked rows currently retained in `capture_inbox`.
     pub fn inbox_count(&self) -> Result<u64, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(0);
-        };
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM capture_inbox", [], |r| r.get(0))?;
-        Ok(n as u64)
+        Ok(self
+            .read_in(|conn| {
+                let n: i64 = conn.query_row("SELECT COUNT(*) FROM capture_inbox", [], |r| r.get(0))?;
+                Ok(n as u64)
+            })?
+            .unwrap_or(0))
     }
 
     // ───────────────────────── Pack Manifests & Custody Acks ─────────────────────────
@@ -712,43 +662,15 @@ impl StateStore {
     /// instead. Read-only and `--frozen` safe; on a checkpointed store without `-wal`/`-journal`
     /// frames, `--frozen` reads `state.db` directly via `immutable=1` without copying to `TMPDIR`.
     pub fn custody_heads(&self) -> Result<Option<Vec<Value>>, StateError> {
-        if crate::env::frozen() {
-            let meta = match std::fs::metadata(&self.db_path) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
-                Err(e) => return Err(StateError::Io(e)),
-            };
-            if !meta.is_file() {
-                return Err(StateError::Io(std::io::Error::other(format!(
-                    "{} is not a regular file",
-                    self.db_path.display()
-                ))));
+        match self.read_compatible_in(|conn| {
+            if super::current_schema_version(conn)? > super::STATE_SCHEMA_VERSION {
+                return Ok(None);
             }
-            if meta.len() == 0 {
-                return Ok(Some(Vec::new()));
-            }
-            return crate::harness::store::sqlite::read(&self.db_path, |conn, _| {
-                let ver = super::current_schema_version(conn)?;
-                if ver == 0 {
-                    return Ok(Some(Vec::new()));
-                }
-                if ver > super::STATE_SCHEMA_VERSION {
-                    return Ok(None);
-                }
-                read_custody_heads_in(conn).map_err(anyhow::Error::from)
-            })
-            .map_err(|e| match e.downcast::<StateError>() {
-                Ok(se) => se,
-                Err(other) => StateError::Io(std::io::Error::other(other)),
-            });
+            read_custody_heads_in(conn)
+        })? {
+            None => Ok(Some(Vec::new())),
+            Some(heads) => Ok(heads),
         }
-        let conn = match self.open_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => return Ok(Some(Vec::new())),
-            Err(StateError::NewerSchema { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        read_custody_heads_in(&conn)
     }
 
     /// List all published pack manifests ordered by `min_commit_pos`.
@@ -761,26 +683,12 @@ impl StateStore {
                 if !conn.table_exists(None, "pack_manifests")? {
                     return Ok(Vec::new());
                 }
-                let mut stmt = conn.prepare(
-                    "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
-                            digest, pack_path, index_meta_json, published_at
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {PACK_MANIFEST_COLS}
                      FROM pack_manifests
-                     ORDER BY min_commit_pos ASC, pack_id ASC",
-                )?;
-                let rows = stmt.query_map([], |r| {
-                    let meta_str: String = r.get(7)?;
-                    Ok(PackManifest {
-                        pack_id: r.get(0)?,
-                        min_commit_pos: r.get(1)?,
-                        max_commit_pos: r.get(2)?,
-                        record_count: r.get::<_, i64>(3)? as u64,
-                        byte_len: r.get::<_, i64>(4)? as u64,
-                        digest: r.get(5)?,
-                        pack_path: r.get(6)?,
-                        index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                        published_at: r.get(8)?,
-                    })
-                })?;
+                     ORDER BY min_commit_pos ASC, pack_id ASC"
+                ))?;
+                let rows = stmt.query_map([], row_to_pack_manifest)?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })?
             .unwrap_or_default())
@@ -791,25 +699,9 @@ impl StateStore {
         Ok(self
             .read_in(|conn| {
                 conn.query_row(
-                    "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
-                            digest, pack_path, index_meta_json, published_at
-                     FROM pack_manifests
-                     WHERE pack_id = ?1",
+                    &format!("SELECT {PACK_MANIFEST_COLS} FROM pack_manifests WHERE pack_id = ?1"),
                     [pack_id],
-                    |r| {
-                        let meta_str: String = r.get(7)?;
-                        Ok(PackManifest {
-                            pack_id: r.get(0)?,
-                            min_commit_pos: r.get(1)?,
-                            max_commit_pos: r.get(2)?,
-                            record_count: r.get::<_, i64>(3)? as u64,
-                            byte_len: r.get::<_, i64>(4)? as u64,
-                            digest: r.get(5)?,
-                            pack_path: r.get(6)?,
-                            index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                            published_at: r.get(8)?,
-                        })
-                    },
+                    row_to_pack_manifest,
                 )
                 .optional()
                 .map_err(StateError::from)
@@ -869,26 +761,27 @@ impl StateStore {
 
     /// List custody acknowledgements recorded for `target_hub`.
     pub fn custody_acks_for(&self, target_hub: &str) -> Result<Vec<CustodyAck>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT target_hub, producer_id, epoch, contiguous_seq, max_commit_pos, pack_id, acked_at
-             FROM custody_acks WHERE target_hub = ?1
-             ORDER BY producer_id ASC, epoch ASC",
-        )?;
-        let rows = stmt.query_map([target_hub], |r| {
-            Ok(CustodyAck {
-                target_hub: r.get(0)?,
-                producer_id: r.get(1)?,
-                epoch: r.get(2)?,
-                contiguous_seq: r.get::<_, i64>(3)? as u64,
-                max_commit_pos: r.get(4)?,
-                pack_id: r.get(5)?,
-                acked_at: r.get(6)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT target_hub, producer_id, epoch, contiguous_seq, max_commit_pos, pack_id, acked_at
+                     FROM custody_acks WHERE target_hub = ?1
+                     ORDER BY producer_id ASC, epoch ASC",
+                )?;
+                let rows = stmt.query_map([target_hub], |r| {
+                    Ok(CustodyAck {
+                        target_hub: r.get(0)?,
+                        producer_id: r.get(1)?,
+                        epoch: r.get(2)?,
+                        contiguous_seq: r.get::<_, i64>(3)? as u64,
+                        max_commit_pos: r.get(4)?,
+                        pack_id: r.get(5)?,
+                        acked_at: r.get(6)?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Never-delete-before-custody gate: returns `true` iff `pack_id` exists and every hub in
@@ -896,96 +789,90 @@ impl StateStore {
     /// covering every `(producer_id, epoch)` bound in `[manifest.min_commit_pos..=manifest.max_commit_pos]`.
     /// If `required_hubs` is empty, local custody alone applies (`true`).
     pub fn is_pack_evictable(&self, pack_id: &str, required_hubs: &[&str]) -> Result<bool, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(false);
-        };
-        let Some((min_pos, max_pos)): Option<(i64, i64)> = conn
-            .query_row(
-                "SELECT min_commit_pos, max_commit_pos FROM pack_manifests WHERE pack_id = ?1",
-                [pack_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-        else {
-            return Ok(false);
-        };
-        if required_hubs.is_empty() {
-            return Ok(true);
-        }
+        Ok(self
+            .read_in(|conn| {
+                let Some((min_pos, max_pos)): Option<(i64, i64)> = conn
+                    .query_row(
+                        "SELECT min_commit_pos, max_commit_pos FROM pack_manifests WHERE pack_id = ?1",
+                        [pack_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?
+                else {
+                    return Ok(false);
+                };
+                if required_hubs.is_empty() {
+                    return Ok(true);
+                }
 
-        let mut stmt = conn.prepare(
-            "SELECT producer_id, epoch, MAX(seq)
-             FROM operation_bindings
-             WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
-             GROUP BY producer_id, epoch",
-        )?;
-        let epoch_reqs: Vec<(String, String, i64)> = stmt
-            .query_map(rusqlite::params![min_pos, max_pos], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                let mut stmt = conn.prepare(
+                    "SELECT producer_id, epoch, MAX(seq)
+                     FROM operation_bindings
+                     WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
+                     GROUP BY producer_id, epoch",
+                )?;
+                let epoch_reqs: Vec<(String, String, i64)> = stmt
+                    .query_map(rusqlite::params![min_pos, max_pos], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                for &hub in required_hubs {
+                    let direct_pack_acked: bool = conn.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM custody_acks
+                             WHERE target_hub = ?1 AND pack_id = ?2
+                         )",
+                        rusqlite::params![hub, pack_id],
+                        |r| r.get(0),
+                    )?;
+                    if direct_pack_acked {
+                        continue;
+                    }
+
+                    if epoch_reqs.is_empty() {
+                        let pos_acked: bool = conn.query_row(
+                            "SELECT EXISTS(
+                                 SELECT 1 FROM custody_acks
+                                 WHERE target_hub = ?1
+                                   AND max_commit_pos IS NOT NULL
+                                   AND max_commit_pos >= ?2
+                             )",
+                            rusqlite::params![hub, max_pos],
+                            |r| r.get(0),
+                        )?;
+                        if !pos_acked {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+
+                    for (prod_id, epoch, req_seq) in &epoch_reqs {
+                        let seq_acked: bool = conn.query_row(
+                            "SELECT EXISTS(
+                                 SELECT 1 FROM custody_acks
+                                 WHERE target_hub = ?1
+                                   AND epoch = ?3
+                                   AND contiguous_seq >= ?4
+                                   AND (
+                                       producer_id = ?2
+                                       OR EXISTS(
+                                           SELECT 1 FROM writer_epochs w
+                                           WHERE w.epoch = ?3 AND w.producer_id = ?2
+                                       )
+                                   )
+                             )",
+                            rusqlite::params![hub, prod_id, epoch, req_seq],
+                            |r| r.get(0),
+                        )?;
+                        if !seq_acked {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for &hub in required_hubs {
-            let direct_pack_acked: bool = conn.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM custody_acks
-                     WHERE target_hub = ?1 AND pack_id = ?2
-                 )",
-                rusqlite::params![hub, pack_id],
-                |r| r.get(0),
-            )?;
-            if direct_pack_acked {
-                continue;
-            }
-
-            if epoch_reqs.is_empty() {
-                let pos_acked: bool = conn.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM custody_acks
-                         WHERE target_hub = ?1
-                           AND max_commit_pos IS NOT NULL
-                           AND max_commit_pos >= ?2
-                     )",
-                    rusqlite::params![hub, max_pos],
-                    |r| r.get(0),
-                )?;
-                if !pos_acked {
-                    return Ok(false);
-                }
-                continue;
-            }
-
-            for (prod_id, epoch, req_seq) in &epoch_reqs {
-                // `Shipper::sync` with a custom `--producer-id` / `[replication.<target>].producer_id`
-                // records `custody_acks` under the overridden outbound `producer_id`, while
-                // `operation_bindings` retains the local `StateStore` producer. Because `writer_epochs`
-                // (`PRIMARY KEY (epoch)`) uniquely binds each allocated writer epoch to one local
-                // producer in `state.db`, matching either `custody_acks.producer_id = ?2` or an owned
-                // `writer_epochs` row allows custom `--producer-id` targets to evict acknowledged packs
-                // without cross-producer collision.
-                let seq_acked: bool = conn.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM custody_acks
-                         WHERE target_hub = ?1
-                           AND epoch = ?3
-                           AND contiguous_seq >= ?4
-                           AND (
-                               producer_id = ?2
-                               OR EXISTS(
-                                   SELECT 1 FROM writer_epochs w
-                                   WHERE w.epoch = ?3 AND w.producer_id = ?2
-                               )
-                           )
-                     )",
-                    rusqlite::params![hub, prod_id, epoch, req_seq],
-                    |r| r.get(0),
-                )?;
-                if !seq_acked {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
+            .unwrap_or(false))
     }
 
     // ───────────────────────── Lane Runs & Endpoint Bindings ─────────────────────────
@@ -997,7 +884,7 @@ impl StateStore {
                 "lane run_id and session_id must not be empty".into(),
             ));
         }
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO lane_runs(
@@ -1068,7 +955,7 @@ impl StateStore {
         exit_status: Option<&str>,
         last_text: Option<&str>,
     ) -> Result<bool, StateError> {
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = tx.execute(
             "UPDATE lane_runs
@@ -1084,35 +971,37 @@ impl StateStore {
 
     /// Fetch a `LaneRun` by `run_id`.
     pub fn get_lane_run(&self, run_id: &str) -> Result<Option<LaneRun>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        Ok(conn
-            .query_row(
-                "SELECT run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
-                        boot_id, transcript_path, agent_transcript_path, cwd, started_at,
-                        exited_at, exit_status, last_text
-                 FROM lane_runs WHERE run_id = ?1",
-                [run_id],
-                row_to_lane_run,
-            )
-            .optional()?)
+        Ok(self
+            .read_in(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
+                                boot_id, transcript_path, agent_transcript_path, cwd, started_at,
+                                exited_at, exit_status, last_text
+                         FROM lane_runs WHERE run_id = ?1",
+                        [run_id],
+                        row_to_lane_run,
+                    )
+                    .optional()?)
+            })?
+            .flatten())
     }
 
     /// List all `LaneRun`s recorded for `session_id`, oldest first.
     pub fn list_lane_runs_for_session(&self, session_id: &str) -> Result<Vec<LaneRun>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
-                    boot_id, transcript_path, agent_transcript_path, cwd, started_at,
-                    exited_at, exit_status, last_text
-             FROM lane_runs WHERE session_id = ?1
-             ORDER BY started_at ASC, run_id ASC",
-        )?;
-        let rows = stmt.query_map([session_id], row_to_lane_run)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT run_id, session_id, agent_id, agent_type, harness, pid, proc_start_time,
+                            boot_id, transcript_path, agent_transcript_path, cwd, started_at,
+                            exited_at, exit_status, last_text
+                     FROM lane_runs WHERE session_id = ?1
+                     ORDER BY started_at ASC, run_id ASC",
+                )?;
+                let rows = stmt.query_map([session_id], row_to_lane_run)?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Bind a `(run_id, endpoint)` pair in `lane_endpoints`.
@@ -1122,7 +1011,7 @@ impl StateStore {
                 "run_id and endpoint must not be empty".into(),
             ));
         }
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         tx.execute(
@@ -1141,43 +1030,45 @@ impl StateStore {
 
     /// List endpoints bound to `run_id`.
     pub fn endpoints_for_run(&self, run_id: &str) -> Result<Vec<LaneEndpointBinding>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT run_id, endpoint, bound_at
-             FROM lane_endpoints WHERE run_id = ?1
-             ORDER BY bound_at ASC, endpoint ASC",
-        )?;
-        let rows = stmt.query_map([run_id], |r| {
-            Ok(LaneEndpointBinding {
-                run_id: r.get(0)?,
-                endpoint: r.get(1)?,
-                bound_at: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT run_id, endpoint, bound_at
+                     FROM lane_endpoints WHERE run_id = ?1
+                     ORDER BY bound_at ASC, endpoint ASC",
+                )?;
+                let rows = stmt.query_map([run_id], |r| {
+                    Ok(LaneEndpointBinding {
+                        run_id: r.get(0)?,
+                        endpoint: r.get(1)?,
+                        bound_at: r.get(2)?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Find the most recently started `LaneRun` bound to `endpoint`.
     pub fn latest_run_for_endpoint(&self, endpoint: &str) -> Result<Option<LaneRun>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(None);
-        };
-        Ok(conn
-            .query_row(
-                "SELECT r.run_id, r.session_id, r.agent_id, r.agent_type, r.harness, r.pid,
-                        r.proc_start_time, r.boot_id, r.transcript_path, r.agent_transcript_path,
-                        r.cwd, r.started_at, r.exited_at, r.exit_status, r.last_text
-                 FROM lane_endpoints e
-                 JOIN lane_runs r ON r.run_id = e.run_id
-                 WHERE e.endpoint = ?1
-                 ORDER BY e.bound_at DESC, r.started_at DESC
-                 LIMIT 1",
-                [endpoint],
-                row_to_lane_run,
-            )
-            .optional()?)
+        Ok(self
+            .read_in(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT r.run_id, r.session_id, r.agent_id, r.agent_type, r.harness, r.pid,
+                                r.proc_start_time, r.boot_id, r.transcript_path, r.agent_transcript_path,
+                                r.cwd, r.started_at, r.exited_at, r.exit_status, r.last_text
+                         FROM lane_endpoints e
+                         JOIN lane_runs r ON r.run_id = e.run_id
+                         WHERE e.endpoint = ?1
+                         ORDER BY e.bound_at DESC, r.started_at DESC
+                         LIMIT 1",
+                        [endpoint],
+                        row_to_lane_run,
+                    )
+                    .optional()?)
+            })?
+            .flatten())
     }
 
     // ───────────────────────── Hash-Chained Receipts ─────────────────────────
@@ -1198,7 +1089,7 @@ impl StateStore {
                 "receipt session_id must not be empty".into(),
             ));
         }
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rec = insert_receipt_in_tx(&tx, session_id, harness, body)?;
         tx.commit()?;
@@ -1221,7 +1112,7 @@ impl StateStore {
                 "receipt session_id must not be empty".into(),
             ));
         }
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rec = insert_receipt_in_tx(&tx, session_id, harness, body)?;
         let op_id = format!("receipt:{}:{}:{}", harness, rec.session_id, rec.seq);
@@ -1255,33 +1146,34 @@ impl StateStore {
 
     /// Return all receipts recorded for `session_id` in chain order (`seq = 1..=N`).
     pub fn receipts_for_session(&self, session_id: &str) -> Result<Vec<ReceiptRecord>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT session_id, seq, ts, harness, agent_id, tool_use_id, tool_name,
-                    kind, digest_sha256, prev_hash, receipt_hash, body_json
-             FROM receipts WHERE session_id = ?1
-             ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map([session_id], |r| {
-            let body_str: String = r.get(11)?;
-            Ok(ReceiptRecord {
-                session_id: r.get(0)?,
-                seq: r.get::<_, i64>(1)? as u64,
-                ts: r.get(2)?,
-                harness: r.get(3)?,
-                agent_id: r.get(4)?,
-                tool_use_id: r.get(5)?,
-                tool_name: r.get(6)?,
-                kind: r.get(7)?,
-                digest_sha256: r.get(8)?,
-                prev_hash: r.get(9)?,
-                receipt_hash: r.get(10)?,
-                body: serde_json::from_str(&body_str).unwrap_or(Value::Null),
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_id, seq, ts, harness, agent_id, tool_use_id, tool_name,
+                            kind, digest_sha256, prev_hash, receipt_hash, body_json
+                     FROM receipts WHERE session_id = ?1
+                     ORDER BY seq ASC",
+                )?;
+                let rows = stmt.query_map([session_id], |r| {
+                    let body_str: String = r.get(11)?;
+                    Ok(ReceiptRecord {
+                        session_id: r.get(0)?,
+                        seq: r.get::<_, i64>(1)? as u64,
+                        ts: r.get(2)?,
+                        harness: r.get(3)?,
+                        agent_id: r.get(4)?,
+                        tool_use_id: r.get(5)?,
+                        tool_name: r.get(6)?,
+                        kind: r.get(7)?,
+                        digest_sha256: r.get(8)?,
+                        prev_hash: r.get(9)?,
+                        receipt_hash: r.get(10)?,
+                        body: serde_json::from_str(&body_str).unwrap_or(Value::Null),
+                    })
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Cryptographically verify the entire receipt chain of `session_id` (`seq = 1..=N`).
@@ -1304,7 +1196,7 @@ impl StateStore {
                 "lineage src_session_id, dst_session_id, and edge_kind must not be empty".into(),
             ));
         }
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let meta_json = serde_json::to_string(&edge.metadata)?;
         tx.execute(
@@ -1332,87 +1224,136 @@ impl StateStore {
 
     /// Outgoing lineage edges from `session_id` (`src_session_id = session_id`).
     pub fn lineage_from(&self, session_id: &str) -> Result<Vec<LineageEdge>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
-             FROM lineage_edges WHERE src_session_id = ?1
-             ORDER BY created_at ASC, dst_session_id ASC, edge_kind ASC",
-        )?;
-        let rows = stmt.query_map([session_id], row_to_lineage_edge)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
+                     FROM lineage_edges WHERE src_session_id = ?1
+                     ORDER BY created_at ASC, dst_session_id ASC, edge_kind ASC",
+                )?;
+                let rows = stmt.query_map([session_id], row_to_lineage_edge)?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Incoming lineage edges into `session_id` (`dst_session_id = session_id`).
     pub fn lineage_to(&self, session_id: &str) -> Result<Vec<LineageEdge>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
-             FROM lineage_edges WHERE dst_session_id = ?1
-             ORDER BY created_at ASC, src_session_id ASC, edge_kind ASC",
-        )?;
-        let rows = stmt.query_map([session_id], row_to_lineage_edge)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(self
+            .read_in(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
+                     FROM lineage_edges WHERE dst_session_id = ?1
+                     ORDER BY created_at ASC, src_session_id ASC, edge_kind ASC",
+                )?;
+                let rows = stmt.query_map([session_id], row_to_lineage_edge)?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?
+            .unwrap_or_default())
     }
 
     /// Transitive descendants reachable from `session_id` (cycle-safe breadth-first walk).
     pub fn lineage_descendants(&self, session_id: &str) -> Result<Vec<LineageEdge>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
-             FROM lineage_edges WHERE src_session_id = ?1
-             ORDER BY created_at ASC, dst_session_id ASC, edge_kind ASC",
-        )?;
-        let mut visited_nodes = HashSet::new();
-        visited_nodes.insert(session_id.to_string());
-        let mut queue = VecDeque::new();
-        queue.push_back(session_id.to_string());
-        let mut edges = Vec::new();
-        while let Some(cur) = queue.pop_front() {
-            let rows = stmt.query_map([&cur], row_to_lineage_edge)?;
-            for edge in rows {
-                let edge = edge?;
-                if visited_nodes.insert(edge.dst_session_id.clone()) {
-                    queue.push_back(edge.dst_session_id.clone());
-                }
-                edges.push(edge);
-            }
-        }
-        Ok(edges)
+        Ok(self
+            .read_in(|conn| {
+                lineage_bfs(
+                    conn,
+                    session_id,
+                    "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
+                     FROM lineage_edges WHERE src_session_id = ?1
+                     ORDER BY created_at ASC, dst_session_id ASC, edge_kind ASC",
+                    |edge| &edge.dst_session_id,
+                )
+            })?
+            .unwrap_or_default())
     }
 
     /// Transitive ancestors leading to `session_id` (cycle-safe breadth-first walk).
     pub fn lineage_ancestors(&self, session_id: &str) -> Result<Vec<LineageEdge>, StateError> {
-        let Some(conn) = self.open_readonly()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = conn.prepare(
-            "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
-             FROM lineage_edges WHERE dst_session_id = ?1
-             ORDER BY created_at ASC, src_session_id ASC, edge_kind ASC",
-        )?;
-        let mut visited_nodes = HashSet::new();
-        visited_nodes.insert(session_id.to_string());
-        let mut queue = VecDeque::new();
-        queue.push_back(session_id.to_string());
-        let mut edges = Vec::new();
-        while let Some(cur) = queue.pop_front() {
-            let rows = stmt.query_map([&cur], row_to_lineage_edge)?;
-            for edge in rows {
-                let edge = edge?;
-                if visited_nodes.insert(edge.src_session_id.clone()) {
-                    queue.push_back(edge.src_session_id.clone());
-                }
-                edges.push(edge);
-            }
-        }
-        Ok(edges)
+        Ok(self
+            .read_in(|conn| {
+                lineage_bfs(
+                    conn,
+                    session_id,
+                    "SELECT src_session_id, dst_session_id, edge_kind, harness, tool_use_id, metadata_json, created_at
+                     FROM lineage_edges WHERE dst_session_id = ?1
+                     ORDER BY created_at ASC, src_session_id ASC, edge_kind ASC",
+                    |edge| &edge.src_session_id,
+                )
+            })?
+            .unwrap_or_default())
     }
+}
+
+const PACK_MANIFEST_COLS: &str =
+    "pack_id, min_commit_pos, max_commit_pos, record_count, byte_len, digest, pack_path, index_meta_json, published_at";
+
+fn row_to_pack_manifest(r: &rusqlite::Row<'_>) -> rusqlite::Result<PackManifest> {
+    let meta_str: String = r.get(7)?;
+    Ok(PackManifest {
+        pack_id: r.get(0)?,
+        min_commit_pos: r.get(1)?,
+        max_commit_pos: r.get(2)?,
+        record_count: r.get::<_, i64>(3)? as u64,
+        byte_len: r.get::<_, i64>(4)? as u64,
+        digest: r.get(5)?,
+        pack_path: r.get(6)?,
+        index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+        published_at: r.get(8)?,
+    })
+}
+
+fn row_to_producer(r: &rusqlite::Row<'_>) -> rusqlite::Result<Producer> {
+    let meta_str: String = r.get(2)?;
+    Ok(Producer {
+        producer_id: r.get(0)?,
+        host_label: r.get(1)?,
+        metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+        enrolled_at: r.get(3)?,
+        updated_at: r.get(4)?,
+    })
+}
+
+fn row_to_operation_binding(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, DurableReceipt)> {
+    let key: String = r.get(0)?;
+    let prod: String = r.get(1)?;
+    let epoch: String = r.get(2)?;
+    let seq: i64 = r.get(3)?;
+    let pos: i64 = r.get(4)?;
+    Ok((
+        key,
+        DurableReceipt {
+            event_id: EventId::new(prod, epoch, seq as u64),
+            local_commit_pos: pos,
+            replayed: true,
+        },
+    ))
+}
+
+fn lineage_bfs(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    sql: &str,
+    next_id: impl Fn(&LineageEdge) -> &str,
+) -> Result<Vec<LineageEdge>, StateError> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut visited_nodes = HashSet::new();
+    visited_nodes.insert(session_id.to_string());
+    let mut queue = VecDeque::new();
+    queue.push_back(session_id.to_string());
+    let mut edges = Vec::new();
+    while let Some(cur) = queue.pop_front() {
+        let rows = stmt.query_map([&cur], row_to_lineage_edge)?;
+        for edge in rows {
+            let edge = edge?;
+            let neighbor = next_id(&edge);
+            if visited_nodes.insert(neighbor.to_owned()) {
+                queue.push_back(neighbor.to_owned());
+            }
+            edges.push(edge);
+        }
+    }
+    Ok(edges)
 }
 
 fn row_to_lane_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<LaneRun> {
@@ -1681,7 +1622,7 @@ impl StateStore {
     /// (`prod-<12hex>`) stored in `producers.metadata_json["ship_producer_id"]` for this store so
     /// multiple machines shipping with default settings never collide under `"local"`.
     pub fn ensure_ship_producer_id(&self) -> Result<String, StateError> {
-        let mut conn = self.open_writable()?;
+        let mut conn = self.open_writable_core()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let prod_key = self.default_producer();
         let existing_meta: Option<String> = tx
@@ -1850,12 +1791,48 @@ impl StateStore {
     }
 }
 
-/// Whether `custody_heads` exists and folds exactly the manifests `pack_manifests` holds now (its
-/// watermark's count and newest position). False on a store without the tables.
-pub(crate) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
+fn manifest_watermark_fresh(conn: &rusqlite::Connection, table: &str, through: &str) -> Result<bool, StateError> {
     let exists: bool = conn.query_row(
-        "SELECT COUNT(*) = 2 FROM sqlite_schema
-         WHERE type = 'table' AND name IN ('custody_heads', 'custody_heads_through')",
+        "SELECT COUNT(*) = 2 FROM sqlite_schema WHERE type = 'table' AND name IN (?1, ?2)",
+        [table, through],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+    let fresh: Option<bool> = conn
+        .query_row(
+            &format!(
+                "SELECT w.manifests = m.n AND w.through = m.pos
+                 FROM {through} w,
+                      (SELECT COUNT(*) AS n, COALESCE(MAX(min_commit_pos), 0) AS pos FROM pack_manifests) m
+                 WHERE w.id = 1"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(fresh == Some(true))
+}
+
+fn mark_manifest_watermark(tx: &rusqlite::Transaction<'_>, through: &str) -> Result<(), StateError> {
+    tx.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {through}(id, manifests, through)
+             SELECT 1, COUNT(*), COALESCE(MAX(min_commit_pos), 0) FROM pack_manifests"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+/// Fast-path check for [`super::schema::converge`]: verifies all four custody/watermark tables
+/// exist and both watermarks match `pack_manifests` in one `pack_manifests` aggregation.
+pub(super) fn custody_tables_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) = 4 FROM sqlite_schema
+         WHERE type = 'table'
+           AND name IN ('custody_heads', 'custody_heads_through', 'custody_commits', 'custody_commits_through')",
         [],
         |r| r.get(0),
     )?;
@@ -1864,10 +1841,12 @@ pub(crate) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, S
     }
     let fresh: Option<bool> = conn
         .query_row(
-            "SELECT w.manifests = m.n AND w.through = m.pos
-             FROM custody_heads_through w,
+            "SELECT h.manifests = m.n AND h.through = m.pos
+                AND c.manifests = m.n AND c.through = m.pos
+             FROM custody_heads_through h,
+                  custody_commits_through c,
                   (SELECT COUNT(*) AS n, COALESCE(MAX(min_commit_pos), 0) AS pos FROM pack_manifests) m
-             WHERE w.id = 1",
+             WHERE h.id = 1 AND c.id = 1",
             [],
             |r| r.get(0),
         )
@@ -1875,14 +1854,15 @@ pub(crate) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, S
     Ok(fresh == Some(true))
 }
 
+/// Whether `custody_heads` exists and folds exactly the manifests `pack_manifests` holds now (its
+/// watermark's count and newest position). False on a store without the tables.
+pub(crate) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
+    manifest_watermark_fresh(conn, "custody_heads", "custody_heads_through")
+}
+
 /// Record that `custody_heads` folds every manifest `pack_manifests` holds now.
 fn mark_custody_heads(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
-    tx.execute(
-        "INSERT OR REPLACE INTO custody_heads_through(id, manifests, through)
-         SELECT 1, COUNT(*), COALESCE(MAX(min_commit_pos), 0) FROM pack_manifests",
-        [],
-    )?;
-    Ok(())
+    mark_manifest_watermark(tx, "custody_heads_through")
 }
 
 /// Refold `custody_heads` from every published manifest in commit order, then mark it fresh.
@@ -1907,35 +1887,11 @@ pub(super) fn rebuild_custody_heads(tx: &rusqlite::Transaction<'_>) -> Result<()
 
 /// Whether `custody_commits` exists and folds every published `pack_manifests` row.
 pub(super) fn custody_commits_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
-    let exists: bool = conn.query_row(
-        "SELECT COUNT(*) = 2 FROM sqlite_schema
-         WHERE type = 'table' AND name IN ('custody_commits', 'custody_commits_through')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !exists {
-        return Ok(false);
-    }
-    let fresh: Option<bool> = conn
-        .query_row(
-            "SELECT w.manifests = m.n AND w.through = m.pos
-             FROM custody_commits_through w,
-                  (SELECT COUNT(*) AS n, COALESCE(MAX(min_commit_pos), 0) AS pos FROM pack_manifests) m
-             WHERE w.id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(fresh == Some(true))
+    manifest_watermark_fresh(conn, "custody_commits", "custody_commits_through")
 }
 
 fn mark_custody_commits(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
-    tx.execute(
-        "INSERT OR REPLACE INTO custody_commits_through(id, manifests, through)
-         SELECT 1, COUNT(*), COALESCE(MAX(min_commit_pos), 0) FROM pack_manifests",
-        [],
-    )?;
-    Ok(())
+    mark_manifest_watermark(tx, "custody_commits_through")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2209,26 +2165,12 @@ pub(super) fn rebuild_custody_commits(
 ) -> Result<(), StateError> {
     tx.execute("DELETE FROM custody_commits", [])?;
     let manifests: Vec<PackManifest> = {
-        let mut stmt = tx.prepare(
-            "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
-                    digest, pack_path, index_meta_json, published_at
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {PACK_MANIFEST_COLS}
              FROM pack_manifests
-             ORDER BY min_commit_pos ASC, pack_id ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let meta_str: String = r.get(7)?;
-            Ok(PackManifest {
-                pack_id: r.get(0)?,
-                min_commit_pos: r.get(1)?,
-                max_commit_pos: r.get(2)?,
-                record_count: r.get::<_, i64>(3)? as u64,
-                byte_len: r.get::<_, i64>(4)? as u64,
-                digest: r.get(5)?,
-                pack_path: r.get(6)?,
-                index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
-                published_at: r.get(8)?,
-            })
-        })?;
+             ORDER BY min_commit_pos ASC, pack_id ASC"
+        ))?;
+        let rows = stmt.query_map([], row_to_pack_manifest)?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     for pm in &manifests {

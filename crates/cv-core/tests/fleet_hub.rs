@@ -1,3 +1,4 @@
+#![cfg(feature = "sqlite")]
 //! End-to-end multi-producer delta replication, spool/seal & pull topologies,
 //! `O(delta)` native extent shipping, and `AuthorityEnvelope` soundness tests.
 

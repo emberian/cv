@@ -1887,3 +1887,92 @@ fn custody_heads_converge_on_a_store_whose_version_numbers_are_taken() {
     assert_eq!(store.custody_heads().unwrap().map(|h| h.len()), Some(2));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #tooth Checkpointed `--frozen` bounded queries across `state/tables.rs` read `state.db` in place
+/// via `immutable=1` without copying `state.db` into `TMPDIR`.
+#[test]
+#[cfg(unix)]
+fn frozen_bounded_table_queries_read_checkpointed_state_without_tmpdir_copies() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_state_dir("frozen-zero-copy-tables");
+    let store = StateStore::at_dir(&dir);
+    let prod = store.enroll_producer("prod-z", "host-z", &json!({})).unwrap();
+    let ep = store.activate_epoch(&prod.producer_id, "serverless").unwrap();
+    let receipt = store.append("op-z", "dig-z", &json!({"k": 1})).unwrap();
+    store
+        .record_lane_start(&tables::LaneRun {
+            run_id: "run-z".into(),
+            session_id: "sess-z".into(),
+            agent_id: Some("agent-z".into()),
+            agent_type: None,
+            harness: Some("claude".into()),
+            pid: None,
+            proc_start_time: None,
+            boot_id: None,
+            transcript_path: None,
+            agent_transcript_path: None,
+            cwd: None,
+            started_at: 100,
+            exited_at: Some(200),
+            exit_status: Some("ok".into()),
+            last_text: None,
+        })
+        .unwrap();
+    store.bind_lane_endpoint("run-z", "lane:z").unwrap();
+    store
+        .append_receipt("sess-z", "claude", json!({"tool": "Read"}).as_object().unwrap().clone())
+        .unwrap();
+    store
+        .record_lineage_edge(&tables::LineageEdge {
+            src_session_id: "sess-p".into(),
+            dst_session_id: "sess-z".into(),
+            edge_kind: "continues".into(),
+            harness: Some("claude".into()),
+            tool_use_id: None,
+            metadata: json!({}),
+            created_at: 1,
+        })
+        .unwrap();
+    store.checkpoint_wal(true).unwrap();
+    let _ = std::fs::remove_file(dir.join("state.db-wal"));
+    let _ = std::fs::remove_file(dir.join("state.db-shm"));
+
+    let locked_tmp = dir.join("locked-tmp");
+    std::fs::create_dir_all(&locked_tmp).unwrap();
+    std::fs::set_permissions(&locked_tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let checks = (|| -> Result<(), StateError> {
+        let _frozen = crate::env::Env::from_vars([
+            ("CLUSTERVISION_HOME", dir.as_os_str()),
+            ("TMPDIR", locked_tmp.as_os_str()),
+        ])
+        .with_frozen()
+        .enter();
+        assert_eq!(store.session_whispers("claude", "sess-z")?.len(), 0);
+        assert_eq!(store.session_baggage("claude", "sess-z")?, None);
+        assert_eq!(store.get_producer("prod-z")?.unwrap().host_label, "host-z");
+        assert!(!store.list_producers()?.is_empty());
+        assert_eq!(store.get_epoch(&ep.epoch)?.unwrap().producer_id, "prod-z");
+        assert_eq!(store.get_operation_binding("op-z")?.unwrap().0, "dig-z");
+        assert_eq!(
+            store.list_operation_bindings_range(1, receipt.local_commit_pos)?.len(),
+            1
+        );
+        assert_eq!(store.read_inbox_range(1, receipt.local_commit_pos)?.len(), 1);
+        assert_eq!(store.inbox_count()?, 1);
+        assert_eq!(store.custody_acks_for("hub-z")?.len(), 0);
+        assert!(!store.is_pack_evictable("missing", &[])?);
+        assert_eq!(store.get_lane_run("run-z")?.unwrap().session_id, "sess-z");
+        assert_eq!(store.list_lane_runs_for_session("sess-z")?.len(), 1);
+        assert_eq!(store.endpoints_for_run("run-z")?.len(), 1);
+        assert_eq!(store.latest_run_for_endpoint("lane:z")?.unwrap().run_id, "run-z");
+        assert_eq!(store.receipts_for_session("sess-z")?.len(), 1);
+        assert_eq!(store.lineage_from("sess-p")?.len(), 1);
+        assert_eq!(store.lineage_to("sess-z")?.len(), 1);
+        assert_eq!(store.lineage_descendants("sess-p")?.len(), 1);
+        assert_eq!(store.lineage_ancestors("sess-z")?.len(), 1);
+        Ok(())
+    })();
+    std::fs::set_permissions(&locked_tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+    checks.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

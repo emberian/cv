@@ -253,8 +253,18 @@ impl StateStore {
         PathBuf::from("/tmp").join(sub_dir).join(file_name)
     }
 
-    /// Open a migrated writable SQLite connection configured with `WAL` + `synchronous=FULL`.
+    /// Open a migrated writable SQLite connection configured with `WAL` + `synchronous=FULL`,
+    /// including custody table/watermark convergence (`custody_heads`, `custody_commits`).
     pub fn open_writable(&self) -> Result<Connection, StateError> {
+        let mut conn = self.open_writable_core()?;
+        schema::converge(&mut conn)?;
+        Ok(conn)
+    }
+
+    /// Open a migrated writable SQLite connection for core non-custody domain writes (`whispers`,
+    /// `lane_runs`, `receipts`, `lineage_edges`, `producers`, `writer_epochs`, WAL checkpoints)
+    /// without running custody-manifest watermark queries on every append.
+    pub(crate) fn open_writable_core(&self) -> Result<Connection, StateError> {
         if crate::env::frozen() || self.export_snapshot.is_some() {
             return Err(StateError::Frozen);
         }
@@ -287,7 +297,7 @@ impl StateStore {
             "PRAGMA synchronous = FULL;
              PRAGMA foreign_keys = ON;",
         )?;
-        schema::ensure_migrated(&mut conn)?;
+        schema::apply_migrations(&mut conn)?;
         Ok(conn)
     }
 
@@ -298,7 +308,7 @@ impl StateStore {
         if crate::env::frozen() || !self.db_path.is_file() {
             return Ok(None);
         }
-        let conn = self.open_writable()?;
+        let conn = self.open_writable_core()?;
         let sql = if truncate {
             "PRAGMA wal_checkpoint(TRUNCATE)"
         } else {
