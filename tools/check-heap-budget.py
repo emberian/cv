@@ -221,6 +221,8 @@ SHELL_DOCTOR_EXPECTED = {
     "whisper_uptake": {},
     "post_compaction_churn": [],
     "summary_provenance_contrast": [],
+    "compaction_laundering": [],
+    "diary_ledger_divergence": [],
     "spin_episodes": [],
     "instruction_bloat": [],
 }
