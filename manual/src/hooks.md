@@ -49,6 +49,9 @@ go to stderr); with a terminal on stdin it exits 2 with usage. None scans the fl
   trigger and size, says so, and points at `cv show <id> --kind compaction_boundary,compaction_summary`.
   [`cv show --pre-compaction`](cli.md#cv-show) reads the compacted records;
   [`cv rewind --at`](cli.md#cv-rewind) resumes before them.
+  When the new summary states a directive that repeats a tool result and nothing a person typed,
+  the one line is instead `N compaction directive(s) repeat tool output, not a human prompt · cv
+  doctor <harness>:<id>` ([`compaction_laundering`](cli.md#cv-doctor)).
 - **start** reads the catalog without a freshness probe: sessions newer than the last `cv ls` /
   `cv archive sync` are missing. The sha is the last `[branch sha]` line in the transcript's tail,
   the 8 MiB split across the rows; a row with none there says how far back it looked.

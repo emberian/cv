@@ -1243,6 +1243,10 @@ pub struct Lane {
     /// Where the hook record and the transcript tail disagree ([`witness_divergence`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_divergence: Option<String>,
+    /// The lane's last report says builds or tests pass and its own record of runs and edits
+    /// does not show that ([`crate::doctor::DiaryLedgerDivergence`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diary_ledger_divergence: Option<crate::doctor::DiaryLedgerDivergence>,
     /// Why a `failed` / `killed` lane died, read from its transcript's last API-error notice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_cause: Option<String>,
@@ -1646,6 +1650,7 @@ struct Pass {
     endpoint: Option<String>,
     /// An open tool call is a question or approval for the operator.
     pending_ask: bool,
+    diary_ledger_divergence: Option<crate::doctor::DiaryLedgerDivergence>,
 }
 
 /// A question or approval call: answering it is the operator's move.
@@ -1674,6 +1679,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
     let mut seen = HashSet::new();
     let mut open_tools: HashSet<String> = HashSet::new();
     let mut asks: HashSet<String> = HashSet::new();
+    let mut ledger = crate::doctor::Ledger::default();
     // Only response identity is needed beyond the ordinary IR. Keep source-backed arguments
     // without unrelated raw result metadata; demanded assistant reports retain their full text.
     let opts = Demand::USAGE.with_spans();
@@ -1682,6 +1688,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
         r,
         &opts,
         &mut crate::stream::TryFnSink::new(|m: Message| {
+            ledger.observe(Some(r.harness), &m, &resolver)?;
             if m.kind == MessageKind::CompactionBoundary {
                 open_tools.clear();
                 asks.clear();
@@ -1779,6 +1786,7 @@ fn pass(r: &SessionRef) -> Result<Pass> {
     }
     p.open_tool_calls = open_tools.len();
     p.pending_ask = asks.iter().any(|id| open_tools.contains(id));
+    p.diary_ledger_divergence = ledger.finish(Some(&r.id));
     Ok(p)
 }
 
@@ -2252,6 +2260,7 @@ fn lane_of(
         pending_ask: p.pending_ask,
         attention: AttentionState::Done,
         witness_divergence: divergence,
+        diary_ledger_divergence: p.diary_ledger_divergence,
         failure_cause: cause.map(str::to_string),
         resets_at: notice.and_then(|n| n.resets_at),
         failure_detail: notice.map(|n| n.text.clone()),
@@ -2465,6 +2474,7 @@ mod tests {
             pending_ask: false,
             attention: AttentionState::Done,
             witness_divergence: None,
+            diary_ledger_divergence: None,
             failure_cause: None,
             resets_at: None,
             failure_detail: None,
@@ -2665,6 +2675,7 @@ mod tests {
             pending_ask: false,
             attention: AttentionState::Done,
             witness_divergence: None,
+            diary_ledger_divergence: None,
             failure_cause: None,
             resets_at: None,
             failure_detail: None,
@@ -2828,6 +2839,7 @@ mod tests {
             pending_ask: false,
             attention: AttentionState::Done,
             witness_divergence: None,
+            diary_ledger_divergence: None,
             failure_cause: None,
             resets_at: None,
             failure_detail: None,
@@ -3225,6 +3237,7 @@ mod tests {
                 pending_ask: true,
                 attention: AttentionState::Done,
                 witness_divergence: None,
+                diary_ledger_divergence: None,
                 failure_cause: None,
                 resets_at: None,
                 failure_detail: None,
@@ -3265,6 +3278,7 @@ mod tests {
             pending_ask: true,
             attention: AttentionState::Done,
             witness_divergence: None,
+            diary_ledger_divergence: None,
             failure_cause: None,
             resets_at: None,
             failure_detail: None,

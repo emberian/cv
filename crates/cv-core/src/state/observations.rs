@@ -43,6 +43,8 @@ enum Pointer {
     Inbox { count: u32, source: crate::source::FileId },
     Compact(u32),
     Adopt { count: u32, from: String },
+    /// Directives in the newest compaction summary that repeat a tool result and no human prompt.
+    Laundering(u32),
 }
 impl Pointer {
     fn kind(&self) -> &'static str {
@@ -50,6 +52,7 @@ impl Pointer {
             Self::Compact(_) => "compaction",
             Self::Inbox { .. } => "decisions",
             Self::Adopt { .. } => "adopt",
+            Self::Laundering(_) => "laundering",
         }
     }
     fn command(&self, harness: Harness, session: &str) -> Option<String> {
@@ -60,6 +63,9 @@ impl Pointer {
             Self::Inbox { count, .. } if *count > 0 => Some("cv task inbox".into()),
             Self::Adopt { count, from } if *count > 0 && valid_id(from) && valid_id(session) => {
                 Some(format!("cv adopt --join --from {from} --into {session}"))
+            }
+            Self::Laundering(count) if *count > 0 && valid_id(session) => {
+                Some(format!("cv doctor {harness}:{session}"))
             }
             _ => None,
         }
@@ -135,6 +141,9 @@ pub fn observe(hook: &str, harness: Harness, payload: &Value) -> Option<String> 
         Some(match w.pointer {
             Pointer::Inbox { count, .. } | Pointer::Adopt { count, .. } => format!("{count} · {command}"),
             Pointer::Compact(_) => command,
+            Pointer::Laundering(count) => {
+                format!("{count} compaction directive(s) repeat tool output, not a human prompt · {command}")
+            }
         })
     });
     let details = match hook {
@@ -321,12 +330,19 @@ fn consume(store: &StateStore, mut obs: Observation) -> Result<()> {
             let r = crate::SessionRef::new(&obs.session, obs.harness, path);
             let boundaries = crate::compaction::detect(&r, false)?;
             let Some(last) = boundaries.last() else { return Ok(()) };
-            (
-                Pointer::Compact(u32::try_from(boundaries.len())?),
-                last.boundary_uuid
-                    .clone()
-                    .unwrap_or_else(|| last.boundary_msg_idx.to_string()),
-            )
+            let rev = last
+                .boundary_uuid
+                .clone()
+                .unwrap_or_else(|| last.boundary_msg_idx.to_string());
+            // One mailbox slot: a summary that promoted tool output to an instruction outranks
+            // the pointer back to what the compaction left out. An unreadable scan warns of nothing.
+            let laundered = crate::harness::for_harness(obs.harness)
+                .and_then(|adapter| crate::doctor::newest_compaction_laundering(adapter.as_ref(), &r).ok())
+                .map_or(0, |found| found.len());
+            match u32::try_from(laundered)? {
+                0 => (Pointer::Compact(u32::try_from(boundaries.len())?), rev),
+                count => (Pointer::Laundering(count), format!("laundering:{rev}")),
+            }
         }
         "start" | "decisions" => {
             if let Some(cand) = inbox_candidate()? {

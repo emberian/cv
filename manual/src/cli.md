@@ -529,6 +529,8 @@ in the last five minutes), `stale` (running but quieter), `idle` (stopped, nothi
 **`witness_divergence`** appears when the hook record and the transcript disagree: a hook stop
 followed by transcript activity more than 500 ms later (Claude flushes about 100 ms after `Stop`),
 a stop with unsettled tool calls, or an open run whose transcript already ended in a report.
+**`diary_ledger_divergence`** (`--json`) appears when a lane's last report claims passing builds
+or tests against its own record of runs and edits, as in [`cv doctor`](#cv-doctor).
 
 **`--tasks`** shows up to five tasks each lane's endpoint holds (id, state, title, last note). The
 endpoint is the first `CV_ENDPOINT=<kind>:<name>` the lane's own shell exported
@@ -651,6 +653,20 @@ prune markers 1.5; +12 per block, 3k per image): 7% under to 46% over, middle wi
 and peak prompt are the provider's recorded sizes (largest first under `--recent`) unless
 `cv prune` rewrote them. JSON: `conversational` and per-tool values are byte estimates,
 `peak_context` the peak, `fixed_overhead_est` the first prompt.
+
+Two findings read the transcript's account of itself against its record. Both are advisory: fixed
+phrase lists and word overlap, with the evidence named so you can check it.
+
+- **`compaction_laundering`**: a directive in a compaction summary (`do not`, `never`, `must`,
+  `skip`, `approved`, `ignore`, …) at least 60% of whose word trigrams sit in one directive
+  sentence of an earlier tool result, and at most 15% anywhere in what a person typed. The summary
+  turned something a tool printed into an instruction. Each finding gives the clause, the
+  `tool_use_id` and the two shares; the report prints `cv cat <session> <tool_use_id>`.
+- **`diary_ledger_divergence`**: the last assistant report says builds or tests pass (`all tests
+  pass`, `build succeeded`, `0 errors`, `all green`) while the record before it says otherwise:
+  `failing_validation` (the last recognized build/test run failed), `post_failure_edit` (it
+  failed, then source files were edited and no run followed) or `unverified_edit` (edits after the
+  last passing run). Edits to prose files do not count, and a hedged sentence is not a claim.
 
 ---
 

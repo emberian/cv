@@ -482,6 +482,55 @@ fn trajectory_lines(rep: &Report) -> Vec<String> {
             ));
         }
     }
+    if !rep.compaction_laundering.is_empty() {
+        out.push(format!(
+            "\nCompaction laundering ({}; a summary directive that repeats a tool result and no human prompt):",
+            rep.compaction_laundering.len()
+        ));
+        for l in rep.compaction_laundering.iter().take(8) {
+            let session = l.session.as_deref().unwrap_or("<session>");
+            out.push(format!(
+                "  {:<24} \"{}\"\n  {:<24} from {} {} ({:.0}% of its words; {:.0}% in human prompts) · cv cat {} {}",
+                at(&l.session, l.index),
+                sanitize_line(&l.clause),
+                "",
+                sanitize_line(l.tool_name.as_deref().unwrap_or("tool result")),
+                sanitize_line(&l.tool_use_id),
+                l.tool_overlap * 100.0,
+                l.human_overlap * 100.0,
+                sanitize_line(session),
+                sanitize_line(&l.tool_use_id),
+            ));
+        }
+    }
+    if !rep.diary_ledger_divergence.is_empty() {
+        out.push(format!(
+            "\nDiary vs ledger ({}; the last report says builds or tests pass, the record does not):",
+            rep.diary_ledger_divergence.len()
+        ));
+        for d in rep.diary_ledger_divergence.iter().take(8) {
+            use cv_core::doctor::DivergenceKind;
+            let record = match d.kind {
+                DivergenceKind::FailingValidation => "the last run failed".to_string(),
+                DivergenceKind::PostFailureEdit => {
+                    format!("the last run failed, then {} edit(s) no run checked", d.edits_after)
+                }
+                DivergenceKind::UnverifiedEdit => {
+                    format!("{} edit(s) after the last passing run, unchecked", d.edits_after)
+                }
+            };
+            out.push(format!(
+                "  {:<24} \"{}\"\n  {:<24} {record} · @msg {} `{}` ({}) {}",
+                at(&d.session, d.claim_index),
+                sanitize_line(&d.claim),
+                "",
+                d.validation_index,
+                sanitize_line(&d.validation_command),
+                sanitize_line(&d.validation_tool_use_id),
+                sanitize_line(&d.edited_paths.join(" ")),
+            ));
+        }
+    }
     if !rep.instruction_bloat.is_empty() {
         out.push(format!(
             "\nInstruction files over {} words (carried every turn; estimates):",

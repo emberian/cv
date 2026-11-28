@@ -22,7 +22,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod integrity;
 mod trajectory;
+pub(crate) use integrity::Ledger;
+pub use integrity::{
+    CompactionLaundering, DiaryLedgerDivergence, DivergenceKind, LAUNDERING_HUMAN_OVERLAP, LAUNDERING_TOOL_OVERLAP,
+};
 pub use trajectory::{
     ChurnSeam, ChurnWindow, InstructionBloat, SpinEpisode, SummaryContrast, CHURN_TURNS_AFTER, INSTRUCTION_BLOAT_WORDS,
 };
@@ -214,6 +219,10 @@ pub struct Report {
     pub spin_episodes: Vec<SpinEpisode>,
     /// Loaded instruction files over [`INSTRUCTION_BLOAT_WORDS`] words.
     pub instruction_bloat: Vec<InstructionBloat>,
+    /// Directive clauses in compaction summaries that repeat a tool result and no human prompt.
+    pub compaction_laundering: Vec<CompactionLaundering>,
+    /// Sessions whose last assistant report claims passing builds or tests against the record.
+    pub diary_ledger_divergence: Vec<DiaryLedgerDivergence>,
 }
 
 impl Report {
@@ -247,6 +256,8 @@ impl Report {
             msg_facts: Vec::new(),
             latch: Default::default(),
             trajectory: Default::default(),
+            laundering: Default::default(),
+            ledger: Default::default(),
             session_id: None,
         }
     }
@@ -325,6 +336,8 @@ impl Report {
             "history": history,
             "post_compaction_churn": self.post_compaction_churn,
             "summary_provenance_contrast": self.summary_provenance_contrast,
+            "compaction_laundering": self.compaction_laundering,
+            "diary_ledger_divergence": self.diary_ledger_divergence,
             "spin_episodes": self.spin_episodes,
             "instruction_bloat": self.instruction_bloat,
         })
@@ -347,8 +360,38 @@ fn ran_pointer(command: &str, pointer: &str) -> bool {
     let expected: Vec<_> = expected.collect();
     matches!(
         expected.as_slice(),
-        ["show" | "cat" | "lanes" | "adopt", ..] | ["task", "inbox" | "events", ..]
+        ["show" | "cat" | "lanes" | "adopt" | "doctor", ..] | ["task", "inbox" | "events", ..]
     ) && expected.into_iter().all(|part| actual.next() == Some(part))
+}
+
+/// Whether `m` is off the thread a session's own sensors read: a branch the conversation left,
+/// or a sub-agent's record inside its parent's transcript.
+fn off_thread(m: &Message, session_id: Option<&str>) -> bool {
+    has_extra_bool(m, "inactive_branch")
+        || (has_extra_bool(m, "isSidechain") && !session_id.is_some_and(|id| id.starts_with("agent-")))
+}
+
+/// The compaction-laundering findings of a session's newest compaction summary, read in one
+/// streamed pass ([`CompactionLaundering`]): what a post-compaction hook warns about.
+pub fn newest_compaction_laundering(
+    adapter: &dyn crate::harness::Adapter,
+    session: &crate::SessionRef,
+) -> anyhow::Result<Vec<CompactionLaundering>> {
+    let resolver = crate::lazy::Resolver::new(Some(session.path.clone()));
+    let mut sensor = integrity::Laundering::default();
+    adapter.try_stream(
+        session,
+        &crate::Demand::FACTS.with_spans(),
+        &mut crate::stream::TryFnSink::new(|m: Message| {
+            if off_thread(&m, Some(&session.id)) {
+                sensor.skip_message();
+            } else {
+                sensor.observe(&m, &resolver)?;
+            }
+            Ok(Flow::Continue)
+        }),
+    )?;
+    Ok(sensor.finish_newest(Some(&session.id)))
 }
 
 fn has_extra_bool(m: &Message, key: &str) -> bool {
@@ -442,6 +485,8 @@ pub struct SessionPass<'a> {
     msg_facts: Vec<MsgFact>,
     latch: crate::stream::Latch,
     trajectory: trajectory::Trajectory,
+    laundering: integrity::Laundering,
+    ledger: integrity::Ledger,
     session_id: Option<String>,
 }
 
@@ -570,6 +615,10 @@ impl SessionPass<'_> {
         rep.summary_provenance_contrast.extend(found.contrast);
         rep.spin_episodes.extend(found.spins);
         rep.instruction_bloat.extend(found.bloat);
+        rep.compaction_laundering
+            .extend(self.laundering.finish(self.session_id.as_deref()));
+        rep.diary_ledger_divergence
+            .extend(self.ledger.finish(self.session_id.as_deref()));
         Ok(())
     }
 
@@ -578,10 +627,13 @@ impl SessionPass<'_> {
         self.observe_whispers(m)?;
         let inactive_branch = has_extra_bool(m, "inactive_branch");
         let sidechain = has_extra_bool(m, "isSidechain");
-        let is_subagent_session = self.session_id.as_deref().is_some_and(|id| id.starts_with("agent-"));
-        if inactive_branch || (sidechain && !is_subagent_session) {
+        if off_thread(m, self.session_id.as_deref()) {
             self.trajectory.skip_message();
+            self.laundering.skip_message();
+            self.ledger.skip_message();
         } else {
+            self.laundering.observe(m, &self.resolver)?;
+            self.ledger.observe(self.harness, m, &self.resolver)?;
             let turn_key = (m.role == Role::Assistant)
                 .then(|| msg_usage_key(self.harness, m))
                 .flatten();
@@ -1413,6 +1465,7 @@ mod tests {
             "cv show claude:abc --pre-compaction 1",
             "cv cat abc tu9",
             "cv lanes abc",
+            "cv doctor claude:abc",
             "cv task inbox",
             "cv task events --since event7",
         ] {

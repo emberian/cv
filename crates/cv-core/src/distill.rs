@@ -725,7 +725,7 @@ fn re(which: Re) -> &'static Regex {
         Re::RemoteTarget => (&RES[5], r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]"),
         Re::GateCmd => (
             &RES[6],
-            r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
+            r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bvitest\b|\bjest\b|\btsc\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
         ),
         Re::Verdict => (
             &RES[7],
@@ -2907,8 +2907,19 @@ fn render_reads(h: &mut String, reads: &[(usize, String, String, String)], f: &F
 /// Distinctive names carried per brick from the `Read` outputs it elides.
 const BRICK_SYMBOLS: usize = 8;
 
+/// Whether `command` runs a build or a test suite: a run whose result is a verdict on the tree.
+pub(crate) fn is_gate_command(command: &str) -> bool {
+    re(Re::GateCmd).is_match(command)
+}
+
+/// Whether build/test output reports a failure its tool did not flag as an error. Line-anchored,
+/// so it reads a whole output or one line of it.
+pub(crate) fn gate_failed(output: &str) -> bool {
+    re(Re::GateFailed).is_match(output)
+}
+
 /// Prose files, whose distinctive names are their headings rather than code definitions.
-fn is_prose_path(path: &str) -> bool {
+pub(crate) fn is_prose_path(path: &str) -> bool {
     let ext = basename(path)
         .rsplit_once('.')
         .map_or("", |(_, e)| e)
