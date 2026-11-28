@@ -64,31 +64,13 @@ pub struct RedactOptions {
     pub classes: RedactClasses,
 }
 
-impl RedactOptions {
-    /// Convert these secret-class options into an equivalent [`ScrubProfile`] (with network, path,
-    /// and principal transformations disabled).
-    pub fn to_scrub_profile(&self) -> ScrubProfile {
-        ScrubProfile::from(self)
-    }
-
-    /// Build an infallible [`CompiledProfile`] for these secret-class options.
-    pub fn compile(&self) -> CompiledProfile {
-        CompiledProfile::from_options(self)
-    }
-}
-
+/// The same secret classes, with network, path and principal transformations disabled.
 impl From<&RedactOptions> for ScrubProfile {
     fn from(opts: &RedactOptions) -> Self {
         Self {
             classes: opts.classes,
             ..Self::default()
         }
-    }
-}
-
-impl From<RedactOptions> for ScrubProfile {
-    fn from(opts: RedactOptions) -> Self {
-        Self::from(&opts)
     }
 }
 
@@ -587,8 +569,7 @@ pub fn redact_with(session: &Session, opts: &RedactOptions) -> anyhow::Result<(S
 
 /// Redact secrets from a single string. The core building block.
 pub fn redact_text(s: &str) -> String {
-    let mut stats = RedactStats::default();
-    scrub(s, &RedactOptions::default(), &mut stats)
+    scrub_cow(s, &RedactOptions::default(), &mut RedactStats::default()).into_owned()
 }
 
 /// Credential-only redaction options (`emails: false`, so ordinary git author emails in commit
@@ -606,9 +587,8 @@ pub fn credential_options() -> RedactOptions {
 /// Scrub credential-shaped strings from `s` (leaving ordinary email addresses intact), returning
 /// `(redacted_text, redaction_count)`. Idempotent: `[REDACTED:kind]` markers never re-trigger.
 pub fn redact_credentials(s: &str) -> (String, usize) {
-    let mut stats = RedactStats::default();
-    let out = scrub(s, &credential_options(), &mut stats);
-    (out, stats.total())
+    let (out, count) = redact_credentials_cow(s);
+    (out.into_owned(), count)
 }
 
 /// Allocation-aware twin of [`redact_credentials`]: borrows `s` when no credential matched.
@@ -626,46 +606,7 @@ pub fn str_needs_scrub(s: &str, opts: &RedactOptions) -> bool {
     if secrets::additional(s, &opts.classes).is_some() {
         return true;
     }
-    if s.is_empty() {
-        return false;
-    }
-    const MAX_RULES: usize = 16;
-    let all = rules();
-    debug_assert!(all.len() <= MAX_RULES);
-    let mut slots: [Option<(&Rule, Option<Hit>)>; MAX_RULES] = [None; MAX_RULES];
-    let mut count = 0usize;
-    for r in all {
-        if r.kind.enabled(opts) {
-            slots[count] = Some((r, r.next_hit(s, 0)));
-            count += 1;
-        }
-    }
-    let active = &mut slots[..count];
-    let mut cur = 0usize;
-    loop {
-        for (r, h) in active.iter_mut().flatten() {
-            if h.as_ref().is_some_and(|hit| hit.start < cur) {
-                *h = r.next_hit(s, cur);
-            }
-        }
-        let Some(hit) = active
-            .iter()
-            .filter_map(|slot| slot.as_ref().and_then(|(_, h)| *h))
-            .min_by_key(|h| h.start)
-        else {
-            return false;
-        };
-        cur = hit.end.max(hit.start + 1);
-        if hit.kind.label().is_some() {
-            return true;
-        }
-    }
-}
-
-/// Zero-allocation pre-scan over a [`crate::json::JsonView`]: checks string leaves in place without
-/// building a `serde_json::Value` tree. Source identity and bounds are still verified by the view.
-pub fn json_view_needs_scrub(view: crate::json::JsonView<'_>, opts: &RedactOptions) -> anyhow::Result<bool> {
-    CompiledProfile::from_options(opts).json_view_needs_scrub(view, None)
+    !s.is_empty() && hits(s, opts).next().is_some()
 }
 
 /// Zero-allocation pre-scan over a [`crate::json::Json`] (`Owned` or `Source`) before calling
@@ -734,32 +675,9 @@ pub fn redact_message(
     Ok(())
 }
 
-/// Apply a [`ScrubProfile`] (filter + secret classes + IP/hostname/SSH scrubbing + `$REPO`/`$HOME`/regex
-/// path rewrites + `principal` policy) to `session`. Returns `Ok(None)` without materializing lazy
-/// payloads when `profile.filter` excludes the session.
-pub fn filter_and_scrub_session(
-    session: &Session,
-    profile: &ScrubProfile,
-) -> anyhow::Result<Option<(Session, ScrubStats)>> {
-    if !profile.matches_session(session) {
-        return Ok(None);
-    }
-    let compiled = profile.compile()?;
-    compiled.scrub_session(session).map(Some)
-}
-
 /// Scrub `session` unconditionally under `profile` (ignoring `profile.filter`).
 pub fn scrub_session_with_profile(session: &Session, profile: &ScrubProfile) -> anyhow::Result<(Session, ScrubStats)> {
     profile.compile()?.scrub_session(session)
-}
-
-/// Scrub a standalone string under `profile` (using `repo_root` when `rewrite_repo` is set).
-pub fn scrub_text_with_profile(s: &str, profile: &ScrubProfile) -> anyhow::Result<String> {
-    let compiled = profile.compile()?;
-    let mut stats = ScrubStats::default();
-    Ok(compiled
-        .scrub_text_cow(s, profile.repo_root.as_deref(), &mut stats)
-        .into_owned())
 }
 
 impl CompiledProfile {
@@ -782,18 +700,10 @@ impl CompiledProfile {
             || !self.custom.is_empty()
     }
 
-    /// Zero-allocation pre-scan over a [`crate::json::JsonView`] under this profile.
-    pub fn json_view_needs_scrub(
-        &self,
-        view: crate::json::JsonView<'_>,
-        repo_root: Option<&Path>,
-    ) -> anyhow::Result<bool> {
-        json_view_any_str(view, &mut |s| self.text_needs_scrub(s, repo_root))
-    }
-
-    /// Zero-allocation pre-scan over a [`crate::json::Json`] (`Owned` or `Source`) under this profile.
+    /// Zero-allocation pre-scan over a [`crate::json::Json`] (`Owned` or `Source`) under this profile:
+    /// string leaves are checked in place, and the view still verifies source identity and bounds.
     pub fn json_needs_scrub(&self, json: &crate::json::Json, repo_root: Option<&Path>) -> anyhow::Result<bool> {
-        json.with_view(|v| self.json_view_needs_scrub(v, repo_root))
+        json.with_view(|v| json_view_any_str(v, &mut |s| self.text_needs_scrub(s, repo_root)))
     }
 
     /// Scrub a session with zero-allocation `JsonView` pre-scanning on clean `ToolUse` inputs.
@@ -1522,13 +1432,9 @@ const PLACEHOLDER_OPEN: &str = "[REDACTED:";
 // Core scanner
 // ---------------------------------------------------------------------------
 
-/// Walk `s` once, replacing every recognized secret span with a placeholder.
-fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
-    scrub_cow(s, opts, stats).into_owned()
-}
-
-/// [`scrub`], allocation-aware: returns `Cow::Borrowed(s)` when nothing matched (the overwhelmingly
-/// common case for ordinary transcript text), and copies clean stretches between matches in bulk.
+/// Walk `s` once, replacing every recognized secret span with a placeholder. Returns
+/// `Cow::Borrowed(s)` when nothing matched (the overwhelmingly common case for ordinary transcript
+/// text), and copies clean stretches between matches in bulk.
 ///
 /// Routes through [`CompiledProfile::scrub_text_cow`] so escaped JSON envelopes and plain text share
 /// one AST/leaf walker across `RedactOptions` and `ScrubProfile`.
@@ -1552,10 +1458,9 @@ fn escaped_envelope(s: &str) -> bool {
     s.trim_start().starts_with(['{', '[', '"']) && s.contains('\\')
 }
 
-fn legacy_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
-    if s.is_empty() {
-        return Cow::Borrowed(s);
-    }
+/// The accepted hits of every enabled rule with their placeholder labels, leftmost first and
+/// never overlapping. An existing placeholder is stepped over, not yielded.
+fn hits<'a>(s: &'a str, opts: &RedactOptions) -> impl Iterator<Item = (Hit, &'static str)> + 'a {
     const MAX_RULES: usize = 16;
     let all = rules();
     debug_assert!(all.len() <= MAX_RULES);
@@ -1567,26 +1472,33 @@ fn legacy_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> 
             count += 1;
         }
     }
-    let active = &mut slots[..count];
-    // The redacted output, allocated lazily on the first match; `copied` is how much of `s` has
-    // already been flushed into it.
-    let (mut out, mut copied, mut cur) = (None::<String>, 0, 0);
-    loop {
+    let mut cur = 0;
+    std::iter::from_fn(move || loop {
+        let active = &mut slots[..count];
         for (r, h) in active.iter_mut().flatten() {
             if h.as_ref().is_some_and(|h| h.start < cur) {
                 *h = r.next_hit(s, cur);
             }
         }
-        let Some(hit) = active
+        let hit = active
             .iter()
             .filter_map(|slot| slot.as_ref().and_then(|(_, h)| *h))
-            .min_by_key(|h| h.start)
-        else {
-            break;
-        };
-        let Hit { start, keep, end, kind } = hit;
-        cur = end.max(start + 1);
-        let Some(label) = kind.label() else { continue }; // a placeholder: leave it in place
+            .min_by_key(|h| h.start)?;
+        cur = hit.end.max(hit.start + 1);
+        if let Some(label) = hit.kind.label() {
+            return Some((hit, label));
+        }
+    })
+}
+
+fn legacy_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
+    if s.is_empty() {
+        return Cow::Borrowed(s);
+    }
+    // The redacted output, allocated lazily on the first match; `copied` is how much of `s` has
+    // already been flushed into it.
+    let (mut out, mut copied) = (None::<String>, 0);
+    for (Hit { keep, end, kind, .. }, label) in hits(s, opts) {
         let o = out.get_or_insert_with(String::new);
         // The clean stretch plus any prefix the rule preserves (e.g. `Authorization: `).
         o.push_str(&s[copied..keep]);
@@ -2978,7 +2890,8 @@ mod tests {
         m.content.push(Block::from_text("Connect via ssh deploy@bastion-01 to 10.42.0.19 or 100.88.1.5 (keep 127.0.0.1 and v10.2.3.4), check db.internal and node.tailnet.ts.net, read /Users/alice/dev/secret-proj/src/lib.rs, /Users/alice/.zshrc, and /mnt/nas/vol9/data. Keep alice@example.com.".into()));
         s.messages.push(m);
 
-        let (scrubbed, stats) = filter_and_scrub_session(&s, &profile)?.expect("matching session should pass filter");
+        assert!(profile.matches_session(&s), "matching session should pass filter");
+        let (scrubbed, stats) = scrub_session_with_profile(&s, &profile)?;
         let rendered = scrubbed.messages[0].text().expect("text block");
         assert!(rendered.contains("ssh [REDACTED:ssh]"), "{rendered}");
         assert!(!rendered.contains("10.42.0.19"), "{rendered}");
@@ -3007,11 +2920,11 @@ mod tests {
         // Denied cwd or non-matching harness is filtered out before materializing.
         let mut denied = s.clone();
         denied.cwd = Some(PathBuf::from("/Users/alice/dev/private-vault/sub"));
-        assert!(filter_and_scrub_session(&denied, &profile)?.is_none());
+        assert!(!profile.matches_session(&denied));
 
         let mut wrong_harness = s.clone();
         wrong_harness.harness = Harness::Codex;
-        assert!(filter_and_scrub_session(&wrong_harness, &profile)?.is_none());
+        assert!(!profile.matches_session(&wrong_harness));
         Ok(())
     }
     #[test]
@@ -3163,7 +3076,7 @@ mod tests {
 
         let opts = credential_options();
         let (via_opts, opts_stats) = redact_with(&s, &opts)?;
-        let (via_profile, prof_stats) = opts.to_scrub_profile().compile()?.scrub_session(&s)?;
+        let (via_profile, prof_stats) = ScrubProfile::from(&opts).compile()?.scrub_session(&s)?;
         assert_eq!(serde_json::to_value(&via_opts)?, serde_json::to_value(&via_profile)?);
         assert_eq!(opts_stats, prof_stats.secrets);
         assert_eq!(prof_stats.total(), opts_stats.total());
