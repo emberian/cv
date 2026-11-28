@@ -225,16 +225,7 @@ mod imp {
         read_only_connection(path, "mode=ro").or_else(|| open_checkpoint(path))
     }
 
-    fn checkpoint_only(path: &Path) -> bool {
-        ["-wal", "-journal"].iter().all(|suffix| {
-            let mut sidecar = path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            match std::fs::metadata(sidecar) {
-                Ok(m) => m.is_file() && m.len() == 0,
-                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-            }
-        })
-    }
+    use crate::harness::store::sqlite::{checkpoint_only, sqlite_uri};
 
     /// Immutable is valid only for a checkpoint, never as a way around a live WAL read error.
     /// As with frozen reads, the copy must remain read-only for the connection's lifetime.
@@ -282,15 +273,9 @@ mod imp {
     fn read_only_connection(path: &Path, query: &str) -> Option<Connection> {
         use rusqlite::OpenFlags;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let file = path
-            .to_string_lossy()
-            .replace('%', "%25")
-            .replace('?', "%3f")
-            .replace('#', "%23");
+        let uri = sqlite_uri(path, query);
         let version = crate::discover_cache::INTERPRETATION_VERSION.to_string();
-        let conn = Connection::open_with_flags(format!("file:{file}?{query}"), flags)
-            .inspect_err(note_sql)
-            .ok()?;
+        let conn = Connection::open_with_flags(uri, flags).inspect_err(note_sql).ok()?;
         conn.busy_timeout(Duration::from_secs(5)).inspect_err(note_sql).ok()?;
         let _ = conn.execute_batch("PRAGMA query_only = ON;");
         let stored: String = conn
@@ -1408,9 +1393,6 @@ mod imp {
             if !condemned {
                 if let Some(a) = crate::harness::for_harness(h) {
                     let roots = a.roots();
-                    let unwatched_root = roots
-                        .iter()
-                        .any(|r| r.exists() && !watched_paths.contains(r.to_string_lossy().as_ref()));
                     let leftover_rows = roots.is_empty()
                         && conn
                             .query_row(
@@ -1419,7 +1401,7 @@ mod imp {
                                 |r| r.get::<_, bool>(0),
                             )
                             .unwrap_or(false);
-                    if (!roots.is_empty() != has_watches) || unwatched_root || leftover_rows {
+                    if roots_out_of_sync(&roots, has_watches, |p| watched_paths.contains(p)) || leftover_rows {
                         condemned = true;
                     }
                 }
@@ -1829,12 +1811,10 @@ mod imp {
             if stale.contains(&h) {
                 continue;
             }
-            let unwatched_root = || {
-                a.roots()
-                    .iter()
-                    .any(|r| r.exists() && !watched_paths.contains(&(h, r.to_string_lossy().into_owned())))
-            };
-            if !a.roots().is_empty() != watched_harnesses.contains(&h) || unwatched_root() {
+            let roots = a.roots();
+            if roots_out_of_sync(&roots, watched_harnesses.contains(&h), |p| {
+                watched_paths.contains(&(h, p.to_owned()))
+            }) {
                 mark(&mut stale, h);
             }
         }
@@ -2580,6 +2560,16 @@ mod imp {
         rows.flatten().flatten().filter(|r| r.id.starts_with(id)).collect()
     }
 
+    fn has_unwatched_existing_root(roots: &[PathBuf], mut is_watched: impl FnMut(&str) -> bool) -> bool {
+        roots
+            .iter()
+            .any(|r| r.exists() && !is_watched(r.to_string_lossy().as_ref()))
+    }
+
+    fn roots_out_of_sync(roots: &[PathBuf], has_watches: bool, is_watched: impl FnMut(&str) -> bool) -> bool {
+        (!roots.is_empty() != has_watches) || has_unwatched_existing_root(roots, is_watched)
+    }
+
     fn has_unwatched_root_in(conn: &Connection, h: Harness) -> Option<bool> {
         let Some(a) = crate::harness::for_harness(h) else {
             return Some(false);
@@ -2596,12 +2586,7 @@ mod imp {
             .collect::<rusqlite::Result<_>>()
             .inspect_err(note_sql)
             .ok()?;
-        Some(
-            (!roots.is_empty() && watched.is_empty())
-                || roots
-                    .iter()
-                    .any(|r| r.exists() && !watched.contains(r.to_string_lossy().as_ref())),
-        )
+        Some((!roots.is_empty() && watched.is_empty()) || has_unwatched_existing_root(&roots, |p| watched.contains(p)))
     }
 
     /// Exact-id catalog rows for `(id, harness)` when `catalog.db` is openable and covers the
@@ -2629,6 +2614,47 @@ mod imp {
     mod tests {
         use super::*;
         use std::time::UNIX_EPOCH;
+
+        #[test]
+        fn read_only_catalog_opens_paths_with_spaces_delimiters_and_raw_unix_bytes() {
+            let world = crate::test_world("catalog-uri-encoding");
+            let tricky = world.base.join("cache dir #1?v=100%");
+            std::fs::create_dir_all(&tricky).unwrap();
+            let db = tricky.join("catalog.db");
+            {
+                let conn = open_writable(&db).unwrap();
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            }
+            let _ = std::fs::remove_file(tricky.join("catalog.db-wal"));
+            let _ = std::fs::remove_file(tricky.join("catalog.db-shm"));
+            {
+                let _frozen = crate::env::Env::default().with_frozen().enter();
+                assert!(
+                    open_at(&db).is_some(),
+                    "checkpointed frozen catalog with spaces/delimiters must open"
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::ffi::OsString;
+                use std::os::unix::ffi::OsStringExt;
+                let mut raw_name = b"raw-cache-".to_vec();
+                raw_name.push(0xff);
+                // Some filesystems (APFS on macOS) reject non-UTF-8 filenames at mkdir; test raw
+                // bytes whenever the host filesystem admits them.
+                let raw_dir = world.base.join(OsString::from_vec(raw_name));
+                if std::fs::create_dir_all(&raw_dir).is_ok() {
+                    let raw_db = raw_dir.join("catalog.db");
+                    let conn = open_writable(&raw_db).unwrap();
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+                    drop(conn);
+                    let _ = std::fs::remove_file(raw_dir.join("catalog.db-wal"));
+                    let _ = std::fs::remove_file(raw_dir.join("catalog.db-shm"));
+                    let _frozen = crate::env::Env::default().with_frozen().enter();
+                    assert!(open_at(&raw_db).is_some());
+                }
+            }
+        }
 
         fn rootless(h: Harness) -> &'static dyn crate::harness::Adapter {
             crate::harness::rootless(h).unwrap()

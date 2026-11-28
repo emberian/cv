@@ -373,13 +373,21 @@ fn open_ro_fresh(path: &Path) -> Result<ReadConnection> {
     open_ro_inner(path, false)
 }
 
+/// Whether `path` has neither uncheckpointed WAL frames nor an active rollback journal (an absent
+/// or empty `-wal`/`-journal` is clean; an unreadable sidecar fails closed).
+pub(crate) fn checkpoint_only(path: &Path) -> bool {
+    ["-wal", "-journal"]
+        .iter()
+        .all(|suffix| match std::fs::metadata(sidecar(path, suffix)) {
+            Ok(m) => m.is_file() && m.len() == 0,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        })
+}
+
 fn open_ro_inner(path: &Path, allow_ttl_reuse: bool) -> Result<ReadConnection> {
     let path = std::path::absolute(path)?;
     let reads = record_store_reads(&path);
-    let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
-    let has_journal = sidecar(&path, "-journal").exists();
-    let immutable = !has_frames && !has_journal;
-    if immutable {
+    if checkpoint_only(&path) {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
         let connection = Connection::open_with_flags(immutable_uri(&path), flags)
             .with_context(|| format!("opening {}", path.display()))?;
@@ -394,6 +402,8 @@ fn open_ro_inner(path: &Path, allow_ttl_reuse: bool) -> Result<ReadConnection> {
         });
     }
 
+    let has_frames = std::fs::metadata(sidecar(&path, "-wal")).is_ok_and(|m| m.len() > 0);
+    let has_journal = sidecar(&path, "-journal").exists();
     let has_shm = sidecar(&path, "-shm").exists();
     if !crate::env::frozen() && has_frames && !has_journal && has_shm {
         if allow_ttl_reuse {
@@ -606,20 +616,31 @@ fn open_cold_ro_inner(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("SQLite source dependencies changed or unavailable")))
 }
 
-/// `file:<path>?immutable=1`, with the URI's reserved characters percent-encoded.
-fn immutable_uri(path: &Path) -> String {
+/// `file:<path>?<query>`, absolutized with reserved URI characters, spaces, and controls
+/// percent-encoded (preserving raw `OsStr` bytes on Unix).
+pub(crate) fn sqlite_uri(path: &Path, query: &str) -> String {
     const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b'%').add(b'?').add(b'#').add(b' ');
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
     #[cfg(unix)]
     let encoded = {
         use std::os::unix::ffi::OsStrExt;
-        percent_encoding::percent_encode(path.as_os_str().as_bytes(), RESERVED).to_string()
+        percent_encoding::percent_encode(abs.as_os_str().as_bytes(), RESERVED).to_string()
     };
     #[cfg(not(unix))]
     let encoded = {
-        let text = format!("/{}", path.to_string_lossy().replace('\\', "/"));
+        let text = format!("/{}", abs.to_string_lossy().replace('\\', "/"));
         percent_encoding::utf8_percent_encode(&text, RESERVED).to_string()
     };
-    format!("file:{encoded}?immutable=1")
+    format!("file:{encoded}?{query}")
+}
+
+/// `file:<path>?immutable=1`, with the URI's reserved characters percent-encoded.
+pub(crate) fn immutable_uri(path: &Path) -> String {
+    sqlite_uri(path, "immutable=1")
 }
 
 /// Copy a snapshot's immutable TEXT/BLOB cell into an operation-owned arena using bounded

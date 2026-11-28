@@ -692,29 +692,7 @@ fn snapshot_copy_is_consistent(
     }
 }
 
-fn immutable_sqlite_uri(path: &Path) -> String {
-    sqlite_uri(path, "immutable=1")
-}
-
-fn sqlite_uri(path: &Path, query: &str) -> String {
-    const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b'%').add(b'?').add(b'#').add(b' ');
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
-    #[cfg(unix)]
-    let encoded = {
-        use std::os::unix::ffi::OsStrExt;
-        percent_encoding::percent_encode(abs.as_os_str().as_bytes(), RESERVED).to_string()
-    };
-    #[cfg(not(unix))]
-    let encoded = {
-        let text = format!("/{}", abs.to_string_lossy().replace('\\', "/"));
-        percent_encoding::utf8_percent_encode(&text, RESERVED).to_string()
-    };
-    format!("file:{encoded}?{query}")
-}
+use crate::harness::store::sqlite::{immutable_uri as immutable_sqlite_uri, sqlite_uri};
 
 pub(crate) fn set_restrictive_file_mode(path: &Path) {
     #[cfg(unix)]
