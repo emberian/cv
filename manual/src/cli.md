@@ -67,6 +67,18 @@ An **ambiguous** prefix lists the candidates (`harness:full-id`) and exits `2`.
 | `--as-of <gen>` | pin `ls`, `search`, `events`, and `touched` to hub generation `<gen>` |
 | `--max-staleness <dur>` | fail closed (exit 2 / HTTP 503) if any unsealed place exceeds `<dur>` |
 
+Historical search scans scrubbed message text for a case-insensitive literal in the selected
+generation. Historical file activity comes from those same session revisions. An unmatched
+place selector reports unknown coverage. Generations published before the hub recorded
+per-place state can report their stored frontiers with partial authority.
+
+Use `cv archive sync --pull TARGET` to collect over SSH. Each target is bound to the producer ID
+in its first successful import. Set `CV_PRODUCER_ID` on the source to keep that ID stable.
+`--export-delta` is read-only and writes the binary stream to stdout. For offline transfer, use
+`--spool DIR` on the producer and `--ingest-spool DIR` on the hub. Importing a spool trusts
+its declared producer identity. New archive captures can travel through either transport and replay
+at the same hub when the scrub policy is the same.
+
 **`--thinking` and replay.** Most thinking blocks carry only an opaque provider **signature**
 (177 of 204 on one 900-message session), not text; a proxied session carries another model's
 reasoning and tool IDs the Anthropic API cannot read back. `cv rewind` and `cv port` default to

@@ -536,10 +536,10 @@ fn fleet_hub_conflict_quarantine_freezes_frontier() {
     let quar_5_id = st.quarantine.entries[0].quarantine_id;
 
     // Operator resolves `quar_5_id` via `accept_existing` -> `F` immediately unblocks and jumps to `6`!
-    let admin = HttpClient::new(&hub_url, Some("quar-token".into())).unwrap();
+    let admin = reader(&hub_url);
     let (res_raw, _) = admin
         .post_json(
-            "/api/hub/quarantine",
+            "/api/hub/quarantine/resolve",
             &json!({"quarantine_id": quar_5_id, "resolution": "accept_existing"}),
         )
         .unwrap();
@@ -629,8 +629,8 @@ fn fleet_hub_per_producer_bound_capability_tokens_enforce_isolation() {
 
     let (hub_url, _port, _reaper) = spawn_hub_serve(&hub_w, Some("admin-bootstrap-tok"));
 
-    // Admin bootstrap token can also mint a bound token for `prod-b` via `POST /api/hub/producers`.
-    let admin = HttpClient::new(&hub_url, Some("admin-bootstrap-tok".into())).unwrap();
+    // The configured operator can also mint a bound token for `prod-b` via `POST /api/hub/producers`.
+    let admin = reader(&hub_url);
     let (mint_b_resp, _) = admin
         .post_json(
             "/api/hub/producers",

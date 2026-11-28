@@ -528,6 +528,7 @@ impl Archive {
         for ((key, is_delta_append), entry) in written.iter().zip(entries.iter()) {
             let op_id = format!("archive:{pack_id}:{}", key.selector());
             let mut envelope = json!({
+                "archive_version": 2,
                 "kind": if *is_delta_append { "session_delta" } else { "session_archive" },
                 "producer_id": producer_id,
                 "harness": entry.harness,
@@ -552,6 +553,12 @@ impl Archive {
                     ..
                 } = &entry.custody
                 {
+                    if let Some(cv_core::custody::CustodyKind::NativeExtents {
+                        prefix_blake3: base, ..
+                    }) = known.get(&key.selector()).map(|e| &e.custody)
+                    {
+                        envelope["base_checkpoint"] = json!(base);
+                    }
                     envelope["total_bytes"] = json!(total_bytes);
                     envelope["prefix_blake3"] = json!(prefix_blake3);
                     envelope["file_name"] = json!(file_name);
@@ -1201,14 +1208,9 @@ fn resolve_local_producer_id(store: &StateStore) -> Result<String> {
         }
     }
     if cv_core::env::frozen() {
-        for p in store.list_producers().unwrap_or_default() {
-            if let Some(ship_id) = p.metadata.get("ship_producer_id").and_then(|v| v.as_str()) {
-                if !ship_id.trim().is_empty() {
-                    return Ok(ship_id.to_string());
-                }
-            }
-            if p.producer_id != "local" {
-                return Ok(p.producer_id);
+        if let Some(local) = store.get_producer(store.default_producer())? {
+            if let Some(id) = local.metadata["ship_producer_id"].as_str().filter(|s| !s.is_empty()) {
+                return Ok(id.to_owned());
             }
         }
         return Ok(format!("host-{}", cv_core::state::default_host_label()));
@@ -1222,7 +1224,7 @@ pub fn cmd_sync(archive: &Archive, args: SyncArgs) -> Result<()> {
     // 1. Read-only `--export-delta <WATERMARK>` mode (runs cleanly under `--frozen`, writing pure
     //    `CVDLT001` binary delta stream to stdout for `cv archive sync --pull <SSH_TARGET>`).
     if let Some(ref watermark) = args.export_delta {
-        let store = archive.state_store();
+        let store = archive.state_store().for_export();
         let producer_id = resolve_local_producer_id(&store)?;
         let cfg = cv_core::config::load();
         let stdout = std::io::stdout();
@@ -1268,19 +1270,33 @@ pub fn cmd_sync(archive: &Archive, args: SyncArgs) -> Result<()> {
     // 3. Agentless SSH `--frozen` pull (`cv archive sync --pull <SSH_TARGET>`).
     if let Some(ref ssh_target) = args.pull {
         let ssh_target = ssh_target.trim();
-        if ssh_target.is_empty() || ssh_target.starts_with('-') {
+        if ssh_target.is_empty()
+            || ssh_target.starts_with('-')
+            || !ssh_target
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.@:%[]".contains(&b))
+        {
             return crate::util::usage("invalid --pull SSH target");
         }
         let hub = cv_core::state::hub::HubStore::at_home(&archive.home);
         let watermark = hub.pull_watermark_for(ssh_target)?;
         let ssh_bin = cv_core::env::var("CV_SSH_BIN").unwrap_or_else(|_| "ssh".into());
         let remote_cv = cv_core::env::var("CV_REMOTE_BIN").unwrap_or_else(|_| "cv".into());
-        let child = std::process::Command::new(&ssh_bin)
+        if remote_cv.is_empty()
+            || remote_cv.starts_with('-')
+            || !remote_cv
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+        {
+            return crate::util::usage("CV_REMOTE_BIN must name a shell-safe executable path");
+        }
+        let mut child = std::process::Command::new(&ssh_bin)
             .args([
                 "-o",
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=3",
+                "--",
                 ssh_target,
                 &remote_cv,
                 "--frozen",
@@ -1291,22 +1307,23 @@ pub fn cmd_sync(archive: &Archive, args: SyncArgs) -> Result<()> {
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .with_context(|| format!("spawning `{ssh_bin}` to pull delta from `{ssh_target}`"))?;
-        let out = child
-            .wait_with_output()
-            .with_context(|| format!("waiting for `{ssh_bin}` pull from `{ssh_target}`"))?;
-        if !out.status.success() {
-            bail!(
-                "pull from `{ssh_target}` failed (exit {:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        let stdout = child.stdout.take().expect("piped SSH output");
+        let result = hub.ingest_delta_stream_checked(std::io::BufReader::new(stdout), Some(ssh_target), || {
+            let status = child.wait()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("ssh exited with {status}")))
+            }
+        });
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let rep = hub
-            .ingest_delta_stream(std::io::Cursor::new(&out.stdout), Some(ssh_target))
-            .with_context(|| format!("ingesting delta stream pulled from `{ssh_target}`"))?;
+        let rep = result.with_context(|| format!("ingesting delta stream pulled from `{ssh_target}`"))?;
         let gen_note = rep
             .hub_generation
             .map(|g| format!(" · generation {g}"))

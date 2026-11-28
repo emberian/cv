@@ -371,6 +371,10 @@ impl StateStore {
         let Some(conn) = self.open_readonly()? else {
             return Ok(Vec::new());
         };
+        Self::producers_in(&conn)
+    }
+
+    pub(super) fn producers_in(conn: &rusqlite::Connection) -> Result<Vec<Producer>, StateError> {
         let mut stmt = conn.prepare(
             "SELECT producer_id, host_label, metadata_json, enrolled_at, updated_at
              FROM producers ORDER BY enrolled_at ASC, producer_id ASC",

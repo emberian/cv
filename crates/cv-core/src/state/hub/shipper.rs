@@ -34,6 +34,8 @@ const MAX_OUTBOUND_PACK_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum commits processed per chunked sync iteration (`<= 8 MiB` JSON batch).
 const MAX_COMMITS_PER_BATCH: usize = 2048;
 /// Magic header for `cv --frozen archive sync --export-delta` binary stdio stream.
+const MAX_DELTA_INDEX: u64 = 64 << 20;
+const MAX_DELTA_ZST: u64 = 512 << 20;
 const DELTA_STREAM_MAGIC: &[u8; 8] = b"CVDLT001";
 
 struct TempStageDir(PathBuf);
@@ -763,6 +765,7 @@ impl Shipper {
             store
                 .ship_cursors_for(&self.cfg.target_name)?
                 .into_iter()
+                .filter(|c| c.producer_id == self.cfg.producer_id)
                 .map(|cur| (cur.epoch, cur.contiguous_seq))
                 .collect()
         };
@@ -788,7 +791,7 @@ impl Shipper {
             let prepared_batch = prepare_and_pack_commits(
                 &pending_rows,
                 local_packs_dir,
-                stage_dir.path(),
+                |id, records| seal_to_directory(stage_dir.path(), id, records),
                 &self.cfg.producer_id,
                 &self.cfg.target_name,
                 &profile,
@@ -842,7 +845,7 @@ impl Shipper {
                 )?;
             }
 
-            if self.cfg.force_reship || fetched_len < MAX_COMMITS_PER_BATCH {
+            if fetched_len < MAX_COMMITS_PER_BATCH {
                 break;
             }
         }
@@ -858,24 +861,15 @@ impl Shipper {
         existing_watermarks: &mut BTreeMap<String, u64>,
         report: &mut ShipReport,
     ) -> Result<(), HubError> {
-        let referenced_in_chunk: BTreeSet<String> = events
-            .iter()
-            .flat_map(|ev| {
-                let mut ids = Vec::new();
-                if let Some(ref addr) = ev.payload_addr {
-                    ids.push(addr.pack_id.clone());
-                }
-                if let Some(arr) = ev.envelope.get("delta_extents").and_then(Value::as_array) {
-                    for v in arr {
-                        if let Some(pid) = v.get("pack_id").and_then(Value::as_str) {
-                            ids.push(pid.to_string());
-                        }
-                    }
-                }
-                ids
-            })
-            .collect();
-
+        let mut referenced_in_chunk = BTreeSet::new();
+        let mut sent_through = BTreeMap::new();
+        for ev in &events {
+            for addr in super::receiver::pack_references(ev.payload_addr.as_ref(), &ev.envelope)? {
+                referenced_in_chunk.insert(addr.pack_id);
+            }
+            let seq = sent_through.entry(ev.event_id.epoch.clone()).or_insert(0);
+            *seq = (*seq).max(ev.event_id.seq);
+        }
         let batch_req = IngestBatchRequest { events };
         let (ingest_resp, ingest_ack) = self.send_ingest_batch(&batch_req)?;
         report.transport_acks.push(ingest_ack);
@@ -904,16 +898,26 @@ impl Shipper {
         }
 
         for hub_wm in &ingest_resp.custody_acks {
-            if hub_wm.contiguous_seq == 0 {
+            let Some(&sent) = sent_through
+                .get(&hub_wm.epoch)
+                .filter(|_| hub_wm.producer_id == self.cfg.producer_id)
+            else {
+                return Err(HubError::Transport {
+                    status: Some(200),
+                    message: "custody acknowledgement identifies another origin".into(),
+                });
+            };
+            let seq = hub_wm.contiguous_seq.min(sent);
+            if seq <= existing_watermarks.get(&hub_wm.epoch).copied().unwrap_or(0) {
                 continue;
             }
-            existing_watermarks.insert(hub_wm.epoch.clone(), hub_wm.contiguous_seq);
-            let max_commit_pos = store.max_commit_pos_at_or_below(&hub_wm.epoch, hub_wm.contiguous_seq)?;
+            existing_watermarks.insert(hub_wm.epoch.clone(), seq);
+            let max_commit_pos = store.max_commit_pos_at_or_below(&hub_wm.epoch, seq)?;
             let ack = CustodyAck {
                 target_hub: self.cfg.target_name.clone(),
                 producer_id: self.cfg.producer_id.clone(),
                 epoch: hub_wm.epoch.clone(),
-                contiguous_seq: hub_wm.contiguous_seq,
+                contiguous_seq: seq,
                 max_commit_pos,
                 pack_id: None,
                 acked_at: hub_wm.acked_at,
@@ -922,6 +926,15 @@ impl Shipper {
                 store.record_custody_ack(&ack)?;
             }
             report.durable_custody_acks.push(ack);
+        }
+        if sent_through
+            .iter()
+            .any(|(epoch, seq)| existing_watermarks.get(epoch).copied().unwrap_or(0) < *seq)
+        {
+            return Err(HubError::Transport {
+                status: Some(200),
+                message: "hub has not acknowledged a contiguous frontier through this batch".into(),
+            });
         }
         Ok(())
     }
@@ -1569,10 +1582,41 @@ fn outbound_session_anchor(producer_id: &str, raw_envelope: &Value, harness: Har
     crate::custody::archive_anchor(&key)
 }
 
+type OutboundRecords = [(String, Vec<u8>)];
+
+fn seal_to_directory(
+    dir: &Path,
+    pack_id: &str,
+    records: &OutboundRecords,
+) -> Result<crate::packs::RecordIndex, HubError> {
+    let build = || -> anyhow::Result<_> {
+        let mut builder = PackBuilder::create(dir, pack_id)?;
+        for (anchor, bytes) in records {
+            builder.append_record(anchor, bytes)?;
+        }
+        Ok(builder.seal(Claim::New)?.record_index)
+    };
+    match build() {
+        Ok(index) => Ok(index),
+        Err(e) if e.downcast_ref::<crate::publish::Exists>().is_some() => {
+            let pack = SealedPack::open(dir, pack_id).map_err(|e| HubError::Pack(e.to_string()))?;
+            let index = pack.record_index();
+            if records.len() != index.len()
+                || !records.iter().zip(index.records()).all(|((a, b), r)| {
+                    r.anchor == *a && pack.read_payload(&r.clone().into_addr(pack_id)).is_ok_and(|v| v == *b)
+                })
+            {
+                return Err(HubError::Pack(format!("existing spool pack {pack_id} differs")));
+            }
+            Ok(index.clone())
+        }
+        Err(e) => Err(HubError::Pack(e.to_string())),
+    }
+}
 fn prepare_and_pack_commits(
     pending: &[SealedCommitEntry],
     local_packs_dir: &Path,
-    stage_dir: &Path,
+    mut seal_pack: impl FnMut(&str, &OutboundRecords) -> Result<crate::packs::RecordIndex, HubError>,
     producer_id: &str,
     target_name: &str,
     profile: &ScrubProfile,
@@ -1637,6 +1681,18 @@ fn prepare_and_pack_commits(
                 &mut stats,
             );
             scrubbed_env["kind"] = json!("session_delta");
+            if let Some(end) = commit.envelope["total_bytes"]
+                .as_u64()
+                .filter(|_| commit.envelope["archive_version"] == 2)
+            {
+                let start = end
+                    .checked_sub(combined_raw.len() as u64)
+                    .ok_or_else(|| HubError::InvalidArgument("source delta exceeds declared end".into()))?;
+                scrubbed_env["source_start"] = json!(start);
+                scrubbed_env["source_end"] = json!(end);
+                scrubbed_env["base_checkpoint"] = commit.envelope["base_checkpoint"].clone();
+                scrubbed_env["source_checkpoint"] = commit.envelope["prefix_blake3"].clone();
+            }
             let file_name = commit
                 .envelope
                 .get("file_name")
@@ -1672,7 +1728,8 @@ fn prepare_and_pack_commits(
                 extents,
                 file_name,
                 layout,
-                ..
+                prefix_blake3,
+                total_bytes,
             }) = serde_json::from_value::<crate::custody::CustodyKind>(custody_val.clone())
             {
                 if extents.len() == 1 && file_name.ends_with(".jsonl") && profile.filter.tags.is_empty() {
@@ -1699,7 +1756,7 @@ fn prepare_and_pack_commits(
                         .read_payload(ext)
                         .map_err(|e| HubError::Pack(format!("reading local pack `{}`: {e:#}", ext.pack_id)))?;
                     let scrubbed_bytes = scrub_jsonl_slice(&raw_bytes, compiled, profile, raw_repo_root, &mut stats);
-                    let scrubbed_env = build_scrubbed_envelope(
+                    let mut scrubbed_env = build_scrubbed_envelope(
                         &commit.envelope,
                         &scrubbed_stub,
                         compiled,
@@ -1707,6 +1764,10 @@ fn prepare_and_pack_commits(
                         raw_repo_root,
                         &mut stats,
                     );
+                    if commit.envelope["archive_version"] == 2 {
+                        scrubbed_env["source_end"] = json!(total_bytes);
+                        scrubbed_env["source_checkpoint"] = json!(prefix_blake3);
+                    }
                     redactions_applied += stats.total();
                     let anchor = outbound_session_anchor(producer_id, &commit.envelope, stub.harness, &stub.id);
                     staged_events.push(StagedEvent {
@@ -1801,51 +1862,68 @@ fn prepare_and_pack_commits(
         });
     }
 
-    // Coalesce outbound payload records into multi-record Zstd-Seekable packs (`<= 8 MiB` per pack,
-    // flushing whenever an anchor repeats inside the same pack so `RecordIndex` anchors stay unique),
-    // naming each pack `ship-<64hex_blake3>`!
+    // A v2 revision's addresses survive retries with a different pending window or transport.
+    // Retain the original coalescing and naming rules for previously captured events.
+    #[derive(Default)]
     struct PackGroup {
         indices: Vec<usize>,
         anchors_and_bytes: Vec<(String, Vec<u8>)>,
         seen_anchors: BTreeSet<String>,
         total_bytes: usize,
+        revision_pack: bool,
     }
     let mut groups: Vec<PackGroup> = Vec::new();
-    for (idx, item) in staged_events.iter().enumerate() {
+    for (idx, (item, commit)) in staged_events.iter().zip(pending).enumerate() {
+        let revision_pack = commit.envelope["archive_version"] == 2;
         let (anchor, bytes) = match &item.record {
             OutboundRecordKind::None => continue,
             OutboundRecordKind::Projection { anchor, bytes }
             | OutboundRecordKind::InitialNativeExtent { anchor, bytes, .. }
-            | OutboundRecordKind::DeltaExtent { anchor, bytes, .. } => (anchor.clone(), bytes.clone()),
+            | OutboundRecordKind::DeltaExtent { anchor, bytes, .. } => (anchor, bytes),
         };
-        let needs_new_group = match groups.last() {
-            None => true,
-            Some(g) => {
-                g.seen_anchors.contains(&anchor)
-                    || (!g.indices.is_empty() && g.total_bytes + bytes.len() > MAX_OUTBOUND_PACK_BYTES)
+        let chunk_size = if revision_pack && !matches!(item.record, OutboundRecordKind::Projection { .. }) {
+            MAX_OUTBOUND_PACK_BYTES
+        } else {
+            bytes.len().max(1)
+        };
+        let mut rest = bytes.as_slice();
+        loop {
+            let (chunk, tail) = rest.split_at(rest.len().min(chunk_size));
+            if revision_pack
+                || groups.last().is_none_or(|g| {
+                    g.revision_pack
+                        || g.seen_anchors.contains(anchor)
+                        || g.total_bytes + chunk.len() > MAX_OUTBOUND_PACK_BYTES
+                })
+            {
+                groups.push(PackGroup {
+                    revision_pack,
+                    ..Default::default()
+                });
             }
-        };
-        if needs_new_group {
-            groups.push(PackGroup {
-                indices: Vec::new(),
-                anchors_and_bytes: Vec::new(),
-                seen_anchors: BTreeSet::new(),
-                total_bytes: 0,
-            });
+            let g = groups.last_mut().expect("created group");
+            g.total_bytes += chunk.len();
+            g.seen_anchors.insert(anchor.clone());
+            g.indices.push(idx);
+            g.anchors_and_bytes.push((anchor.clone(), chunk.to_vec()));
+            rest = tail;
+            if rest.is_empty() {
+                break;
+            }
         }
-        let g = groups.last_mut().expect("just pushed");
-        g.total_bytes += bytes.len();
-        g.seen_anchors.insert(anchor.clone());
-        g.indices.push(idx);
-        g.anchors_and_bytes.push((anchor, bytes));
     }
 
-    let mut resolved_addrs: Vec<Option<PayloadAddr>> = vec![None; staged_events.len()];
+    let mut resolved_addrs = vec![Vec::new(); staged_events.len()];
     let mut pack_ids: Vec<String> = Vec::new();
-    let mut seen_pack_ids: BTreeSet<String> = BTreeSet::new();
+    let mut indexes = BTreeMap::new();
 
     for group in groups {
         let mut group_hasher = blake3::Hasher::new();
+        if group.revision_pack {
+            group_hasher.update(b"cv-archive-pack-v2");
+            group_hasher.update(&(producer_id.len() as u64).to_le_bytes());
+            group_hasher.update(producer_id.as_bytes());
+        }
         for (anchor, bytes) in &group.anchors_and_bytes {
             group_hasher.update(&(anchor.len() as u64).to_le_bytes());
             group_hasher.update(anchor.as_bytes());
@@ -1855,55 +1933,46 @@ fn prepare_and_pack_commits(
         let pack_hex = group_hasher.finalize().to_hex();
         let out_pack_id = format!("ship-{}", pack_hex.as_str());
 
-        if seen_pack_ids.insert(out_pack_id.clone()) {
-            let mut builder =
-                PackBuilder::create(stage_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-            let mut group_addrs = Vec::with_capacity(group.indices.len());
-            for (anchor, bytes) in &group.anchors_and_bytes {
-                let addr = builder
-                    .append_record(anchor, bytes)
-                    .map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                group_addrs.push(addr);
-            }
-            builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-            for (ev_idx, addr) in group.indices.into_iter().zip(group_addrs) {
-                resolved_addrs[ev_idx] = Some(addr);
-            }
-            pack_ids.push(out_pack_id);
-        } else {
-            let sealed = SealedPack::open(stage_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-            for (ev_idx, (anchor, _)) in group.indices.into_iter().zip(group.anchors_and_bytes) {
-                let span = sealed
-                    .record_index()
-                    .get(&anchor)
-                    .ok_or_else(|| HubError::Pack(format!("missing record `{anchor}` in `{out_pack_id}`")))?;
-                resolved_addrs[ev_idx] = Some(span.clone().into_addr(&out_pack_id));
-            }
+        if !indexes.contains_key(&out_pack_id) {
+            let index = seal_pack(&out_pack_id, &group.anchors_and_bytes)?;
+            indexes.insert(out_pack_id.clone(), index);
+            pack_ids.push(out_pack_id.clone());
+        }
+        for (idx, span) in group.indices.into_iter().zip(indexes[&out_pack_id].records()) {
+            resolved_addrs[idx].push(span.clone().into_addr(&out_pack_id));
         }
     }
 
     let mut wire_events = Vec::with_capacity(staged_events.len());
-    for (mut item, addr) in staged_events.into_iter().zip(resolved_addrs) {
-        let wire_addr = match (&item.record, addr) {
-            (OutboundRecordKind::InitialNativeExtent { file_name, layout, .. }, Some(a)) => {
+    for ((mut item, extents), commit) in staged_events.into_iter().zip(resolved_addrs).zip(pending) {
+        let wire_addr = extents.last().cloned();
+        match &item.record {
+            OutboundRecordKind::InitialNativeExtent {
+                bytes,
+                file_name,
+                layout,
+                ..
+            } => {
                 let custody = crate::custody::CustodyKind::NativeExtents {
-                    extents: vec![a.clone()],
-                    total_bytes: a.length,
-                    prefix_blake3: a.digest_hex(),
+                    extents,
+                    total_bytes: bytes.len() as u64,
+                    prefix_blake3: crate::blake3_hex(bytes),
                     file_name: file_name.clone(),
                     layout: layout.clone(),
                 };
                 item.scrubbed_envelope["custody"] = serde_json::to_value(&custody)?;
-                Some(a)
             }
-            (OutboundRecordKind::DeltaExtent { .. }, Some(a)) => {
-                item.scrubbed_envelope["delta_extents"] = json!([a.clone()]);
-                Some(a)
+            OutboundRecordKind::DeltaExtent { .. } => {
+                item.scrubbed_envelope["delta_extents"] = serde_json::to_value(extents)?
             }
-            (_, other) => other,
-        };
+            _ => {}
+        }
         let event_id = EventId::new(producer_id.to_string(), item.epoch.clone(), item.seq);
-        let op_id = format!("ship:{target_name}:{producer_id}:{}:{}", item.epoch, item.seq);
+        let op_id = if commit.envelope["archive_version"] == 2 {
+            format!("archive-v2:{producer_id}:{}:{}", item.epoch, item.seq)
+        } else {
+            format!("ship:{target_name}:{producer_id}:{}:{}", item.epoch, item.seq)
+        };
         wire_events.push(IngestEventRecord::new(
             event_id,
             op_id,
@@ -2000,7 +2069,7 @@ pub fn parse_watermark(raw: &str) -> Result<BTreeMap<String, u64>, HubError> {
         let Some((hex_ep, seq_str)) = item.split_once(':') else {
             return Err(HubError::InvalidArgument(format!("invalid watermark segment {item:?}")));
         };
-        if !hex_ep.len().is_multiple_of(2) {
+        if hex_ep.is_empty() || !hex_ep.is_ascii() || !hex_ep.len().is_multiple_of(2) {
             return Err(HubError::InvalidArgument(format!(
                 "invalid epoch hex in watermark {item:?}"
             )));
@@ -2016,7 +2085,11 @@ pub fn parse_watermark(raw: &str) -> Result<BTreeMap<String, u64>, HubError> {
         let seq: u64 = seq_str
             .parse()
             .map_err(|_| HubError::InvalidArgument(format!("invalid seq in watermark {item:?}")))?;
-        out.insert(epoch, seq);
+        if seq > i64::MAX as u64 || out.insert(epoch, seq).is_some() {
+            return Err(HubError::InvalidArgument(
+                "duplicate epoch or out-of-range watermark".into(),
+            ));
+        }
     }
     Ok(out)
 }
@@ -2049,6 +2122,7 @@ pub fn export_to_spool(
     let mut watermarks: BTreeMap<String, u64> = store
         .ship_cursors_for(&target_key)?
         .into_iter()
+        .filter(|c| c.producer_id == producer_id)
         .map(|c| (c.epoch, c.contiguous_seq))
         .collect();
 
@@ -2095,7 +2169,7 @@ pub fn export_to_spool(
             prepare_and_pack_commits(
                 &pending_rows,
                 local_packs_dir,
-                &spool_packs_dir,
+                |id, records| seal_to_directory(&spool_packs_dir, id, records),
                 producer_id,
                 "spool",
                 profile,
@@ -2125,7 +2199,7 @@ pub fn export_to_spool(
             })?;
         }
 
-        let batch_id = format!("batch-{now_ms}-{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+        let batch_id = format!("batch-{now_ms}-{}", uuid::Uuid::now_v7().simple());
         let manifest = SpoolBatchManifest {
             producer_id: producer_id.to_string(),
             host_label: clean_host,
@@ -2135,11 +2209,13 @@ pub fn export_to_spool(
                 events: prepared.wire_events,
             },
         };
-        let tmp_path = spool_batches_dir.join(format!(".{batch_id}.tmp"));
         let final_path = spool_batches_dir.join(format!("{batch_id}.json"));
-        std::fs::write(&tmp_path, serde_json::to_vec_pretty(&manifest)?)?;
-        crate::state::set_restrictive_file_mode(&tmp_path);
-        std::fs::rename(&tmp_path, &final_path)?;
+        let mut staged =
+            crate::publish::Staged::beside(&final_path, "batch", 0o600).map_err(|e| HubError::Pack(e.to_string()))?;
+        serde_json::to_writer(&mut staged, &manifest)?;
+        staged
+            .publish(&final_path, Claim::New)
+            .map_err(|e| HubError::Pack(e.to_string()))?;
 
         if !crate::env::frozen() {
             for (ep, &sq) in &watermarks {
@@ -2182,6 +2258,8 @@ pub fn export_delta_stream<W: Write>(
     watermark_str: &str,
     mut writer: W,
 ) -> Result<DeltaExportReport, HubError> {
+    let export_store = store.for_export();
+    let store = &export_store;
     let watermarks = parse_watermark(watermark_str)?;
     let compiled = profile
         .compile()
@@ -2195,27 +2273,48 @@ pub fn export_delta_stream<W: Write>(
             .collect(),
     };
 
-    let temp_parent = std::env::temp_dir();
-    let stage_dir = TempStageDir::create_in(&temp_parent)?;
-    let prepared = if pending_rows.is_empty() {
-        PreparedBatch {
-            pack_ids: Vec::new(),
-            wire_events: Vec::new(),
-            sessions_admitted: 0,
-            sessions_filtered_out: 0,
-            redactions_applied: 0,
-        }
-    } else {
-        prepare_and_pack_commits(
-            &pending_rows,
-            local_packs_dir,
-            stage_dir.path(),
-            producer_id,
-            "pull",
-            profile,
-            &compiled,
-        )?
-    };
+    let mut pack_blobs = Vec::new();
+    let mut pack_descs = Vec::new();
+    let prepared = prepare_and_pack_commits(
+        &pending_rows,
+        local_packs_dir,
+        |id, records| {
+            use crate::packs::{PackManifest, RecordIndex, RecordSpan, SeekableWriter, PACK_INDEX_VERSION};
+            let mut zst = SeekableWriter::new(Vec::new());
+            let mut record_index = RecordIndex::new();
+            for (anchor, bytes) in records {
+                let span = RecordSpan {
+                    anchor: anchor.clone(),
+                    decoded_offset: zst.decoded_offset(),
+                    length: bytes.len() as u64,
+                    blake3_digest: *blake3::hash(bytes).as_bytes(),
+                };
+                record_index.insert(span).map_err(|e| HubError::Pack(e.to_string()))?;
+                zst.write_all(bytes)?;
+            }
+            let (zst, frames) = zst.finish()?;
+            let manifest = PackManifest {
+                version: PACK_INDEX_VERSION,
+                pack_id: id.into(),
+                total_decoded_len: frames.total_decoded_len(),
+                frame_count: frames.len(),
+                record_index,
+                codec_checkpoints: Default::default(),
+            };
+            let idx = serde_json::to_vec(&manifest)?;
+            pack_descs.push(DeltaStreamPackDesc {
+                pack_id: id.into(),
+                idx_len: idx.len() as u64,
+                zst_len: zst.len() as u64,
+            });
+            pack_blobs.push((idx, zst));
+            Ok(manifest.record_index)
+        },
+        producer_id,
+        "pull",
+        profile,
+        &compiled,
+    )?;
 
     let mut enroll_stats = ScrubStats::default();
     let clean_host = if host_label.is_empty() {
@@ -2227,21 +2326,6 @@ pub fn export_delta_stream<W: Write>(
     };
     let mut prod_meta = json!({});
     attach_policy_metadata(&mut prod_meta, producer_id, profile);
-
-    let mut pack_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(prepared.pack_ids.len());
-    let mut pack_descs: Vec<DeltaStreamPackDesc> = Vec::with_capacity(prepared.pack_ids.len());
-    for pack_id in &prepared.pack_ids {
-        let idx_bytes =
-            std::fs::read(pack_idx_path(stage_dir.path(), pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
-        let zst_bytes =
-            std::fs::read(pack_zst_path(stage_dir.path(), pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
-        pack_descs.push(DeltaStreamPackDesc {
-            pack_id: pack_id.clone(),
-            idx_len: idx_bytes.len() as u64,
-            zst_len: zst_bytes.len() as u64,
-        });
-        pack_blobs.push((idx_bytes, zst_bytes));
-    }
 
     let events_exported = prepared.wire_events.len();
     let packs_exported = pack_descs.len();
@@ -2255,6 +2339,7 @@ pub fn export_delta_stream<W: Write>(
         },
     };
     let header_bytes = serde_json::to_vec(&header)?;
+    store.verify_export_snapshot()?;
     writer.write_all(DELTA_STREAM_MAGIC)?;
     writer.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
     writer.write_all(&header_bytes)?;
@@ -2270,50 +2355,121 @@ pub fn export_delta_stream<W: Write>(
     })
 }
 
+/// Hold each spool subdirectory open so replacing it cannot redirect subsequent pack opens.
+struct SpoolDirectory {
+    path: PathBuf,
+    #[cfg(unix)]
+    dir: std::fs::File,
+}
+
+impl SpoolDirectory {
+    fn open(path: PathBuf) -> Result<Self, HubError> {
+        #[cfg(unix)]
+        let dir = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&path)?
+        };
+        #[cfg(not(unix))]
+        if !std::fs::symlink_metadata(&path)?.is_dir() {
+            return Err(HubError::InvalidArgument("expected a spool directory".into()));
+        }
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            dir,
+        })
+    }
+
+    fn file(&self, name: &str, max: u64) -> Result<std::io::Take<std::fs::File>, HubError> {
+        crate::publish::validate_output_id(name).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = std::ffi::CString::new(name).expect("validated component");
+            // SAFETY: dir and name remain live during openat. The returned descriptor is owned.
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let path = self.path.join(name);
+            if !std::fs::symlink_metadata(&path)?.is_file() {
+                return Err(HubError::InvalidArgument("expected a regular spool file".into()));
+            }
+            std::fs::File::open(path)?
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.len() > max {
+            return Err(HubError::InvalidArgument(format!("invalid spool member {name:?}")));
+        }
+        Ok(file.take(meta.len()))
+    }
+}
+
+fn validate_source_batch(producer: &str, batch: &IngestBatchRequest) -> Result<(), HubError> {
+    if producer.trim().is_empty()
+        || producer.trim() != producer
+        || producer.eq_ignore_ascii_case("local")
+        || batch.events.iter().any(|ev| ev.event_id.producer_id != producer)
+    {
+        return Err(HubError::Forbidden("invalid or inconsistent import producer".into()));
+    }
+    Ok(())
+}
+
 impl HubStore {
     /// Idempotently ingest a sandbox spool directory written by [`export_to_spool`].
     pub fn ingest_spool_dir(&self, spool_dir: &Path) -> Result<SpoolIngestReport, HubError> {
-        let batches_dir = spool_dir.join("batches");
-        let packs_dir = spool_dir.join("packs");
-        if !batches_dir.is_dir() {
-            return Err(HubError::InvalidArgument(format!(
-                "spool directory `{}` has no `batches/` subdirectory",
-                spool_dir.display()
-            )));
+        let batches = SpoolDirectory::open(spool_dir.join("batches"))?;
+        let mut batch_files = Vec::new();
+        for entry in std::fs::read_dir(&batches.path)? {
+            let name = entry?.file_name();
+            if let Some(name) = name.to_str().filter(|n| !n.starts_with('.') && n.ends_with(".json")) {
+                batch_files.push(name.to_owned());
+            }
         }
-        let mut batch_files: Vec<PathBuf> = std::fs::read_dir(&batches_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| !n.starts_with('.') && n.ends_with(".json"))
-            })
-            .collect();
         batch_files.sort();
 
         let mut report = SpoolIngestReport::default();
-        for batch_path in batch_files {
-            let raw = std::fs::read(&batch_path)?;
-            let manifest: SpoolBatchManifest = serde_json::from_slice(&raw)?;
-            self.enroll_producer(&manifest.producer_id, &manifest.host_label, &manifest.producer_metadata)?;
-            for pack_id in &manifest.pack_ids {
-                let idx_bytes =
-                    std::fs::read(pack_idx_path(&packs_dir, pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
-                let zst_bytes =
-                    std::fs::read(pack_zst_path(&packs_dir, pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
-                self.upload_pack_bytes(pack_id, Some(&manifest.producer_id), None, &idx_bytes, &zst_bytes)?;
+        for name in batch_files {
+            let manifest: SpoolBatchManifest =
+                serde_json::from_reader(std::io::BufReader::new(batches.file(&name, MAX_DELTA_INDEX)?))?;
+            validate_source_batch(&manifest.producer_id, &manifest.batch)?;
+            if !manifest.pack_ids.is_empty() {
+                let packs = SpoolDirectory::open(spool_dir.join("packs"))?;
+                for id in &manifest.pack_ids {
+                    crate::publish::validate_output_id(id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
+                    let mut idx = Vec::new();
+                    packs
+                        .file(&format!("{id}.pack.idx.json"), MAX_DELTA_INDEX)?
+                        .read_to_end(&mut idx)?;
+                    let zst = packs.file(&format!("{id}.pack.zst"), MAX_DELTA_ZST)?;
+                    self.upload_pack_stream_for_producer(id, None, Some(&manifest.producer_id), None, &idx, zst)?;
+                }
             }
-            if !manifest.batch.events.is_empty() {
-                let resp = self.ingest_batch(&manifest.batch)?;
-                report.events_accepted += resp.accepted_count;
-                report.events_replayed += resp.replayed_count;
-                report.hub_generation = resp.hub_generation;
-                report.publication_id = resp.publication_id;
-            } else {
-                let latest = self.latest_generation_fast()?;
-                report.hub_generation = latest.as_ref().map(|(g, _)| *g);
-                report.publication_id = latest.map(|(_, pid)| pid);
-            }
+            let resp = self.ingest_source_batch(
+                &manifest.producer_id,
+                &manifest.host_label,
+                &manifest.producer_metadata,
+                &manifest.batch,
+                None,
+            )?;
+            report.events_accepted += resp.accepted_count;
+            report.events_replayed += resp.replayed_count;
+            report.hub_generation = resp.hub_generation;
+            report.publication_id = resp.publication_id;
             report.batches_ingested += 1;
         }
         Ok(report)
@@ -2321,31 +2477,33 @@ impl HubStore {
 
     /// Build the current pull watermark token for `producer_or_host` from `hub_frontiers`.
     pub fn pull_watermark_for(&self, producer_or_host: &str) -> Result<String, HubError> {
-        let status = self.hub_status()?;
-        let matched_producers: BTreeSet<String> = status
-            .producers
-            .iter()
-            .filter(|p| {
-                p.producer_id == producer_or_host
-                    || p.host_label == producer_or_host
-                    || p.metadata.get("ssh_target").and_then(Value::as_str) == Some(producer_or_host)
-            })
-            .map(|p| p.producer_id.clone())
-            .collect();
-        let mut wm = BTreeMap::new();
-        for f in &status.frontiers {
-            if f.producer_id == producer_or_host || matched_producers.contains(&f.producer_id) {
-                wm.insert(f.epoch.clone(), f.contiguous_seq);
-            }
+        let Some(conn) = self.store.open_readonly()? else {
+            return Ok("0".into());
+        };
+        if !conn.table_exists(None, "hub_pull_sources")? {
+            return Ok("0".into());
         }
-        Ok(format_watermark(&wm))
+        let mut stmt = conn.prepare(
+            "SELECT f.epoch,f.contiguous_seq FROM hub_pull_sources s JOIN hub_frontiers f USING(producer_id) WHERE s.target=?1")?;
+        let rows = stmt.query_map([producer_or_host], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(format_watermark(&rows.collect::<Result<_, _>>()?))
     }
 
     /// Ingest a `CVDLT001` binary delta stream produced by [`export_delta_stream`].
     pub fn ingest_delta_stream<R: Read>(
         &self,
+        reader: R,
+        ssh_target_hint: Option<&str>,
+    ) -> Result<DeltaIngestReport, HubError> {
+        self.ingest_delta_stream_checked(reader, ssh_target_hint, || Ok(()))
+    }
+
+    /// Require a successful transport exit after the final frame and before committing events.
+    pub fn ingest_delta_stream_checked<R: Read>(
+        &self,
         mut reader: R,
         ssh_target_hint: Option<&str>,
+        finish: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<DeltaIngestReport, HubError> {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
@@ -2362,39 +2520,47 @@ impl HubStore {
         }
         let mut header_bytes = vec![0u8; header_len as usize];
         reader.read_exact(&mut header_bytes)?;
-        let mut header: DeltaStreamHeader = serde_json::from_slice(&header_bytes)?;
-        if let Some(hint) = ssh_target_hint {
-            if !header.producer_metadata.is_object() {
-                header.producer_metadata = json!({});
-            }
-            header.producer_metadata["ssh_target"] = json!(hint);
-        }
-        self.enroll_producer(&header.producer_id, &header.host_label, &header.producer_metadata)?;
-
+        let header: DeltaStreamHeader = serde_json::from_slice(&header_bytes)?;
+        validate_source_batch(&header.producer_id, &header.batch)?;
         for desc in &header.packs {
-            if desc.idx_len > 64 * 1024 * 1024 || desc.zst_len > 512 * 1024 * 1024 {
+            crate::publish::validate_output_id(&desc.pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
+            if desc.idx_len > MAX_DELTA_INDEX || desc.zst_len > MAX_DELTA_ZST {
                 return Err(HubError::Pack(format!(
                     "oversized pack `{}` in delta stream",
                     desc.pack_id
                 )));
             }
-            let mut idx_bytes = vec![0u8; desc.idx_len as usize];
-            reader.read_exact(&mut idx_bytes)?;
-            let mut zst_bytes = vec![0u8; desc.zst_len as usize];
-            reader.read_exact(&mut zst_bytes)?;
-            self.upload_pack_bytes(&desc.pack_id, Some(&header.producer_id), None, &idx_bytes, &zst_bytes)?;
         }
-
-        if header.batch.events.is_empty() {
-            let latest = self.latest_generation_fast()?;
-            return Ok(DeltaIngestReport {
-                events_accepted: 0,
-                events_replayed: 0,
-                hub_generation: latest.as_ref().map(|(g, _)| *g),
-                publication_id: latest.map(|(_, pid)| pid),
-            });
+        for desc in &header.packs {
+            let mut idx_bytes = Vec::new();
+            reader.by_ref().take(desc.idx_len).read_to_end(&mut idx_bytes)?;
+            if idx_bytes.len() as u64 != desc.idx_len {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let mut body = reader.by_ref().take(desc.zst_len);
+            self.upload_pack_stream_for_producer(
+                &desc.pack_id,
+                None,
+                Some(&header.producer_id),
+                None,
+                &idx_bytes,
+                &mut body,
+            )?;
+            if body.limit() != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
         }
-        let resp = self.ingest_batch(&header.batch)?;
+        if reader.read(&mut [0u8])? != 0 {
+            return Err(HubError::InvalidArgument("trailing bytes in delta stream".into()));
+        }
+        finish()?;
+        let resp = self.ingest_source_batch(
+            &header.producer_id,
+            &header.host_label,
+            &header.producer_metadata,
+            &header.batch,
+            ssh_target_hint,
+        )?;
         Ok(DeltaIngestReport {
             events_accepted: resp.accepted_count,
             events_replayed: resp.replayed_count,

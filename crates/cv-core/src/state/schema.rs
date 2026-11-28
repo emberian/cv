@@ -11,7 +11,7 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 8;
+pub const STATE_SCHEMA_VERSION: i64 = 9;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -23,6 +23,13 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (6, "v6_hub_producer_credentials", MIGRATION_V6),
     (7, "v7_hub_generational_mvcc", MIGRATION_V7),
     (8, "v8_custody_outbox_and_ship_cursors", MIGRATION_V8),
+    (
+        9,
+        "v9_generation_authority",
+        "ALTER TABLE hub_generations ADD COLUMN authority_json TEXT;
+        CREATE UNIQUE INDEX hub_open_session_head ON hub_session_heads(producer_id,session_id) WHERE gen_to IS NULL;
+        CREATE TABLE hub_pull_sources(target TEXT PRIMARY KEY, producer_id TEXT NOT NULL);",
+    ),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -450,7 +457,6 @@ SELECT
     message_count, epoch, event_seq, payload_addr_json, NULL, metadata_json
 FROM hub_sessions;
 
-DROP TABLE IF EXISTS hub_snapshots;
 "#;
 
 const MIGRATION_V8: &str = r#"
@@ -710,6 +716,9 @@ pub fn apply_migrations_with(
             continue;
         }
         tx.execute_batch(sql)?;
+        if name == "v7_hub_generational_mvcc" {
+            super::hub::snapshot::migrate_snapshot_history(&tx)?;
+        }
         tx.execute(
             "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![ver, name, now_ms],

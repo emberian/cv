@@ -59,13 +59,13 @@ fn multi_producer_delta_extents_sealed_spool_pull_and_authority_soundness() {
             "cwd": format!("{fake_home}/work/service"),
             "message": {
                 "role": "user",
-                "content": format!("initial turn {i} padding {}", "x".repeat(420))
+                "content": format!("initial turn {i} padding {}", "pad ".repeat(5500))
             }
         });
         initial_jsonl.extend_from_slice(serde_json::to_string(&line).unwrap().as_bytes());
         initial_jsonl.push(b'\n');
     }
-    assert!(initial_jsonl.len() > 200 * 1024);
+    assert!(initial_jsonl.len() > 8 * 1024 * 1024);
 
     let key_local = cv_core::SessionKey {
         producer: "local".into(),
@@ -86,6 +86,7 @@ fn multi_producer_delta_extents_sealed_spool_pull_and_authority_soundness() {
         layout: Vec::new(),
     };
     let init_env = json!({
+        "archive_version": 2,
         "kind": "session_archive",
         "producer_id": "local",
         "harness": "claude",
@@ -198,6 +199,7 @@ fn multi_producer_delta_extents_sealed_spool_pull_and_authority_soundness() {
     b2.seal(Claim::New).unwrap();
 
     let delta_env = json!({
+        "archive_version": 2,
         "kind": "session_delta",
         "producer_id": "local",
         "harness": "claude",
@@ -209,6 +211,8 @@ fn multi_producer_delta_extents_sealed_spool_pull_and_authority_soundness() {
         "message_count": 408,
         "file_name": "native-big.jsonl",
         "delta_extents": [delta_addr],
+        "total_bytes": init_addr.length + delta_addr.length,
+        "base_checkpoint": init_addr.digest_hex(),
     });
     let r2 = prod1_store
         .append_request(
@@ -400,10 +404,174 @@ fn multi_producer_delta_extents_sealed_spool_pull_and_authority_soundness() {
     assert_eq!(body_asof1["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(body_asof1["authority"]["generation"], 1);
 
+    // #tooth Historical authority freezes enrollment, quarantine and raw counters together.
+    let historical = &body_asof1["authority"]["places"].as_array().unwrap();
+    assert_eq!(historical.len(), 1);
+    assert_eq!(historical[0]["place_id"], "prod-push");
+    assert_eq!(historical[0]["contiguous_seq"], 1);
+    assert_eq!(historical[0]["state"], "live");
+    for pattern in ["absent-*", "absent-box"] {
+        let ctx = AuthorityQueryContext {
+            place_glob: Some(pattern),
+            max_staleness_ms: Some(1000),
+            ..Default::default()
+        };
+        let env = hub.check_authority(&ctx).unwrap_err().authority;
+        assert_eq!(env.status, AuthorityStatus::Partial);
+        assert_eq!(env.places[0].state, PlaceState::Unknown);
+    }
+    for invalid in [0, 9999] {
+        assert!(hub.heads_at_generation(Some(invalid)).is_err());
+        assert!(hub.session_head_for(&sel_p1, Some(invalid)).unwrap().is_none());
+    }
+
+    // #tooth Identical scrubbed records appended twice occupy two logical ranges.
+    // Source offsets stay in the original byte space even when redaction shrank the base.
+    let entry = hub.session_head_for(&sel_p1, Some(2)).unwrap().unwrap();
+    let last = entry.payload_addr.unwrap();
+    let end = init_addr.length + delta_addr.length;
+    let append = |start| {
+        IngestBatchRequest { events: vec![IngestEventRecord::new(
+        EventId::new("prod-push", &entry.epoch, entry.event_seq+1), "append-again",
+        json!({"kind":"session_delta","session_id":"native-big","harness":"claude",
+            "source_start":start,"source_end":start + delta_addr.length,"file_name":"native-big.jsonl","delta_extents":[last]}),
+        Some(last.clone())).unwrap()] }
+    };
+    assert!(hub.ingest_batch(&append(end + 1)).is_err());
+    assert!(hub.ingest_batch(&append(end - 1)).is_err());
+    hub.ingest_batch(&append(end)).unwrap();
+    let head = hub.session_head_for(&sel_p1, None).unwrap().unwrap();
+    let key = head.session_key_struct().unwrap();
+    let CustodyKind::NativeExtents {
+        extents, total_bytes, ..
+    } = head.custody.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(extents.len(), 4);
+    assert!(extents.iter().all(|e| e.length <= 8 * 1024 * 1024));
+    assert_eq!(extents[2], extents[3]);
+    assert_ne!(extents[0].length + extents[1].length, init_addr.length);
+    let chain = cv_core::custody::ExtentChain::open(hub.packs_dir(), &key, &extents).unwrap();
+    let mut actual = Vec::new();
+    std::io::Read::read_to_end(
+        &mut cv_core::custody::ExtentChainReader::new(std::sync::Arc::new(chain)),
+        &mut actual,
+    )
+    .unwrap();
+    assert_eq!(actual.len() as u64, total_bytes);
+    let base_bytes = (extents[0].length + extents[1].length) as usize;
+    let appends = &actual[base_bytes..];
+    let (first, second) = appends.split_at(last.length as usize);
+    assert_eq!(first.len(), last.length as usize);
+    assert_eq!(first, second);
+
     let (st_stale, body_stale) = cv_core::api::route_json(&["api", "sessions"], "place=prod-stale&max_staleness=1s");
     assert_eq!(
         st_stale, 503,
         "violated max_staleness must return HTTP 503: {body_stale}"
     );
     assert_eq!(body_stale["authority"]["status"], "partial");
+}
+
+/// #tooth Every address used to materialize a head belongs to the producer of that event,
+/// including references in credential-free imports and in a mixed-producer operator batch.
+#[test]
+fn nested_custody_addresses_obey_pack_ownership() {
+    let w = World::in_process("nested-custody", Env::enter_isolated);
+    let hub = HubStore::at_home(&w.cv_home);
+    let dir = w.base.join("source");
+    let mut pack = PackBuilder::create(&dir, "record").unwrap();
+    let addr = pack.append_record("session", b"record").unwrap();
+    pack.seal(Claim::New).unwrap();
+    hub.upload_pack_bytes(
+        "record",
+        Some("owner"),
+        None,
+        &fs::read(dir.join("record.pack.idx.json")).unwrap(),
+        &fs::read(dir.join("record.pack.zst")).unwrap(),
+    )
+    .unwrap();
+    let base = |producer, kind, custody, delta| {
+        IngestEventRecord::new(
+            EventId::new(producer, "epoch", 1),
+            "event",
+            json!({"kind":kind,"session_id":"session","harness":"claude",
+        "custody":custody,"delta_extents":delta}),
+            None,
+        )
+        .unwrap()
+    };
+    let custody = json!(CustodyKind::NativeExtents {
+        extents: vec![addr.clone()],
+        total_bytes: addr.length,
+        prefix_blake3: addr.digest_hex(),
+        file_name: "session.jsonl".into(),
+        layout: vec![]
+    });
+    let first = base("owner", "session_archive", custody.clone(), json!([]));
+    let spool = w.base.join("spool");
+    fs::create_dir_all(spool.join("batches")).unwrap();
+    for other in [
+        base("visitor", "session_archive", custody.clone(), json!([])),
+        base("visitor", "session_delta", serde_json::Value::Null, json!([addr])),
+    ] {
+        let batch = IngestBatchRequest {
+            events: vec![other.clone()],
+        };
+        assert!(matches!(
+            hub.ingest_batch_for_producer(&batch, Some("visitor")),
+            Err(HubError::Forbidden(_))
+        ));
+        assert!(matches!(
+            hub.ingest_batch(&IngestBatchRequest {
+                events: vec![first.clone(), other]
+            }),
+            Err(HubError::Forbidden(_))
+        ));
+        let manifest =
+            json!({"producer_id":"visitor","host_label":"box","producer_metadata":{},"pack_ids":[],"batch":batch});
+        fs::write(
+            spool.join("batches/import.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(hub.ingest_spool_dir(&spool), Err(HubError::Forbidden(_))));
+    }
+    // Validate the whole filename component before opening either companion file.
+    for id in ["..", "dir/record", "dir\\record", "record\0suffix"] {
+        let manifest = json!({"producer_id":"visitor","host_label":"box","producer_metadata":{},
+            "pack_ids":[id],"batch":{"events":[]}});
+        fs::create_dir_all(spool.join("packs")).unwrap();
+        fs::write(
+            spool.join("batches/import.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            hub.ingest_spool_dir(&spool),
+            Err(HubError::InvalidArgument(_))
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let manifest = spool.join("batches/import.json");
+        let file = w.base.join("unrelated-file");
+        fs::rename(&manifest, &file).unwrap();
+        std::os::unix::fs::symlink(&file, &manifest).unwrap();
+        assert!(matches!(hub.ingest_spool_dir(&spool), Err(HubError::Io(_))));
+    }
+    assert!(hub.latest_generation_fast().unwrap().is_none());
+    assert!(hub.state_store().get_producer("visitor").unwrap().is_none());
+    hub.ingest_batch(&IngestBatchRequest { events: vec![first] }).unwrap();
+    let mut head = hub.heads_at_generation(None).unwrap().pop().unwrap();
+    head.producer_id = "visitor".into();
+    let backing = cv_core::custody::backing_from_hub_head(hub.packs_dir(), head)
+        .unwrap()
+        .unwrap();
+    assert!(backing
+        .parse(&backing.reference)
+        .unwrap_err()
+        .to_string()
+        .contains("foreign pack"));
 }

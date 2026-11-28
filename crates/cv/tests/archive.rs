@@ -803,7 +803,7 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
     let fake_ssh = hub_w.base.join("fake-ssh.sh");
     fs::write(
         &fake_ssh,
-        "#!/bin/sh\nshift 5\nHOME=\"$FAKE_REMOTE_HOME\" XDG_CONFIG_HOME=\"$FAKE_REMOTE_HOME/.config\" CLUSTERVISION_HOME=\"$FAKE_REMOTE_CV_HOME\" CV_PRODUCER_ID=\"remote-box\" exec \"$@\"\n",
+        "#!/bin/sh\n[ \"$5\" = -- ] || exit 2\nshift 6\nHOME=\"$FAKE_REMOTE_HOME\" XDG_CONFIG_HOME=\"$FAKE_REMOTE_HOME/.config\" CLUSTERVISION_HOME=\"$FAKE_REMOTE_CV_HOME\" CV_PRODUCER_ID=\"remote-box\" exec \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -830,7 +830,7 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
             "type": "assistant",
             "uuid": "ra-delta-1",
             "timestamp": "2026-06-10T10:05:00Z",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": format!("narwhal-delta-marker {}", "y".repeat(3500))}]}
+            "message": {"role": "assistant", "content": [{"type": "text", "text": format!("narwhal-delta-marker {}", "y".repeat(3500))}, {"type":"tool_use","id":"edit-on-second","name":"Edit","input":{"file_path":"revision-proof.rs","old_string":"a","new_string":"b"}}]}
         })
     );
     fs::OpenOptions::new()
@@ -846,6 +846,13 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
         .unwrap();
     let (ok, code, out2, err2) = remote_w.cv_env(&["archive", "sync"], &[("CV_PRODUCER_ID", "remote-box")]);
     assert!(ok, "remote delta sync exited {code}: {out2}\n{err2}");
+    // #tooth A different batching window and transport replay the same captured revision.
+    let alternate = hub_w.base.join("remote-spool");
+    let (ok, _, _, err) = remote_w.cv_env(
+        &["archive", "sync", "--spool", alternate.to_str().unwrap()],
+        &[("CV_PRODUCER_ID", "remote-box")],
+    );
+    assert!(ok, "{err}");
     fs::remove_file(&init_packs[0]).unwrap();
 
     let (ok, code, pull2_out, pull2_err) = hub_w.cv_env(&["archive", "sync", "--pull", "remote-box"], &pull_env);
@@ -855,6 +862,8 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
         "{pull2_out}"
     );
 
+    let (replay, _) = hub_w.cv_ok(&["archive", "sync", "--ingest-spool", alternate.to_str().unwrap()]);
+    assert!(replay.contains("0 accepted, 3 replayed"), "{replay}");
     // 3. Credential-free ephemeral sandbox (`sbx_w`): `--spool <dir> --seal` + idempotent `--ingest-spool <dir>`.
     let sbx_w = world("topo-sbx");
     let beta_sbx = fs::read_to_string(sbx_w.transcript("betasess"))
@@ -883,6 +892,11 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
     // 4. Semiauthoritative CLI queries (`--as-of`, `--place`, `--max-staleness`):
     let hub_json = |args: &[&str]| -> Value { serde_json::from_str(&hub_w.cv_ok(args).0).unwrap() };
 
+    // #tooth The historical file inventory reads the selected revision, even after the later edit arrived.
+    for (generation, count) in [("1", 0), ("2", 1)] {
+        let touched = hub_json(&["touched", "revision-proof.rs", "--as-of", generation, "--json"]);
+        assert_eq!(touched["touched"].as_array().unwrap().len(), count, "{touched}");
+    }
     let s_at_1 = hub_json(&["search", "narwhal-delta-marker", "--as-of", "1", "--json"]);
     assert_eq!(s_at_1["total"], 0, "Gen 1 precedes delta append: {s_at_1}");
     assert_eq!(s_at_1["authority"]["generation"], 1);
@@ -915,4 +929,89 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
         !ok && code == 2 && stale_err.contains("stale-box"),
         "violated --max-staleness must fail closed with exit 2: code={code} err={stale_err}"
     );
+}
+
+/// #tooth Frozen delta export works without scratch files and never creates SQLite sidecars.
+/// A receiver accepts the framed events only after exact EOF and transport success.
+#[test]
+fn archive_export_is_read_only_and_import_requires_complete_transport() {
+    let source = world("export-readonly");
+    source.cv_ok(&["archive", "sync"]);
+    let db = source.cv_home.join("state.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    drop(conn);
+    let stored = fs::read(&db).unwrap();
+    let no_tempdir = source.base.join("regular-file");
+    fs::write(&no_tempdir, b"").unwrap();
+    let export = || {
+        source
+            .cv_command()
+            .args(["archive", "sync", "--export-delta", "0"])
+            .env("CV_PRODUCER_ID", "exporter")
+            .env("TMPDIR", &no_tempdir)
+            .output()
+            .unwrap()
+    };
+    let output = export();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(&db).unwrap(), stored);
+    for name in ["state.db-wal", "state.db-shm", "state.db-journal"] {
+        assert!(!source.cv_home.join(name).exists(), "{name}");
+    }
+    // The remote can also have an active WAL writer with uncheckpointed commits.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE export_test_row(id INTEGER);")
+        .unwrap();
+    let files = ["state.db", "state.db-wal", "state.db-shm"].map(|name| source.cv_home.join(name));
+    let before = files.each_ref().map(|p| fs::read(p).unwrap());
+    let active = export();
+    assert!(active.status.success(), "{}", String::from_utf8_lossy(&active.stderr));
+    assert_eq!(files.each_ref().map(|p| fs::read(p).unwrap()), before);
+    assert_eq!(active.stdout, output.stdout);
+    let receiver = cv_testkit::World::new("framed-import");
+    let hub = cv_core::state::hub::HubStore::at_home(&receiver.cv_home);
+    let mut wire = output.stdout;
+    assert!(hub
+        .ingest_delta_stream(&wire[..wire.len() - 1], Some("source"))
+        .is_err());
+    wire.push(0);
+    assert!(hub.ingest_delta_stream(wire.as_slice(), Some("source")).is_err());
+    wire.pop();
+    assert!(hub
+        .ingest_delta_stream_checked(wire.as_slice(), Some("source"), || Err(std::io::Error::other(
+            "transport closed"
+        )))
+        .is_err());
+    assert_eq!(hub.pull_watermark_for("source").unwrap(), "0");
+    assert_eq!(
+        hub.ingest_delta_stream(wire.as_slice(), Some("source"))
+            .unwrap()
+            .events_accepted,
+        2
+    );
+}
+
+/// #tooth Reject option-like SSH destinations and non-literal executable names before spawning SSH.
+#[test]
+fn archive_pull_validates_ssh_arguments_before_transport() {
+    let w = cv_testkit::World::new("pull-arguments");
+    for (target, binary, reason) in [
+        ("-invalid", "cv", "SSH target"),
+        ("source", "two words", "executable path"),
+    ] {
+        let output = w
+            .cv_command()
+            .args(["archive", "sync", &format!("--pull={target}")])
+            .env("CV_REMOTE_BIN", binary)
+            .env("CV_SSH_BIN", w.base.join("absent"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(reason),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

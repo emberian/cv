@@ -275,7 +275,10 @@ pub(crate) fn parse_live_ref(r: &SessionRef) -> Option<Session> {
 }
 
 #[cfg(feature = "sqlite")]
-fn hub_head_to_ref(packs_dir: &std::path::Path, entry: &crate::state::hub::SessionRevisionEntry) -> Option<SessionRef> {
+pub fn hub_head_to_ref(
+    packs_dir: &std::path::Path,
+    entry: &crate::state::hub::SessionRevisionEntry,
+) -> Option<SessionRef> {
     if let Ok(Some(backing)) = crate::custody::backing_from_hub_head(packs_dir, entry.clone()) {
         return Some(backing.reference);
     }
@@ -309,15 +312,7 @@ fn evaluate_api_authority(
     let place = params.get("place").or_else(|| params.get("producer"));
     let cwd = params.get("cwd");
     let q_str = params.get("q");
-    let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
-        return Ok(crate::state::hub::AuthorityEnvelope {
-            generation: 0,
-            indexed_generation: 0,
-            status: crate::state::hub::AuthorityStatus::Complete,
-            places: Vec::new(),
-            omissions: Vec::new(),
-        });
-    };
+    let hub = crate::state::hub::HubStore::default_hub().map_err(|e| err(503, &e.to_string()))?;
     let ctx = crate::state::hub::AuthorityQueryContext {
         place_glob: place.as_deref(),
         as_of_gen: resolved_as_of_gen,
@@ -376,7 +371,7 @@ fn places(query: &str) -> (u16, Value) {
             "authority": {
                 "generation": 0,
                 "indexed_generation": 0,
-                "status": "complete",
+                "status": "partial",
                 "places": [],
                 "omissions": [],
             }
@@ -438,13 +433,19 @@ fn sessions(query: &str) -> (u16, Value) {
                 Ok(h) => h,
                 Err(e) => return err(500, &e.to_string()),
             };
+            let mut refs = Vec::new();
             for entry in &heads {
+                if let Some(q) = &parsed_q {
+                    match entry.matches_query(hub.packs_dir(), q) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => return err(500, &e.to_string()),
+                    }
+                }
                 selector_places.insert(entry.selector_string(), entry.producer_id.clone());
+                refs.extend(hub_head_to_ref(hub.packs_dir(), entry));
             }
-            heads
-                .iter()
-                .filter_map(|e| hub_head_to_ref(hub.packs_dir(), e))
-                .collect()
+            refs
         }
         #[cfg(not(feature = "sqlite"))]
         {
@@ -484,13 +485,30 @@ fn sessions(query: &str) -> (u16, Value) {
                 .is_some_and(|c| c.to_string_lossy().contains(needle.as_str()))
         });
     }
-    if let Some(ref pat) = place {
+    #[cfg(feature = "sqlite")]
+    let scope = if place.is_some() || params.get("max_staleness").is_some() || params.flag("authority") {
+        let has_neg = parsed_q.as_ref().is_some_and(crate::query::SessionQuery::has_negation);
+        match evaluate_api_authority(&params, resolved_as_of_gen, has_neg, false) {
+            Ok(env) => Some(env),
+            Err(reply) => return reply,
+        }
+    } else {
+        None
+    };
+    if let Some(ref _pattern) = place {
         refs.retain(|r| {
             let p = selector_places.get(&r.id).map_or("local", String::as_str);
-            glob_match(pat, p)
+            #[cfg(feature = "sqlite")]
+            {
+                scope.as_ref().is_some_and(|s| s.includes(p))
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                glob_match(_pattern, p)
+            }
         });
     }
-    if let Some(ref sq) = parsed_q {
+    if let Some(sq) = parsed_q.as_ref().filter(|_| resolved_as_of_gen.is_none()) {
         refs.retain(|r| {
             if !sq.prefilter(r) {
                 return false;
@@ -498,29 +516,7 @@ fn sessions(query: &str) -> (u16, Value) {
             if sq.eval(&crate::query::Facts::from_ref(r)).ok() == Some(crate::query::Tri::True) {
                 return true;
             }
-            let hydrated: Option<Session> = {
-                #[cfg(feature = "sqlite")]
-                {
-                    if resolved_as_of_gen.is_some() {
-                        crate::custody::backing_for_as_of(r, resolved_as_of_gen)
-                            .ok()
-                            .flatten()
-                            .and_then(|a| {
-                                let mut sink = crate::stream::CollectSink::default();
-                                let mut s = a.stream(r, &crate::Demand::RICH, &mut sink).ok()?;
-                                s.messages = sink.messages;
-                                s.materialize().ok()?;
-                                Some(s)
-                            })
-                    } else {
-                        parse_live_ref(r)
-                    }
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    parse_live_ref(r)
-                }
-            };
+            let hydrated = parse_live_ref(r);
             crate::query::matches_session_or_ref(sq, r, hydrated.as_ref())
         });
     }
@@ -553,20 +549,9 @@ fn sessions(query: &str) -> (u16, Value) {
         .collect();
 
     #[cfg(feature = "sqlite")]
-    if params.get("max_staleness").is_some() || params.flag("authority") {
-        let has_neg = parsed_q.as_ref().is_some_and(crate::query::SessionQuery::has_negation);
-        let env = match evaluate_api_authority(&params, resolved_as_of_gen, has_neg, false) {
-            Ok(env) => env,
-            Err(reply) => return reply,
-        };
-        if params.flag("authority") {
-            return ok(json!({
-                "sessions": rows,
-                "authority": env,
-            }));
-        }
+    if let Some(env) = scope.filter(|_| params.flag("authority")) {
+        return ok(json!({ "sessions": rows, "authority": env }));
     }
-
     ok(Value::Array(rows))
 }
 
@@ -897,6 +882,17 @@ fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
     ok(window_envelope(&r, &sink, messages))
 }
 
+#[cfg(feature = "sqlite")]
+pub fn session_in_places(r: &SessionRef, scope: &crate::state::hub::AuthorityEnvelope) -> anyhow::Result<bool> {
+    let place = if crate::custody::is_pack_ref(r) {
+        crate::state::hub::HubStore::default_hub()?
+            .session_head_for(&r.id, None)?
+            .map(|e| e.producer_id)
+    } else {
+        None
+    };
+    Ok(scope.includes(place.as_deref().unwrap_or("local")))
+}
 /// `GET /api/session/{harness}/{id}/events?kind=&as_of=&max_staleness=&authority=1` — the session's
 /// extracted tool events (file edits/reads, commands, errors) from the event catalog, in transcript
 /// order, as `cv events --json` rows. A stale or missing catalog row is (re)ingested on the spot.
@@ -929,15 +925,19 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
             Ok(h) => h,
             Err(e) => return err(500, &e.to_string()),
         };
-        let matched = heads.into_iter().find(|e| {
-            Harness::parse(&e.harness) == Some(want_harness)
+        let mut matches = heads.into_iter().filter(|e| {
+            env.includes(&e.producer_id)
+                && Harness::parse(&e.harness) == Some(want_harness)
                 && (e.selector_string() == id
                     || e.session_id == id
                     || e.metadata.get("native_id").and_then(Value::as_str) == Some(id))
         });
-        let Some(entry) = matched else {
+        let Some(entry) = matches.next() else {
             return err(404, "session not found");
         };
+        if matches.next().is_some() {
+            return err(400, "ambiguous session id");
+        }
         let Some(backing) = crate::custody::backing_from_hub_head(hub.packs_dir(), entry)
             .ok()
             .flatten()
@@ -983,8 +983,15 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
         return ok(json!(out));
     }
 
+    #[cfg(not(feature = "sqlite"))]
+    if as_of.is_some() {
+        return err(400, "as_of requires sqlite support");
+    }
     #[cfg(feature = "sqlite")]
-    let auth_opt = if params.get("max_staleness").is_some() || params.flag("authority") {
+    let auth_opt = if params.get("place").or_else(|| params.get("producer")).is_some()
+        || params.get("max_staleness").is_some()
+        || params.flag("authority")
+    {
         match evaluate_api_authority(&params, None, false, false) {
             Ok(env) => Some(env),
             Err(reply) => return reply,
@@ -997,6 +1004,14 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
         Ok(x) => x,
         Err(e) => return e,
     };
+    #[cfg(feature = "sqlite")]
+    if let Some(scope) = &auth_opt {
+        match session_in_places(&r, scope) {
+            Ok(true) => {}
+            Ok(false) => return err(404, "session not found in selected places"),
+            Err(e) => return err(500, &e.to_string()),
+        }
+    }
     let rows = match events::read_ref(&r, kind.as_deref()) {
         Ok(rows) => rows,
         Err(e) => return err(500, &format!("event catalog: {e:#}")),
@@ -1104,6 +1119,67 @@ fn compactions(harness: &str, id: &str) -> (u16, Value) {
     }
 }
 
+/// Derive historical file activity from the same immutable session revisions as the inventory.
+#[cfg(feature = "sqlite")]
+pub fn touched_at_generation(
+    gen: u64,
+    path: &str,
+    edits_only: bool,
+    scope: &crate::state::hub::AuthorityEnvelope,
+) -> anyhow::Result<Vec<crate::events::TouchedSession>> {
+    use crate::Adapter as _;
+    let hub = crate::state::hub::HubStore::default_hub()?;
+    let abs = crate::events::absolutize(path, crate::env::current_dir().as_deref());
+    let suffix = format!(
+        "/{}",
+        path.trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+    );
+    let mut rows = Vec::new();
+    for entry in hub.heads_at_generation(Some(gen))? {
+        if !scope.includes(&entry.producer_id) {
+            continue;
+        }
+        let b = crate::custody::backing_from_hub_head(hub.packs_dir(), entry)?
+            .ok_or_else(|| anyhow::anyhow!("historical event payload unavailable"))?;
+        let r = b.reference.clone();
+        let mut sink = crate::events::EventSink::new(r.cwd.clone());
+        b.stream(&r, &crate::Demand::LEAN.with_spans(), &mut sink)?;
+        let mut row = crate::events::TouchedSession {
+            harness: r.harness.to_string(),
+            session_id: r.id,
+            title: r.title,
+            reads: 0,
+            edits: 0,
+            last_ts: None,
+            parent_id: None,
+            agent_id: None,
+            workflow: None,
+        };
+        for event in sink.into_events()? {
+            if !event
+                .target
+                .as_deref()
+                .is_some_and(|t| t == abs || t.to_ascii_lowercase().ends_with(&suffix))
+            {
+                continue;
+            }
+            match event.kind {
+                "file_edit" => row.edits += 1,
+                "file_read" => row.reads += 1,
+                _ => continue,
+            }
+            row.last_ts = row.last_ts.max(event.ts);
+        }
+        if row.edits > 0 || (!edits_only && row.reads > 0) {
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|a, b| b.last_ts.cmp(&a.last_ts).then_with(|| a.session_id.cmp(&b.session_id)));
+    Ok(rows)
+}
+
 /// `GET /api/touched?path=&edits_only=&place=&as_of=&max_staleness=&authority=1` — sessions whose
 /// tool events touched a file (exact or suffix path match), newest activity first, as `cv touched
 /// --json` rows. Empty on a cold catalog; a catalog error is a 500, never an empty list.
@@ -1133,7 +1209,11 @@ fn touched(query: &str) -> (u16, Value) {
     };
 
     #[cfg(feature = "sqlite")]
-    let auth_opt = if params.get("max_staleness").is_some() || params.flag("authority") || resolved_as_of.is_some() {
+    let auth_opt = if place.is_some()
+        || params.get("max_staleness").is_some()
+        || params.flag("authority")
+        || resolved_as_of.is_some()
+    {
         match evaluate_api_authority(&params, resolved_as_of, false, false) {
             Ok(env) => Some(env),
             Err(reply) => return reply,
@@ -1142,11 +1222,29 @@ fn touched(query: &str) -> (u16, Value) {
         None
     };
 
+    #[cfg(feature = "sqlite")]
+    if let Some(gen) = resolved_as_of {
+        let scope = auth_opt.as_ref().expect("evaluated for pinned generation");
+        let rows = match touched_at_generation(gen, &path, params.flag("edits_only"), scope) {
+            Ok(rows) => rows,
+            Err(e) => return err(503, &e.to_string()),
+        };
+        let rows: Vec<_> = rows.iter().map(crate::rows::touched_row).collect();
+        return if params.flag("authority") {
+            ok(json!({ "touched": rows, "authority": scope }))
+        } else {
+            ok(json!(rows))
+        };
+    }
+    #[cfg(not(feature = "sqlite"))]
+    if as_of.is_some() {
+        return err(400, "as_of requires sqlite support");
+    }
     let mut rows = match crate::events::sessions_touching(&path, params.flag("edits_only")) {
         Ok(rows) => rows,
         Err(e) => return err(500, &format!("event catalog: {e:#}")),
     };
-    if let Some(ref pat) = place {
+    if let Some(ref _pattern) = place {
         #[cfg(feature = "sqlite")]
         let hub_opt = crate::state::hub::HubStore::default_hub().ok();
         rows.retain(|t| {
@@ -1166,7 +1264,14 @@ fn touched(query: &str) -> (u16, Value) {
                     "local".into()
                 }
             };
-            glob_match(pat, &p)
+            #[cfg(feature = "sqlite")]
+            {
+                auth_opt.as_ref().is_some_and(|s| s.includes(&p))
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                glob_match(_pattern, &p)
+            }
         });
     }
     let out: Vec<Value> = rows.iter().map(crate::rows::touched_row).collect();

@@ -285,7 +285,7 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
     } = args;
     let want = parse_harness(&harness)?;
     let raw_query_str = query.clone();
-    let query = crate::cmd::query::build(query)?;
+    let mut query = crate::cmd::query::build(query)?;
     let has_negation = query.as_ref().is_some_and(cv_core::SessionQuery::has_negation);
     let auth_envelope = evaluate_cli_authority(
         &authority,
@@ -312,13 +312,18 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
     let all = if let Some(gen) = authority.as_of {
         let hub = cv_core::state::hub::HubStore::default_hub()?;
         let heads = hub.heads_at_generation(Some(gen))?;
-        for e in &heads {
+        let pinned_query = query.take();
+        let mut refs = Vec::new();
+        for e in heads {
+            if let Some(q) = &pinned_query {
+                if !e.matches_query(hub.packs_dir(), q)? {
+                    continue;
+                }
+            }
             selector_places.insert(e.selector_string(), e.producer_id.clone());
+            refs.extend(cv_core::api::hub_head_to_ref(hub.packs_dir(), &e));
         }
-        cv_core::custody::inventory_as_of(Some(gen))?
-            .into_iter()
-            .map(|b| b.reference)
-            .collect()
+        refs
     } else {
         if authority.place.is_some() {
             if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
@@ -345,15 +350,16 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
         })
         .filter(|r| match authority.place.as_deref() {
             None => true,
-            Some(pat) => {
+            Some(_) => {
                 let p = selector_places.get(&r.id).map_or("local", String::as_str);
-                cv_core::query::glob_match(pat, p)
+                auth_envelope.as_ref().is_some_and(|scope| scope.includes(p))
             }
         })
         .collect();
     // Queried windows still require ordered predicate/error evaluation; text needs exact totals.
     // Heapify only a small unqueried machine window, preserving the existing row stat seam.
-    let heap_window = json && query.is_none() && limit.saturating_mul(HEAP_WINDOW_RATIO) < refs.len();
+    let heap_window =
+        json && authority.as_of.is_none() && query.is_none() && limit.saturating_mul(HEAP_WINDOW_RATIO) < refs.len();
     let total = if heap_window {
         refs.len()
     } else {
@@ -368,7 +374,9 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
         // `--enrich` (git + display_title) is opt-in because it costs one transcript parse per
         // emitted row — O(limit), not O(fleet), but not the catalog-cheap default `ls --json`
         // promises. See the perf note in the flag's help.
-        let ranked_rows = if heap_window {
+        let ranked_rows = if authority.as_of.is_some() {
+            refs.iter().take(limit).map(|r| (r, session_row(r, None))).collect()
+        } else if heap_window {
             ranked_json_rows(&refs, limit, sort_by, asc)
         } else {
             json_rows(refs.iter(), limit)
@@ -381,9 +389,13 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
                     // content on disk (memory-safe on the multi-MB "single-exchange giants" sesh
                     // warns about) while still carrying the session's git metadata and enough of the
                     // first user turn to synthesize a title.
-                    let enriched = cv_core::harness::for_harness(r.harness)
-                        .with_context(|| format!("no adapter for {}", r.harness))
-                        .and_then(|a| enrich_head(a.as_ref(), r));
+                    let enriched = if authority.as_of.is_some() {
+                        cv_core::custody::backing_for_as_of(r, authority.as_of)
+                    } else {
+                        Ok(cv_core::harness::for_harness(r.harness))
+                    }
+                    .and_then(|a| a.with_context(|| format!("no adapter for {}", r.harness)))
+                    .and_then(|a| enrich_head(a.as_ref(), r));
                     let map = obj.as_object_mut().expect("json object");
                     match enriched {
                         // A row whose transcript cannot be read says why, so a consumer can tell
@@ -437,7 +449,7 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
             if index % METADATA_BATCH_SIZE == 0 {
                 probe = cv_core::source::Probe::default();
             }
-            probe.ref_exists(r).then_some(r)
+            (authority.as_of.is_some() || probe.ref_exists(r)).then_some(r)
         })
         .take(limit)
         .collect();

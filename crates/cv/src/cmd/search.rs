@@ -28,9 +28,9 @@ fn resolve_allowed_ids(
     want: Option<cv_core::Harness>,
     cwd: Option<&str>,
     filter_query: Option<String>,
-    place_glob: Option<&str>,
+    place_scope: Option<&cv_core::state::hub::AuthorityEnvelope>,
 ) -> Result<Option<std::collections::HashSet<String>>> {
-    if filter_query.is_none() && place_glob.is_none() {
+    if filter_query.is_none() && place_scope.is_none() {
         return Ok(None);
     }
     let sq = crate::cmd::query::build(filter_query)?;
@@ -38,7 +38,7 @@ fn resolve_allowed_ids(
     if let Some(needle) = cwd {
         candidates.retain(|r| r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)));
     }
-    if let Some(pat) = place_glob {
+    if let Some(scope) = place_scope {
         let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
             if let Ok(heads) = hub.heads_at_generation(None) {
@@ -49,7 +49,7 @@ fn resolve_allowed_ids(
         }
         candidates.retain(|r| {
             let p = selector_places.get(&r.id).map_or("local", String::as_str);
-            cv_core::query::glob_match(pat, p)
+            scope.includes(p)
         });
     }
     if let Some(ref sq) = sq {
@@ -67,103 +67,52 @@ fn resolve_allowed_ids(
 pub(crate) fn search_pinned_generation(
     gen: u64,
     query: &str,
-    want: Option<cv_core::Harness>,
-    cwd: Option<&str>,
-    place_glob: Option<&str>,
+    filter: cv_search::SearchFilter<'_>,
+    scope: &cv_core::state::hub::AuthorityEnvelope,
+    predicate: Option<&cv_core::SessionQuery>,
     limit: usize,
 ) -> Result<Found> {
     use cv_core::harness::Parse as _;
     let hub = cv_core::state::hub::HubStore::default_hub()?;
-    let heads = hub.heads_at_generation(Some(gen))?;
-    let needles: Vec<String> = query
-        .split_whitespace()
-        .map(|s| s.trim_matches('"').to_lowercase())
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("and") && !s.eq_ignore_ascii_case("or"))
-        .collect();
     let mut hits = Vec::new();
-    for entry in heads {
-        if let Some(pat) = place_glob {
-            if !cv_core::query::glob_match(pat, &entry.producer_id) {
+    let mut total = 0;
+    for entry in hub.heads_at_generation(Some(gen))? {
+        if !scope.includes(&entry.producer_id)
+            || filter.harness.is_some_and(|h| h != entry.harness)
+            || filter
+                .cwd
+                .is_some_and(|cwd| !entry.cwd.as_ref().is_some_and(|p| p.contains(cwd)))
+        {
+            continue;
+        }
+        if let Some(q) = predicate {
+            if !entry.matches_query(hub.packs_dir(), q)? {
                 continue;
             }
         }
-        let Some(h) = cv_core::Harness::parse(&entry.harness) else {
-            continue;
-        };
-        if want.is_some_and(|w| w != h) {
-            continue;
+        let b = cv_core::custody::backing_from_hub_head(hub.packs_dir(), entry)?
+            .ok_or_else(|| anyhow::anyhow!("historical search payload unavailable at generation {gen}"))?;
+        let session = b.parse(&b.reference)?;
+        let mut matcher = cv_core::scan::Matcher::new(vec![query.to_lowercase()], 1);
+        let resolver = session.resolver();
+        for msg in session.messages.iter().filter(|m| filter.scope.holds(m.kind)) {
+            cv_core::projection::searchable(&msg.content, &resolver, &mut matcher, &mut || Ok(()))?;
         }
-        if let Some(c_needle) = cwd {
-            if !entry.cwd.as_deref().is_some_and(|c| c.contains(c_needle)) {
-                continue;
+        let excerpt = matcher.finish();
+        if matcher.anchored() {
+            total += 1;
+            if hits.len() < limit {
+                hits.push(
+                    cv_core::scan::LiveHit {
+                        title: cv_core::label_from(session.title.as_deref(), session.synth_title().as_deref()),
+                        snippet: cv_core::scan::snippet(&excerpt.text, excerpt.at, excerpt.len),
+                        session: b.reference,
+                    }
+                    .into(),
+                );
             }
-        }
-        let Some(backing) = cv_core::custody::backing_from_hub_head(hub.packs_dir(), entry.clone())? else {
-            continue;
-        };
-        let session = match backing.parse(&backing.reference) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let mut corpus = String::new();
-        if let Some(ref t) = session.title {
-            corpus.push_str(t);
-            corpus.push('\n');
-        }
-        for m in &session.messages {
-            for b in &m.content {
-                match b {
-                    cv_core::Block::Text { text, .. } | cv_core::Block::Thinking { text, .. } => {
-                        corpus.push_str(text);
-                        corpus.push('\n');
-                    }
-                    cv_core::Block::ToolResult { content, .. } => {
-                        corpus.push_str(content);
-                        corpus.push('\n');
-                    }
-                    cv_core::Block::ToolUse { name, input, .. } => {
-                        corpus.push_str(name);
-                        if let Ok(s) = serde_json::to_string(input) {
-                            corpus.push(' ');
-                            corpus.push_str(&s);
-                        }
-                        corpus.push('\n');
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let lower = corpus.to_lowercase();
-        if needles.is_empty() || needles.iter().all(|n| lower.contains(n.as_str())) {
-            let snippet = needles
-                .first()
-                .and_then(|n| lower.find(n.as_str()).map(|pos| (pos, n.len())))
-                .map(|(pos, len)| {
-                    let start = corpus.floor_char_boundary(pos.saturating_sub(40));
-                    let end = corpus.ceil_char_boundary((pos + len + 80).min(corpus.len()));
-                    corpus[start..end].replace('\n', " ")
-                })
-                .unwrap_or_default();
-            let selector = backing.reference.id.clone();
-            hits.push(cv_search::Hit {
-                id: selector.clone(),
-                session_key: Some(selector),
-                harness: h.as_str().to_string(),
-                cwd: entry.cwd.clone(),
-                title: entry.title.clone(),
-                created_at: backing.reference.created_at.map(|t| t.timestamp()),
-                updated_at: backing.reference.updated_at.map(|t| t.timestamp()),
-                score: 1.0,
-                snippet,
-                agent_id: None,
-                parent_id: None,
-                workflow: None,
-                session: Some(backing.reference),
-            });
         }
     }
-    let total = hits.len();
-    hits.truncate(limit);
     Ok(Found {
         hits,
         source: Source::Live,
@@ -198,6 +147,9 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         },
     };
     if batch {
+        if authority.is_active() {
+            return crate::util::usage("batch search cannot apply place or generation constraints");
+        }
         return batch_search(
             cv_search::SearchFilter {
                 harness: want.map(|h| h.as_str()),
@@ -217,12 +169,30 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     )?;
 
     if let Some(gen) = authority.as_of {
-        let found = search_pinned_generation(gen, query, want, cwd.as_deref(), authority.place.as_deref(), limit)?;
+        let predicate = crate::cmd::query::build(filter_query)?;
+        let filter = cv_search::SearchFilter {
+            harness: want.map(|h| h.as_str()),
+            cwd: cwd.as_deref(),
+            scope,
+        };
+        let found = search_pinned_generation(
+            gen,
+            query,
+            filter,
+            auth_envelope.as_ref().expect("pinned scope"),
+            predicate.as_ref(),
+            limit,
+        )?;
         let work = cv_search::SearchWork::default();
         return render(found, work, query, json, stats, auth_envelope.as_ref());
     }
 
-    let allowed_ids = resolve_allowed_ids(want, cwd.as_deref(), filter_query, authority.place.as_deref())?;
+    let allowed_ids = resolve_allowed_ids(
+        want,
+        cwd.as_deref(),
+        filter_query,
+        auth_envelope.as_ref().filter(|_| authority.place.is_some()),
+    )?;
     let source = if scan {
         eprintln!("(--scan: scanning every transcript live; `cv index` makes search instant)");
         Source::Live
@@ -765,10 +735,12 @@ pub(crate) fn cmd_index(
             if rebuild { "rebuilding" } else { "updating" },
             if subagents { " (+ sub-agent forest)" } else { "" }
         );
+        let hub = cv_core::state::hub::HubStore::default_hub().ok();
+        let before = hub.as_ref().and_then(|h| h.latest_generation_fast().ok().flatten());
         let (indexed, _refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
-        if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
-            if let Ok(Some((gen, _))) = hub.latest_generation_fast() {
-                let _ = hub.record_indexed_generation(gen);
+        if let (Some(hub), Some((gen, _))) = (hub, before) {
+            if indexed.unreadable.is_empty() && hub.latest_generation_fast()?.is_some_and(|(g, _)| gen == g) {
+                hub.record_indexed_generation(gen)?;
             }
         }
         if !json {

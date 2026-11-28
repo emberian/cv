@@ -523,6 +523,7 @@ pub struct Backing {
     addr: PayloadAddr,
     custody: CustodyKind,
     source: &'static str,
+    owner_store: Option<crate::state::StateStore>,
 }
 
 impl Backing {
@@ -626,6 +627,9 @@ impl Adapter for Backing {
         Ok(Default::default())
     }
     fn stream(&self, _: &SessionRef, demand: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
+        if let Some(store) = &self.owner_store {
+            store.check_hub_pack_owners(&self.key.producer, &self.addr, &self.custody)?;
+        }
         if let CustodyKind::NativeExtents {
             extents,
             total_bytes,
@@ -670,6 +674,7 @@ pub fn collect_native(directory: &Path, key: SessionKey, custody: CustodyKind) -
         addr,
         custody,
         source: "custody_pack",
+        owner_store: None,
     };
     crate::stream::collect(&backing, &reference)
 }
@@ -723,6 +728,18 @@ pub fn backing_from_hub_head(
     hub_packs_dir: &Path,
     entry: crate::state::hub::SessionRevisionEntry,
 ) -> Result<Option<Backing>> {
+    let home = hub_packs_dir
+        .parent()
+        .and_then(Path::parent)
+        .context("hub pack directory has no store root")?;
+    hub_revision_backing(&crate::state::StateStore::at_dir(home), hub_packs_dir, entry)
+}
+
+pub(crate) fn hub_revision_backing(
+    store: &crate::state::StateStore,
+    hub_packs_dir: &Path,
+    entry: crate::state::hub::SessionRevisionEntry,
+) -> Result<Option<Backing>> {
     let custody = entry.custody.clone().unwrap_or(CustodyKind::PortableProjection);
     let addr = match (&entry.payload_addr, &custody) {
         (Some(addr), _) => addr.clone(),
@@ -756,6 +773,7 @@ pub fn backing_from_hub_head(
         addr,
         custody,
         source: "hub_snapshot",
+        owner_store: Some(store.clone()),
     }))
 }
 
@@ -784,11 +802,40 @@ fn backing_from_local_head(home: &Path, mut entry: ArchivedSessionEntry) -> Resu
             addr: entry.addr,
             custody: entry.custody,
             source: "custody_pack",
+            owner_store: None,
         },
     ))
 }
 
 impl crate::state::StateStore {
+    // Heads written before nested references were checked at admission can outlive an upgrade.
+    pub(crate) fn check_hub_pack_owners(
+        &self,
+        producer: &str,
+        addr: &PayloadAddr,
+        custody: &CustodyKind,
+    ) -> Result<()> {
+        let extents = match custody {
+            CustodyKind::NativeExtents { extents, .. } => extents.as_slice(),
+            CustodyKind::PortableProjection => &[],
+        };
+        let ids: std::collections::BTreeSet<_> = std::iter::once(addr).chain(extents).map(|a| &a.pack_id).collect();
+        let ids = serde_json::to_string(&ids)?;
+        let allowed = self
+            .read_in(|conn| {
+                Ok(conn.query_row(
+                    "SELECT NOT EXISTS (
+               SELECT 1 FROM json_each(?1) ref LEFT JOIN hub_packs p ON p.pack_id = ref.value
+               WHERE p.pack_id IS NULL OR (p.producer_id IS NOT NULL AND p.producer_id <> ?2))",
+                    rusqlite::params![ids, producer],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })?
+            .unwrap_or(false);
+        anyhow::ensure!(allowed, "unavailable or foreign pack in stored hub revision");
+        Ok(())
+    }
+
     /// Indexed `O(log N)` point lookup for a single session's [`Backing`] by canonical `selector`,
     /// reading only that session's row from `custody_heads` or `hub_session_heads` (optionally
     /// pinned to `as_of_gen`). Safe under `--frozen`.
@@ -1051,6 +1098,7 @@ mod tests {
                 layout: vec!["projects".into(), "-work-proj".into()],
             },
             source: "custody_pack",
+            owner_store: None,
         };
         let staging = || {
             std::fs::read_dir(std::env::temp_dir())

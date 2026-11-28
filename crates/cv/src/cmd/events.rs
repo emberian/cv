@@ -22,21 +22,21 @@ pub(crate) fn cmd_events(
     let (r, rows): (cv_core::SessionRef, Vec<events::EventRow>) = if let Some(gen) = authority.as_of {
         let hub = cv_core::state::hub::HubStore::default_hub()?;
         let heads = hub.heads_at_generation(Some(gen))?;
-        let matched = heads.into_iter().find(|e| {
+        let mut matches = heads.into_iter().filter(|e| {
             let h_ok = want.is_none_or(|w| cv_core::Harness::parse(&e.harness) == Some(w));
-            let p_ok = authority
-                .place
-                .as_deref()
-                .is_none_or(|pat| cv_core::query::glob_match(pat, &e.producer_id));
+            let p_ok = auth_envelope.as_ref().is_none_or(|env| env.includes(&e.producer_id));
             let id_ok = e.selector_string() == id
                 || e.selector_string().starts_with(id)
                 || e.session_id == id
                 || e.metadata.get("native_id").and_then(|v| v.as_str()) == Some(id);
             h_ok && p_ok && id_ok
         });
-        let Some(entry) = matched else {
+        let Some(entry) = matches.next() else {
             return crate::util::usage(format!("session {id:?} not found at generation {gen}"));
         };
+        if matches.next().is_some() {
+            return crate::util::usage(format!("ambiguous session id {id:?}"));
+        }
         let Some(backing) = cv_core::custody::backing_from_hub_head(hub.packs_dir(), entry)? else {
             return crate::util::usage(format!("session {id:?} has no mirrored payload at generation {gen}"));
         };
@@ -69,6 +69,11 @@ pub(crate) fn cmd_events(
         (backing.reference, out_rows)
     } else {
         let (r, _adapter) = resolve(id, want)?;
+        if let Some(scope) = &auth_envelope {
+            if !cv_core::api::session_in_places(&r, scope)? {
+                return crate::util::usage("session not found in selected places");
+            }
+        }
         let rows = events::read_ref(&r, kind.as_deref())?;
         (r, rows)
     };
@@ -148,7 +153,7 @@ pub(crate) fn cmd_events(
     // `--subagents`: descend into the forest and attribute each agent's events to it. Sub-agents
     // aren't in the catalog (there can be thousands), so they're streamed on the spot through an
     // `EventSink` — large tool-result content stays on disk (lazy), only the small rows accumulate.
-    if subagents {
+    if subagents && authority.as_of.is_none() {
         print_subagent_events(&r, kind.as_deref(), wide)?;
     }
     Ok(())
@@ -270,8 +275,15 @@ fn print_event_row(
 
 pub(crate) fn cmd_touched(path: &str, edits_only: bool, json: bool, authority: crate::AuthorityArgs) -> Result<()> {
     let auth_envelope = crate::cmd::browse::evaluate_cli_authority(&authority, None, None, false, false)?;
-    let mut rows = cv_core::events::sessions_touching(path, edits_only)?;
-    if let Some(ref pat) = authority.place {
+    let mut rows = if let Some(gen) = authority.as_of {
+        cv_core::api::touched_at_generation(gen, path, edits_only, auth_envelope.as_ref().expect("pinned scope"))?
+    } else {
+        cv_core::events::sessions_touching(path, edits_only)?
+    };
+    if let Some(scope) = auth_envelope
+        .as_ref()
+        .filter(|_| authority.place.is_some() && authority.as_of.is_none())
+    {
         let hub_opt = cv_core::state::hub::HubStore::default_hub().ok();
         rows.retain(|t| {
             let p = if cv_core::SessionKey::split_selector(&t.session_id).is_none() {
@@ -283,7 +295,7 @@ pub(crate) fn cmd_touched(path: &str, edits_only: bool, json: bool, authority: c
                     .map(|e| e.producer_id)
                     .unwrap_or_else(|| "local".to_string())
             };
-            cv_core::query::glob_match(pat, &p)
+            scope.includes(&p)
         });
     }
     if json {

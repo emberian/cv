@@ -207,6 +207,19 @@ fn canonical_record_signature(
     }))
 }
 
+pub(super) fn pack_references(payload: Option<&PayloadAddr>, envelope: &Value) -> Result<Vec<PayloadAddr>, HubError> {
+    let mut addresses = payload.into_iter().cloned().collect::<Vec<_>>();
+    if let Some(custody) = envelope.get("custody").filter(|v| !v.is_null()) {
+        if let crate::custody::CustodyKind::NativeExtents { extents, .. } = serde_json::from_value(custody.clone())? {
+            addresses.extend(extents);
+        }
+    }
+    if let Some(delta) = envelope.get("delta_extents") {
+        addresses.extend(serde_json::from_value::<Vec<PayloadAddr>>(delta.clone())?);
+    }
+    Ok(addresses)
+}
+
 impl HubStore {
     /// Stream a Zstd-Seekable `.pack.zst` + companion `.pack.idx.json` into staged temp files in
     /// `$CLUSTERVISION_HOME/hub/packs/`, verify whole-file BLAKE3 + Zstd-Seekable `FrameIndex` +
@@ -631,6 +644,26 @@ impl HubStore {
         req: &IngestBatchRequest,
         authenticated_producer: Option<&str>,
     ) -> Result<IngestBatchResponse, HubError> {
+        self.ingest(req, authenticated_producer, None)
+    }
+
+    pub(super) fn ingest_source_batch(
+        &self,
+        producer: &str,
+        host: &str,
+        metadata: &Value,
+        batch: &IngestBatchRequest,
+        ssh_target: Option<&str>,
+    ) -> Result<IngestBatchResponse, HubError> {
+        self.ingest(batch, Some(producer), Some((producer, host, metadata, ssh_target)))
+    }
+
+    fn ingest(
+        &self,
+        req: &IngestBatchRequest,
+        authenticated_producer: Option<&str>,
+        enrollment: Option<(&str, &str, &Value, Option<&str>)>,
+    ) -> Result<IngestBatchResponse, HubError> {
         let bound_producer = match authenticated_producer {
             Some(bound) => {
                 let bound = bound.trim();
@@ -694,77 +727,96 @@ impl HubStore {
 
         // 1. Enforce `publish-before-reference` BEFORE mutating any table!
         let mut verified_pack_digests: BTreeMap<String, String> = BTreeMap::new();
-        let mut loaded_manifests: BTreeMap<String, PackManifest> = BTreeMap::new();
+        let mut loaded_manifests: BTreeMap<String, (Option<String>, PackManifest)> = BTreeMap::new();
 
         for rec in &req.events {
-            let Some(ref addr) = rec.payload_addr else {
-                continue;
-            };
-            if !loaded_manifests.contains_key(&addr.pack_id) {
-                let row: Option<(Option<String>, String, String)> = tx
-                    .query_row(
-                        "SELECT producer_id, blake3_digest, manifest_json FROM hub_packs WHERE pack_id = ?1",
-                        [&addr.pack_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .optional()?;
-                let Some((pack_owner, pack_digest, manifest_str)) = row else {
-                    return Err(HubError::MissingPackDependency {
-                        pack_id: addr.pack_id.clone(),
-                        detail: "pack not yet uploaded to hub (`publish-before-reference` violation)".into(),
-                    });
-                };
-                if let Some(bound) = bound_producer {
-                    if pack_owner.as_deref() != Some(bound) {
-                        return Err(HubError::Forbidden(format!(
-                            "credential bound to producer `{bound}` cannot reference pack `{}` owned by another producer",
-                            addr.pack_id
-                        )));
+            for addr in pack_references(rec.payload_addr.as_ref(), &rec.envelope)? {
+                if !loaded_manifests.contains_key(&addr.pack_id) {
+                    let row: Option<(Option<String>, String, String)> = tx
+                        .query_row(
+                            "SELECT producer_id, blake3_digest, manifest_json FROM hub_packs WHERE pack_id = ?1",
+                            [&addr.pack_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .optional()?;
+                    let Some((pack_owner, pack_digest, manifest_str)) = row else {
+                        return Err(HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: "pack not yet uploaded to hub (`publish-before-reference` violation)".into(),
+                        });
+                    };
+                    let zst_path =
+                        pack_zst_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: e.to_string(),
+                        })?;
+                    let idx_path =
+                        pack_idx_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: e.to_string(),
+                        })?;
+                    if !zst_path.is_file() || !idx_path.is_file() {
+                        return Err(HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: "mirrored pack files missing on disk".into(),
+                        });
                     }
-                }
-                let zst_path =
-                    pack_zst_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
-                        pack_id: addr.pack_id.clone(),
-                        detail: e.to_string(),
+                    let manifest = PackManifest::from_json_slice(manifest_str.as_bytes()).map_err(|e| {
+                        HubError::MissingPackDependency {
+                            pack_id: addr.pack_id.clone(),
+                            detail: format!("corrupt stored pack manifest: {e:#}"),
+                        }
                     })?;
-                let idx_path =
-                    pack_idx_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
-                        pack_id: addr.pack_id.clone(),
-                        detail: e.to_string(),
-                    })?;
-                if !zst_path.is_file() || !idx_path.is_file() {
-                    return Err(HubError::MissingPackDependency {
-                        pack_id: addr.pack_id.clone(),
-                        detail: "mirrored pack files missing on disk".into(),
-                    });
+                    verified_pack_digests.insert(addr.pack_id.clone(), pack_digest);
+                    loaded_manifests.insert(addr.pack_id.clone(), (pack_owner, manifest));
                 }
-                let manifest = PackManifest::from_json_slice(manifest_str.as_bytes()).map_err(|e| {
-                    HubError::MissingPackDependency {
-                        pack_id: addr.pack_id.clone(),
-                        detail: format!("corrupt stored pack manifest: {e:#}"),
-                    }
-                })?;
-                verified_pack_digests.insert(addr.pack_id.clone(), pack_digest);
-                loaded_manifests.insert(addr.pack_id.clone(), manifest);
-            }
 
-            let manifest = loaded_manifests.get(&addr.pack_id).expect("loaded above");
-            let span_matches = manifest.record_index.records().iter().any(|span| {
-                span.decoded_offset == addr.decoded_offset
-                    && span.length == addr.length
-                    && span.blake3_digest == addr.blake3_digest
-            });
-            if !span_matches {
-                return Err(HubError::MissingPackDependency {
-                    pack_id: addr.pack_id.clone(),
-                    detail: format!(
-                        "PayloadAddr (offset={}, len={}, digest={}) not present in pack manifest",
-                        addr.decoded_offset,
-                        addr.length,
-                        addr.digest_hex()
-                    ),
+                let (owner, manifest) = loaded_manifests.get(&addr.pack_id).expect("loaded above");
+                if owner.as_deref().is_some_and(|p| p != rec.event_id.producer_id)
+                    || (bound_producer.is_some() && owner.is_none())
+                {
+                    return Err(HubError::Forbidden(format!(
+                        "pack `{}` is outside this producer's custody",
+                        addr.pack_id
+                    )));
+                }
+                let span_matches = manifest.record_index.records().iter().any(|span| {
+                    span.decoded_offset == addr.decoded_offset
+                        && span.length == addr.length
+                        && span.blake3_digest == addr.blake3_digest
                 });
+                if !span_matches {
+                    return Err(HubError::MissingPackDependency {
+                        pack_id: addr.pack_id.clone(),
+                        detail: format!(
+                            "PayloadAddr (offset={}, len={}, digest={}) not present in pack manifest",
+                            addr.decoded_offset,
+                            addr.length,
+                            addr.digest_hex()
+                        ),
+                    });
+                }
             }
+        }
+
+        if let Some((producer, host, metadata, ssh_target)) = enrollment {
+            if let Some(target) = ssh_target {
+                tx.execute(
+                    "INSERT INTO hub_pull_sources(target,producer_id) VALUES (?1,?2) ON CONFLICT(target) DO NOTHING",
+                    [target, producer],
+                )?;
+                let expected: String = tx.query_row(
+                    "SELECT producer_id FROM hub_pull_sources WHERE target=?1",
+                    [target],
+                    |r| r.get(0),
+                )?;
+                if expected != producer {
+                    return Err(HubError::Forbidden(format!(
+                        "pull target {target} changed producer identity"
+                    )));
+                }
+            }
+            super::enroll_in_tx(&tx, producer, host, metadata, now_ms)?;
         }
 
         if req.events.is_empty() {
@@ -801,7 +853,7 @@ impl HubStore {
             );
             if let Some(&first_idx) = seen_coords.get(&coord) {
                 let first = &unique_in_batch[first_idx];
-                if first.rec.digest == rec.digest && first.sig == sig {
+                if first.rec.digest.trim().eq_ignore_ascii_case(rec.digest.trim()) && first.sig == sig {
                     replayed_count += 1;
                     continue;
                 }
@@ -845,7 +897,7 @@ impl HubStore {
                     None => None,
                 };
                 let ex_sig = canonical_record_signature(&ex_op_id, &ex_env, ex_addr.as_ref())?;
-                if ex_digest == rec.digest && ex_sig == item.sig {
+                if ex_digest.trim().eq_ignore_ascii_case(rec.digest.trim()) && ex_sig == item.sig {
                     replayed_count += 1;
                     continue;
                 }

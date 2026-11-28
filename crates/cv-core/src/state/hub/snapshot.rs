@@ -85,6 +85,34 @@ impl SessionRevisionEntry {
         })
     }
 
+    /// Evaluate the predicate using only this revision and its immutable payload.
+    pub fn matches_query(&self, packs: &std::path::Path, query: &SessionQuery) -> anyhow::Result<bool> {
+        use crate::harness::Parse as _;
+        let r = entry_to_session_ref(self);
+        let evaluate = |session: Option<&Session>| {
+            let ext = PinnedSessionExt {
+                entry: self,
+                session,
+                hydrated_attempted: session.is_some(),
+            };
+            query.eval(&Facts {
+                r: &r,
+                session,
+                ext: &ext,
+            })
+        };
+        match evaluate(None)? {
+            Tri::False => Ok(false),
+            Tri::True => Ok(true),
+            Tri::Unknown => {
+                let Some(b) = crate::custody::backing_from_hub_head(packs, self.clone())? else {
+                    return Ok(false);
+                };
+                Ok(evaluate(Some(&b.parse(&b.reference)?))? == Tri::True)
+            }
+        }
+    }
+
     pub fn selector_string(&self) -> String {
         match self.session_key_struct() {
             Some(k) => k.selector(),
@@ -179,6 +207,12 @@ pub struct AuthorityEnvelope {
     pub status: AuthorityStatus,
     pub places: Vec<PlaceWatermark>,
     pub omissions: Vec<AuthorityOmission>,
+}
+
+impl AuthorityEnvelope {
+    pub fn includes(&self, producer: &str) -> bool {
+        self.places.iter().any(|p| p.place_id == producer)
+    }
 }
 
 /// Input parameters evaluated by [`HubStore::compute_authority`] / [`HubStore::check_authority`].
@@ -1050,32 +1084,53 @@ pub(crate) fn fold_origin_range_in_tx(
                                 rusqlite::params![producer_id, epoch, ext.pack_id],
                             )?;
                         }
-                        let prev_entry: Option<SessionRevisionEntry> = tx
-                            .query_row(
-                                "SELECT entry_json FROM hub_epoch_sessions
-                                 WHERE producer_id = ?1 AND session_id = ?2 AND is_delete = 0
-                                 ORDER BY sort_ts_ms DESC, epoch DESC, event_seq DESC
-                                 LIMIT 1",
-                                rusqlite::params![producer_id, &session_id],
-                                |r| r.get::<_, Option<String>>(0),
-                            )
-                            .optional()?
-                            .flatten()
-                            .and_then(|raw| serde_json::from_str(&raw).ok())
-                            .or_else(|| {
-                                read_head_entry_in_conn(tx, producer_id, &session_id, None)
-                                    .ok()
-                                    .flatten()
-                            });
-                        let mut extents = match prev_entry.and_then(|p| p.custody) {
-                            Some(crate::custody::CustodyKind::NativeExtents { extents, .. }) => extents,
-                            _ => Vec::new(),
-                        };
-                        for ext in delta_extents {
-                            if !extents.contains(&ext) {
-                                extents.push(ext);
+                        // Prefer the same writer, then its latest predecessor. A delete is
+                        // a chain boundary. Derived live heads may still describe the future
+                        // while rebuilding the fold and cannot supply the base.
+                        let mut stmt = tx.prepare(
+                            "SELECT epoch,entry_json FROM hub_epoch_sessions
+                            WHERE producer_id=?1 AND session_id=?2",
+                        )?;
+                        let candidates = stmt
+                            .query_map(rusqlite::params![producer_id, session_id], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let current = (epoch_generation(epoch), epoch);
+                        let previous = candidates
+                            .iter()
+                            .filter(|(e, _)| (epoch_generation(e), e.as_str()) <= current)
+                            .max_by_key(|(e, _)| (epoch_generation(e), e.as_str()))
+                            .and_then(|(_, entry)| entry.as_deref());
+                        let prev: SessionRevisionEntry = serde_json::from_str(previous.ok_or_else(|| {
+                            HubError::InvalidArgument("session delta has no preceding native revision".into())
+                        })?)?;
+                        if envelope.get("source_start").is_some() || envelope.get("source_end").is_some() {
+                            let (Some(start), Some(end)) =
+                                (envelope["source_start"].as_u64(), envelope["source_end"].as_u64())
+                            else {
+                                return Err(HubError::InvalidArgument(
+                                    "missing or invalid native source range".into(),
+                                ));
+                            };
+                            if end <= start || prev.metadata["source_end"].as_u64().is_some_and(|prev| start != prev) {
+                                return Err(HubError::InvalidArgument("noncontiguous native source offsets".into()));
                             }
                         }
+                        if let (Some(base), Some(checkpoint)) = (
+                            envelope["base_checkpoint"].as_str(),
+                            prev.metadata["source_checkpoint"].as_str(),
+                        ) {
+                            if base != checkpoint {
+                                return Err(HubError::InvalidArgument("native source checkpoint changed".into()));
+                            }
+                        }
+                        let Some(crate::custody::CustodyKind::NativeExtents { mut extents, .. }) = prev.custody else {
+                            return Err(HubError::InvalidArgument("session delta requires a native base".into()));
+                        };
+                        // Sequence replay is eliminated at ingest. Distinct appends may have
+                        // exactly the same bytes and therefore the same content address.
+                        extents.extend(delta_extents);
                         let total_bytes: u64 = extents.iter().map(|e| e.length).sum();
                         let file_name = envelope
                             .get("file_name")
@@ -1101,6 +1156,18 @@ pub(crate) fn fold_origin_range_in_tx(
                             file_name,
                             layout,
                         });
+                    }
+                }
+                if entry.custody.is_some() {
+                    if !entry.metadata.is_object() {
+                        entry.metadata = json!({});
+                    }
+                    let meta = entry.metadata.as_object_mut().expect("object");
+                    for name in ["source_end", "source_checkpoint"] {
+                        meta.remove(name);
+                        if let Some(v) = envelope.get(name) {
+                            meta.insert(name.into(), v.clone());
+                        }
                     }
                 }
                 let sort_ts_ms = match parse_rfc3339_ms(entry.updated_at.as_deref().or(entry.created_at.as_deref())) {
@@ -1334,7 +1401,7 @@ fn upsert_head_at_gen_in_tx(
     producer_id: &str,
     session_id: &str,
     entry_opt: Option<&SessionRevisionEntry>,
-) -> Result<(), HubError> {
+) -> Result<(), crate::state::StateError> {
     tx.execute(
         "UPDATE hub_session_heads
          SET gen_to = ?1
@@ -1388,6 +1455,80 @@ fn upsert_head_at_gen_in_tx(
     Ok(())
 }
 
+/// Convert retained v6 publications while their original inventories and frontiers are available.
+pub(crate) fn migrate_snapshot_history(tx: &Transaction<'_>) -> Result<(), crate::state::StateError> {
+    {
+        let mut stmt = tx.prepare("SELECT hub_generation, manifest_json FROM hub_snapshots ORDER BY hub_generation")?;
+        let mut rows = stmt.query([])?;
+        let mut previous = BTreeMap::<String, SessionRevisionEntry>::new();
+        let mut first = true;
+        while let Some(row) = rows.next()? {
+            let generation: u64 = row.get(0)?;
+            let snapshot: SnapshotPublicationManifest = serde_json::from_str(&row.get::<_, String>(1)?)?;
+            if first {
+                // The SQL fallback seeds the latest live heads when no snapshots were published.
+                tx.execute("DELETE FROM hub_session_heads", [])?;
+                first = false;
+            }
+            let frontier: BTreeMap<_, _> = snapshot
+                .origin_frontier
+                .iter()
+                .map(|((p, e), seq)| (encode_pair_key(p, e), seq))
+                .collect();
+            tx.execute("UPDATE hub_generations SET frontier_json=?1, control_revision=?2, quarantine_count=?3 WHERE generation=?4",
+                rusqlite::params![serde_json::to_string(&frontier)?, snapshot.control_revision, snapshot.quarantine_count, generation])?;
+            for (key, entry) in &previous {
+                if !snapshot.session_revisions.contains_key(key) {
+                    upsert_head_at_gen_in_tx(tx, generation, &entry.producer_id, &entry.session_id, None)?;
+                }
+            }
+            for (key, entry) in &snapshot.session_revisions {
+                if previous.get(key) != Some(entry) {
+                    upsert_head_at_gen_in_tx(tx, generation, &entry.producer_id, &entry.session_id, Some(entry))?;
+                }
+            }
+            previous = snapshot.session_revisions;
+        }
+    }
+    tx.execute("DROP TABLE hub_snapshots", [])?;
+    Ok(())
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AuthorityInputs {
+    #[serde(default)]
+    indexed_generation: u64,
+    producers: Vec<Producer>,
+    frontiers: Vec<FrontierStatus>,
+    quarantined: BTreeSet<String>,
+}
+
+impl AuthorityInputs {
+    fn read(conn: &Connection) -> Result<Self, HubError> {
+        let quarantined = if conn.table_exists(None, "hub_quarantine")? {
+            let mut stmt = conn.prepare("SELECT DISTINCT producer_id FROM hub_quarantine WHERE resolved_at IS NULL")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        } else {
+            BTreeSet::new()
+        };
+        let indexed_generation = if conn.table_exists(None, "hub_generations")? {
+            conn.query_row(
+                "SELECT COALESCE(MAX(indexed_generation), 0) FROM hub_generations",
+                [],
+                |r| r.get(0),
+            )?
+        } else {
+            0
+        };
+        Ok(Self {
+            indexed_generation,
+            producers: crate::state::StateStore::producers_in(conn)?,
+            frontiers: frontier_rows(conn, false)?,
+            quarantined,
+        })
+    }
+}
 /// Publish a new monotonic generation into `hub_generations` and update `hub_session_heads` in
 /// `O(|head_deltas| + |origins|)` — zero fleet-wide table scan, zero monolithic `manifest_json`.
 pub(crate) fn publish_generation_delta_in_tx(
@@ -1494,8 +1635,8 @@ pub(crate) fn publish_generation_delta_in_tx(
     tx.execute(
         "INSERT INTO hub_generations(
              generation, publication_id, published_at, frontier_digest,
-             control_revision, quarantine_count, indexed_generation, pinned, frontier_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
+             control_revision, quarantine_count, indexed_generation, pinned, frontier_json, authority_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, ?8)",
         rusqlite::params![
             next_gen as i64,
             final_pub_id,
@@ -1504,6 +1645,7 @@ pub(crate) fn publish_generation_delta_in_tx(
             control_revision as i64,
             quarantine_count as i64,
             frontier_json,
+            serde_json::to_string(&AuthorityInputs::read(tx)?)?,
         ],
     )?;
     prune_unpinned_generations_in_tx(tx, MAX_RETAINED_HUB_SNAPSHOTS)?;
@@ -1633,8 +1775,8 @@ pub(crate) fn materialize_snapshot_in_conn(
             |r| r.get(0),
         )
         .optional()?
-        .unwrap_or_else(|| "{}".into());
-    let encoded_frontier: BTreeMap<String, u64> = serde_json::from_str(&frontier_raw).unwrap_or_default();
+        .ok_or_else(|| HubError::NotFound(format!("generation {} no longer retained", gen_rec.generation)))?;
+    let encoded_frontier: BTreeMap<String, u64> = serde_json::from_str(&frontier_raw)?;
     let mut origin_frontier = BTreeMap::new();
     for (k, seq) in encoded_frontier {
         if let Ok(pair) = super::decode_pair_key(&k) {
@@ -1675,6 +1817,22 @@ pub(crate) fn materialize_snapshot_in_conn(
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         for r in rows {
             referenced_packs.insert(r?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT payload_addr_json, envelope_json FROM hub_ingested_events
+             WHERE producer_id=?1 AND epoch=?2 AND seq<=?3",
+        )?;
+        for ((producer, epoch), seq) in &origin_frontier {
+            let mut rows = stmt.query(rusqlite::params![producer, epoch, seq])?;
+            while let Some(row) = rows.next()? {
+                let payload: Option<String> = row.get(0)?;
+                let addr = payload.as_deref().map(serde_json::from_str).transpose()?;
+                let envelope: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+                for addr in super::receiver::pack_references(addr.as_ref(), &envelope)? {
+                    referenced_packs.insert(addr.pack_id);
+                }
+            }
         }
     }
 
@@ -1743,6 +1901,10 @@ fn missing_ranges_for(
 }
 
 fn read_frontiers_in_conn(conn: &Connection) -> Result<Vec<FrontierStatus>, HubError> {
+    frontier_rows(conn, true)
+}
+
+fn frontier_rows(conn: &Connection, include_ranges: bool) -> Result<Vec<FrontierStatus>, HubError> {
     let has_table: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_frontiers')",
         [],
@@ -1782,7 +1944,11 @@ fn read_frontiers_in_conn(conn: &Connection) -> Result<Vec<FrontierStatus>, HubE
 
     let mut out = Vec::with_capacity(raw_rows.len());
     for row in raw_rows {
-        let missing_ranges = missing_ranges_for(conn, &row.producer_id, &row.epoch, row.contiguous_seq)?;
+        let missing_ranges = if include_ranges && row.buffered_count > 0 {
+            missing_ranges_for(conn, &row.producer_id, &row.epoch, row.contiguous_seq)?
+        } else {
+            Vec::new()
+        };
         let lag_events = row.max_received_seq.saturating_sub(row.contiguous_seq);
         out.push(FrontierStatus {
             producer_id: row.producer_id,
@@ -1873,6 +2039,10 @@ impl PinnedSessionExt<'_> {
 }
 
 impl ExtFacts for PinnedSessionExt<'_> {
+    fn place(&self) -> Option<&str> {
+        Some(&self.entry.producer_id)
+    }
+
     fn model(&self, needle: &str, exact: bool) -> anyhow::Result<Tri> {
         if let Some(m) = self.entry.model.as_deref() {
             let lower = m.to_lowercase();
@@ -2023,6 +2193,10 @@ impl HubStore {
                 None => Ok(None),
             };
         };
+        Self::resolve_generation_in(&conn, spec)
+    }
+
+    fn resolve_generation_in(conn: &Connection, spec: Option<&str>) -> Result<Option<HubGenerationRecord>, HubError> {
         let has_table: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_generations')",
             [],
@@ -2035,7 +2209,7 @@ impl HubStore {
             };
         }
         match spec.map(str::trim).filter(|s| !s.is_empty()) {
-            None => latest_generation_in_conn(&conn),
+            None => latest_generation_in_conn(conn),
             Some(want) => {
                 let by_gen = want.parse::<u64>().ok();
                 let rec = if let Some(g) = by_gen {
@@ -2126,6 +2300,7 @@ impl HubStore {
                                     payload_addr_json, custody_json, metadata_json
                              FROM hub_session_heads
                              WHERE selector = ?1
+                               AND EXISTS (SELECT 1 FROM hub_generations WHERE generation=?2)
                                AND gen_from <= ?2 AND (gen_to IS NULL OR gen_to > ?2)
                              ORDER BY gen_from DESC
                              LIMIT 1",
@@ -2142,19 +2317,29 @@ impl HubStore {
     /// List all session heads visible at `as_of_gen` (`None` = active `gen_to IS NULL` heads).
     /// Safe under `--frozen`.
     pub fn heads_at_generation(&self, as_of_gen: Option<u64>) -> Result<Vec<SessionRevisionEntry>, HubError> {
-        if let Some(g) = as_of_gen {
-            let _ = self.resolve_generation(Some(&g.to_string()))?;
-        }
-        Ok(self
+        let result = self
             .store
             .read_in(|conn| {
+                let _snapshot = (as_of_gen.is_some() && conn.is_autocommit())
+                    .then(|| conn.unchecked_transaction())
+                    .transpose()?;
                 let has_table: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_session_heads')",
                     [],
                     |r| r.get(0),
                 )?;
                 if !has_table {
-                    return Ok(Vec::new());
+                    return Ok(None);
+                }
+                if let Some(g) = as_of_gen {
+                    let exists: bool = conn.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM hub_generations WHERE generation=?1)",
+                        [g],
+                        |r| r.get(0),
+                    )?;
+                    if !exists {
+                        return Ok(None);
+                    }
                 }
                 match as_of_gen {
                     None => {
@@ -2167,7 +2352,7 @@ impl HubStore {
                              ORDER BY updated_at DESC, producer_id ASC, session_id ASC",
                         )?;
                         let rows = stmt.query_map([], map_head_row)?;
-                        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                        Ok(Some(rows.collect::<Result<Vec<_>, _>>()?))
                     }
                     Some(g) => {
                         let mut stmt = conn.prepare(
@@ -2179,11 +2364,15 @@ impl HubStore {
                              ORDER BY updated_at DESC, producer_id ASC, session_id ASC",
                         )?;
                         let rows = stmt.query_map([g as i64], map_head_row)?;
-                        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                        Ok(Some(rows.collect::<Result<Vec<_>, _>>()?))
                     }
                 }
             })?
-            .unwrap_or_default())
+            .flatten();
+        match (as_of_gen, result) {
+            (Some(g), None) => Err(HubError::NotFound(format!("generation {g} not found"))),
+            (_, entries) => Ok(entries.unwrap_or_default()),
+        }
     }
 
     /// Return the latest published [`SnapshotPublicationManifest`], if any.
@@ -2194,13 +2383,17 @@ impl HubStore {
     /// Look up a [`SnapshotPublicationManifest`] by `publication_id` or numeric generation, or the
     /// latest published generation when `id` is `None`.
     pub fn get_snapshot(&self, id: Option<&str>) -> Result<Option<SnapshotPublicationManifest>, HubError> {
-        let Some(gen_rec) = self.resolve_generation(id)? else {
-            return Ok(None);
-        };
         let Some(conn) = self.store.open_readonly()? else {
+            return match id {
+                Some(want) => Err(HubError::NotFound(format!("snapshot `{want}` not found"))),
+                None => Ok(None),
+            };
+        };
+        let tx = conn.unchecked_transaction()?;
+        let Some(gen_rec) = Self::resolve_generation_in(&tx, id)? else {
             return Ok(None);
         };
-        Ok(Some(materialize_snapshot_in_conn(&conn, &gen_rec)?))
+        Ok(Some(materialize_snapshot_in_conn(&tx, &gen_rec)?))
     }
 
     /// Build the `GET /api/hub/status` payload.
@@ -2306,7 +2499,6 @@ impl HubStore {
         };
 
         let mut entries: Vec<&SessionRevisionEntry> = Vec::with_capacity(manifest.session_revisions.len());
-        let mut open_packs: BTreeMap<String, SealedPack> = BTreeMap::new();
 
         for entry in manifest.session_revisions.values() {
             if let Some(prod) = producer {
@@ -2326,58 +2518,13 @@ impl HubStore {
             }
 
             if let Some(ref sq) = parsed_query {
-                let sref = entry_to_session_ref(entry);
-                if !sq.prefilter(&sref) {
+                if !entry
+                    .matches_query(&self.packs_dir, sq)
+                    .map_err(|e| HubError::Pack(e.to_string()))?
+                {
                     continue;
                 }
-                let cheap_ext = PinnedSessionExt {
-                    entry,
-                    session: None,
-                    hydrated_attempted: false,
-                };
-                let cheap_tri = sq
-                    .eval(&Facts {
-                        r: &sref,
-                        session: None,
-                        ext: &cheap_ext,
-                    })
-                    .map_err(|e| HubError::InvalidArgument(e.to_string()))?;
-                match cheap_tri {
-                    Tri::True => {}
-                    Tri::False => continue,
-                    Tri::Unknown => {
-                        let hydrated = match &entry.payload_addr {
-                            Some(addr) => {
-                                if !open_packs.contains_key(&addr.pack_id) {
-                                    let pack = SealedPack::open(&self.packs_dir, &addr.pack_id)
-                                        .map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                                    open_packs.insert(addr.pack_id.clone(), pack);
-                                }
-                                let pack = open_packs.get(&addr.pack_id).expect("just inserted");
-                                let bytes = pack.read_payload(addr).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                                Some(decode_packed_session(&bytes)?)
-                            }
-                            None => None,
-                        };
-                        let full_ext = PinnedSessionExt {
-                            entry,
-                            session: hydrated.as_ref(),
-                            hydrated_attempted: true,
-                        };
-                        let matched = sq
-                            .matches(&Facts {
-                                r: &sref,
-                                session: hydrated.as_ref(),
-                                ext: &full_ext,
-                            })
-                            .map_err(|e| HubError::InvalidArgument(e.to_string()))?;
-                        if !matched {
-                            continue;
-                        }
-                    }
-                }
             }
-
             entries.push(entry);
         }
 
@@ -2441,7 +2588,9 @@ impl HubStore {
                 ))
             })?;
 
-        let Some(ref addr) = entry.payload_addr else {
+        let Some(backing) = crate::custody::hub_revision_backing(&self.store, &self.packs_dir, entry.clone())
+            .map_err(|e| HubError::Pack(e.to_string()))?
+        else {
             let unavailable = HydratedHubSession::PayloadUnavailable {
                 snapshot_id: manifest.publication_id.clone(),
                 hub_generation: manifest.hub_generation,
@@ -2450,16 +2599,10 @@ impl HubStore {
             };
             return Ok((manifest, unavailable));
         };
-
-        // Whole-pack integrity was verified at custody acceptance. Hydration verifies the
-        // selected record against the digest pinned in this snapshot's PayloadAddr, decoding
-        // only intersecting frames rather than hashing the entire immutable pack on every read.
-        let pack = SealedPack::open(&self.packs_dir, &addr.pack_id)
-            .map_err(|e| HubError::Pack(format!("opening mirrored pack `{}`: {e:#}", addr.pack_id)))?;
-        let payload_bytes = pack
-            .read_payload(addr)
-            .map_err(|e| HubError::Pack(format!("reading payload from pack `{}`: {e:#}", addr.pack_id)))?;
-        let session = decode_packed_session(&payload_bytes)?;
+        use crate::harness::Parse as _;
+        let session = backing
+            .parse(&backing.reference)
+            .map_err(|e| HubError::Pack(format!("reading hub revision: {e:#}")))?;
 
         let hydrated = HydratedHubSession::Hydrated {
             snapshot_id: manifest.publication_id.clone(),
@@ -2802,7 +2945,7 @@ impl HubStore {
             tx.execute(
                 "UPDATE hub_generations
                  SET indexed_generation = MAX(indexed_generation, ?1)
-                 WHERE generation <= ?1",
+                 WHERE generation = ?1",
                 [indexed_gen as i64],
             )?;
         }
@@ -2817,58 +2960,80 @@ impl HubStore {
         const DEFAULT_LIVE_MS: i64 = 60_000;
         const DEFAULT_PARTITION_MS: i64 = 300_000;
 
-        let now_ms = Utc::now().timestamp_millis();
         let partition_threshold_ms = ctx.max_staleness_ms.unwrap_or(DEFAULT_PARTITION_MS);
-
-        let gen_rec = match ctx.as_of_gen {
-            Some(g) => self.resolve_generation(Some(&g.to_string()))?,
-            None => self.resolve_generation(None)?,
-        };
-        let generation = gen_rec.as_ref().map_or(0, |g| g.generation);
-        let indexed_generation = match &gen_rec {
-            Some(g) if g.indexed_generation > 0 => g.indexed_generation,
-            _ => self.resolve_generation(None)?.map_or(0, |g| g.indexed_generation),
-        };
-
-        let producers = self.store.list_producers()?;
-        let (frontiers, quarantine) = match self.store.read_in(|conn| {
-            let has_hub: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_frontiers')",
-                [],
-                |r| r.get(0),
-            )?;
-            if !has_hub {
-                return Ok((
-                    Vec::new(),
-                    QuarantineSummary {
-                        count: 0,
-                        entries: Vec::new(),
-                    },
-                ));
+        let mut inputs = AuthorityInputs::default();
+        let mut generation = 0;
+        let mut indexed_generation = 0;
+        let mut now_ms = Utc::now().timestamp_millis();
+        let mut legacy = false;
+        if let Some(conn) = self.store.open_readonly()? {
+            let tx = conn.unchecked_transaction()?;
+            if let Some(g) = ctx.as_of_gen {
+                let has_history = tx.column_exists(None, "hub_generations", "authority_json")?;
+                let column = if has_history { "authority_json" } else { "NULL" };
+                if !tx.table_exists(None, "hub_generations")? {
+                    return Err(HubError::NotFound(format!("generation {g} not found")));
+                }
+                let (published, raw, frontier): (i64, Option<String>, String) = tx
+                    .query_row(
+                        &format!("SELECT published_at,{column},frontier_json FROM hub_generations WHERE generation=?1"),
+                        [g],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| HubError::NotFound(format!("generation {g} not found")))?;
+                generation = g;
+                now_ms = published;
+                if let Some(raw) = raw {
+                    inputs = serde_json::from_str(&raw)?;
+                    indexed_generation = inputs.indexed_generation.min(generation);
+                } else {
+                    // Older publications committed the contiguous counters only.
+                    legacy = true;
+                    let mut ids = BTreeSet::new();
+                    for (pair, seq) in serde_json::from_str::<BTreeMap<String, u64>>(&frontier)? {
+                        let (producer_id, epoch) = super::decode_pair_key(&pair).map_err(HubError::InvalidArgument)?;
+                        if ids.insert(producer_id.clone()) {
+                            inputs.producers.push(Producer {
+                                producer_id: producer_id.clone(),
+                                host_label: String::new(),
+                                metadata: Value::Null,
+                                enrolled_at: published,
+                                updated_at: published,
+                            });
+                        }
+                        inputs.frontiers.push(FrontierStatus {
+                            producer_id,
+                            epoch,
+                            contiguous_seq: seq,
+                            max_received_seq: seq,
+                            buffered_count: 0,
+                            lag_events: 0,
+                            missing_ranges: vec![],
+                            first_conflict_seq: None,
+                            updated_at: published,
+                        });
+                    }
+                }
+            } else {
+                if let Some(g) = latest_generation_in_conn(&tx)? {
+                    generation = g.generation;
+                }
+                inputs = AuthorityInputs::read(&tx)?;
+                indexed_generation = inputs.indexed_generation.min(generation);
             }
-            let f = read_frontiers_in_conn(conn).map_err(|e| crate::state::StateError::Io(std::io::Error::other(e)))?;
-            let q =
-                read_quarantine_in_conn(conn).map_err(|e| crate::state::StateError::Io(std::io::Error::other(e)))?;
-            Ok((f, q))
-        })? {
-            Some(pair) => pair,
-            None => (
-                Vec::new(),
-                QuarantineSummary {
-                    count: 0,
-                    entries: Vec::new(),
-                },
-            ),
-        };
-
-        // Group frontiers by producer_id (picking newest epoch for summary watermark, while tracking any buffered gap).
+        } else if ctx.as_of_gen.is_some() {
+            return Err(HubError::NotFound("generation not found".into()));
+        }
+        let AuthorityInputs {
+            producers,
+            frontiers,
+            quarantined: quarantined_prods,
+            ..
+        } = inputs;
         let mut frontiers_by_prod: BTreeMap<String, Vec<&FrontierStatus>> = BTreeMap::new();
         for f in &frontiers {
             frontiers_by_prod.entry(f.producer_id.clone()).or_default().push(f);
-        }
-        let mut quarantined_prods: BTreeSet<String> = BTreeSet::new();
-        for q in &quarantine.entries {
-            quarantined_prods.insert(q.event_id.producer_id.clone());
         }
 
         let query_lower = ctx.query_str.unwrap_or("").to_lowercase();
@@ -2896,7 +3061,8 @@ impl HubStore {
         if ctx.include_local
             && ctx.as_of_gen.is_none()
             && local_matches
-            && producers.iter().all(|p| p.producer_id != "local")
+            && !frontiers_by_prod.contains_key("local")
+            && !quarantined_prods.contains("local")
         {
             places.push(PlaceWatermark {
                 place_id: "local".into(),
@@ -2941,7 +3107,11 @@ impl HubStore {
                 .get("lifecycle")
                 .and_then(|v| serde_json::from_value::<ProducerLifecycle>(v.clone()).ok());
 
-            let latest_f = prod_frontiers.and_then(|list| list.last().copied());
+            let latest_f = prod_frontiers.and_then(|list| {
+                list.iter()
+                    .copied()
+                    .max_by_key(|f| (epoch_generation(&f.epoch), f.epoch.as_str()))
+            });
             let epoch = latest_f
                 .map(|f| f.epoch.clone())
                 .or_else(|| match &lifecycle {
@@ -2962,7 +3132,14 @@ impl HubStore {
                 None => Some(prod.updated_at),
             };
 
-            let (state, producer_head_seq) = if any_conflict {
+            let (state, producer_head_seq) = if legacy {
+                omissions.push(AuthorityOmission {
+                    place_id: prod.producer_id.clone(),
+                    reason: "unknown_historical_policy".into(),
+                    detail: "publication predates lifecycle and policy history".into(),
+                });
+                (PlaceState::Unknown, None)
+            } else if any_conflict {
                 let head = latest_f.map(|f| f.max_received_seq);
                 omissions.push(AuthorityOmission {
                     place_id: prod.producer_id.clone(),
@@ -2974,12 +3151,10 @@ impl HubStore {
                 });
                 (PlaceState::Quarantined, head)
             } else if let Some(ProducerLifecycle::Sealed {
-                final_epoch: _,
-                final_seq,
-                ..
+                final_epoch, final_seq, ..
             }) = &lifecycle
             {
-                if contiguous_seq >= *final_seq && !any_gap {
+                if epoch == *final_epoch && contiguous_seq == *final_seq && !any_gap {
                     // Open-world soundness: a Sealed sandbox epoch at contiguous_seq == head is
                     // Complete forever without heartbeats!
                     (PlaceState::Sealed, Some(*final_seq))
@@ -2988,8 +3163,8 @@ impl HubStore {
                         place_id: prod.producer_id.clone(),
                         reason: "incomplete_sealed_frontier".into(),
                         detail: format!(
-                            "sealed place `{}` at contiguous_seq={} < final_seq={}",
-                            prod.producer_id, contiguous_seq, final_seq
+                            "sealed place `{}` has frontier {} in epoch {} and requires {} in epoch {}",
+                            prod.producer_id, contiguous_seq, epoch, final_seq, final_epoch
                         ),
                     });
                     (PlaceState::Partitioned, Some(*final_seq))
@@ -3110,11 +3285,9 @@ impl HubStore {
             });
         }
 
-        // If the caller explicitly asked for a concrete `--place <id>` (no glob wildcards) that
-        // matches zero known places, record an explicit `Unknown` witness rather than vacuously
-        // claiming `Complete` over the empty set!
+        // An unmatched selector leaves the requested place coverage unknown.
         if let Some(pat) = ctx.place_glob {
-            if places.is_empty() && !pat.is_empty() && !pat.contains('*') && !pat.contains('?') {
+            if places.is_empty() {
                 places.push(PlaceWatermark {
                     place_id: pat.to_string(),
                     host_label: String::new(),
@@ -3134,6 +3307,13 @@ impl HubStore {
             }
         }
 
+        if legacy && omissions.is_empty() {
+            omissions.push(AuthorityOmission {
+                place_id: "*".into(),
+                reason: "unknown_historical_policy".into(),
+                detail: "publication predates lifecycle and policy history".into(),
+            });
+        }
         let status = if !omissions.is_empty() {
             AuthorityStatus::Partial
         } else if ctx.indexed_only && (generation > indexed_generation || generation == 0) {
@@ -3166,7 +3346,6 @@ impl HubStore {
         })?;
 
         if let Some(max_ms) = ctx.max_staleness_ms {
-            let now_ms = Utc::now().timestamp_millis();
             let mut violations = Vec::new();
             for p in &authority.places {
                 match p.state {
@@ -3176,12 +3355,7 @@ impl HubStore {
                     PlaceState::Unknown | PlaceState::Partitioned | PlaceState::Quarantined => {
                         violations.push(format!("{} ({:?})", p.place_id, p.state));
                     }
-                    PlaceState::Live | PlaceState::Quiet => {
-                        let age_ms = p.last_contact_ms.map_or(i64::MAX, |ts| (now_ms - ts).max(0));
-                        if age_ms > max_ms {
-                            violations.push(format!("{} (stale {}ms > {}ms)", p.place_id, age_ms, max_ms));
-                        }
-                    }
+                    PlaceState::Live | PlaceState::Quiet => {}
                 }
             }
             if !violations.is_empty() {

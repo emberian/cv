@@ -147,6 +147,7 @@ impl std::ops::Deref for StateReadConnection {
 pub struct StateStore {
     db_path: PathBuf,
     default_producer: String,
+    export_snapshot: Option<[Option<crate::source::FileId>; 3]>,
 }
 
 impl StateStore {
@@ -161,6 +162,7 @@ impl StateStore {
         Self {
             db_path: db_path.into(),
             default_producer: DEFAULT_LOCAL_PRODUCER.to_string(),
+            export_snapshot: None,
         }
     }
 
@@ -183,6 +185,26 @@ impl StateStore {
     /// Default producer id bound to this handle.
     pub fn default_producer(&self) -> &str {
         &self.default_producer
+    }
+
+    fn export_files(&self) -> [Option<crate::source::FileId>; 3] {
+        ["", "-wal", "-journal"].map(|suffix| crate::source::FileId::at(&path_with_suffix(&self.db_path, suffix)))
+    }
+
+    /// A read-only export may run on a host with no writable temporary directory.
+    pub fn for_export(&self) -> Self {
+        let mut store = self.clone();
+        store.export_snapshot.get_or_insert_with(|| self.export_files());
+        store
+    }
+
+    pub(crate) fn verify_export_snapshot(&self) -> Result<(), StateError> {
+        if self.export_snapshot.is_some_and(|files| files != self.export_files()) {
+            return Err(StateError::Io(std::io::Error::other(
+                "state changed during delta export; retry",
+            )));
+        }
+        Ok(())
     }
 
     /// Advisory OS ownership lockfile coordinating [`RecorderServer`] and serverless writers.
@@ -220,7 +242,7 @@ impl StateStore {
 
     /// Open a migrated writable SQLite connection configured with `WAL` + `synchronous=FULL`.
     pub fn open_writable(&self) -> Result<Connection, StateError> {
-        if crate::env::frozen() {
+        if crate::env::frozen() || self.export_snapshot.is_some() {
             return Err(StateError::Frozen);
         }
         if let Some(parent) = self.db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -302,7 +324,24 @@ impl StateStore {
             Ok((c, ver))
         };
 
-        let (conn, ver) = if crate::env::frozen() {
+        let (conn, ver) = if let Some(files) = self.export_snapshot {
+            self.verify_export_snapshot()?;
+            let uri = if files[1..].iter().flatten().any(|id| id.len > 0) {
+                sqlite_uri(&self.db_path, "mode=ro&readonly_shm=1")
+            } else {
+                immutable_sqlite_uri(&self.db_path)
+            };
+            let connection = Connection::open_with_flags(uri, ro_flags | OpenFlags::SQLITE_OPEN_URI)?;
+            connection.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; BEGIN")?;
+            let ver = schema::current_schema_version(&connection)?;
+            (
+                StateReadConnection {
+                    connection,
+                    _snapshot: None,
+                },
+                ver,
+            )
+        } else if crate::env::frozen() {
             // Even a checkpointed database can change after opening. Keep a stable private
             // snapshot for the connection's lifetime, without creating or writing source SHM.
             open_folded()?
@@ -352,7 +391,7 @@ impl StateStore {
         &self,
         f: impl FnOnce(&Connection) -> Result<T, StateError>,
     ) -> Result<Option<T>, StateError> {
-        if crate::env::frozen() {
+        if crate::env::frozen() && self.export_snapshot.is_none() {
             let meta = match std::fs::metadata(&self.db_path) {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -608,6 +647,10 @@ fn snapshot_copy_is_consistent(
 }
 
 fn immutable_sqlite_uri(path: &Path) -> String {
+    sqlite_uri(path, "immutable=1")
+}
+
+fn sqlite_uri(path: &Path, query: &str) -> String {
     const RESERVED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS.add(b'%').add(b'?').add(b'#').add(b' ');
     let abs = if path.is_absolute() {
         path.to_path_buf()
@@ -624,7 +667,7 @@ fn immutable_sqlite_uri(path: &Path) -> String {
         let text = format!("/{}", abs.to_string_lossy().replace('\\', "/"));
         percent_encoding::utf8_percent_encode(&text, RESERVED).to_string()
     };
-    format!("file:{encoded}?immutable=1")
+    format!("file:{encoded}?{query}")
 }
 
 pub(crate) fn set_restrictive_file_mode(path: &Path) {

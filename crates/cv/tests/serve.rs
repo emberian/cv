@@ -2240,11 +2240,24 @@ fn serve_sse_stream_auth_and_live_cursor_wakeup() {
 
     let query = raw_request(port, "GET", "/api/stream?token=stream-secret", &[]);
     assert_eq!(raw_status(&query), 401, "{query}");
-    let auth = raw_request(port, "GET", "/api/auth", &[("Authorization", "Bearer stream-secret")]);
+    let auth = raw_request(
+        port,
+        "GET",
+        "/api/auth",
+        &[
+            ("Authorization", "Bearer stream-secret"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
+    );
     let header = header_of(&auth, "Set-Cookie").unwrap();
     assert!(header.contains("HttpOnly"));
     let cookie = header.split(';').next().unwrap();
-    let init = raw_request(port, "GET", "/api/stream", &[("Cookie", cookie)]);
+    let init = raw_request(
+        port,
+        "GET",
+        "/api/stream",
+        &[("Cookie", cookie), ("Sec-Fetch-Site", "same-origin")],
+    );
     assert_eq!(raw_status(&init), 200, "{init}");
     assert!(
         header_of(&init, "Content-Type")
@@ -2856,4 +2869,43 @@ fn overview_http_matches_the_cli_projection() {
     assert_eq!(status, 200, "{actual}");
     assert_eq!(actual, expected);
     assert_eq!(get_json(port, "/api/session/claude/missing-overview/overview").0, 404);
+}
+
+/// #tooth A public read credential and the legacy replication secret cannot administer a hub.
+#[test]
+fn serve_security_hub_admin_requires_operator() {
+    let w = world("hub-admin");
+    let (port, _server) = spawn_serve_cfg(
+        &w,
+        &["--hub"],
+        &[
+            ("CV_SERVE_TOKEN", "operator"),
+            ("CV_SERVE_READ_TOKEN", "reader"),
+            ("CV_HUB_PRODUCER_TOKEN", "replica"),
+        ],
+    );
+    let mint = raw_post(
+        port,
+        "/api/hub/producers",
+        r#"{"producer_id":"p.one"}"#,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer operator"),
+        ],
+    );
+    assert!((200..300).contains(&raw_status(&mint)), "{mint}");
+    let token: Value = serde_json::from_str(mint.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let bound = format!("Bearer {}", token["token"].as_str().unwrap());
+    for path in [
+        "/api/hub/producers",
+        "/api/hub/quarantine/resolve",
+        "/api/hub/quarantine",
+    ] {
+        for bearer in ["Bearer reader", "Bearer replica", bound.as_str()] {
+            assert_eq!(
+                raw_status(&raw_request(port, "POST", path, &[("Authorization", bearer)])),
+                403
+            );
+        }
+    }
 }

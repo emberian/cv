@@ -1411,7 +1411,17 @@ fn run() -> Result<()> {
     // Install before any library read, and enter it so subprocesses inherit the flag
     // as CV_FROZEN without mutating the process environment.
     let env = cv_core::env::Env::from_process();
-    let env = if cli.frozen { env.with_frozen() } else { env };
+    let export = matches!(
+        &cli.cmd,
+        Cmd::Archive {
+            action: ArchiveCmd::Sync {
+                export_delta: Some(_),
+                ..
+            },
+            ..
+        }
+    );
+    let env = if cli.frozen || export { env.with_frozen() } else { env };
     cv_core::env::Env::install(env.clone());
     let _env = env.enter();
     if cv_core::env::frozen() {

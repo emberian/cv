@@ -59,10 +59,11 @@ pub(crate) const HUB_ROUTES: &[&str] = &[
     "GET /api/hub/status",
     "GET /api/hub/quarantine",
     "POST /api/hub/quarantine",
+    "POST /api/hub/quarantine/resolve",
     "GET /api/hub/snapshot",
 ];
 
-type ResidentPreparedIndex = std::sync::RwLock<Option<(FileStamp, std::sync::Arc<cv_search::PreparedIndex>)>>;
+type ResidentPreparedIndex = std::sync::RwLock<Option<((PathBuf, String), std::sync::Arc<cv_search::PreparedIndex>)>>;
 
 /// What one request handler needs to know beyond the request itself.
 struct Ctx {
@@ -115,8 +116,8 @@ impl Credentials {
         let configured = |name| cv_core::env::var(name).ok().filter(|s| !s.is_empty());
         let env_read_token = configured("CV_SERVE_READ_TOKEN");
         let env_serve_token = configured("CV_SERVE_TOKEN");
-        let from_operator_flag = cli_token.is_some() || (env_read_token.is_none() && env_serve_token.is_some());
-        let reader = cli_token.or(env_read_token).or(env_serve_token);
+        let operator = cli_token.or(env_serve_token);
+        let reader = env_read_token.or_else(|| operator.clone());
         let producer_raw = configured("CV_HUB_PRODUCER_TOKEN");
         let explicit_task_writer = configured("CV_TASK_WRITE_TOKEN");
 
@@ -128,6 +129,12 @@ impl Credentials {
             );
         }
 
+        if let Some(op) = operator.as_ref().filter(|op| Some(*op) != reader.as_ref()) {
+            anyhow::ensure!(
+                !op.is_empty() && values.insert(op.as_str()),
+                "each serve capability needs a distinct nonempty credential"
+            );
+        }
         let mut producer_map = std::collections::BTreeMap::new();
         let mut producer_bootstrap = None;
         if let Some(raw) = producer_raw {
@@ -139,13 +146,13 @@ impl Credentials {
                         continue;
                     }
                     let Some((prod_id, secret)) = entry.split_once('=') else {
-                        anyhow::bail!("invalid CV_HUB_PRODUCER_TOKEN map entry {entry:?}; expected producer_id=token");
+                        anyhow::bail!("invalid CV_HUB_PRODUCER_TOKEN map entry; expected producer_id=token");
                     };
                     let prod_id = prod_id.trim();
                     let secret = secret.trim();
                     anyhow::ensure!(
                         !prod_id.is_empty() && !secret.is_empty() && !prod_id.eq_ignore_ascii_case("local"),
-                        "invalid CV_HUB_PRODUCER_TOKEN map entry {entry:?}"
+                        "invalid CV_HUB_PRODUCER_TOKEN map entry"
                     );
                     anyhow::ensure!(
                         seen_secrets.insert(secret.to_string()),
@@ -153,7 +160,7 @@ impl Credentials {
                     );
                     if let Some(ref r) = reader {
                         anyhow::ensure!(
-                            r != secret,
+                            r != secret && operator.as_deref() != Some(secret),
                             "each serve capability needs a distinct nonempty credential"
                         );
                     }
@@ -163,7 +170,10 @@ impl Credentials {
                             "each serve capability needs a distinct nonempty credential"
                         );
                     }
-                    producer_map.insert(prod_id.to_string(), secret.to_string());
+                    anyhow::ensure!(
+                        producer_map.insert(prod_id.to_string(), secret.to_string()).is_none(),
+                        "duplicate producer ID in CV_HUB_PRODUCER_TOKEN"
+                    );
                 }
                 anyhow::ensure!(
                     !producer_map.is_empty(),
@@ -184,11 +194,7 @@ impl Credentials {
         );
 
         let unrestricted = tier.is_none() && scope.is_none();
-        let operator_token = if from_operator_flag && unrestricted {
-            reader.clone()
-        } else {
-            None
-        };
+        let operator_token = if unrestricted { operator } else { None };
         let task_writer = explicit_task_writer.or_else(|| operator_token.clone());
 
         Ok(Self {
@@ -223,7 +229,7 @@ impl Credentials {
         if hub
             && cv_core::state::hub::HubStore::default_hub()
                 .ok()
-                .and_then(|h| h.has_active_producer_credentials().ok())
+                .and_then(|h| h.has_producer_credentials().ok())
                 .unwrap_or(false)
         {
             return Some("cvp1-configured");
@@ -501,7 +507,7 @@ fn run(
 }
 
 /// Whether `request` originates from the exact `(host, bound_port)` authority this server bound,
-/// with `Sec-Fetch-Site: same-origin` whenever the browser attached `Sec-Fetch-Site`.
+/// with explicit browser evidence from `Sec-Fetch-Site: same-origin`.
 ///
 /// RFC 6265 cookies ignore port on `localhost`, so cross-port callers (`http://localhost:5173`,
 /// `Sec-Fetch-Site: same-site`/`cross-site`) must authenticate via `Authorization: Bearer` and are
@@ -525,10 +531,8 @@ fn is_same_origin_authority(
     if req_port != bound_port {
         return false;
     }
-    if let Some(sfs) = sec_fetch_site {
-        if !sfs.trim().eq_ignore_ascii_case("same-origin") {
-            return false;
-        }
+    if !sec_fetch_site.is_some_and(|s| s.trim().eq_ignore_ascii_case("same-origin")) {
+        return false;
     }
     if let Some(orig) = raw_origin {
         let Some((default_port, authority)) = orig
@@ -610,16 +614,22 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     let post = method == "POST";
     let put = method == "PUT";
     let is_task_post = post && matches!(parts.as_slice(), ["api", "task", _, _]);
+    let is_hub_admin = post
+        && matches!(
+            parts.as_slice(),
+            ["api", "hub", "producers" | "quarantine"] | ["api", "hub", "quarantine", "resolve"]
+        );
     let is_hub_write = ctx.hub
-        && ((post
-            && matches!(
-                parts.as_slice(),
-                [
-                    "api",
-                    "hub",
-                    "producers" | "enroll" | "upload_pack" | "ingest_batch" | "quarantine"
-                ]
-            ))
+        && (is_hub_admin
+            || (post
+                && matches!(
+                    parts.as_slice(),
+                    [
+                        "api",
+                        "hub",
+                        "producers" | "enroll" | "upload_pack" | "ingest_batch" | "quarantine"
+                    ]
+                ))
             || (put && matches!(parts.as_slice(), ["api", "hub", "packs", _])));
 
     // GET reads anything; POST is an inbox write (`/api/task/<id>/<verb>`) or (when hub mode is
@@ -655,13 +665,31 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
     }
     let auth = &ctx.auth;
     let configured = auth.configured()
-        || (is_hub_write
+        || (ctx.hub
             && cv_core::state::hub::HubStore::default_hub()
                 .ok()
-                .and_then(|h| h.has_active_producer_credentials().ok())
-                .unwrap_or(false));
+                .and_then(|h| h.has_producer_credentials().ok())
+                .unwrap_or(true));
     let mut hub_grant: Option<HubWriteGrant> = None;
-    let header_ok = if is_hub_write {
+    if ctx.hub
+        && is_hub_admin
+        && !auth
+            .operator_token
+            .as_deref()
+            .is_some_and(|op| bearer_token.is_some_and(|b| token_matches(b, op)))
+    {
+        request.respond(json_response(
+            403,
+            &json!({"error": "operator bearer required"}),
+            cors,
+            &[],
+        ));
+        return;
+    }
+    let header_ok = if ctx.hub && is_hub_admin {
+        hub_grant = Some(HubWriteGrant::AdminBootstrap);
+        true
+    } else if is_hub_write {
         if let Some(provided) = bearer_token {
             hub_grant = auth.verify_hub_bearer(provided);
             hub_grant.is_some()
@@ -674,8 +702,9 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
             .is_some_and(|secret| bearer_token.is_some_and(|provided| token_matches(provided, secret)))
     } else {
         auth.reader
-            .as_ref()
-            .is_some_and(|secret| bearer_token.is_some_and(|provided| token_matches(provided, secret)))
+            .iter()
+            .chain(auth.operator_token.iter())
+            .any(|secret| bearer_token.is_some_and(|provided| token_matches(provided, secret)))
     };
     let cookie_ok = !is_hub_write
         && !is_task_post
@@ -1182,22 +1211,28 @@ fn obtain_prepared_index(
     cache: &ResidentPreparedIndex,
     dir: &Path,
 ) -> Result<std::sync::Arc<cv_search::PreparedIndex>> {
-    let stamp = file_stamp(&dir.join("meta.json"));
+    let stamp = (
+        dir.to_owned(),
+        cv_core::blake3_hex(&std::fs::read(dir.join("meta.json"))?),
+    );
     if let Ok(guard) = cache.read() {
-        if let Some((cached_stamp, ref reader)) = *guard {
-            if cached_stamp == stamp {
+        if let Some((ref cached_stamp, ref reader)) = *guard {
+            if cached_stamp == &stamp {
                 return Ok(reader.clone());
             }
         }
     }
     let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached_stamp, ref reader)) = *guard {
-        if cached_stamp == stamp {
+    if let Some((ref cached_stamp, ref reader)) = *guard {
+        if cached_stamp == &stamp {
             return Ok(reader.clone());
         }
     }
     let opened = std::sync::Arc::new(cv_search::PreparedIndex::open(dir)?);
-    *guard = Some((stamp, opened.clone()));
+    // A writer can publish again while the reader opens the segments.
+    if cv_core::blake3_hex(&std::fs::read(dir.join("meta.json"))?) == stamp.1 {
+        *guard = Some((stamp, opened.clone()));
+    }
     Ok(opened)
 }
 
@@ -1307,14 +1342,14 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
                     }
                 }
             } else {
-                None
+                return bad(503, "place authority unavailable");
             }
         } else {
             None
         };
 
     let mut allowed_ids: Option<std::collections::HashSet<String>> = None;
-    if let Some(ref pat) = place {
+    if let Some(scope) = auth_envelope.as_ref().filter(|_| place.is_some()) {
         if resolved_as_of_gen.is_none() {
             let mut ids = std::collections::HashSet::new();
             let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -1327,7 +1362,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
             }
             for r in cv_core::sessions() {
                 let p = selector_places.get(&r.id).map_or("local", String::as_str);
-                if cv_core::query::glob_match(pat, p) {
+                if scope.includes(p) {
                     ids.insert(r.session_selector());
                     ids.insert(r.id);
                 }
@@ -1338,7 +1373,14 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
 
     let tantivy_dir = cv_search::default_tantivy_dir();
     let result = if let Some(gen) = resolved_as_of_gen {
-        super::search::search_pinned_generation(gen, &q, want, cwd.as_deref(), place.as_deref(), limit)
+        super::search::search_pinned_generation(
+            gen,
+            &q,
+            filter,
+            auth_envelope.as_ref().expect("pinned scope"),
+            None,
+            limit,
+        )
     } else if exact {
         searcher.search_exact_in_allowed(
             &cv_search::default_trigram_dir(),
@@ -1829,7 +1871,7 @@ fn handle_hub_write(
                 }
             }
         }
-        ["api", "hub", "quarantine"] => {
+        ["api", "hub", "quarantine"] | ["api", "hub", "quarantine", "resolve"] => {
             if bound_producer.is_some() {
                 return json_response(
                     403,
@@ -2864,12 +2906,29 @@ mod search_service_tests {
                 401
             );
         }
-        let response = request("GET", "/api/auth", &[("Authorization", "Bearer reader")]);
+        for path in [
+            "/api/hub/producers",
+            "/api/hub/quarantine/resolve",
+            "/api/hub/quarantine",
+        ] {
+            for bearer in ["Bearer reader", "Bearer producer", "Bearer writer"] {
+                assert_eq!(request("POST", path, &[("Authorization", bearer)]).status(), 403);
+            }
+        }
+        let response = request(
+            "GET",
+            "/api/auth",
+            &[("Authorization", "Bearer reader"), ("Sec-Fetch-Site", "same-origin")],
+        );
         assert_eq!(response.status(), 200);
         let mut cookie = response.headers()["Set-Cookie"].to_str().unwrap().split(';');
         let cookie_value = cookie.next().unwrap();
         assert!(cookie.any(|s| s.trim() == "HttpOnly"));
-        let cookie_header = [("Cookie", cookie_value)];
+        assert_eq!(
+            request("GET", "/api/sessions", &[("Cookie", cookie_value)]).status(),
+            401
+        );
+        let cookie_header = [("Cookie", cookie_value), ("Sec-Fetch-Site", "same-origin")];
         assert_eq!(request("GET", "/api/health", &cookie_header).status(), 200);
         assert_eq!(request("GET", "/api/sessions", &cookie_header).status(), 200);
         assert_eq!(request("GET", "/api/search?q=secret", &cookie_header).status(), 403);
@@ -2893,6 +2952,37 @@ mod search_service_tests {
             .status(),
             401
         );
+    }
+
+    /// #tooth Revalidate the resident reader when a same-length metadata replacement preserves mtime.
+    #[test]
+    fn resident_search_reader_observes_metadata_contents() {
+        let w = crate::test_world("resident-reader");
+        let dir = w.base.join("index");
+        cv_search::index_sessions(Some(dir.clone()), [], false, false).unwrap();
+        let meta = dir.join("meta.json");
+        let mut bytes = std::fs::read(&meta).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&meta, &bytes).unwrap();
+        let stamp = meta.metadata().unwrap().modified().unwrap();
+        let cache = std::sync::RwLock::new(None);
+        let first = obtain_prepared_index(&cache, &dir).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &obtain_prepared_index(&cache, &dir).unwrap()
+        ));
+        *bytes.last_mut().unwrap() = b'\n';
+        std::fs::write(&meta, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&meta)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &first,
+            &obtain_prepared_index(&cache, &dir).unwrap()
+        ));
     }
 
     #[test]

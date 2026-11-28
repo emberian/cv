@@ -124,6 +124,43 @@ pub struct HubStore {
     packs_dir: PathBuf,
 }
 
+fn enroll_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    producer: &str,
+    host: &str,
+    metadata: &Value,
+    now: i64,
+) -> Result<Producer, HubError> {
+    if producer.trim().is_empty() || !metadata.is_object() {
+        return Err(HubError::InvalidArgument(
+            "enrollment requires a producer ID and a metadata object".into(),
+        ));
+    }
+    let label = if host.trim().is_empty() {
+        super::default_host_label()
+    } else {
+        host.to_owned()
+    };
+    Ok(tx.query_row(
+        "INSERT INTO producers(producer_id,host_label,metadata_json,enrolled_at,updated_at)
+         VALUES (?1,?2,?3,?4,?4) ON CONFLICT(producer_id) DO UPDATE SET
+         host_label=excluded.host_label, metadata_json=json_patch(producers.metadata_json,excluded.metadata_json),
+         updated_at=excluded.updated_at RETURNING metadata_json,enrolled_at",
+        rusqlite::params![producer, label, serde_json::to_string(metadata)?, now],
+        |r| {
+            Ok(Producer {
+                producer_id: producer.into(),
+                host_label: label.clone(),
+                metadata: serde_json::from_str(&r.get::<_, String>(0)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })?,
+                enrolled_at: r.get(1)?,
+                updated_at: now,
+            })
+        },
+    )?)
+}
+
 impl HubStore {
     /// Open a handle to `$CLUSTERVISION_HOME/state.db` + `$CLUSTERVISION_HOME/hub/packs`.
     pub fn default_hub() -> Result<Self, HubError> {
@@ -159,17 +196,17 @@ impl HubStore {
     /// Enroll or update a producer identity in `producers`, preserving any prior `Sealed`
     /// lifecycle record unless incoming `metadata` explicitly carries a `lifecycle` update.
     pub fn enroll_producer(&self, producer_id: &str, host_label: &str, metadata: &Value) -> Result<Producer, HubError> {
-        let mut merged = metadata.clone();
-        if let Some(existing) = self.store.get_producer(producer_id)? {
-            if let (Some(prev_obj), Some(new_obj)) = (existing.metadata.as_object(), merged.as_object_mut()) {
-                for (k, v) in prev_obj {
-                    if !new_obj.contains_key(k) {
-                        new_obj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
-        Ok(self.store.enroll_producer(producer_id, host_label, &merged)?)
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let producer = enroll_in_tx(
+            &tx,
+            producer_id,
+            host_label,
+            metadata,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
+        tx.commit()?;
+        Ok(producer)
     }
 
     /// Issue (or rotate) a per-producer capability token (`cvp1.<producer_id>.<secret>`) bound
@@ -275,7 +312,7 @@ impl HubStore {
         };
         if producer_id.is_empty()
             || producer_id.eq_ignore_ascii_case("local")
-            || secret.is_empty()
+            || secret.len() != 64
             || !secret.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Ok(None);
@@ -306,22 +343,22 @@ impl HubStore {
         if revoked_at.is_some() {
             return Ok(None);
         }
-        let presented_hex = blake3::hash(presented_token.as_bytes()).to_hex();
-        let a = presented_hex.as_bytes();
-        let b = stored_hex.as_bytes();
-        let mut diff = u8::from(a.len() != b.len());
-        for (i, &byte) in a.iter().enumerate() {
-            diff |= byte ^ b.get(i % b.len().max(1)).copied().unwrap_or(0);
-        }
-        if std::hint::black_box(diff) == 0 {
-            Ok(Some(producer_id.to_string()))
-        } else {
-            Ok(None)
-        }
+        let presented = blake3::hash(presented_token.as_bytes());
+        Ok(blake3::Hash::from_hex(stored_hex)
+            .is_ok_and(|stored| stored == presented)
+            .then(|| producer_id.to_owned()))
     }
 
-    /// Return `true` when at least one non-revoked producer credential exists in `state.db`.
+    /// Revocation disables a credential while keeping the hub in authenticated mode.
+    pub fn has_producer_credentials(&self) -> Result<bool, HubError> {
+        self.credentials_exist(true)
+    }
+
     pub fn has_active_producer_credentials(&self) -> Result<bool, HubError> {
+        self.credentials_exist(false)
+    }
+
+    fn credentials_exist(&self, include_revoked: bool) -> Result<bool, HubError> {
         let Some(conn) = self.store.open_readonly()? else {
             return Ok(false);
         };
@@ -333,12 +370,11 @@ impl HubStore {
         if !has_table {
             return Ok(false);
         }
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM hub_producer_credentials WHERE revoked_at IS NULL",
-            [],
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hub_producer_credentials WHERE ?1 OR revoked_at IS NULL)",
+            [include_revoked],
             |r| r.get(0),
-        )?;
-        Ok(count > 0)
+        )?)
     }
 }
 
@@ -373,9 +409,9 @@ pub fn decode_pair_key(encoded: &str) -> Result<(String, String), String> {
             if i + 2 >= bytes.len() {
                 return Err(format!("truncated percent escape in pair key {encoded:?}"));
             }
-            match &raw_first[i..i + 3] {
-                "%25" => first.push('%'),
-                "%2f" | "%2F" => first.push('/'),
+            match &bytes[i..i + 3] {
+                b"%25" => first.push('%'),
+                b"%2f" | b"%2F" => first.push('/'),
                 other => return Err(format!("unsupported escape {other:?} in pair key {encoded:?}")),
             }
             i += 3;

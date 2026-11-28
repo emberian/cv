@@ -54,14 +54,21 @@ fn schema_migrations_are_forward_only_and_independent_of_source_version() {
     {
         let conn = v1_migrated.open_writable().unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), STATE_SCHEMA_VERSION);
-        let hub_tables: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'hub_%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(hub_tables, 8, "expected 8 v3 hub_* tables");
+        for name in [
+            "hub_packs",
+            "hub_ingested_events",
+            "hub_quarantine",
+            "hub_frontiers",
+            "hub_epoch_sessions",
+            "hub_frontier_packs",
+            "hub_generations",
+            "hub_session_heads",
+            "hub_producer_credentials",
+            "hub_pull_sources",
+        ] {
+            assert!(conn.table_exists(None, name).unwrap(), "missing migrated table {name}");
+        }
+        assert!(conn.column_exists(None, "hub_generations", "authority_json").unwrap());
     }
     assert_eq!(
         v1_migrated.get_producer("legacy-v1-prod").unwrap().unwrap().host_label,
@@ -69,6 +76,35 @@ fn schema_migrations_are_forward_only_and_independent_of_source_version() {
     );
     std::fs::remove_dir_all(&v1_dir).ok();
 
+    // #tooth Upgrade retained manifests including a subsequent deletion. Both cuts survive.
+    let legacy = StateStore::at_dir(tmp_state_dir("retained-generations"));
+    {
+        let mut conn = rusqlite::Connection::open(legacy.path()).unwrap();
+        apply_migrations_with(&mut conn, 6, &schema::MIGRATIONS[..6]).unwrap();
+        let entry = json!({"producer_id":"p","session_id":"s","harness":"claude","revision":"first","epoch":"e","event_seq":1,"message_count":3});
+        for (gen, revisions) in [(1, json!({"p/s":entry})), (2, json!({}))] {
+            let manifest = json!({"hub_generation":gen,"publication_id":format!("pub-{gen}"),"published_at":gen,
+                "origin_frontier":{"p/e":gen},"session_revisions":revisions,"pack_digests":{},"quarantine_count":0});
+            conn.execute(
+                "INSERT INTO hub_snapshots(hub_generation,publication_id,published_at,manifest_json,pinned)
+                VALUES(?1,?2,?1,?3,1)",
+                rusqlite::params![gen, format!("pub-{gen}"), manifest.to_string()],
+            )
+            .unwrap();
+        }
+    }
+    drop(legacy.open_writable().unwrap());
+    let hub = hub::HubStore::at_home(legacy.path().parent().unwrap());
+    assert_eq!(hub.heads_at_generation(Some(1)).unwrap()[0].session_id, "s");
+    assert!(hub.heads_at_generation(Some(2)).unwrap().is_empty());
+    let old = hub
+        .compute_authority(&hub::AuthorityQueryContext {
+            as_of_gen: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(old.places[0].contiguous_seq, 1);
+    assert_eq!(old.status, hub::AuthorityStatus::Partial);
     // Forward migration to STATE_SCHEMA_VERSION + 1 preserves every existing authoritative row.
     let next_ver = STATE_SCHEMA_VERSION + 1;
     let mut extended = schema::MIGRATIONS.to_vec();
@@ -1559,7 +1595,7 @@ fn state_v4_upgrades_to_v5_and_records_pre_receipt_files() {
         .append_receipt_with_inbox("sess-v4", "codex", body.as_object().unwrap().clone())
         .unwrap();
     let conn = store.open_writable().unwrap();
-    assert_eq!(current_schema_version(&conn).unwrap(), 5);
+    assert_eq!(current_schema_version(&conn).unwrap(), STATE_SCHEMA_VERSION);
     let folds: i64 = conn
         .query_row("SELECT COUNT(*) FROM task_folds", [], |r| r.get(0))
         .unwrap();
