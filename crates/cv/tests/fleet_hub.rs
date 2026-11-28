@@ -3,14 +3,14 @@
 //! 1. Out-of-order batch delivery (`5..=8` before `1..=4`) holds `F(p, e) == 0` until `1..=4`
 //!    lands, then jumps to `8` (`Snapshot` #1 -> #2), plus `publish-before-reference` (`424`).
 //! 2. Duplicate batch & pack replay is 100% idempotent; conflicting pack upload returns `409`.
-//! 3. Loud conflict quarantine (`gpt-6-astra` Gate): same `EventId` with different digest returns
+//! 3. Loud conflict quarantine: same `EventId` with different digest returns
 //!    `409 Conflict`, writes `hub_quarantine`, and freezes `F(p, e)` below the conflict.
 //! 4. Sleeping/offline producer host + pinned `?snapshot=` read consistency + tear-free multi-page
 //!    pagination + metadata-only `pack_not_mirrored` fallback + `X-Cv-Snapshot` header stamping.
 //! 5. `[replication.<target>]` configurable privacy filter & scrubbing pipeline + Two-Stage Ack
 //!    Accounting (`TransportDeliveryAck` vs durable `CustodyAck` gating `is_pack_evictable`) +
 //!    full wire/disk zero-leak audit.
-//! 6. Rebuild Parity Invariant (`gpt-6-astra` Gate): wipe derived hub views (`hub_snapshots`,
+//! 6. Rebuild Parity Invariant: wipe derived hub views (`hub_snapshots`,
 //!    `hub_sessions`, `hub_frontiers`, and `hub_packs` rows) and rebuild from raw
 //!    `hub_ingested_events` + `hub_quarantine` + `hub/packs/` -> bit-for-bit identical snapshot
 //!    frontier, manifest, and hydrated sessions.
@@ -495,7 +495,7 @@ fn fleet_hub_duplicate_replay_and_pack_conflict() {
     assert_eq!(ing3.hub_generation, Some(1));
 }
 
-/// 3. Loud Conflict Quarantine (`gpt-6-astra` Gate): same `EventId` arriving with a different
+/// 3. Loud Conflict Quarantine: same `EventId` arriving with a different
 ///    digest returns `409 Conflict` naming `EventId` + both digests, writes `hub_quarantine`,
 ///    never overwrites committed state, and freezes `F(p, e)` below the conflict (`seq - 1`).
 #[test]
@@ -1293,7 +1293,7 @@ tags = ["team-share"]
     }
 }
 
-/// 6. Rebuild Parity Invariant (`gpt-6-astra` Gate): wipe derived hub views (`hub_snapshots`,
+/// 6. Rebuild Parity Invariant: wipe derived hub views (`hub_snapshots`,
 ///    `hub_sessions`, `hub_frontiers`, plus `hub_packs` table rows) and rebuild strictly from raw
 ///    `hub_ingested_events` + `hub_quarantine` + `hub/packs/` on disk -> resulting `Snapshot`
 ///    frontier, manifest (`publication_id`, `pack_digests`, `session_revisions`), and hydrated
