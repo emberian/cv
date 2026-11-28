@@ -752,9 +752,12 @@ impl StateStore {
     }
 
     /// List all published pack manifests ordered by `min_commit_pos`.
+    ///
+    /// Uses [`Self::read_compatible_in`] so stores stamped with a newer `user_version` still fall
+    /// back to reading `pack_manifests` cleanly when `custody_heads` returns `Ok(None)`.
     pub fn list_pack_manifests(&self) -> Result<Vec<PackManifest>, StateError> {
         Ok(self
-            .read_in(|conn| {
+            .read_compatible_in(|conn| {
                 if !conn.table_exists(None, "pack_manifests")? {
                     return Ok(Vec::new());
                 }

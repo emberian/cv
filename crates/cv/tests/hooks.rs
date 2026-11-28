@@ -1172,6 +1172,7 @@ fn frozen_hooks_never_brick_tool_calls_and_still_enforce_retired_policy() {
     cv_ok(&w, &["ls", "--json"]);
     cv_ok(&w, &["events", "alphasess", "--json"]);
     cv_ok(&w, &["task", "open", "seed state.db"]);
+    cv_ok(&w, &["task", "list", "--json"]);
     let live_writer = rusqlite::Connection::open(w.cv_home.join("state.db")).unwrap();
     live_writer.execute_batch("BEGIN DEFERRED;").unwrap();
     let _: i64 = live_writer

@@ -309,12 +309,9 @@ impl StateStore {
         Ok(Some((log_frames, checkpointed_frames)))
     }
 
-    /// Open a read-only SQLite connection without migrations or application writes.
-    /// Frozen reads and read-only fallbacks use private temporary snapshots, leaving source
-    /// files untouched; ordinary WAL readers may update SQLite coordination sidecars.
-    ///
-    /// Returns `Ok(None)` when `state.db` does not exist yet or is an uninitialized 0-version file.
-    pub fn open_readonly(&self) -> Result<Option<StateReadConnection>, StateError> {
+    /// Open a read-only SQLite connection without migrations or application writes, returning the
+    /// raw `(connection, user_version)` before enforcing `STATE_SCHEMA_VERSION`.
+    fn open_readonly_raw(&self) -> Result<Option<(StateReadConnection, i64)>, StateError> {
         let meta = match std::fs::metadata(&self.db_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -382,14 +379,26 @@ impl StateStore {
                 Err(primary_err) => return Err(StateError::Sqlite(primary_err)),
             }
         };
+        if ver == 0 {
+            return Ok(None);
+        }
+        Ok(Some((conn, ver)))
+    }
+
+    /// Open a read-only SQLite connection without migrations or application writes.
+    /// Frozen reads and read-only fallbacks use private temporary snapshots, leaving source
+    /// files untouched; ordinary WAL readers may update SQLite coordination sidecars.
+    ///
+    /// Returns `Ok(None)` when `state.db` does not exist yet or is an uninitialized 0-version file.
+    pub fn open_readonly(&self) -> Result<Option<StateReadConnection>, StateError> {
+        let Some((conn, ver)) = self.open_readonly_raw()? else {
+            return Ok(None);
+        };
         if ver > schema::STATE_SCHEMA_VERSION {
             return Err(StateError::NewerSchema {
                 found: ver,
                 supported: schema::STATE_SCHEMA_VERSION,
             });
-        }
-        if ver == 0 {
-            return Ok(None);
         }
         Ok(Some(conn))
     }
@@ -402,6 +411,24 @@ impl StateStore {
     /// [`crate::harness::store::sqlite::ReadScope`] snapshot.
     pub(crate) fn read_in<T>(
         &self,
+        f: impl FnOnce(&Connection) -> Result<T, StateError>,
+    ) -> Result<Option<T>, StateError> {
+        self.read_in_checked(true, f)
+    }
+
+    /// Like [`Self::read_in`], but permits reading stable v1 tables (`pack_manifests`,
+    /// `lineage_edges`) from a store stamped with a newer `user_version` rather than failing on
+    /// [`StateError::NewerSchema`].
+    pub(crate) fn read_compatible_in<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StateError>,
+    ) -> Result<Option<T>, StateError> {
+        self.read_in_checked(false, f)
+    }
+
+    fn read_in_checked<T>(
+        &self,
+        reject_newer_schema: bool,
         f: impl FnOnce(&Connection) -> Result<T, StateError>,
     ) -> Result<Option<T>, StateError> {
         if crate::env::frozen() && self.export_snapshot.is_none() {
@@ -428,7 +455,7 @@ impl StateStore {
                         anyhow::bail!("state schema check failed");
                     }
                 };
-                if ver > schema::STATE_SCHEMA_VERSION {
+                if reject_newer_schema && ver > schema::STATE_SCHEMA_VERSION {
                     inner_err = Some(StateError::NewerSchema {
                         found: ver,
                         supported: schema::STATE_SCHEMA_VERSION,
@@ -452,9 +479,15 @@ impl StateStore {
                 Err(other) => Err(StateError::Io(std::io::Error::other(other))),
             };
         }
-        let Some(conn) = self.open_readonly()? else {
+        let Some((conn, ver)) = self.open_readonly_raw()? else {
             return Ok(None);
         };
+        if reject_newer_schema && ver > schema::STATE_SCHEMA_VERSION {
+            return Err(StateError::NewerSchema {
+                found: ver,
+                supported: schema::STATE_SCHEMA_VERSION,
+            });
+        }
         f(&conn).map(Some)
     }
 }
