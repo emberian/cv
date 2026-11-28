@@ -183,6 +183,10 @@ fn antigravity_uncompact_1516_cold_successor_and_field_coverage() -> Result<()> 
     assert_eq!(next.messages.len(), 142);
     assert!(!next.messages.iter().any(|m| m.kind == MessageKind::CompactionBoundary));
     let conn = Connection::open(&dst)?;
+    // #tooth Antigravity 1.5.18+ checks `PRAGMA user_version == 1` when opening `conversations/<id>.db`
+    // and rejects `user_version == 0` with `trajectory db is not initialized`.
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    assert_eq!(user_version, 1);
     for i in [0, 139, 140, 141] {
         let (md, b): (Vec<u8>, Vec<u8>) =
             conn.query_row("SELECT metadata,step_payload FROM steps WHERE idx=?", [i], |r| {

@@ -636,11 +636,7 @@ pub(super) struct SummarySpec<'a> {
     pub replace: bool,
 }
 
-pub(super) fn summary_tx(conn: &mut Connection, spec: &SummarySpec<'_>) -> Result<()> {
-    conn.busy_timeout(Duration::ZERO)?;
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .context("conversation_summaries.db is locked by another writer")?;
+fn write_summary(tx: &rusqlite::Transaction<'_>, spec: &SummarySpec<'_>) -> Result<()> {
     // Only ordinary tables without application triggers are an offline summary
     // store. Never run foreign code as a side effect of inserting the new key.
     let foreign: bool = tx.query_row(
@@ -689,7 +685,6 @@ pub(super) fn summary_tx(conn: &mut Connection, spec: &SummarySpec<'_>) -> Resul
         |row| row.get(0),
     )?;
     ensure!(verified, "staged summary differs from selected trajectory");
-    tx.commit()?;
     Ok(())
 }
 
@@ -725,12 +720,7 @@ fn publish(stage: StagedDir, out: &Path, r: &Derived, session: &Session) -> Resu
     publish_staged_app_root(stage, out, &spec, Claim::New, |_| Ok(()))
 }
 
-fn summary_key_taken(index: &Path, id: &str) -> Result<bool> {
-    if !index.exists() {
-        return Ok(false);
-    }
-    let conn = Connection::open(index)?;
-    conn.busy_timeout(Duration::ZERO)?;
+fn summary_key_taken(conn: &Connection, id: &str) -> Result<bool> {
     let has_table: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE tbl_name='conversation_summaries' AND type='table')",
         [],
@@ -755,17 +745,15 @@ pub(super) fn publish_staged_app_root(
     verify_installed: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
     if !out.exists() {
-        summary_tx(
-            &mut Connection::open(stage.path().join("conversation_summaries.db"))?,
-            spec,
-        )?;
+        let mut conn = Connection::open(stage.path().join("conversation_summaries.db"))?;
+        let tx = conn.transaction()?;
+        write_summary(&tx, spec)?;
+        tx.commit()?;
+        drop(conn);
         verify_installed(stage.path())?;
-        stage.publish(out, claim)?;
+        stage.publish(out, Claim::New)?;
         return Ok(());
     }
-    // Existing offline root: stage/hard-link artifacts and run verification outside the SQLite
-    // write transaction so `conversation_summaries.db`'s `BEGIN IMMEDIATE` lock is held only for
-    // the single index-row write. Roll back installed artifacts if verification or index write fails.
     for dir in ["annotations", "brain", "conversations"] {
         let path = out.join(dir);
         if path.exists() {
@@ -788,7 +776,13 @@ pub(super) fn publish_staged_app_root(
             ensure!(m.is_file(), "unsafe destination index sidecar");
         }
     }
-    probe_summary_unlocked(out)?;
+    // Reserve the summary writer through installation and rollback. Two replacements
+    // of one conversation must never back up or restore each other's artifacts.
+    let mut conn = Connection::open(&index)?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("conversation_summaries.db is locked by another writer")?;
     let brain = PathBuf::from("brain").join(spec.new_id);
     let annotations = PathBuf::from("annotations").join(format!("{}.pbtxt", spec.new_id));
     let db = PathBuf::from("conversations").join(format!("{}.db", spec.new_id));
@@ -804,7 +798,7 @@ pub(super) fn publish_staged_app_root(
             crate::publish::refuse_existing(&out.join(&sidecar), "")?;
         }
         ensure!(
-            !summary_key_taken(&index, spec.new_id)?,
+            !summary_key_taken(&tx, spec.new_id)?,
             "conversation {} already exists in {}",
             spec.new_id,
             index.display()
@@ -817,53 +811,34 @@ pub(super) fn publish_staged_app_root(
         os.push(&bak_tag);
         PathBuf::from(os)
     };
-    let restore_backups = |backups: &[(PathBuf, PathBuf)]| {
-        for (orig, bak) in backups.iter().rev() {
-            let _ = fs::rename(bak, orig);
-        }
-    };
-    let cleanup_backups = |backups: &[(PathBuf, PathBuf)]| {
-        for (_, bak) in backups {
-            if let Ok(meta) = fs::symlink_metadata(bak) {
-                if meta.is_dir() {
-                    let _ = fs::remove_dir_all(bak);
-                } else {
-                    let _ = fs::remove_file(bak);
-                }
-            }
-        }
-    };
-
-    if replace {
-        let mut candidates = vec![
-            out.join(&brain),
-            out.join(&annotations),
-            out.join(&db),
-            out.join(&sidecar),
-        ];
-        for suffix in ["-wal", "-shm", "-journal"] {
-            candidates.push(out.join("conversations").join(format!("{}.db{suffix}", spec.new_id)));
-        }
-        for orig in candidates {
-            if fs::symlink_metadata(&orig).is_ok() {
-                let bak = backup_path(&orig);
-                if let Err(err) = fs::rename(&orig, &bak) {
-                    restore_backups(&backups);
-                    return Err(err.into());
-                }
-                backups.push((orig, bak));
-            }
-        }
-    } else {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let wal_sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
-            crate::publish::refuse_existing(&wal_sidecar, "")?;
-        }
-        crate::publish::refuse_existing(&out.join(&brain), "")?;
-    }
-
     let mut installed = Vec::new();
     let result = (|| -> Result<()> {
+        if replace {
+            let mut candidates = vec![
+                out.join(&brain),
+                out.join(&annotations),
+                out.join(&db),
+                out.join(&sidecar),
+            ];
+            for suffix in ["-wal", "-shm", "-journal"] {
+                candidates.push(out.join("conversations").join(format!("{}.db{suffix}", spec.new_id)));
+            }
+            for orig in candidates {
+                let bak = backup_path(&orig);
+                match fs::rename(&orig, &bak) {
+                    Ok(()) => backups.push((orig, bak)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        } else {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let wal_sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
+                crate::publish::refuse_existing(&wal_sidecar, "")?;
+            }
+            crate::publish::refuse_existing(&out.join(&brain), "")?;
+        }
+
         // Claim the directory exclusively, then install its files without following symlinks.
         fs::create_dir(out.join(&brain))?;
         installed.push(brain.clone());
@@ -885,23 +860,54 @@ pub(super) fn publish_staged_app_root(
             installed.push(path);
         }
         verify_installed(out)?;
-        let mut conn = Connection::open(&index)?;
-        summary_tx(&mut conn, spec)
+        write_summary(&tx, spec)?;
+        // Leave the transaction alive on a failed COMMIT until files are restored.
+        tx.execute_batch("COMMIT")?;
+        Ok(())
     })();
 
-    if result.is_err() {
+    let mut failures = Vec::new();
+    if let Err(cause) = result {
         for p in installed.into_iter().rev() {
-            if p == brain {
-                let _ = fs::remove_dir_all(out.join(p));
+            let dest = out.join(&p);
+            let removed = if p == brain {
+                fs::remove_dir_all(&dest)
             } else {
-                let _ = fs::remove_file(out.join(p));
+                fs::remove_file(&dest)
+            };
+            if let Err(e) = removed {
+                failures.push(format!("removing {}: {e}", dest.display()));
             }
         }
-        restore_backups(&backups);
-    } else {
-        cleanup_backups(&backups);
+        for (orig, bak) in backups.iter().rev() {
+            if let Err(e) = fs::rename(bak, orig) {
+                failures.push(format!("restoring {} from {}: {e}", orig.display(), bak.display()));
+            }
+        }
+        return if failures.is_empty() {
+            Err(cause)
+        } else {
+            Err(cause.context(format!("artifact rollback incomplete ({})", failures.join(", "))))
+        };
     }
-    result
+    for (_, bak) in backups {
+        let removed = fs::symlink_metadata(&bak).and_then(|meta| {
+            if meta.is_dir() {
+                fs::remove_dir_all(&bak)
+            } else {
+                fs::remove_file(&bak)
+            }
+        });
+        if let Err(e) = removed {
+            failures.push(format!("{}: {e}", bak.display()));
+        }
+    }
+    ensure!(
+        failures.is_empty(),
+        "published; backup cleanup failed ({})",
+        failures.join(", ")
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -923,20 +929,25 @@ mod replace_tests {
         fs::write(out.join("conversations").join(format!("{id}.db")), b"original-db")?;
         fs::write(out.join("annotations").join(format!("{id}.pbtxt")), b"original-ann")?;
 
-        let stage = crate::publish::StagedDir::beside(&out, "agy-replace")?;
-        fs::create_dir_all(stage.path().join("brain").join(id))?;
-        fs::create_dir_all(stage.path().join("conversations"))?;
-        fs::create_dir_all(stage.path().join("annotations"))?;
-        fs::write(stage.path().join("brain").join(id).join("keep.txt"), b"staged-brain")?;
-        fs::write(
-            stage.path().join("conversations").join(format!("{id}.db")),
-            b"staged-db",
-        )?;
-        fs::write(
-            stage.path().join("annotations").join(format!("{id}.pbtxt")),
-            b"staged-ann",
-        )?;
+        let old_sidecar = out.join("conversations").join(format!("{id}.flat.jsonl"));
+        fs::write(&old_sidecar, b"prior sidecar")?;
+        let make_stage = || -> Result<StagedDir> {
+            let stage = crate::publish::StagedDir::beside(&out, "agy-replace")?;
+            fs::create_dir_all(stage.path().join("brain").join(id))?;
+            fs::create_dir_all(stage.path().join("conversations"))?;
+            fs::create_dir_all(stage.path().join("annotations"))?;
+            fs::write(stage.path().join("brain").join(id).join("keep.txt"), b"staged-brain")?;
+            fs::write(
+                stage.path().join("conversations").join(format!("{id}.db")),
+                b"staged-db",
+            )?;
+            fs::write(
+                stage.path().join("annotations").join(format!("{id}.pbtxt")),
+                b"staged-ann",
+            )?;
 
+            Ok(stage)
+        };
         let spec = SummarySpec {
             new_id: id,
             trajectory_id: "bbbbbbbb-2222-4222-8222-222222222222",
@@ -949,7 +960,9 @@ mod replace_tests {
             last_user_time: None,
             replace: true,
         };
-        let err = publish_staged_app_root(stage, &out, &spec, Claim::Replace, |_| {
+        let err = publish_staged_app_root(make_stage()?, &out, &spec, Claim::Replace, |root| {
+            // #tooth A second publisher cannot replace or restore this installation.
+            assert!(probe_summary_unlocked(root).is_err());
             anyhow::bail!("injected verification failure")
         })
         .unwrap_err();
@@ -967,6 +980,18 @@ mod replace_tests {
             fs::read(out.join("annotations").join(format!("{id}.pbtxt")))?,
             b"original-ann"
         );
+        assert_eq!(fs::read(&old_sidecar)?, b"prior sidecar");
+        publish_staged_app_root(make_stage()?, &out, &spec, Claim::Replace, |_| Ok(()))?;
+        assert_eq!(fs::read(out.join("brain").join(id).join("keep.txt"))?, b"staged-brain");
+        assert_eq!(
+            fs::read(out.join("conversations").join(format!("{id}.db")))?,
+            b"staged-db"
+        );
+        assert!(!old_sidecar.exists());
+        assert!(summary_key_taken(
+            &Connection::open(out.join("conversation_summaries.db"))?,
+            id
+        )?);
         for sub in ["brain", "conversations", "annotations"] {
             for entry in fs::read_dir(out.join(sub))? {
                 let name = entry?.file_name();
