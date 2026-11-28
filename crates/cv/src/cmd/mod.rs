@@ -24,7 +24,6 @@ pub(crate) mod schema;
 pub(crate) mod search;
 pub(crate) mod serve;
 pub(crate) mod serve_tasks;
-pub(crate) mod session_json;
 pub(crate) mod session_reports;
 pub(crate) mod share;
 pub(crate) mod task;

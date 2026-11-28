@@ -600,7 +600,7 @@ fn staged_session_json_inner(
     let read = cv_core::stream::stream_counted(adapter, r, &cv_core::Demand::RICH.with_spans(), &mut sink, pass)?;
     let frames = sink.finish()?;
     let mut output = std::io::BufWriter::with_capacity(64 * 1024, cv_core::bytes::ByteStage::default());
-    super::session_json::write_document(&mut output, &read.session, &frames, sink.selected, document)?;
+    cv_core::projection::write_session_document(&mut output, &read.session, &frames, sink.selected, document)?;
     output.write_all(b"\n")?;
     if let Some(guard) = read.guard {
         guard.verify(r)?;

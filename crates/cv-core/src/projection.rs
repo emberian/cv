@@ -6,7 +6,7 @@ mod json_string;
 mod string;
 use crate::ir::truncate;
 use crate::{Resolver, Text};
-pub use json_frames::{write_frame, write_frames, write_json_array, Counted, Framing, Prefix};
+pub use json_frames::{write_frame, write_frames, write_json_array, write_session_document, Counted, Framing, Prefix};
 pub use json_string::{for_each_lossy_utf8_chunk, write_json_string};
 pub(crate) use string::{string_prefix, string_until};
 

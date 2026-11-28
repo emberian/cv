@@ -973,12 +973,7 @@ fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<V
                 .into_iter()
                 .map(|(op_id, rec)| (rec.local_commit_pos, (op_id, rec)))
                 .collect();
-            let phys_pack_id = pm
-                .index_meta
-                .get("physical_pack_id")
-                .and_then(Value::as_str)
-                .or_else(|| pm.pack_id.split_once("--r").map(|(base, _)| base))
-                .unwrap_or(&pm.pack_id);
+            let phys_pack_id = crate::custody::physical_pack_id(&pm.pack_id, &pm.index_meta);
             if let Some(sessions) = pm.index_meta.get("sessions").and_then(Value::as_array) {
                 for (idx, sess_val) in sessions.iter().enumerate() {
                     let pos = pm.min_commit_pos + idx as i64;

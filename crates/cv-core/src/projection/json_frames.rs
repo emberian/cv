@@ -144,6 +144,37 @@ pub fn write_json_array(
     write_frames(out, envelope, field, frames, Framing::default()).map(|_| ())
 }
 
+/// Write the pretty session envelope used by custody and JSON export around staged messages.
+pub fn write_session_document(
+    writer: &mut impl Write,
+    session: &crate::Session,
+    spool: &ByteSource,
+    total: usize,
+    document: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        session.messages.is_empty(),
+        "JSON header unexpectedly retained messages"
+    );
+    let framing = Framing {
+        pretty: true,
+        total: Some(total),
+        ..Framing::default()
+    };
+    if document {
+        write_frames(
+            writer,
+            &crate::harness::opensession::document(session),
+            "messages",
+            spool,
+            framing,
+        )?;
+    } else {
+        write_frames(writer, session, "messages", spool, framing)?;
+    }
+    Ok(())
+}
+
 /// [`write_json_array`] with the pretty and archive options; returns the recorded [`Prefix`].
 /// Stage output before publishing: a missing field or mismatched total can fail after envelope
 /// bytes have already been written to out.

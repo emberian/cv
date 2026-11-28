@@ -1,4 +1,4 @@
-//! Read immutable local and replicated session custody through its committed manifests.
+//! Capture and read immutable local and replicated session custody through its committed manifests.
 //!
 //! An archived session is held in one of two shapes ([`CustodyKind`]). A single append-only
 //! native file keeps its own bytes as a chain of pack extents, each archive pass adding only the
@@ -6,6 +6,9 @@
 //! chain by position ([`ExtentChain`]), so verbatim `_record` carriers survive the live file and
 //! nothing is staged on disk. Every other store, and every
 //! entry written before native custody existed, keeps one portable Session IR JSON projection.
+mod write;
+pub use write::{Archive, SyncSummary, WatchBaselines};
+
 use crate::packs::{pack_idx_path, pack_zst_path, PackManifest as PackFileManifest, PayloadAddr, SealedPack};
 use crate::{Adapter, Demand, Discovered, Harness, MessageSink, Session, SessionKey, SessionRef};
 use anyhow::{Context, Result};
@@ -438,6 +441,14 @@ impl ArchivedSessionEntry {
     }
 }
 
+/// The sealed pack shared by every contiguous manifest run, including legacy implicit IDs.
+pub(crate) fn physical_pack_id<'a>(id: &'a str, meta: &'a serde_json::Value) -> &'a str {
+    meta.get("physical_pack_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| id.split_once("--r").map(|(base, _)| base))
+        .unwrap_or(id)
+}
+
 /// Read-only map of session selectors to their latest archived revision across
 /// all published `pack_manifests` (ascending commit order so newer packs supersede older ones).
 /// Also validates any present `.pack.idx.json` record spans. Safe under `--frozen`.
@@ -454,19 +465,13 @@ fn committed_entries(home: &Path, verify_indexes: bool) -> Result<(ArchiveSessio
 
     for m in manifests {
         distinct_packs.insert(m.pack_path.clone());
-        let phys_pack_id = m
-            .index_meta
-            .get("physical_pack_id")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| m.pack_id.split_once("--r").map(|(base, _)| base))
-            .unwrap_or(&m.pack_id)
-            .to_string();
+        let phys_pack_id = physical_pack_id(&m.pack_id, &m.index_meta);
 
         if let Some(sessions_val) = m.index_meta.get("sessions") {
             let entries: Vec<ArchivedSessionEntry> = serde_json::from_value(sessions_val.clone())
                 .with_context(|| format!("decoding index_meta.sessions for pack {}", m.pack_id))?;
             for mut entry in entries {
-                normalize(&mut entry, &phys_pack_id)?;
+                normalize(&mut entry, phys_pack_id)?;
                 if verify_indexes {
                     let key = entry.key()?;
                     for addr in entry.records() {

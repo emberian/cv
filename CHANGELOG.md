@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Archive watch catches native transcripts appended during its initial sync.
 - Codex command extraction preserves non-BMP characters written as UTF-16 surrogate pairs in scripts.
 - Distillation attributes messages and written file contents to their own tool calls inside batched Codex scripts.
 - Derived search hits retain profile identity, and index-only lineage lookups use recorded metadata without rediscovering live sessions.

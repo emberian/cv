@@ -1719,11 +1719,7 @@ fn upsert_custody_heads(
     let Some(sessions) = index_meta.get("sessions").and_then(Value::as_array) else {
         return Ok(());
     };
-    let physical = index_meta
-        .get("physical_pack_id")
-        .and_then(Value::as_str)
-        .or_else(|| pack_id.split_once("--r").map(|(base, _)| base))
-        .unwrap_or(pack_id);
+    let physical = crate::custody::physical_pack_id(pack_id, index_meta);
     for entry in sessions {
         let mut entry = entry.clone();
         if entry["addr"]["pack_id"].as_str().is_some_and(str::is_empty) {
@@ -2065,12 +2061,7 @@ fn upsert_custody_commits(
                 binding_by_pos.insert(pos, (op_id, prod, ep, seq));
             }
         }
-        let phys_pack_id = pm
-            .index_meta
-            .get("physical_pack_id")
-            .and_then(Value::as_str)
-            .or_else(|| pm.pack_id.split_once("--r").map(|(base, _)| base))
-            .unwrap_or(&pm.pack_id);
+        let phys_pack_id = crate::custody::physical_pack_id(&pm.pack_id, &pm.index_meta);
         if let Some(sessions) = pm.index_meta.get("sessions").and_then(Value::as_array) {
             for (idx, sess_val) in sessions.iter().enumerate() {
                 let pos = pm.min_commit_pos + idx as i64;
