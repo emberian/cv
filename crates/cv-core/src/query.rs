@@ -36,6 +36,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldId {
     Harness,
+    Place,
     Model,
     Cwd,
     Title,
@@ -159,6 +160,8 @@ pub const HAS_FLAGS: &[(&str, &str, Cost)] = &[
 pub const FIELDS: &[FieldDef] = &[
     FieldDef { id: FieldId::Harness, name: "harness", aliases: &[("h", None)], kind: Kind::HarnessEnum, cost: Cost::Catalog,
         desc: "Which harness produced the session.", example: "harness:claude" },
+    FieldDef { id: FieldId::Place, name: "place", aliases: &[("producer", None), ("host", None)], kind: Kind::Str, cost: Cost::Catalog,
+        desc: "Originating place or producer id (glob, substring, or exact).", example: "place:laptop-*" },
     FieldDef { id: FieldId::Model, name: "model", aliases: &[("m", None)], kind: Kind::Str, cost: Cost::Counted,
         desc: "Any turn's model id (substring; counted in catalog once parsed).", example: "model:fable" },
     FieldDef { id: FieldId::Cwd, name: "cwd", aliases: &[("dir", None)], kind: Kind::Path, cost: Cost::Catalog,
@@ -367,6 +370,10 @@ pub trait ExtFacts {
     fn count(&self, _field: FieldId) -> anyhow::Result<Option<u64>> {
         Ok(None)
     }
+    /// Originating place / producer id when already known by the caller.
+    fn place(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The do-nothing resolver (everything `Unknown`) — used in the cheap prefilter phase.
@@ -490,6 +497,18 @@ impl SessionQuery {
         walk(&self.expr, field)
     }
 
+    /// Whether the query contains any `NOT` (`-term`) negation node.
+    pub fn has_negation(&self) -> bool {
+        fn walk(e: &Expr) -> bool {
+            match e {
+                Expr::All | Expr::Term(_) => false,
+                Expr::Not(_) => true,
+                Expr::And(v) | Expr::Or(v) => v.iter().any(walk),
+            }
+        }
+        walk(&self.expr)
+    }
+
     /// Cheap catalog-only prefilter: evaluate against the ref alone (parse/index/events leaves are
     /// `Unknown`). Returns `false` only when the query is *definitely* false — safe to prune.
     pub fn prefilter(&self, r: &SessionRef) -> bool {
@@ -601,12 +620,72 @@ fn eval(e: &Expr, f: &Facts) -> anyhow::Result<Tri> {
     })
 }
 
+/// Wildcard glob matching (`*` = any 0+ bytes, `?` = any single byte).
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let txt = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
 fn eval_term(t: &Term, f: &Facts) -> anyhow::Result<Tri> {
     Ok(match t.field {
         FieldId::Harness => match &t.val {
             Val::Strs(names) => Tri::of(names.iter().any(|n| Harness::parse(n) == Some(f.r.harness))),
             _ => Tri::False,
         },
+        FieldId::Place => {
+            let resolved_place: String = if let Some(p) = f.ext.place() {
+                p.to_lowercase()
+            } else if crate::SessionKey::split_selector(&f.r.id).is_none() {
+                "local".to_string()
+            } else {
+                #[cfg(feature = "sqlite")]
+                {
+                    crate::state::hub::HubStore::default_hub()
+                        .ok()
+                        .and_then(|h| h.session_head_for(&f.r.id, None).ok().flatten())
+                        .map(|e| e.producer_id.to_lowercase())
+                        .unwrap_or_else(|| "local".to_string())
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    "local".to_string()
+                }
+            };
+            match &t.val {
+                Val::Strs(pats) => Tri::of(pats.iter().any(|pat| {
+                    if pat.contains('*') || pat.contains('?') {
+                        glob_match(pat, &resolved_place)
+                    } else if t.op == Op::Eq {
+                        resolved_place == *pat
+                    } else {
+                        resolved_place.contains(pat.as_str())
+                    }
+                })),
+                _ => Tri::False,
+            }
+        }
         FieldId::Cwd => str_match(
             t.op,
             &t.val,

@@ -21,25 +21,155 @@ pub(crate) struct SearchArgs<'a> {
     pub live_bytes: Option<u64>,
     pub json: bool, // emit `{hits, total}` (session rows + score/snippet/provenance) instead of the table
     pub stats: bool,
+    pub authority: crate::AuthorityArgs,
 }
 
 fn resolve_allowed_ids(
     want: Option<cv_core::Harness>,
     cwd: Option<&str>,
     filter_query: Option<String>,
+    place_glob: Option<&str>,
 ) -> Result<Option<std::collections::HashSet<String>>> {
-    let Some(sq) = crate::cmd::query::build(filter_query)? else {
+    if filter_query.is_none() && place_glob.is_none() {
         return Ok(None);
-    };
-    let text = crate::cmd::query::text_sets(&sq)?;
+    }
+    let sq = crate::cmd::query::build(filter_query)?;
     let mut candidates = cv_core::try_sessions_for(want)?;
     if let Some(needle) = cwd {
         candidates.retain(|r| r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)));
     }
-    crate::cmd::query::filter_refs(&mut candidates, &sq, &text)?;
-    Ok(Some(
-        candidates.iter().map(cv_core::SessionRef::session_selector).collect(),
-    ))
+    if let Some(pat) = place_glob {
+        let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+            if let Ok(heads) = hub.heads_at_generation(None) {
+                for e in heads {
+                    selector_places.insert(e.selector_string(), e.producer_id);
+                }
+            }
+        }
+        candidates.retain(|r| {
+            let p = selector_places.get(&r.id).map_or("local", String::as_str);
+            cv_core::query::glob_match(pat, p)
+        });
+    }
+    if let Some(ref sq) = sq {
+        let text = crate::cmd::query::text_sets(sq)?;
+        crate::cmd::query::filter_refs(&mut candidates, sq, &text)?;
+    }
+    let mut out = std::collections::HashSet::with_capacity(candidates.len() * 2);
+    for c in &candidates {
+        out.insert(c.session_selector());
+        out.insert(c.id.clone());
+    }
+    Ok(Some(out))
+}
+
+pub(crate) fn search_pinned_generation(
+    gen: u64,
+    query: &str,
+    want: Option<cv_core::Harness>,
+    cwd: Option<&str>,
+    place_glob: Option<&str>,
+    limit: usize,
+) -> Result<Found> {
+    use cv_core::harness::Parse as _;
+    let hub = cv_core::state::hub::HubStore::default_hub()?;
+    let heads = hub.heads_at_generation(Some(gen))?;
+    let needles: Vec<String> = query
+        .split_whitespace()
+        .map(|s| s.trim_matches('"').to_lowercase())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("and") && !s.eq_ignore_ascii_case("or"))
+        .collect();
+    let mut hits = Vec::new();
+    for entry in heads {
+        if let Some(pat) = place_glob {
+            if !cv_core::query::glob_match(pat, &entry.producer_id) {
+                continue;
+            }
+        }
+        let Some(h) = cv_core::Harness::parse(&entry.harness) else {
+            continue;
+        };
+        if want.is_some_and(|w| w != h) {
+            continue;
+        }
+        if let Some(c_needle) = cwd {
+            if !entry.cwd.as_deref().is_some_and(|c| c.contains(c_needle)) {
+                continue;
+            }
+        }
+        let Some(backing) = cv_core::custody::backing_from_hub_head(hub.packs_dir(), entry.clone())? else {
+            continue;
+        };
+        let session = match backing.parse(&backing.reference) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut corpus = String::new();
+        if let Some(ref t) = session.title {
+            corpus.push_str(t);
+            corpus.push('\n');
+        }
+        for m in &session.messages {
+            for b in &m.content {
+                match b {
+                    cv_core::Block::Text { text, .. } | cv_core::Block::Thinking { text, .. } => {
+                        corpus.push_str(text);
+                        corpus.push('\n');
+                    }
+                    cv_core::Block::ToolResult { content, .. } => {
+                        corpus.push_str(content);
+                        corpus.push('\n');
+                    }
+                    cv_core::Block::ToolUse { name, input, .. } => {
+                        corpus.push_str(name);
+                        if let Ok(s) = serde_json::to_string(input) {
+                            corpus.push(' ');
+                            corpus.push_str(&s);
+                        }
+                        corpus.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let lower = corpus.to_lowercase();
+        if needles.is_empty() || needles.iter().all(|n| lower.contains(n.as_str())) {
+            let snippet = needles
+                .first()
+                .and_then(|n| lower.find(n.as_str()).map(|pos| (pos, n.len())))
+                .map(|(pos, len)| {
+                    let start = corpus.floor_char_boundary(pos.saturating_sub(40));
+                    let end = corpus.ceil_char_boundary((pos + len + 80).min(corpus.len()));
+                    corpus[start..end].replace('\n', " ")
+                })
+                .unwrap_or_default();
+            let selector = backing.reference.id.clone();
+            hits.push(cv_search::Hit {
+                id: selector.clone(),
+                session_key: Some(selector),
+                harness: h.as_str().to_string(),
+                cwd: entry.cwd.clone(),
+                title: entry.title.clone(),
+                created_at: backing.reference.created_at.map(|t| t.timestamp()),
+                updated_at: backing.reference.updated_at.map(|t| t.timestamp()),
+                score: 1.0,
+                snippet,
+                agent_id: None,
+                parent_id: None,
+                workflow: None,
+                session: Some(backing.reference),
+            });
+        }
+    }
+    let total = hits.len();
+    hits.truncate(limit);
+    Ok(Found {
+        hits,
+        source: Source::Live,
+        notes: Vec::new(),
+        total,
+    })
 }
 
 pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
@@ -57,6 +187,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         live_bytes,
         json,
         stats,
+        authority,
     } = args;
     let want = parse_harness(&harness)?;
     let scope = match kind.as_deref() {
@@ -76,7 +207,22 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
             limit,
         );
     }
-    let allowed_ids = resolve_allowed_ids(want, cwd.as_deref(), filter_query)?;
+    let live_allowed = !cv_core::env::frozen() && live_bytes != Some(0);
+    let auth_envelope = crate::cmd::browse::evaluate_cli_authority(
+        &authority,
+        cwd.as_deref(),
+        Some(query),
+        false,
+        !scan && !live_allowed && authority.as_of.is_none(),
+    )?;
+
+    if let Some(gen) = authority.as_of {
+        let found = search_pinned_generation(gen, query, want, cwd.as_deref(), authority.place.as_deref(), limit)?;
+        let work = cv_search::SearchWork::default();
+        return render(found, work, query, json, stats, auth_envelope.as_ref());
+    }
+
+    let allowed_ids = resolve_allowed_ids(want, cwd.as_deref(), filter_query, authority.place.as_deref())?;
     let source = if scan {
         eprintln!("(--scan: scanning every transcript live; `cv index` makes search instant)");
         Source::Live
@@ -141,7 +287,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     } else {
         collapse_search_hits(&mut found, limit, live_allowed);
     }
-    render(found, work, query, json, stats)
+    render(found, work, query, json, stats, auth_envelope.as_ref())
 }
 
 fn state_lineage_parent(id: &str) -> Option<String> {
@@ -402,7 +548,14 @@ fn matches_line(shown: usize, total: usize) -> String {
 /// `N of M matches` footer and the notes, or, with `json`, `{"hits": [...], "total": M}` on
 /// stdout with the SAME hits in the same order — notes on stderr, an empty result `"hits": []` —
 /// so the output pipes cleanly.
-fn render(found: Found, work: cv_search::SearchWork, query: &str, json: bool, stats: bool) -> Result<()> {
+fn render(
+    found: Found,
+    work: cv_search::SearchWork,
+    query: &str,
+    json: bool,
+    stats: bool,
+    authority: Option<&cv_core::state::hub::AuthorityEnvelope>,
+) -> Result<()> {
     let Found {
         hits,
         source,
@@ -416,7 +569,7 @@ fn render(found: Found, work: cv_search::SearchWork, query: &str, json: bool, st
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let rows = std::cell::LazyCell::new(cv_core::rows::SearchRowContext::new);
-        write_json_rows(&mut out, &hits, total, stats.then_some(&work), |hit| {
+        write_json_rows_with_authority(&mut out, &hits, total, stats.then_some(&work), authority, |hit| {
             cv_search::row(hit, &rows)
         })?;
         out.flush()?;
@@ -503,6 +656,8 @@ struct JsonFound<'a, R> {
     total: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     work: Option<&'a cv_search::SearchWork>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<&'a cv_core::state::hub::AuthorityEnvelope>,
 }
 struct JsonRows<'a, T, F> {
     rows: &'a [T],
@@ -518,11 +673,23 @@ impl<T, F: Fn(&T) -> serde_json::Value> serde::Serialize for JsonRows<'_, T, F> 
         sequence.end()
     }
 }
+#[cfg(test)]
 fn write_json_rows<T>(
     out: &mut impl Write,
     rows: &[T],
     total: usize,
     work: Option<&cv_search::SearchWork>,
+    row: impl Fn(&T) -> serde_json::Value,
+) -> Result<()> {
+    write_json_rows_with_authority(out, rows, total, work, None, row)
+}
+
+fn write_json_rows_with_authority<T>(
+    out: &mut impl Write,
+    rows: &[T],
+    total: usize,
+    work: Option<&cv_search::SearchWork>,
+    authority: Option<&cv_core::state::hub::AuthorityEnvelope>,
     row: impl Fn(&T) -> serde_json::Value,
 ) -> Result<()> {
     serde_json::to_writer_pretty(
@@ -531,6 +698,7 @@ fn write_json_rows<T>(
             hits: JsonRows { rows, row },
             total,
             work,
+            authority,
         },
     )?;
     writeln!(out)?;
@@ -598,6 +766,11 @@ pub(crate) fn cmd_index(
             if subagents { " (+ sub-agent forest)" } else { "" }
         );
         let (indexed, _refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
+        if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+            if let Ok(Some((gen, _))) = hub.latest_generation_fast() {
+                let _ = hub.record_indexed_generation(gen);
+            }
+        }
         if !json {
             println!(
                 "indexed {} top-level session(s) → {}{}",
@@ -742,7 +915,7 @@ mod tests {
         assert_eq!(alpha_only.hits.len(), 2);
 
         // Combining `--cwd proj-alpha` + `-q after:2026-06-01` narrows to `sess-new-alpha` in both Index and Live (`--scan`).
-        let allowed = resolve_allowed_ids(None, Some("proj-alpha"), Some("after:2026-06-01".into())).unwrap();
+        let allowed = resolve_allowed_ids(None, Some("proj-alpha"), Some("after:2026-06-01".into()), None).unwrap();
         for source in [Source::Index, Source::Live] {
             let filtered = searcher
                 .search_allowed(

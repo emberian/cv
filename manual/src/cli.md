@@ -63,6 +63,9 @@ An **ambiguous** prefix lists the candidates (`harness:full-id`) and exits `2`.
 | `--thinking <mode>` | reasoning policy: `native`, `portable`, `text`, `drop`; rewind accepts native/portable |
 | `--strict` | `port`: fail on unexpected fidelity loss; `index`: fail on any unreadable session |
 | `--skills <p>` | restored skills in a new Claude session: `keep`, `drop`, `drop-stale` |
+| `--place <glob>` | restrict `ls`, `search`, `events`, and `touched` to matching producer places |
+| `--as-of <gen>` | pin `ls`, `search`, `events`, and `touched` to hub generation `<gen>` |
+| `--max-staleness <dur>` | fail closed (exit 2 / HTTP 503) if any unsealed place exceeds `<dur>` |
 
 **`--thinking` and replay.** Most thinking blocks carry only an opaque provider **signature**
 (177 of 204 on one 900-message session), not text; a proxied session carries another model's
@@ -1018,7 +1021,7 @@ cv ls -q "harness:claude agent:Explore subtool:Bash"  # a forest query
 
 Fields, by cost:
 
-- **catalog** (free): `harness`, `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:`/`since:`/`until:` are sugar).
+- **catalog** (free): `harness`, `place` (`producer:`/`host:`), `cwd`, `title`, `id`, `msgs`, `created`, `updated` (`before:`/`after:`/`since:`/`until:` are sugar).
 - **parse** (reads the transcript): `model` (any turn's), `git` (branch/remote).
 - **index**: `text`, full-text over content.
 - **events**: `tool` (a tool this session ran), `touched` (a file it read or edited), `has` (`subagents`, `errors`, `tools`, `images`, `compacted`, `workflows`, and every affordance kind — `plan`, `schedule`, `background_job`, `approval`, … — see [`--kind`](#views)).

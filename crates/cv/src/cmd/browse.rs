@@ -231,6 +231,43 @@ pub(crate) struct LsArgs<'a> {
     pub fresh: bool,
     pub json: bool,
     pub enrich: bool,
+    pub authority: crate::AuthorityArgs,
+}
+
+pub(crate) fn evaluate_cli_authority(
+    authority: &crate::AuthorityArgs,
+    cwd_filter: Option<&str>,
+    query_str: Option<&str>,
+    has_negation: bool,
+    indexed_only: bool,
+) -> Result<Option<cv_core::state::hub::AuthorityEnvelope>> {
+    if !authority.is_active() {
+        return Ok(None);
+    }
+    let max_staleness_ms = match authority.max_staleness.as_deref() {
+        Some(raw) => Some(cv_core::state::hub::parse_duration_ms(raw).map_err(crate::util::UsageError)?),
+        None => None,
+    };
+    let hub = cv_core::state::hub::HubStore::default_hub()?;
+    if let Some(g) = authority.as_of {
+        if hub.resolve_generation(Some(&g.to_string()))?.is_none() {
+            return crate::util::usage(format!("hub generation `{g}` not found"));
+        }
+    }
+    let ctx = cv_core::state::hub::AuthorityQueryContext {
+        place_glob: authority.place.as_deref(),
+        as_of_gen: authority.as_of,
+        max_staleness_ms,
+        cwd_filter,
+        query_str,
+        has_negation,
+        indexed_only,
+        include_local: authority.as_of.is_none(),
+    };
+    match hub.check_authority(&ctx) {
+        Ok(env) => Ok(Some(env)),
+        Err(violation) => crate::util::usage(violation.message),
+    }
 }
 
 pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
@@ -244,18 +281,59 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
         fresh,
         json,
         enrich,
+        authority,
     } = args;
     let want = parse_harness(&harness)?;
+    let raw_query_str = query.clone();
     let query = crate::cmd::query::build(query)?;
+    let has_negation = query.as_ref().is_some_and(cv_core::SessionQuery::has_negation);
+    let auth_envelope = evaluate_cli_authority(
+        &authority,
+        cwd.as_deref(),
+        raw_query_str.as_deref(),
+        has_negation,
+        false,
+    )?;
+
     // An empty machine window requires no inventory or enrichment; still validate inputs.
     if json && limit == 0 {
-        println!("[]");
+        if let Some(env) = auth_envelope {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "sessions": [], "authority": env }))?
+            );
+        } else {
+            println!("[]");
+        }
         return Ok(());
     }
-    let all = if fresh {
-        cv_core::discover_all()
+
+    let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let all = if let Some(gen) = authority.as_of {
+        let hub = cv_core::state::hub::HubStore::default_hub()?;
+        let heads = hub.heads_at_generation(Some(gen))?;
+        for e in &heads {
+            selector_places.insert(e.selector_string(), e.producer_id.clone());
+        }
+        cv_core::custody::inventory_as_of(Some(gen))?
+            .into_iter()
+            .map(|b| b.reference)
+            .collect()
     } else {
-        cv_core::sessions()
+        if authority.place.is_some() {
+            if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+                if let Ok(heads) = hub.heads_at_generation(None) {
+                    for e in heads {
+                        selector_places.insert(e.selector_string(), e.producer_id);
+                    }
+                }
+            }
+        }
+        if fresh {
+            cv_core::discover_all()
+        } else {
+            cv_core::sessions()
+        }
     };
     let discovered = all.len();
     let mut refs: Vec<SessionRef> = all
@@ -264,6 +342,13 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
         .filter(|r| match &cwd {
             None => true,
             Some(c) => r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(c)),
+        })
+        .filter(|r| match authority.place.as_deref() {
+            None => true,
+            Some(pat) => {
+                let p = selector_places.get(&r.id).map_or("local", String::as_str);
+                cv_core::query::glob_match(pat, p)
+            }
         })
         .collect();
     // Queried windows still require ordered predicate/error evaluation; text needs exact totals.
@@ -324,7 +409,17 @@ pub(crate) fn cmd_ls(args: LsArgs<'_>) -> Result<()> {
                 obj
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        if let Some(env) = auth_envelope {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "sessions": rows,
+                    "authority": env,
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
         return Ok(());
     }
     if total < discovered {

@@ -1159,7 +1159,10 @@ tags = ["team-share"]
     assert!(hyd_text.contains("$VAULT/prod.env"), "{hyd_text}");
     assert!(hyd_text.contains("[REDACTED:"), "{hyd_text}");
     let principal_str = hyd["principal"].as_str().expect("hashed principal string");
-    assert!(principal_str.starts_with("sha256:"), "principal={principal_str}");
+    assert!(
+        principal_str.starts_with("sha256:") && principal_str.len() == 71,
+        "principal={principal_str}"
+    );
 
     // Exhaustive wire/disk zero-leak audit across hub `state.db`, WAL, and decompressed `hub/packs/*`!
     let forbidden_substrings = [
@@ -1683,6 +1686,11 @@ deny_cwds = ["/work/secret-ops"]
     );
     assert!(!rev_meta_str.contains(quoted_secret));
     assert!(!rev_meta_str.contains("alice-raw-principal"));
+    let env_principal = rev.metadata["principal"].as_str().expect("envelope principal hash");
+    assert!(
+        env_principal.starts_with("blake3:") && env_principal.len() == 71,
+        "envelope principal must keep full 64-hex blake3 digest: {env_principal}"
+    );
 
     let (hyd_raw, _) = reader(&hub_url)
         .get("/api/session/claude/prod-mixed:claude:sess-keep")

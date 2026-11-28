@@ -139,6 +139,26 @@ pub(crate) struct RecoveryArgs {
     pre_compaction: Option<usize>,
 }
 
+/// Shared semiauthoritative fleet query selectors (`--place`, `--as-of`, `--max-staleness`).
+#[derive(clap::Args, Default, Clone, Debug)]
+pub(crate) struct AuthorityArgs {
+    /// Restrict to places (producers) matching this glob pattern (`local`, `laptop-*`, `sbx-*`).
+    #[arg(long, value_name = "GLOB")]
+    pub place: Option<String>,
+    /// Pin read to hub generation N (`hub_generations.generation`) for repeatable snapshot queries.
+    #[arg(long = "as-of", value_name = "GEN")]
+    pub as_of: Option<u64>,
+    /// Fail closed (exit 2) when any selected unsealed place exceeds this staleness bound (`30s`, `5m`, `1h`).
+    #[arg(long = "max-staleness", value_name = "DUR")]
+    pub max_staleness: Option<String>,
+}
+
+impl AuthorityArgs {
+    pub fn is_active(&self) -> bool {
+        self.place.is_some() || self.as_of.is_some() || self.max_staleness.is_some()
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// List discovered sessions across all harnesses.
@@ -182,6 +202,8 @@ enum Cmd {
         /// row whose transcript cannot be read carries `enrich_error` instead.
         #[arg(long)]
         enrich: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// Print a single session (by `harness:id` or a unique id prefix).
     Show {
@@ -311,6 +333,8 @@ enum Cmd {
         /// setup/evaluation microseconds): under `"work"` in `--json`, or on stderr otherwise.
         #[arg(long)]
         stats: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// List what a session DID: its extracted events (file edits/reads, commands, errors).
     ///
@@ -339,6 +363,8 @@ enum Cmd {
         /// shortened to 90 characters and the detail line to 100, a cut marked with `…`.
         #[arg(long, conflicts_with = "json")]
         wide: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// Sessions that touched a file — every session with a file_edit/file_read event on its path.
     ///
@@ -352,6 +378,8 @@ enum Cmd {
         /// Emit the rows as one JSON array (snake_case keys) instead of the table.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// Cross-agent tool analytics: per-agent histograms, which-agent-used-what, aggregate usage,
     /// and a tool-call timeline — across the orchestrator and its whole sub-agent forest.
@@ -1300,11 +1328,26 @@ enum ArchiveCmd {
     /// Discover and archive every session once, then exit (idempotent: unchanged ones are skipped).
     Sync {
         /// Replicate sealed custody packs and events to this hub URL or `[replication.<target>]` profile.
-        #[arg(long, value_name = "TARGET")]
+        #[arg(long, value_name = "TARGET", conflicts_with_all = ["spool", "ingest_spool", "pull", "export_delta"])]
         to: Option<String>,
         /// Bearer credential for `--to` hub replication (overrides $CV_HUB_PRODUCER_TOKEN and profile token).
         #[arg(long, value_name = "TOKEN", requires = "to")]
         token: Option<String>,
+        /// Write scrubbed custody packs and delta envelopes into a credential-free sandbox spool directory.
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["to", "ingest_spool", "pull", "export_delta"])]
+        spool: Option<PathBuf>,
+        /// Mark the producer epoch sealed on sandbox/container exit (`--spool` only).
+        #[arg(long, requires = "spool")]
+        seal: bool,
+        /// Idempotently ingest a sandbox spool directory into this hub.
+        #[arg(long = "ingest-spool", value_name = "DIR", conflicts_with_all = ["to", "spool", "pull", "export_delta"])]
+        ingest_spool: Option<PathBuf>,
+        /// Pull scrubbed delta custody from a remote host via `ssh <host> cv --frozen archive sync --export-delta`.
+        #[arg(long, value_name = "SSH_TARGET", conflicts_with_all = ["to", "spool", "ingest_spool", "export_delta"])]
+        pull: Option<String>,
+        /// Stream scrubbed delta custody after WATERMARK to stdout (read-only; runs under `--frozen`).
+        #[arg(long = "export-delta", value_name = "WATERMARK", conflicts_with_all = ["to", "spool", "ingest_spool", "pull"])]
+        export_delta: Option<String>,
     },
     /// List what's in the archive, newest activity first.
     Ls,
@@ -1411,8 +1454,16 @@ fn run() -> Result<()> {
             ),
             Cmd::Hooks { action } => (!matches!(action, HooksCmd::Show { .. }))
                 .then_some("use `cv hooks show` to inspect hook state, or run with CV_FROZEN=0"),
-            Cmd::Archive { action, .. } => matches!(action, ArchiveCmd::Sync { .. })
-                .then_some("use `cv archive ls` or `cv archive path` to inspect, or run with CV_FROZEN=0"),
+            Cmd::Archive { action, .. } => match action {
+                ArchiveCmd::Sync {
+                    export_delta: Some(_),
+                    ..
+                } => None,
+                ArchiveCmd::Sync { .. } => {
+                    Some("use `cv archive ls` or `cv archive path` to inspect, or run with CV_FROZEN=0")
+                }
+                ArchiveCmd::Ls | ArchiveCmd::Path => None,
+            },
             Cmd::Config { add_export, rm_export } => (add_export.is_some() || rm_export.is_some())
                 .then_some("run `cv config` without flags to inspect, or run with CV_FROZEN=0"),
             Cmd::Pack { format, out, .. } => (format == "session" || out.is_some())
@@ -1454,6 +1505,7 @@ fn run() -> Result<()> {
             fresh,
             json,
             enrich,
+            authority,
         } => browse::cmd_ls(browse::LsArgs {
             harness,
             cwd,
@@ -1464,6 +1516,7 @@ fn run() -> Result<()> {
             fresh,
             json,
             enrich,
+            authority,
         }),
         Cmd::Search {
             query,
@@ -1479,6 +1532,7 @@ fn run() -> Result<()> {
             live_bytes,
             json,
             stats,
+            authority,
         } => search::cmd_search(search::SearchArgs {
             query: query.as_deref().unwrap_or_default(),
             batch,
@@ -1493,6 +1547,7 @@ fn run() -> Result<()> {
             live_bytes,
             json,
             stats,
+            authority,
         }),
         Cmd::Show {
             id,
@@ -1603,8 +1658,14 @@ fn run() -> Result<()> {
             subagents,
             json,
             wide,
-        } => events::cmd_events(&id, harness, kind, subagents, json, wide),
-        Cmd::Touched { path, edits_only, json } => events::cmd_touched(&path, edits_only, json),
+            authority,
+        } => events::cmd_events(&id, harness, kind, subagents, json, wide, authority),
+        Cmd::Touched {
+            path,
+            edits_only,
+            json,
+            authority,
+        } => events::cmd_touched(&path, edits_only, json, authority),
         Cmd::Blame {
             file,
             lines,
@@ -1860,7 +1921,26 @@ fn run() -> Result<()> {
         Cmd::Archive { home, action } => {
             let a = archive::Archive::resolve(home)?;
             match action {
-                ArchiveCmd::Sync { to, token } => archive::cmd_sync(&a, to, token),
+                ArchiveCmd::Sync {
+                    to,
+                    token,
+                    spool,
+                    seal,
+                    ingest_spool,
+                    pull,
+                    export_delta,
+                } => archive::cmd_sync(
+                    &a,
+                    archive::SyncArgs {
+                        to,
+                        token,
+                        spool,
+                        seal,
+                        ingest_spool,
+                        pull,
+                        export_delta,
+                    },
+                ),
                 ArchiveCmd::Ls => archive::cmd_ls(&a),
                 ArchiveCmd::Path => archive::cmd_path(&a),
             }

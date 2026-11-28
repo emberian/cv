@@ -24,8 +24,8 @@ use std::time::Duration;
 pub use recorder::{default_host_label, AppendRequest, FaultMode, RecorderServer};
 pub use schema::{current_schema_version, STATE_SCHEMA_VERSION};
 pub use tables::{
-    CaptureInboxRow, CustodyAck, LaneEndpointBinding, LaneRun, LineageEdge, PackManifest, Producer, ReceiptRecord,
-    WriterEpoch,
+    CaptureInboxRow, CustodyAck, CustodyCommitRow, LaneEndpointBinding, LaneRun, LineageEdge, PackManifest, Producer,
+    ReceiptRecord, ShipCursorRow, WriterEpoch,
 };
 
 /// Default producer identifier used when a local caller appends without explicit enrollment.

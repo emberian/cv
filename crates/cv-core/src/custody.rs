@@ -679,8 +679,13 @@ pub(crate) fn or_archived(
     mut rows: Vec<Backing>,
     id: &str,
 ) -> Result<Option<crate::FoundSession>> {
-    if live.is_some() {
-        return Ok(live);
+    if let Some((r, adapter)) = live {
+        if !is_pack_ref(&r) {
+            return Ok(Some((r, adapter)));
+        }
+        if let Some(backed) = backing_for(&r)? {
+            return Ok(Some((r, backed)));
+        }
     }
     if rows.iter().any(|b| b.reference.id == id || b.key.native_id == id) {
         rows.retain(|b| b.reference.id == id || b.key.native_id == id);
@@ -714,7 +719,7 @@ pub fn head_entries(home: &Path) -> Result<ArchiveSessionMap> {
     Ok(by_key)
 }
 
-pub(crate) fn backing_from_hub_head(
+pub fn backing_from_hub_head(
     hub_packs_dir: &Path,
     entry: crate::state::hub::SessionRevisionEntry,
 ) -> Result<Option<Backing>> {

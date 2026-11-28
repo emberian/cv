@@ -106,6 +106,136 @@ pub struct HubGenerationRecord {
     pub pinned: bool,
 }
 
+/// Lifecycle state declared by a producer (`Active` vs container-exit `Sealed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProducerLifecycle {
+    Active,
+    Sealed {
+        sealed_at_ms: i64,
+        final_epoch: String,
+        final_seq: u64,
+    },
+}
+
+/// Overall soundness status of a semiauthoritative query response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityStatus {
+    Complete,
+    IndexedOnly,
+    Partial,
+}
+
+impl AuthorityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::IndexedOnly => "indexed_only",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+/// Liveness and completeness classification of a single place (`producer_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceState {
+    Live,
+    Quiet,
+    Sealed,
+    Unknown,
+    Partitioned,
+    Quarantined,
+}
+
+/// Per-place watermark and replication-policy digest inside [`AuthorityEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceWatermark {
+    pub place_id: String,
+    pub host_label: String,
+    pub epoch: String,
+    pub contiguous_seq: u64,
+    pub producer_head_seq: Option<u64>,
+    pub last_contact_ms: Option<i64>,
+    pub state: PlaceState,
+    pub scrub_ruleset: String,
+    pub filter_digest: String,
+}
+
+/// Explicit witness explaining why [`AuthorityStatus`] downgraded to `Partial`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityOmission {
+    pub place_id: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// Semiauthoritative completeness and staleness envelope attached to multi-place queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityEnvelope {
+    pub generation: u64,
+    pub indexed_generation: u64,
+    pub status: AuthorityStatus,
+    pub places: Vec<PlaceWatermark>,
+    pub omissions: Vec<AuthorityOmission>,
+}
+
+/// Input parameters evaluated by [`HubStore::compute_authority`] / [`HubStore::check_authority`].
+#[derive(Debug, Clone, Default)]
+pub struct AuthorityQueryContext<'a> {
+    pub place_glob: Option<&'a str>,
+    pub as_of_gen: Option<u64>,
+    pub max_staleness_ms: Option<i64>,
+    pub cwd_filter: Option<&'a str>,
+    pub query_str: Option<&'a str>,
+    pub has_negation: bool,
+    pub indexed_only: bool,
+    pub include_local: bool,
+}
+
+/// Returned when `--max-staleness` / `?max_staleness=` is violated by one or more selected places.
+#[derive(Debug, Clone)]
+pub struct StalenessViolation {
+    pub message: String,
+    pub authority: AuthorityEnvelope,
+}
+
+impl std::fmt::Display for StalenessViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Parse a human staleness duration (`500ms`, `30s`, `5m`, `2h`, `1d`) into milliseconds.
+pub fn parse_duration_ms(raw: &str) -> Result<i64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("duration must not be empty (try `30s`, `5m`, `1h`)".into());
+    }
+    let (num_part, mul_ms) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1i64)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1_000i64)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000i64)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000i64)
+    } else if let Some(v) = s.strip_suffix('d') {
+        (v, 86_400_000i64)
+    } else {
+        (s, 1_000i64)
+    };
+    let val: f64 = num_part
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid duration {raw:?} (try `30s`, `5m`, `1h`)"))?;
+    if !val.is_finite() || val < 0.0 {
+        return Err(format!("duration {raw:?} must be non-negative"));
+    }
+    Ok((val * (mul_ms as f64)).round() as i64)
+}
+
 /// Immutable, monotonically numbered fleet read-consistency manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotPublicationManifest {
@@ -923,8 +1053,10 @@ pub(crate) fn fold_origin_range_in_tx(
                         let prev_entry: Option<SessionRevisionEntry> = tx
                             .query_row(
                                 "SELECT entry_json FROM hub_epoch_sessions
-                                 WHERE producer_id = ?1 AND session_id = ?2 AND epoch = ?3 AND is_delete = 0",
-                                rusqlite::params![producer_id, &session_id, epoch],
+                                 WHERE producer_id = ?1 AND session_id = ?2 AND is_delete = 0
+                                 ORDER BY sort_ts_ms DESC, epoch DESC, event_seq DESC
+                                 LIMIT 1",
+                                rusqlite::params![producer_id, &session_id],
                                 |r| r.get::<_, Option<String>>(0),
                             )
                             .optional()?
@@ -2652,5 +2784,417 @@ impl HubStore {
         };
         tx.commit()?;
         Ok(rebuilt)
+    }
+
+    /// Record that the search index has caught up through `indexed_gen`.
+    pub fn record_indexed_generation(&self, indexed_gen: u64) -> Result<(), HubError> {
+        if crate::env::frozen() || indexed_gen == 0 {
+            return Ok(());
+        }
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_table: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_generations')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_table {
+            tx.execute(
+                "UPDATE hub_generations
+                 SET indexed_generation = MAX(indexed_generation, ?1)
+                 WHERE generation <= ?1",
+                [indexed_gen as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Evaluate the semiauthoritative [`AuthorityEnvelope`] for `ctx`, enforcing open-world
+    /// soundness over producer lifecycles (`Sealed` vs unsealed), frontiers, quarantines,
+    /// filter/scrub rules, and negations. Safe under `--frozen`.
+    pub fn compute_authority(&self, ctx: &AuthorityQueryContext<'_>) -> Result<AuthorityEnvelope, HubError> {
+        const DEFAULT_LIVE_MS: i64 = 60_000;
+        const DEFAULT_PARTITION_MS: i64 = 300_000;
+
+        let now_ms = Utc::now().timestamp_millis();
+        let partition_threshold_ms = ctx.max_staleness_ms.unwrap_or(DEFAULT_PARTITION_MS);
+
+        let gen_rec = match ctx.as_of_gen {
+            Some(g) => self.resolve_generation(Some(&g.to_string()))?,
+            None => self.resolve_generation(None)?,
+        };
+        let generation = gen_rec.as_ref().map_or(0, |g| g.generation);
+        let indexed_generation = match &gen_rec {
+            Some(g) if g.indexed_generation > 0 => g.indexed_generation,
+            _ => self.resolve_generation(None)?.map_or(0, |g| g.indexed_generation),
+        };
+
+        let producers = self.store.list_producers()?;
+        let (frontiers, quarantine) = match self.store.read_in(|conn| {
+            let has_hub: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_frontiers')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_hub {
+                return Ok((
+                    Vec::new(),
+                    QuarantineSummary {
+                        count: 0,
+                        entries: Vec::new(),
+                    },
+                ));
+            }
+            let f = read_frontiers_in_conn(conn).map_err(|e| crate::state::StateError::Io(std::io::Error::other(e)))?;
+            let q =
+                read_quarantine_in_conn(conn).map_err(|e| crate::state::StateError::Io(std::io::Error::other(e)))?;
+            Ok((f, q))
+        })? {
+            Some(pair) => pair,
+            None => (
+                Vec::new(),
+                QuarantineSummary {
+                    count: 0,
+                    entries: Vec::new(),
+                },
+            ),
+        };
+
+        // Group frontiers by producer_id (picking newest epoch for summary watermark, while tracking any buffered gap).
+        let mut frontiers_by_prod: BTreeMap<String, Vec<&FrontierStatus>> = BTreeMap::new();
+        for f in &frontiers {
+            frontiers_by_prod.entry(f.producer_id.clone()).or_default().push(f);
+        }
+        let mut quarantined_prods: BTreeSet<String> = BTreeSet::new();
+        for q in &quarantine.entries {
+            quarantined_prods.insert(q.event_id.producer_id.clone());
+        }
+
+        let query_lower = ctx.query_str.unwrap_or("").to_lowercase();
+        let query_mentions_secret = [
+            "sk-ant-",
+            "sk-proj-",
+            "ghp_",
+            "akia",
+            "begin openssh private key",
+            "begin rsa private key",
+            "eyjhbgci",
+        ]
+        .iter()
+        .any(|needle| query_lower.contains(needle));
+        let query_has_negation = ctx.has_negation
+            || query_lower
+                .split_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case("not") || (tok.starts_with('-') && tok.len() > 1));
+
+        let mut places: Vec<PlaceWatermark> = Vec::new();
+        let mut omissions: Vec<AuthorityOmission> = Vec::new();
+
+        // Include `"local"` when requested and not pinned to a hub generation.
+        let local_matches = ctx.place_glob.is_none_or(|pat| crate::query::glob_match(pat, "local"));
+        if ctx.include_local
+            && ctx.as_of_gen.is_none()
+            && local_matches
+            && producers.iter().all(|p| p.producer_id != "local")
+        {
+            places.push(PlaceWatermark {
+                place_id: "local".into(),
+                host_label: crate::state::default_host_label(),
+                epoch: "live".into(),
+                contiguous_seq: 0,
+                producer_head_seq: Some(0),
+                last_contact_ms: Some(now_ms),
+                state: PlaceState::Live,
+                scrub_ruleset: "none".into(),
+                filter_digest: "none".into(),
+            });
+        }
+
+        for prod in &producers {
+            // Skip local internal bootstrap row if it never shipped hub frontiers and other hub producers exist.
+            let prod_frontiers = frontiers_by_prod.get(&prod.producer_id);
+            if prod.producer_id == "local" && prod_frontiers.is_none() && !quarantined_prods.contains("local") {
+                continue;
+            }
+            if let Some(pat) = ctx.place_glob {
+                if !crate::query::glob_match(pat, &prod.producer_id) && !crate::query::glob_match(pat, &prod.host_label)
+                {
+                    continue;
+                }
+            }
+
+            let scrub_ruleset = prod
+                .metadata
+                .get("scrub_ruleset")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let filter_digest = prod
+                .metadata
+                .get("filter_digest")
+                .and_then(Value::as_str)
+                .unwrap_or("unfiltered")
+                .to_string();
+            let lifecycle = prod
+                .metadata
+                .get("lifecycle")
+                .and_then(|v| serde_json::from_value::<ProducerLifecycle>(v.clone()).ok());
+
+            let latest_f = prod_frontiers.and_then(|list| list.last().copied());
+            let epoch = latest_f
+                .map(|f| f.epoch.clone())
+                .or_else(|| match &lifecycle {
+                    Some(ProducerLifecycle::Sealed { final_epoch, .. }) => Some(final_epoch.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let contiguous_seq = latest_f.map_or(0, |f| f.contiguous_seq);
+            let any_gap = prod_frontiers.is_some_and(|list| {
+                list.iter()
+                    .any(|f| f.buffered_count > 0 || f.contiguous_seq < f.max_received_seq)
+            });
+            let any_conflict = quarantined_prods.contains(&prod.producer_id)
+                || prod_frontiers.is_some_and(|list| list.iter().any(|f| f.first_conflict_seq.is_some()));
+
+            let last_contact_ms = match latest_f {
+                Some(f) => Some(f.updated_at.max(prod.updated_at)),
+                None => Some(prod.updated_at),
+            };
+
+            let (state, producer_head_seq) = if any_conflict {
+                let head = latest_f.map(|f| f.max_received_seq);
+                omissions.push(AuthorityOmission {
+                    place_id: prod.producer_id.clone(),
+                    reason: "quarantined".into(),
+                    detail: format!(
+                        "place `{}` has unresolved conflict quarantine entries",
+                        prod.producer_id
+                    ),
+                });
+                (PlaceState::Quarantined, head)
+            } else if let Some(ProducerLifecycle::Sealed {
+                final_epoch: _,
+                final_seq,
+                ..
+            }) = &lifecycle
+            {
+                if contiguous_seq >= *final_seq && !any_gap {
+                    // Open-world soundness: a Sealed sandbox epoch at contiguous_seq == head is
+                    // Complete forever without heartbeats!
+                    (PlaceState::Sealed, Some(*final_seq))
+                } else {
+                    omissions.push(AuthorityOmission {
+                        place_id: prod.producer_id.clone(),
+                        reason: "incomplete_sealed_frontier".into(),
+                        detail: format!(
+                            "sealed place `{}` at contiguous_seq={} < final_seq={}",
+                            prod.producer_id, contiguous_seq, final_seq
+                        ),
+                    });
+                    (PlaceState::Partitioned, Some(*final_seq))
+                }
+            } else if latest_f.is_none() {
+                omissions.push(AuthorityOmission {
+                    place_id: prod.producer_id.clone(),
+                    reason: "unknown_frontier".into(),
+                    detail: format!("place `{}` enrolled without committed frontier", prod.producer_id),
+                });
+                (PlaceState::Unknown, None)
+            } else {
+                let head = latest_f.map(|f| f.max_received_seq);
+                let age_ms = last_contact_ms.map_or(i64::MAX, |ts| (now_ms - ts).max(0));
+                if any_gap || age_ms > partition_threshold_ms {
+                    omissions.push(AuthorityOmission {
+                        place_id: prod.producer_id.clone(),
+                        reason: if any_gap {
+                            "frontier_gap"
+                        } else {
+                            "stale_or_partitioned"
+                        }
+                        .into(),
+                        detail: if any_gap {
+                            format!(
+                                "place `{}` has buffered out-of-order events above contiguous_seq={}",
+                                prod.producer_id, contiguous_seq
+                            )
+                        } else {
+                            format!(
+                                "place `{}` last contacted {}ms ago (> {}ms threshold)",
+                                prod.producer_id, age_ms, partition_threshold_ms
+                            )
+                        },
+                    });
+                    (PlaceState::Partitioned, head)
+                } else if age_ms > DEFAULT_LIVE_MS {
+                    (PlaceState::Quiet, head)
+                } else {
+                    (PlaceState::Live, head)
+                }
+            };
+
+            // Filter / Scrub / Negation soundness check against producer's declared policy
+            // (using producer-scoped BLAKE3 cwd-prefix commitments so secret deny_cwds never leak onto the hub!).
+            if let Some(policy) = prod.metadata.get("filter_policy").and_then(Value::as_object) {
+                let has_restrictive_filter = policy.get("restrictive").and_then(Value::as_bool).unwrap_or(false);
+                let has_allow_cwds = policy.get("has_allow_cwds").and_then(Value::as_bool).unwrap_or(false);
+                let allow_hashes: Vec<&str> = policy
+                    .get("allow_cwd_hashes")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let deny_hashes: Vec<&str> = policy
+                    .get("deny_cwd_hashes")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+
+                if let Some(want_cwd) = ctx.cwd_filter {
+                    let ancestor_hashes: Vec<String> = std::path::Path::new(want_cwd)
+                        .ancestors()
+                        .map(|a| super::shipper::hash_cwd_filter_prefix(&prod.producer_id, &a.to_string_lossy()))
+                        .collect();
+                    let denied = ancestor_hashes.iter().any(|ah| deny_hashes.contains(&ah.as_str()));
+                    let not_allowed =
+                        has_allow_cwds && !ancestor_hashes.iter().any(|ah| allow_hashes.contains(&ah.as_str()));
+                    if denied || not_allowed {
+                        omissions.push(AuthorityOmission {
+                            place_id: prod.producer_id.clone(),
+                            reason: "excluded_by_filter_cwd".into(),
+                            detail: format!(
+                                "place `{}` filter ({filter_digest}) excludes cwd `{want_cwd}`",
+                                prod.producer_id
+                            ),
+                        });
+                    }
+                } else if has_restrictive_filter && query_has_negation {
+                    omissions.push(AuthorityOmission {
+                        place_id: prod.producer_id.clone(),
+                        reason: "negation_under_filtered_producer".into(),
+                        detail: format!(
+                            "negated query over filtered place `{}` ({filter_digest}) is not closed-world complete",
+                            prod.producer_id
+                        ),
+                    });
+                }
+            }
+
+            let scrubbed_classes: Vec<&str> = prod
+                .metadata
+                .get("scrubbed_classes")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let scrubs_secrets = scrub_ruleset != "none" || !scrubbed_classes.is_empty();
+            if scrubs_secrets && query_mentions_secret {
+                omissions.push(AuthorityOmission {
+                    place_id: prod.producer_id.clone(),
+                    reason: "excluded_by_scrub_ruleset".into(),
+                    detail: format!(
+                        "place `{}` scrub profile ({scrub_ruleset}) redacts secret literals",
+                        prod.producer_id
+                    ),
+                });
+            }
+
+            places.push(PlaceWatermark {
+                place_id: prod.producer_id.clone(),
+                host_label: prod.host_label.clone(),
+                epoch,
+                contiguous_seq,
+                producer_head_seq,
+                last_contact_ms,
+                state,
+                scrub_ruleset,
+                filter_digest,
+            });
+        }
+
+        // If the caller explicitly asked for a concrete `--place <id>` (no glob wildcards) that
+        // matches zero known places, record an explicit `Unknown` witness rather than vacuously
+        // claiming `Complete` over the empty set!
+        if let Some(pat) = ctx.place_glob {
+            if places.is_empty() && !pat.is_empty() && !pat.contains('*') && !pat.contains('?') {
+                places.push(PlaceWatermark {
+                    place_id: pat.to_string(),
+                    host_label: String::new(),
+                    epoch: String::new(),
+                    contiguous_seq: 0,
+                    producer_head_seq: None,
+                    last_contact_ms: None,
+                    state: PlaceState::Unknown,
+                    scrub_ruleset: "unknown".into(),
+                    filter_digest: "unknown".into(),
+                });
+                omissions.push(AuthorityOmission {
+                    place_id: pat.to_string(),
+                    reason: "unknown_place".into(),
+                    detail: format!("place `{pat}` is not enrolled on this hub"),
+                });
+            }
+        }
+
+        let status = if !omissions.is_empty() {
+            AuthorityStatus::Partial
+        } else if ctx.indexed_only && (generation > indexed_generation || generation == 0) {
+            AuthorityStatus::IndexedOnly
+        } else {
+            AuthorityStatus::Complete
+        };
+
+        Ok(AuthorityEnvelope {
+            generation,
+            indexed_generation,
+            status,
+            places,
+            omissions,
+        })
+    }
+
+    /// Evaluate [`Self::compute_authority`] and fail closed with [`StalenessViolation`] when
+    /// `ctx.max_staleness_ms` is violated by any selected non-`Sealed` place.
+    pub fn check_authority(&self, ctx: &AuthorityQueryContext<'_>) -> Result<AuthorityEnvelope, StalenessViolation> {
+        let authority = self.compute_authority(ctx).map_err(|e| StalenessViolation {
+            message: format!("authority evaluation failed: {e}"),
+            authority: AuthorityEnvelope {
+                generation: 0,
+                indexed_generation: 0,
+                status: AuthorityStatus::Partial,
+                places: Vec::new(),
+                omissions: Vec::new(),
+            },
+        })?;
+
+        if let Some(max_ms) = ctx.max_staleness_ms {
+            let now_ms = Utc::now().timestamp_millis();
+            let mut violations = Vec::new();
+            for p in &authority.places {
+                match p.state {
+                    PlaceState::Sealed => {
+                        // Sealed sandbox at final head never expires without heartbeats!
+                    }
+                    PlaceState::Unknown | PlaceState::Partitioned | PlaceState::Quarantined => {
+                        violations.push(format!("{} ({:?})", p.place_id, p.state));
+                    }
+                    PlaceState::Live | PlaceState::Quiet => {
+                        let age_ms = p.last_contact_ms.map_or(i64::MAX, |ts| (now_ms - ts).max(0));
+                        if age_ms > max_ms {
+                            violations.push(format!("{} (stale {}ms > {}ms)", p.place_id, age_ms, max_ms));
+                        }
+                    }
+                }
+            }
+            if !violations.is_empty() {
+                return Err(StalenessViolation {
+                    message: format!(
+                        "max-staleness ({max_ms}ms) violated by place(s): {}",
+                        violations.join(", ")
+                    ),
+                    authority,
+                });
+            }
+        }
+
+        Ok(authority)
     }
 }

@@ -328,6 +328,8 @@ impl Archive {
         let mut written = Vec::with_capacity(staged.len());
 
         for item in staged {
+            let is_native_delta_append =
+                matches!(&item.content, Content::Native { prior, document, .. } if !prior.is_empty() && !*document);
             let anchor = cv_core::custody::archive_anchor(&cv_core::SessionKey {
                 producer: producer_id.clone(),
                 ..item.key.clone()
@@ -504,7 +506,7 @@ impl Archive {
                 addr,
                 custody,
             });
-            written.push(item.key);
+            written.push((item.key, is_native_delta_append));
         }
         if entries.is_empty() {
             return Ok(summary);
@@ -520,11 +522,13 @@ impl Archive {
         // 2. Append capture envelopes to `StateStore` (`capture_inbox`) with pack-scoped `op_id`s
         //    (preventing retry wedges if an earlier pack failed before publishing) and record each
         //    archived session's exact `local_commit_pos` + `(epoch, seq)` for `Shipper::sync`.
+        //    Appended native extents emit `"kind": "session_delta"` carrying ONLY the newly added
+        //    `delta_extents: [entry.addr]` (`O(1)` per commit, avoiding `O(R^2)` extent rewrites!).
         let mut committed = Vec::with_capacity(entries.len());
-        for (key, entry) in written.iter().zip(entries.iter()) {
+        for ((key, is_delta_append), entry) in written.iter().zip(entries.iter()) {
             let op_id = format!("archive:{pack_id}:{}", key.selector());
             let mut envelope = json!({
-                "kind": "session_archive",
+                "kind": if *is_delta_append { "session_delta" } else { "session_archive" },
                 "producer_id": producer_id,
                 "harness": entry.harness,
                 "session_id": entry.id,
@@ -539,7 +543,24 @@ impl Archive {
                 "decoded_offset": entry.addr.decoded_offset,
                 "length": entry.addr.length,
             });
-            if !entry.custody.is_projection() {
+            if *is_delta_append {
+                if let cv_core::custody::CustodyKind::NativeExtents {
+                    total_bytes,
+                    prefix_blake3,
+                    file_name,
+                    layout,
+                    ..
+                } = &entry.custody
+                {
+                    envelope["total_bytes"] = json!(total_bytes);
+                    envelope["prefix_blake3"] = json!(prefix_blake3);
+                    envelope["file_name"] = json!(file_name);
+                    if !layout.is_empty() {
+                        envelope["layout"] = json!(layout);
+                    }
+                    envelope["delta_extents"] = json!([entry.addr]);
+                }
+            } else if !entry.custody.is_projection() {
                 envelope["custody"] = serde_json::to_value(&entry.custody)?;
             }
             let payload_ref_json = serde_json::to_string(&entry.addr)?;
@@ -1162,10 +1183,146 @@ fn format_ship_report(target_name: &str, report: &cv_core::state::hub::ShipRepor
     )
 }
 
-pub fn cmd_sync(archive: &Archive, to: Option<String>, token: Option<String>) -> Result<()> {
+#[derive(Default)]
+pub struct SyncArgs {
+    pub to: Option<String>,
+    pub token: Option<String>,
+    pub spool: Option<PathBuf>,
+    pub seal: bool,
+    pub ingest_spool: Option<PathBuf>,
+    pub pull: Option<String>,
+    pub export_delta: Option<String>,
+}
+
+fn resolve_local_producer_id(store: &StateStore) -> Result<String> {
+    if let Ok(explicit) = cv_core::env::var("CV_PRODUCER_ID") {
+        if !explicit.trim().is_empty() {
+            return Ok(explicit.trim().to_string());
+        }
+    }
+    if cv_core::env::frozen() {
+        for p in store.list_producers().unwrap_or_default() {
+            if let Some(ship_id) = p.metadata.get("ship_producer_id").and_then(|v| v.as_str()) {
+                if !ship_id.trim().is_empty() {
+                    return Ok(ship_id.to_string());
+                }
+            }
+            if p.producer_id != "local" {
+                return Ok(p.producer_id);
+            }
+        }
+        return Ok(format!("host-{}", cv_core::state::default_host_label()));
+    }
+    store
+        .ensure_ship_producer_id()
+        .context("resolving local replication producer_id")
+}
+
+pub fn cmd_sync(archive: &Archive, args: SyncArgs) -> Result<()> {
+    // 1. Read-only `--export-delta <WATERMARK>` mode (runs cleanly under `--frozen`, writing pure
+    //    `CVDLT001` binary delta stream to stdout for `cv archive sync --pull <SSH_TARGET>`).
+    if let Some(ref watermark) = args.export_delta {
+        let store = archive.state_store();
+        let producer_id = resolve_local_producer_id(&store)?;
+        let cfg = cv_core::config::load();
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        cv_core::state::hub::export_delta_stream(
+            &store,
+            &archive.packs_dir(),
+            &producer_id,
+            &cv_core::state::default_host_label(),
+            &cfg.privacy,
+            watermark,
+            &mut handle,
+        )
+        .map_err(|e| match e {
+            cv_core::state::hub::HubError::InvalidArgument(msg) => anyhow::Error::from(crate::util::UsageError(msg)),
+            other => anyhow::Error::from(other),
+        })?;
+        return Ok(());
+    }
+
+    // 2. Hub spool ingest (`cv archive sync --ingest-spool <DIR>`): idempotently import sandbox spool.
+    if let Some(ref spool_dir) = args.ingest_spool {
+        let hub = cv_core::state::hub::HubStore::at_home(&archive.home);
+        let rep = hub.ingest_spool_dir(spool_dir).map_err(|e| match e {
+            cv_core::state::hub::HubError::InvalidArgument(msg) => anyhow::Error::from(crate::util::UsageError(msg)),
+            other => anyhow::Error::from(other),
+        })?;
+        let gen_note = rep
+            .hub_generation
+            .map(|g| format!(" · generation {g}"))
+            .unwrap_or_default();
+        println!(
+            "✦ ingested {} batch(es) ({} accepted, {} replayed) from {} → {}{gen_note}",
+            rep.batches_ingested,
+            rep.events_accepted,
+            rep.events_replayed,
+            spool_dir.display(),
+            archive.home.display(),
+        );
+        return Ok(());
+    }
+
+    // 3. Agentless SSH `--frozen` pull (`cv archive sync --pull <SSH_TARGET>`).
+    if let Some(ref ssh_target) = args.pull {
+        let ssh_target = ssh_target.trim();
+        if ssh_target.is_empty() || ssh_target.starts_with('-') {
+            return crate::util::usage("invalid --pull SSH target");
+        }
+        let hub = cv_core::state::hub::HubStore::at_home(&archive.home);
+        let watermark = hub.pull_watermark_for(ssh_target)?;
+        let ssh_bin = cv_core::env::var("CV_SSH_BIN").unwrap_or_else(|_| "ssh".into());
+        let remote_cv = cv_core::env::var("CV_REMOTE_BIN").unwrap_or_else(|_| "cv".into());
+        let child = std::process::Command::new(&ssh_bin)
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=3",
+                ssh_target,
+                &remote_cv,
+                "--frozen",
+                "archive",
+                "sync",
+                "--export-delta",
+                &watermark,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning `{ssh_bin}` to pull delta from `{ssh_target}`"))?;
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("waiting for `{ssh_bin}` pull from `{ssh_target}`"))?;
+        if !out.status.success() {
+            bail!(
+                "pull from `{ssh_target}` failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let rep = hub
+            .ingest_delta_stream(std::io::Cursor::new(&out.stdout), Some(ssh_target))
+            .with_context(|| format!("ingesting delta stream pulled from `{ssh_target}`"))?;
+        let gen_note = rep
+            .hub_generation
+            .map(|g| format!(" · generation {g}"))
+            .unwrap_or_default();
+        println!(
+            "✦ pulled {} new event(s) ({} replayed) from {ssh_target} → {}{gen_note}",
+            rep.events_accepted,
+            rep.events_replayed,
+            archive.home.display(),
+        );
+        return Ok(());
+    }
+
     // Validate `--to` upfront before spending time syncing locally if the target profile is missing.
-    let resolved_shipper = match to.as_deref() {
-        Some(target) => Some(resolve_shipper(archive, target, token.as_deref())?),
+    let resolved_shipper = match args.to.as_deref() {
+        Some(target) => Some(resolve_shipper(archive, target, args.token.as_deref())?),
         None => None,
     };
 
@@ -1200,6 +1357,29 @@ pub fn cmd_sync(archive: &Archive, to: Option<String>, token: Option<String>) ->
             .with_context(|| format!("shipping archive custody to `{target_name}`"))?;
         println!("{}", format_ship_report(&target_name, &report));
     }
+
+    if let Some(ref spool_dir) = args.spool {
+        let store = archive.state_store();
+        let producer_id = resolve_local_producer_id(&store)?;
+        let cfg = cv_core::config::load();
+        let rep = cv_core::state::hub::export_to_spool(
+            &store,
+            &archive.packs_dir(),
+            spool_dir,
+            &producer_id,
+            &cv_core::state::default_host_label(),
+            &cfg.privacy,
+            args.seal,
+        )?;
+        println!(
+            "  ↳ spooled {} event(s), {} pack(s){} → {}",
+            rep.events_spooled,
+            rep.packs_written,
+            if rep.sealed { " [SEALED]" } else { "" },
+            spool_dir.display(),
+        );
+    }
+
     Ok(())
 }
 

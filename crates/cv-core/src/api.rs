@@ -63,6 +63,8 @@ routes! {
 
         GET ["api", "sessions"] => sessions(query),
 
+        GET ["api", "places"] => places(query),
+
         GET ["api", "session", harness, id] => session(harness, id, query),
 
         GET ["api", "session", harness, id, "head"] => session_head(harness, id),
@@ -263,32 +265,7 @@ pub fn inbox_window(
 
 // --- sessions -----------------------------------------------------------------------------------
 
-pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
-    let pat = pattern.as_bytes();
-    let txt = text.as_bytes();
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
-    while ti < txt.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == txt[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = Some(pi);
-            pi += 1;
-            star_ti = ti;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
-}
+pub use crate::query::glob_match;
 
 pub(crate) fn parse_live_ref(r: &SessionRef) -> Option<Session> {
     if let Ok(Some((found, adapter))) = crate::find(&r.id, Some(r.harness)) {
@@ -315,8 +292,100 @@ fn hub_head_to_ref(packs_dir: &std::path::Path, entry: &crate::state::hub::Sessi
     })
 }
 
-/// `GET /api/sessions?harness=&cwd=&place=&as_of=&q=&offset=&limit=` — the §3 session rows,
-/// filtered, newest activity first.
+#[cfg(feature = "sqlite")]
+fn evaluate_api_authority(
+    params: &Query,
+    resolved_as_of_gen: Option<u64>,
+    has_negation: bool,
+    indexed_only: bool,
+) -> Result<crate::state::hub::AuthorityEnvelope, (u16, Value)> {
+    let max_staleness_ms = match params.get("max_staleness") {
+        Some(raw) => match crate::state::hub::parse_duration_ms(&raw) {
+            Ok(ms) => Some(ms),
+            Err(e) => return Err(err(400, &e)),
+        },
+        None => None,
+    };
+    let place = params.get("place").or_else(|| params.get("producer"));
+    let cwd = params.get("cwd");
+    let q_str = params.get("q");
+    let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
+        return Ok(crate::state::hub::AuthorityEnvelope {
+            generation: 0,
+            indexed_generation: 0,
+            status: crate::state::hub::AuthorityStatus::Complete,
+            places: Vec::new(),
+            omissions: Vec::new(),
+        });
+    };
+    let ctx = crate::state::hub::AuthorityQueryContext {
+        place_glob: place.as_deref(),
+        as_of_gen: resolved_as_of_gen,
+        max_staleness_ms,
+        cwd_filter: cwd.as_deref(),
+        query_str: q_str.as_deref(),
+        has_negation,
+        indexed_only,
+        include_local: resolved_as_of_gen.is_none(),
+    };
+    hub.check_authority(&ctx).map_err(|v| {
+        (
+            503,
+            json!({
+                "error": v.message,
+                "authority": v.authority,
+            }),
+        )
+    })
+}
+
+/// `GET /api/places?place=&as_of=&max_staleness=` — enrolled places, watermarks, and authority status.
+fn places(query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+    #[cfg(feature = "sqlite")]
+    {
+        let resolved_as_of = match as_of {
+            Some(ref spec) => {
+                let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
+                    return err(404, &format!("snapshot `{spec}` not found"));
+                };
+                match hub.resolve_generation(Some(spec)) {
+                    Ok(Some(g)) => Some(g.generation),
+                    Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
+                        return err(404, &format!("snapshot `{spec}` not found"))
+                    }
+                    Err(e) => return err(400, &e.to_string()),
+                }
+            }
+            None => None,
+        };
+        match evaluate_api_authority(&params, resolved_as_of, false, false) {
+            Ok(env) => ok(json!({
+                "places": env.places,
+                "authority": env,
+            })),
+            Err(reply) => reply,
+        }
+    }
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = (params, as_of);
+        ok(json!({
+            "places": [],
+            "authority": {
+                "generation": 0,
+                "indexed_generation": 0,
+                "status": "complete",
+                "places": [],
+                "omissions": [],
+            }
+        }))
+    }
+}
+
+/// `GET /api/sessions?harness=&cwd=&place=&as_of=&max_staleness=&authority=1&q=&offset=&limit=` —
+/// the §3 session rows, filtered, newest activity first.
 fn sessions(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let harness = match params.get("harness") {
@@ -436,7 +505,13 @@ fn sessions(query: &str) -> (u16, Value) {
                         crate::custody::backing_for_as_of(r, resolved_as_of_gen)
                             .ok()
                             .flatten()
-                            .and_then(|a| a.parse(r).ok())
+                            .and_then(|a| {
+                                let mut sink = crate::stream::CollectSink::default();
+                                let mut s = a.stream(r, &crate::Demand::RICH, &mut sink).ok()?;
+                                s.messages = sink.messages;
+                                s.materialize().ok()?;
+                                Some(s)
+                            })
                     } else {
                         parse_live_ref(r)
                     }
@@ -461,23 +536,38 @@ fn sessions(query: &str) -> (u16, Value) {
     };
     const METADATA_BATCH_SIZE: usize = 256;
     let mut probe = crate::source::Probe::default();
-    ok(Value::Array(
-        sliced
-            .into_iter()
-            .enumerate()
-            .map(|(idx, r)| {
-                if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
-                    probe = crate::source::Probe::default();
-                }
-                let (size, store) = if r.path.as_os_str().is_empty() {
-                    (None, None)
-                } else {
-                    crate::rows::ref_sizes(&mut probe, r)
-                };
-                crate::rows::session_row_with_store(r, size, store)
-            })
-            .collect(),
-    ))
+    let rows: Vec<Value> = sliced
+        .into_iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
+                probe = crate::source::Probe::default();
+            }
+            let (size, store) = if r.path.as_os_str().is_empty() {
+                (None, None)
+            } else {
+                crate::rows::ref_sizes(&mut probe, r)
+            };
+            crate::rows::session_row_with_store(r, size, store)
+        })
+        .collect();
+
+    #[cfg(feature = "sqlite")]
+    if params.get("max_staleness").is_some() || params.flag("authority") {
+        let has_neg = parsed_q.as_ref().is_some_and(crate::query::SessionQuery::has_negation);
+        let env = match evaluate_api_authority(&params, resolved_as_of_gen, has_neg, false) {
+            Ok(env) => env,
+            Err(reply) => return reply,
+        };
+        if params.flag("authority") {
+            return ok(json!({
+                "sessions": rows,
+                "authority": env,
+            }));
+        }
+    }
+
+    ok(Value::Array(rows))
 }
 
 /// Look up one session by harness name + id (or unique prefix), with each failure already a reply.
@@ -807,12 +897,102 @@ fn messages(harness: &str, id: &str, query: &str) -> (u16, Value) {
     ok(window_envelope(&r, &sink, messages))
 }
 
-/// `GET /api/session/{harness}/{id}/events?kind=` — the session's extracted tool events (file
-/// edits/reads, commands, errors) from the event catalog, in transcript order, as `cv events
-/// --json` rows. A stale or missing catalog row is (re)ingested on the spot.
+/// `GET /api/session/{harness}/{id}/events?kind=&as_of=&max_staleness=&authority=1` — the session's
+/// extracted tool events (file edits/reads, commands, errors) from the event catalog, in transcript
+/// order, as `cv events --json` rows. A stale or missing catalog row is (re)ingested on the spot.
 fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
     use crate::events;
-    let kind = Query::parse(query).get("kind");
+    let params = Query::parse(query);
+    let kind = params.get("kind");
+    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+
+    #[cfg(feature = "sqlite")]
+    if let Some(ref spec) = as_of {
+        let Some(want_harness) = Harness::parse(harness) else {
+            return err(400, &format!("unknown harness {harness:?}"));
+        };
+        let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
+            return err(404, &format!("snapshot `{spec}` not found"));
+        };
+        let gen_rec = match hub.resolve_generation(Some(spec)) {
+            Ok(Some(g)) => g,
+            Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
+                return err(404, &format!("snapshot `{spec}` not found"))
+            }
+            Err(e) => return err(400, &e.to_string()),
+        };
+        let env = match evaluate_api_authority(&params, Some(gen_rec.generation), false, false) {
+            Ok(env) => env,
+            Err(reply) => return reply,
+        };
+        let heads = match hub.heads_at_generation(Some(gen_rec.generation)) {
+            Ok(h) => h,
+            Err(e) => return err(500, &e.to_string()),
+        };
+        let matched = heads.into_iter().find(|e| {
+            Harness::parse(&e.harness) == Some(want_harness)
+                && (e.selector_string() == id
+                    || e.session_id == id
+                    || e.metadata.get("native_id").and_then(Value::as_str) == Some(id))
+        });
+        let Some(entry) = matched else {
+            return err(404, "session not found");
+        };
+        let Some(backing) = crate::custody::backing_from_hub_head(hub.packs_dir(), entry)
+            .ok()
+            .flatten()
+        else {
+            return err(404, "session payload not mirrored");
+        };
+        let mut sink = events::EventSink::new(backing.reference.cwd.clone());
+        if let Err(e) = crate::Adapter::stream(
+            &backing,
+            &backing.reference,
+            &crate::Demand::LEAN.with_spans(),
+            &mut sink,
+        ) {
+            return err(500, &format!("event extraction failed: {e:#}"));
+        }
+        let extracted = match sink.into_events() {
+            Ok(evs) => evs,
+            Err(e) => return err(500, &format!("event extraction failed: {e:#}")),
+        };
+        let out: Vec<Value> = extracted
+            .into_iter()
+            .filter(|e| kind.as_deref().is_none_or(|k| e.kind == k))
+            .map(|e| {
+                crate::rows::event_row(&events::EventRow {
+                    baggage: None,
+                    harness: backing.reference.harness.as_str().to_string(),
+                    session_id: backing.reference.id.clone(),
+                    msg_idx: e.msg_idx as i64,
+                    ts: e.ts,
+                    kind: e.kind.to_string(),
+                    tool: e.tool,
+                    target: e.target,
+                    detail: e.detail,
+                    parent_id: None,
+                    agent_id: None,
+                    workflow: None,
+                })
+            })
+            .collect();
+        if params.flag("authority") {
+            return ok(json!({ "events": out, "authority": env }));
+        }
+        return ok(json!(out));
+    }
+
+    #[cfg(feature = "sqlite")]
+    let auth_opt = if params.get("max_staleness").is_some() || params.flag("authority") {
+        match evaluate_api_authority(&params, None, false, false) {
+            Ok(env) => Some(env),
+            Err(reply) => return reply,
+        }
+    } else {
+        None
+    };
+
     let (r, _) = match lookup(harness, id) {
         Ok(x) => x,
         Err(e) => return e,
@@ -822,6 +1002,12 @@ fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
         Err(e) => return err(500, &format!("event catalog: {e:#}")),
     };
     let out: Vec<Value> = rows.iter().map(crate::rows::event_row).collect();
+    #[cfg(feature = "sqlite")]
+    if let Some(env) = auth_opt {
+        if params.flag("authority") {
+            return ok(json!({ "events": out, "authority": env }));
+        }
+    }
     ok(json!(out))
 }
 
@@ -918,19 +1104,78 @@ fn compactions(harness: &str, id: &str) -> (u16, Value) {
     }
 }
 
-/// `GET /api/touched?path=&edits_only=` — sessions whose tool events touched a file (exact or
-/// suffix path match), newest activity first, as `cv touched --json` rows. Empty on a cold catalog;
-/// a catalog error is a 500, never an empty list.
+/// `GET /api/touched?path=&edits_only=&place=&as_of=&max_staleness=&authority=1` — sessions whose
+/// tool events touched a file (exact or suffix path match), newest activity first, as `cv touched
+/// --json` rows. Empty on a cold catalog; a catalog error is a 500, never an empty list.
 fn touched(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let Some(path) = params.get("path") else {
         return err(400, "missing path parameter");
     };
-    let rows = match crate::events::sessions_touching(&path, params.flag("edits_only")) {
+    let place = params.get("place").or_else(|| params.get("producer"));
+    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+
+    #[cfg(feature = "sqlite")]
+    let resolved_as_of = match as_of {
+        Some(ref spec) => {
+            let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
+                return err(404, &format!("snapshot `{spec}` not found"));
+            };
+            match hub.resolve_generation(Some(spec)) {
+                Ok(Some(g)) => Some(g.generation),
+                Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
+                    return err(404, &format!("snapshot `{spec}` not found"))
+                }
+                Err(e) => return err(400, &e.to_string()),
+            }
+        }
+        None => None,
+    };
+
+    #[cfg(feature = "sqlite")]
+    let auth_opt = if params.get("max_staleness").is_some() || params.flag("authority") || resolved_as_of.is_some() {
+        match evaluate_api_authority(&params, resolved_as_of, false, false) {
+            Ok(env) => Some(env),
+            Err(reply) => return reply,
+        }
+    } else {
+        None
+    };
+
+    let mut rows = match crate::events::sessions_touching(&path, params.flag("edits_only")) {
         Ok(rows) => rows,
         Err(e) => return err(500, &format!("event catalog: {e:#}")),
     };
+    if let Some(ref pat) = place {
+        #[cfg(feature = "sqlite")]
+        let hub_opt = crate::state::hub::HubStore::default_hub().ok();
+        rows.retain(|t| {
+            let p: String = if crate::SessionKey::split_selector(&t.session_id).is_none() {
+                "local".into()
+            } else {
+                #[cfg(feature = "sqlite")]
+                {
+                    hub_opt
+                        .as_ref()
+                        .and_then(|h| h.session_head_for(&t.session_id, resolved_as_of).ok().flatten())
+                        .map(|e| e.producer_id)
+                        .unwrap_or_else(|| "local".into())
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    "local".into()
+                }
+            };
+            glob_match(pat, &p)
+        });
+    }
     let out: Vec<Value> = rows.iter().map(crate::rows::touched_row).collect();
+    #[cfg(feature = "sqlite")]
+    if let Some(env) = auth_opt {
+        if params.flag("authority") {
+            return ok(json!({ "touched": out, "authority": env }));
+        }
+    }
     ok(json!(out))
 }
 

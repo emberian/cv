@@ -17,13 +17,17 @@ pub use receiver::{
     MirroredPackRecord, UploadPackResponse,
 };
 pub use shipper::{
-    capture_discovered_sessions, capture_session_to_store, resolve_replication_profile, seal_local_inbox_to_pack,
-    HttpClient, RawHttpResponse, ShipConfig, ShipReport, Shipper, TransportDeliveryAck,
+    capture_discovered_sessions, capture_session_to_store, export_delta_stream, export_to_spool, format_watermark,
+    parse_watermark, resolve_replication_profile, seal_local_inbox_to_pack, DeltaExportReport, DeltaIngestReport,
+    HttpClient, RawHttpResponse, ShipConfig, ShipReport, Shipper, SpoolExportReport, SpoolIngestReport,
+    TransportDeliveryAck,
 };
 pub use snapshot::{
-    FrontierStatus, HubGenerationRecord, HubSessionRow, HubSessionsPage, HubSnapshotResponse, HubStatusResponse,
-    HydratedHubSession, QuarantineRecord, QuarantineResolution, QuarantineResolveResponse, QuarantineSummary,
-    SessionRevisionEntry, SnapshotPublicationManifest, HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
+    parse_duration_ms, AuthorityEnvelope, AuthorityOmission, AuthorityQueryContext, AuthorityStatus, FrontierStatus,
+    HubGenerationRecord, HubSessionRow, HubSessionsPage, HubSnapshotResponse, HubStatusResponse, HydratedHubSession,
+    PlaceState, PlaceWatermark, ProducerLifecycle, QuarantineRecord, QuarantineResolution, QuarantineResolveResponse,
+    QuarantineSummary, SessionRevisionEntry, SnapshotPublicationManifest, StalenessViolation,
+    HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
 };
 
 /// Metadata for a per-producer capability token stored in `hub_producer_credentials`.
@@ -152,9 +156,20 @@ impl HubStore {
         &self.packs_dir
     }
 
-    /// Enroll or update a producer identity in `producers`.
+    /// Enroll or update a producer identity in `producers`, preserving any prior `Sealed`
+    /// lifecycle record unless incoming `metadata` explicitly carries a `lifecycle` update.
     pub fn enroll_producer(&self, producer_id: &str, host_label: &str, metadata: &Value) -> Result<Producer, HubError> {
-        Ok(self.store.enroll_producer(producer_id, host_label, metadata)?)
+        let mut merged = metadata.clone();
+        if let Some(existing) = self.store.get_producer(producer_id)? {
+            if let (Some(prev_obj), Some(new_obj)) = (existing.metadata.as_object(), merged.as_object_mut()) {
+                for (k, v) in prev_obj {
+                    if !new_obj.contains_key(k) {
+                        new_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        Ok(self.store.enroll_producer(producer_id, host_label, &merged)?)
     }
 
     /// Issue (or rotate) a per-producer capability token (`cvp1.<producer_id>.<secret>`) bound

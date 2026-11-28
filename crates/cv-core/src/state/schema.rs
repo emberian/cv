@@ -11,7 +11,7 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 7;
+pub const STATE_SCHEMA_VERSION: i64 = 8;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -22,6 +22,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (5, "v5_file_observations", MIGRATION_V5),
     (6, "v6_hub_producer_credentials", MIGRATION_V6),
     (7, "v7_hub_generational_mvcc", MIGRATION_V7),
+    (8, "v8_custody_outbox_and_ship_cursors", MIGRATION_V8),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -452,6 +453,65 @@ FROM hub_sessions;
 DROP TABLE IF EXISTS hub_snapshots;
 "#;
 
+const MIGRATION_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS custody_commits (
+    local_commit_pos   INTEGER PRIMARY KEY,
+    producer_id        TEXT NOT NULL,
+    epoch              TEXT NOT NULL,
+    seq                INTEGER NOT NULL CHECK (seq >= 1),
+    op_id              TEXT NOT NULL,
+    envelope_json      TEXT NOT NULL,
+    payload_addr_json  TEXT,
+    delta_extents_json TEXT,
+    committed_at       INTEGER NOT NULL,
+    UNIQUE(producer_id, epoch, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_custody_commits_epoch_seq
+    ON custody_commits(producer_id, epoch, seq);
+
+CREATE TABLE IF NOT EXISTS custody_commits_through (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    manifests INTEGER NOT NULL,
+    through   INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_capture_inbox_to_custody_commits
+AFTER INSERT ON capture_inbox
+BEGIN
+    INSERT INTO custody_commits(
+        local_commit_pos, producer_id, epoch, seq, op_id,
+        envelope_json, payload_addr_json, delta_extents_json, committed_at
+    ) VALUES (
+        NEW.local_commit_pos, NEW.producer_id, NEW.epoch, NEW.seq, NEW.op_id,
+        NEW.envelope_json, NEW.payload_ref, NULL, NEW.committed_at
+    )
+    ON CONFLICT(local_commit_pos) DO UPDATE SET
+        envelope_json = excluded.envelope_json,
+        payload_addr_json = COALESCE(excluded.payload_addr_json, custody_commits.payload_addr_json);
+END;
+
+INSERT OR IGNORE INTO custody_commits(
+    local_commit_pos, producer_id, epoch, seq, op_id,
+    envelope_json, payload_addr_json, delta_extents_json, committed_at
+)
+SELECT local_commit_pos, producer_id, epoch, seq, op_id,
+       envelope_json, payload_ref, NULL, committed_at
+FROM capture_inbox;
+
+CREATE TABLE IF NOT EXISTS ship_cursors (
+    target_name    TEXT NOT NULL,
+    producer_id    TEXT NOT NULL,
+    epoch          TEXT NOT NULL,
+    contiguous_seq INTEGER NOT NULL CHECK (contiguous_seq >= 0),
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY(target_name, producer_id, epoch)
+);
+
+INSERT OR IGNORE INTO ship_cursors(target_name, producer_id, epoch, contiguous_seq, updated_at)
+SELECT target_hub, producer_id, epoch, contiguous_seq, acked_at
+FROM custody_acks;
+"#;
+
 /// Tables that converge by presence rather than by `user_version`: every writable open creates
 /// what is missing, whatever version numbering other migrations use, so a store at any version
 /// (including one whose numbers another branch of migrations claimed) gains them exactly once.
@@ -472,6 +532,47 @@ CREATE TABLE IF NOT EXISTS custody_heads_through (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     manifests INTEGER NOT NULL,
     through   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS custody_commits (
+    local_commit_pos   INTEGER PRIMARY KEY,
+    producer_id        TEXT NOT NULL,
+    epoch              TEXT NOT NULL,
+    seq                INTEGER NOT NULL CHECK (seq >= 1),
+    op_id              TEXT NOT NULL,
+    envelope_json      TEXT NOT NULL,
+    payload_addr_json  TEXT,
+    delta_extents_json TEXT,
+    committed_at       INTEGER NOT NULL,
+    UNIQUE(producer_id, epoch, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_custody_commits_epoch_seq
+    ON custody_commits(producer_id, epoch, seq);
+CREATE TABLE IF NOT EXISTS custody_commits_through (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    manifests INTEGER NOT NULL,
+    through   INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS trg_capture_inbox_to_custody_commits
+AFTER INSERT ON capture_inbox
+BEGIN
+    INSERT INTO custody_commits(
+        local_commit_pos, producer_id, epoch, seq, op_id,
+        envelope_json, payload_addr_json, delta_extents_json, committed_at
+    ) VALUES (
+        NEW.local_commit_pos, NEW.producer_id, NEW.epoch, NEW.seq, NEW.op_id,
+        NEW.envelope_json, NEW.payload_ref, NULL, NEW.committed_at
+    )
+    ON CONFLICT(local_commit_pos) DO UPDATE SET
+        envelope_json = excluded.envelope_json,
+        payload_addr_json = COALESCE(excluded.payload_addr_json, custody_commits.payload_addr_json);
+END;
+CREATE TABLE IF NOT EXISTS ship_cursors (
+    target_name    TEXT NOT NULL,
+    producer_id    TEXT NOT NULL,
+    epoch          TEXT NOT NULL,
+    contiguous_seq INTEGER NOT NULL CHECK (contiguous_seq >= 0),
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY(target_name, producer_id, epoch)
 );
 CREATE TABLE IF NOT EXISTS hub_producer_credentials (
     producer_id  TEXT PRIMARY KEY,
@@ -547,13 +648,19 @@ pub fn ensure_migrated_with(
 /// Create the [`CONVERGED`] tables a store lacks and rebuild `custody_heads` when its watermark
 /// no longer matches `pack_manifests`. One read on the fast path; independent of `user_version`.
 pub fn converge(conn: &mut Connection) -> Result<(), StateError> {
-    if super::tables::custody_heads_fresh(conn)? {
+    if super::tables::custody_heads_fresh(conn)? && super::tables::custody_commits_fresh(conn)? {
         return Ok(());
     }
+    let db_dir = conn
+        .path()
+        .and_then(|p| std::path::Path::new(p).parent().map(std::path::Path::to_path_buf));
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute_batch(CONVERGED)?;
     if !super::tables::custody_heads_fresh(&tx)? {
         super::tables::rebuild_custody_heads(&tx)?;
+    }
+    if !super::tables::custody_commits_fresh(&tx)? {
+        super::tables::rebuild_custody_commits(&tx, db_dir.as_deref())?;
     }
     tx.commit()?;
     Ok(())

@@ -69,6 +69,32 @@ pub struct CustodyAck {
     pub acked_at: i64,
 }
 
+/// Indexed local replication outbox commit (`custody_commits` table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyCommitRow {
+    pub local_commit_pos: i64,
+    pub producer_id: String,
+    pub epoch: String,
+    pub seq: u64,
+    pub op_id: String,
+    pub envelope: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_addr: Option<crate::packs::PayloadAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_extents: Option<Vec<crate::packs::PayloadAddr>>,
+    pub committed_at: i64,
+}
+
+/// Per-target outbound sequence cursor (`ship_cursors` table).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShipCursorRow {
+    pub target_name: String,
+    pub producer_id: String,
+    pub epoch: String,
+    pub contiguous_seq: u64,
+    pub updated_at: i64,
+}
+
 /// Durable sub-agent / lane process lifecycle record (`lane_runs` table).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneRun {
@@ -628,6 +654,7 @@ impl StateStore {
         }
 
         let heads_were_fresh = custody_heads_fresh(&tx)?;
+        let commits_were_fresh = custody_commits_fresh(&tx)?;
         let index_meta_json = serde_json::to_string(&manifest.index_meta)?;
         tx.execute(
             "INSERT INTO pack_manifests(
@@ -660,6 +687,14 @@ impl StateStore {
             mark_custody_heads(&tx)?;
         } else {
             rebuild_custody_heads(&tx)?;
+        }
+
+        let db_dir = self.db_path.parent();
+        if commits_were_fresh {
+            upsert_custody_commits(&tx, manifest, db_dir)?;
+            mark_custody_commits(&tx)?;
+        } else {
+            rebuild_custody_commits(&tx, db_dir)?;
         }
 
         tx.commit()?;
@@ -801,6 +836,20 @@ impl StateStore {
                 ack.contiguous_seq as i64,
                 ack.max_commit_pos,
                 ack.pack_id,
+                ack.acked_at,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO ship_cursors(target_name, producer_id, epoch, contiguous_seq, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(target_name, producer_id, epoch) DO UPDATE SET
+                 contiguous_seq = MAX(ship_cursors.contiguous_seq, excluded.contiguous_seq),
+                 updated_at = MAX(ship_cursors.updated_at, excluded.updated_at)",
+            rusqlite::params![
+                ack.target_hub,
+                ack.producer_id,
+                ack.epoch,
+                ack.contiguous_seq as i64,
                 ack.acked_at,
             ],
         )?;
@@ -1844,4 +1893,539 @@ pub(super) fn rebuild_custody_heads(tx: &rusqlite::Transaction<'_>) -> Result<()
     }
     drop(stmt);
     mark_custody_heads(tx)
+}
+
+/// Whether `custody_commits` exists and folds every published `pack_manifests` row.
+pub(super) fn custody_commits_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) = 2 FROM sqlite_schema
+         WHERE type = 'table' AND name IN ('custody_commits', 'custody_commits_through')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+    let fresh: Option<bool> = conn
+        .query_row(
+            "SELECT w.manifests = m.n AND w.through = m.pos
+             FROM custody_commits_through w,
+                  (SELECT COUNT(*) AS n, COALESCE(MAX(min_commit_pos), 0) AS pos FROM pack_manifests) m
+             WHERE w.id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(fresh == Some(true))
+}
+
+fn mark_custody_commits(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
+    tx.execute(
+        "INSERT OR REPLACE INTO custody_commits_through(id, manifests, through)
+         SELECT 1, COUNT(*), COALESCE(MAX(min_commit_pos), 0) FROM pack_manifests",
+        [],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_commit_row(
+    tx: &rusqlite::Transaction<'_>,
+    pos: i64,
+    producer_id: &str,
+    epoch: &str,
+    seq: u64,
+    op_id: &str,
+    envelope: &Value,
+    payload_addr: Option<&crate::packs::PayloadAddr>,
+    delta_extents: Option<&[crate::packs::PayloadAddr]>,
+    committed_at: i64,
+) -> Result<(), StateError> {
+    let env_json = serde_json::to_string(envelope)?;
+    let addr_json = match payload_addr {
+        Some(a) => Some(serde_json::to_string(a)?),
+        None => None,
+    };
+    let delta_json = match delta_extents {
+        Some(d) if !d.is_empty() => Some(serde_json::to_string(d)?),
+        _ => envelope
+            .get("delta_extents")
+            .filter(|v| v.is_array())
+            .map(serde_json::to_string)
+            .transpose()?,
+    };
+    tx.execute(
+        "INSERT INTO custody_commits(
+             local_commit_pos, producer_id, epoch, seq, op_id,
+             envelope_json, payload_addr_json, delta_extents_json, committed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(local_commit_pos) DO UPDATE SET
+             producer_id = excluded.producer_id,
+             epoch = excluded.epoch,
+             seq = excluded.seq,
+             op_id = excluded.op_id,
+             envelope_json = excluded.envelope_json,
+             payload_addr_json = COALESCE(excluded.payload_addr_json, custody_commits.payload_addr_json),
+             delta_extents_json = COALESCE(excluded.delta_extents_json, custody_commits.delta_extents_json)",
+        rusqlite::params![
+            pos,
+            producer_id,
+            epoch,
+            seq as i64,
+            op_id,
+            env_json,
+            addr_json,
+            delta_json,
+            committed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_custody_commits(
+    tx: &rusqlite::Transaction<'_>,
+    pm: &PackManifest,
+    db_dir: Option<&std::path::Path>,
+) -> Result<(), StateError> {
+    let mut handled = false;
+
+    if let Some(arr) = pm.index_meta.get("commits").and_then(Value::as_array) {
+        for val in arr {
+            let pos = val
+                .get("local_commit_pos")
+                .and_then(Value::as_i64)
+                .unwrap_or(pm.min_commit_pos);
+            let producer_id = val.get("producer_id").and_then(Value::as_str).unwrap_or("local");
+            let epoch = val.get("epoch").and_then(Value::as_str).unwrap_or("");
+            let seq = val.get("seq").and_then(Value::as_u64).unwrap_or(1);
+            let op_id = val.get("op_id").and_then(Value::as_str).unwrap_or("");
+            let envelope = val.get("envelope").cloned().unwrap_or_else(|| json!({}));
+            let payload_addr = val
+                .get("payload_addr")
+                .and_then(|a| serde_json::from_value::<crate::packs::PayloadAddr>(a.clone()).ok());
+            let delta_extents = val
+                .get("delta_extents")
+                .and_then(|d| serde_json::from_value::<Vec<crate::packs::PayloadAddr>>(d.clone()).ok());
+            if !epoch.is_empty() {
+                upsert_commit_row(
+                    tx,
+                    pos,
+                    producer_id,
+                    epoch,
+                    seq,
+                    op_id,
+                    &envelope,
+                    payload_addr.as_ref(),
+                    delta_extents.as_deref(),
+                    pm.published_at,
+                )?;
+            }
+        }
+        handled = true;
+    }
+
+    if !handled {
+        if let Some(value) = pm.index_meta.get("commits_addr") {
+            if let Ok(addr) = serde_json::from_value::<crate::packs::PayloadAddr>(value.clone()) {
+                let raw_parent = std::path::Path::new(&pm.pack_path).parent();
+                let fallback_dir = db_dir.map(|d| d.join("packs"));
+                let dir_opt = match raw_parent {
+                    Some(p) if !p.as_os_str().is_empty() && p.is_absolute() && p.exists() => Some(p.to_path_buf()),
+                    _ => fallback_dir.filter(|p| p.exists()),
+                };
+                if let Some(dir) = dir_opt {
+                    if let Ok(pack) = crate::packs::SealedPack::open(&dir, &addr.pack_id) {
+                        if let Ok(bytes) = pack.read_payload(&addr) {
+                            if let Ok(entries) = serde_json::from_slice::<Vec<Value>>(&bytes) {
+                                for val in entries {
+                                    let pos = val
+                                        .get("local_commit_pos")
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(pm.min_commit_pos);
+                                    let producer_id = val.get("producer_id").and_then(Value::as_str).unwrap_or("local");
+                                    let epoch = val.get("epoch").and_then(Value::as_str).unwrap_or("");
+                                    let seq = val.get("seq").and_then(Value::as_u64).unwrap_or(1);
+                                    let op_id = val.get("op_id").and_then(Value::as_str).unwrap_or("");
+                                    let envelope = val.get("envelope").cloned().unwrap_or_else(|| json!({}));
+                                    let payload_addr = val.get("payload_addr").and_then(|a| {
+                                        serde_json::from_value::<crate::packs::PayloadAddr>(a.clone()).ok()
+                                    });
+                                    if !epoch.is_empty() {
+                                        upsert_commit_row(
+                                            tx,
+                                            pos,
+                                            producer_id,
+                                            epoch,
+                                            seq,
+                                            op_id,
+                                            &envelope,
+                                            payload_addr.as_ref(),
+                                            None,
+                                            pm.published_at,
+                                        )?;
+                                    }
+                                }
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !handled {
+        // Legacy pre-commits pack manifest: reconstruct from `operation_bindings` + `index_meta.sessions`.
+        let mut binding_by_pos: std::collections::BTreeMap<i64, (String, String, String, u64)> =
+            std::collections::BTreeMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT local_commit_pos, op_id, producer_id, epoch, seq
+                 FROM operation_bindings
+                 WHERE local_commit_pos >= ?1 AND local_commit_pos <= ?2
+                 ORDER BY local_commit_pos ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![pm.min_commit_pos, pm.max_commit_pos], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)? as u64,
+                ))
+            })?;
+            for r in rows {
+                let (pos, op_id, prod, ep, seq) = r?;
+                binding_by_pos.insert(pos, (op_id, prod, ep, seq));
+            }
+        }
+        let phys_pack_id = pm
+            .index_meta
+            .get("physical_pack_id")
+            .and_then(Value::as_str)
+            .or_else(|| pm.pack_id.split_once("--r").map(|(base, _)| base))
+            .unwrap_or(&pm.pack_id);
+        if let Some(sessions) = pm.index_meta.get("sessions").and_then(Value::as_array) {
+            for (idx, sess_val) in sessions.iter().enumerate() {
+                let pos = pm.min_commit_pos + idx as i64;
+                let (op_id, producer_id, epoch, seq) = match binding_by_pos.get(&pos) {
+                    Some((op_id, prod, ep, seq)) => (op_id.clone(), prod.clone(), ep.clone(), *seq),
+                    None => {
+                        let prod = sess_val
+                            .get("producer_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("local")
+                            .to_string();
+                        let harness = sess_val.get("harness").and_then(Value::as_str).unwrap_or("unknown");
+                        let sid = sess_val
+                            .get("id")
+                            .or_else(|| sess_val.get("session_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        (
+                            format!("archive:{}:{prod}:{harness}:{sid}", pm.pack_id),
+                            prod,
+                            format!("legacy-{}", pm.pack_id),
+                            (idx + 1) as u64,
+                        )
+                    }
+                };
+                let mut payload_addr = sess_val
+                    .get("addr")
+                    .and_then(|a| serde_json::from_value::<crate::packs::PayloadAddr>(a.clone()).ok());
+                if let Some(ref mut addr) = payload_addr {
+                    if addr.pack_id.is_empty() {
+                        addr.pack_id = phys_pack_id.to_string();
+                    }
+                }
+                let mut envelope = json!({
+                    "kind": "session_archive",
+                    "producer_id": producer_id,
+                    "harness": sess_val.get("harness").cloned().unwrap_or(Value::Null),
+                    "session_id": sess_val.get("id").or_else(|| sess_val.get("session_id")).cloned().unwrap_or(Value::Null),
+                    "title": sess_val.get("title").cloned().unwrap_or(Value::Null),
+                    "cwd": sess_val.get("cwd").cloned().unwrap_or(Value::Null),
+                    "created_at": sess_val.get("created_at").cloned().unwrap_or(Value::Null),
+                    "updated_at": sess_val.get("updated_at").cloned().unwrap_or(Value::Null),
+                    "message_count": sess_val.get("message_count").cloned().unwrap_or(json!(0)),
+                    "content_blake3": sess_val.get("content_blake3").cloned().unwrap_or(Value::Null),
+                    "pack_id": payload_addr.as_ref().map(|a| a.pack_id.as_str()).unwrap_or(phys_pack_id),
+                    "decoded_offset": payload_addr.as_ref().map(|a| a.decoded_offset).unwrap_or(0),
+                    "length": payload_addr.as_ref().map(|a| a.length).unwrap_or(0),
+                });
+                if let Some(prof) = sess_val.get("profile") {
+                    envelope["profile"] = prof.clone();
+                }
+                if let Some(cust) = sess_val.get("custody") {
+                    envelope["custody"] = cust.clone();
+                }
+                upsert_commit_row(
+                    tx,
+                    pos,
+                    &producer_id,
+                    &epoch,
+                    seq,
+                    &op_id,
+                    &envelope,
+                    payload_addr.as_ref(),
+                    None,
+                    pm.published_at,
+                )?;
+            }
+        } else {
+            for (pos, (op_id, prod, ep, seq)) in binding_by_pos {
+                upsert_commit_row(
+                    tx,
+                    pos,
+                    &prod,
+                    &ep,
+                    seq,
+                    &op_id,
+                    &json!({ "kind": "noop" }),
+                    None,
+                    None,
+                    pm.published_at,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) fn rebuild_custody_commits(
+    tx: &rusqlite::Transaction<'_>,
+    db_dir: Option<&std::path::Path>,
+) -> Result<(), StateError> {
+    tx.execute("DELETE FROM custody_commits", [])?;
+    let manifests: Vec<PackManifest> = {
+        let mut stmt = tx.prepare(
+            "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
+                    digest, pack_path, index_meta_json, published_at
+             FROM pack_manifests
+             ORDER BY min_commit_pos ASC, pack_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let meta_str: String = r.get(7)?;
+            Ok(PackManifest {
+                pack_id: r.get(0)?,
+                min_commit_pos: r.get(1)?,
+                max_commit_pos: r.get(2)?,
+                record_count: r.get::<_, i64>(3)? as u64,
+                byte_len: r.get::<_, i64>(4)? as u64,
+                digest: r.get(5)?,
+                pack_path: r.get(6)?,
+                index_meta: serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({})),
+                published_at: r.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for pm in &manifests {
+        upsert_custody_commits(tx, pm, db_dir)?;
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO custody_commits(
+             local_commit_pos, producer_id, epoch, seq, op_id,
+             envelope_json, payload_addr_json, delta_extents_json, committed_at
+         )
+         SELECT local_commit_pos, producer_id, epoch, seq, op_id,
+                envelope_json, payload_ref, NULL, committed_at
+         FROM capture_inbox",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO ship_cursors(target_name, producer_id, epoch, contiguous_seq, updated_at)
+         SELECT target_hub, producer_id, epoch, contiguous_seq, acked_at
+         FROM custody_acks",
+        [],
+    )?;
+    mark_custody_commits(tx)
+}
+
+impl StateStore {
+    /// Read outbound `ship_cursors` watermarks for `target_name` (merged with `custody_acks`).
+    /// Safe under `--frozen`.
+    pub fn ship_cursors_for(&self, target_name: &str) -> Result<Vec<ShipCursorRow>, StateError> {
+        Ok(self
+            .read_in(|conn| {
+                let mut by_key: std::collections::BTreeMap<(String, String), ShipCursorRow> =
+                    std::collections::BTreeMap::new();
+                let has_acks: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'custody_acks')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if has_acks {
+                    let mut stmt = conn.prepare(
+                        "SELECT producer_id, epoch, contiguous_seq, acked_at
+                         FROM custody_acks WHERE target_hub = ?1",
+                    )?;
+                    let rows = stmt.query_map([target_name], |r| {
+                        Ok(ShipCursorRow {
+                            target_name: target_name.to_string(),
+                            producer_id: r.get(0)?,
+                            epoch: r.get(1)?,
+                            contiguous_seq: r.get::<_, i64>(2)? as u64,
+                            updated_at: r.get(3)?,
+                        })
+                    })?;
+                    for row in rows {
+                        let r = row?;
+                        by_key.insert((r.producer_id.clone(), r.epoch.clone()), r);
+                    }
+                }
+                let has_cursors: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ship_cursors')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if has_cursors {
+                    let mut stmt = conn.prepare(
+                        "SELECT producer_id, epoch, contiguous_seq, updated_at
+                         FROM ship_cursors WHERE target_name = ?1",
+                    )?;
+                    let rows = stmt.query_map([target_name], |r| {
+                        Ok(ShipCursorRow {
+                            target_name: target_name.to_string(),
+                            producer_id: r.get(0)?,
+                            epoch: r.get(1)?,
+                            contiguous_seq: r.get::<_, i64>(2)? as u64,
+                            updated_at: r.get(3)?,
+                        })
+                    })?;
+                    for row in rows {
+                        let r = row?;
+                        by_key
+                            .entry((r.producer_id.clone(), r.epoch.clone()))
+                            .and_modify(|prev| {
+                                if r.contiguous_seq > prev.contiguous_seq {
+                                    prev.contiguous_seq = r.contiguous_seq;
+                                }
+                                if r.updated_at > prev.updated_at {
+                                    prev.updated_at = r.updated_at;
+                                }
+                            })
+                            .or_insert(r);
+                    }
+                }
+                Ok(by_key.into_values().collect())
+            })?
+            .unwrap_or_default())
+    }
+
+    /// Monotonically advance `ship_cursors` for `(target_name, producer_id, epoch)`.
+    pub fn advance_ship_cursor(
+        &self,
+        target_name: &str,
+        producer_id: &str,
+        epoch: &str,
+        contiguous_seq: u64,
+        updated_at: i64,
+    ) -> Result<(), StateError> {
+        let mut conn = self.open_writable()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO ship_cursors(target_name, producer_id, epoch, contiguous_seq, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(target_name, producer_id, epoch) DO UPDATE SET
+                 contiguous_seq = MAX(ship_cursors.contiguous_seq, excluded.contiguous_seq),
+                 updated_at = MAX(ship_cursors.updated_at, excluded.updated_at)",
+            rusqlite::params![target_name, producer_id, epoch, contiguous_seq as i64, updated_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Query unsent commits strictly after `acked_by_epoch` (`epoch -> contiguous_seq`) using the
+    /// indexed `custody_commits` outbox (`O(|delta|)` instead of scanning historical pack manifests).
+    /// Returns `Ok(None)` only when reading `--frozen` against a pre-v8 database whose
+    /// `custody_commits` table has not been populated yet.
+    pub fn pending_custody_commits(
+        &self,
+        acked_by_epoch: &std::collections::BTreeMap<String, u64>,
+        limit: usize,
+    ) -> Result<Option<Vec<CustodyCommitRow>>, StateError> {
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        self.read_in(|conn| {
+            if !custody_commits_fresh(conn)? {
+                return Ok(None);
+            }
+            let epochs: Vec<(String, String)> = {
+                let mut stmt =
+                    conn.prepare("SELECT DISTINCT producer_id, epoch FROM custody_commits ORDER BY epoch ASC")?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut out = Vec::new();
+            for (prod_id, epoch) in epochs {
+                if out.len() >= limit {
+                    break;
+                }
+                let acked = acked_by_epoch.get(&epoch).copied().unwrap_or(0);
+                let rem = (limit - out.len()) as i64;
+                let mut stmt = conn.prepare(
+                    "SELECT local_commit_pos, producer_id, epoch, seq, op_id,
+                            envelope_json, payload_addr_json, delta_extents_json, committed_at
+                     FROM custody_commits
+                     WHERE producer_id = ?1 AND epoch = ?2 AND seq > ?3
+                     ORDER BY seq ASC
+                     LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![prod_id, epoch, acked as i64, rem], |r| {
+                    let env_str: String = r.get(5)?;
+                    let addr_str: Option<String> = r.get(6)?;
+                    let delta_str: Option<String> = r.get(7)?;
+                    Ok(CustodyCommitRow {
+                        local_commit_pos: r.get(0)?,
+                        producer_id: r.get(1)?,
+                        epoch: r.get(2)?,
+                        seq: r.get::<_, i64>(3)? as u64,
+                        op_id: r.get(4)?,
+                        envelope: serde_json::from_str(&env_str).unwrap_or_else(|_| json!({})),
+                        payload_addr: addr_str.and_then(|s| serde_json::from_str(&s).ok()),
+                        delta_extents: delta_str.and_then(|s| serde_json::from_str(&s).ok()),
+                        committed_at: r.get(8)?,
+                    })
+                })?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            out.sort_by_key(|c| c.local_commit_pos);
+            Ok(Some(out))
+        })
+        .map(|opt| opt.unwrap_or(Some(Vec::new())))
+    }
+
+    /// Indexed `O(log N)` lookup for the highest `local_commit_pos` in `epoch` with `seq <= upto_seq`.
+    pub fn max_commit_pos_at_or_below(&self, epoch: &str, upto_seq: u64) -> Result<Option<i64>, StateError> {
+        Ok(self
+            .read_in(|conn| {
+                let has_commits: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'custody_commits')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if has_commits {
+                    let pos: Option<i64> = conn.query_row(
+                        "SELECT MAX(local_commit_pos) FROM custody_commits WHERE epoch = ?1 AND seq <= ?2",
+                        rusqlite::params![epoch, upto_seq as i64],
+                        |r| r.get(0),
+                    )?;
+                    if pos.is_some() {
+                        return Ok(pos);
+                    }
+                }
+                let pos: Option<i64> = conn.query_row(
+                    "SELECT MAX(local_commit_pos) FROM operation_bindings WHERE epoch = ?1 AND seq <= ?2",
+                    rusqlite::params![epoch, upto_seq as i64],
+                    |r| r.get(0),
+                )?;
+                Ok(pos)
+            })?
+            .flatten())
+    }
 }

@@ -1256,13 +1256,109 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
         Ok(bytes) => bytes.map(|b| b as u64),
         Err(error) => return bad(400, &error),
     };
-    let index_only = flag("index_only") || cv_core::env::frozen() || params.get("as_of").is_some();
+    let place = params.get("place").or_else(|| params.get("producer"));
+    let as_of_spec = params.get("as_of").or_else(|| params.get("snapshot"));
+    let want_authority = flag("authority");
+    let resolved_as_of_gen = match as_of_spec.as_deref() {
+        Some(spec) => {
+            let Ok(hub) = cv_core::state::hub::HubStore::default_hub() else {
+                return bad(404, &format!("snapshot `{spec}` not found"));
+            };
+            match hub.resolve_generation(Some(spec)) {
+                Ok(Some(g)) => Some(g.generation),
+                Ok(None) | Err(cv_core::state::hub::HubError::NotFound(_)) => {
+                    return bad(404, &format!("snapshot `{spec}` not found"))
+                }
+                Err(e) => return bad(400, &e.to_string()),
+            }
+        }
+        None => None,
+    };
+
+    let index_only = flag("index_only") || cv_core::env::frozen() || resolved_as_of_gen.is_some();
+    let auth_envelope: Option<cv_core::state::hub::AuthorityEnvelope> =
+        if params.get("max_staleness").is_some() || want_authority || place.is_some() || resolved_as_of_gen.is_some() {
+            let max_ms = match params.get("max_staleness") {
+                Some(raw) => match cv_core::state::hub::parse_duration_ms(&raw) {
+                    Ok(ms) => Some(ms),
+                    Err(e) => return bad(400, &e),
+                },
+                None => None,
+            };
+            if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+                let ctx = cv_core::state::hub::AuthorityQueryContext {
+                    place_glob: place.as_deref(),
+                    as_of_gen: resolved_as_of_gen,
+                    max_staleness_ms: max_ms,
+                    cwd_filter: cwd.as_deref(),
+                    query_str: Some(&q),
+                    has_negation: false,
+                    indexed_only: index_only && resolved_as_of_gen.is_none(),
+                    include_local: resolved_as_of_gen.is_none(),
+                };
+                match hub.check_authority(&ctx) {
+                    Ok(env) => Some(env),
+                    Err(v) => {
+                        return (
+                            503,
+                            json!({ "error": v.message, "authority": v.authority }),
+                            vec![("X-Cv-Authority-Status", "partial".to_string())],
+                        );
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let mut allowed_ids: Option<std::collections::HashSet<String>> = None;
+    if let Some(ref pat) = place {
+        if resolved_as_of_gen.is_none() {
+            let mut ids = std::collections::HashSet::new();
+            let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+                if let Ok(heads) = hub.heads_at_generation(None) {
+                    for e in heads {
+                        selector_places.insert(e.selector_string(), e.producer_id);
+                    }
+                }
+            }
+            for r in cv_core::sessions() {
+                let p = selector_places.get(&r.id).map_or("local", String::as_str);
+                if cv_core::query::glob_match(pat, p) {
+                    ids.insert(r.session_selector());
+                    ids.insert(r.id);
+                }
+            }
+            allowed_ids = Some(ids);
+        }
+    }
+
     let tantivy_dir = cv_search::default_tantivy_dir();
-    let result = if exact {
-        searcher.search_exact(&q, filter, false, limit, live_bytes)
+    let result = if let Some(gen) = resolved_as_of_gen {
+        super::search::search_pinned_generation(gen, &q, want, cwd.as_deref(), place.as_deref(), limit)
+    } else if exact {
+        searcher.search_exact_in_allowed(
+            &cv_search::default_trigram_dir(),
+            &q,
+            filter,
+            false,
+            allowed_ids.as_ref(),
+            limit,
+            live_bytes,
+        )
     } else if !scan && index_only && tantivy_dir.join("meta.json").is_file() {
         obtain_prepared_index(prepared_index, &tantivy_dir)
-            .and_then(|reader| reader.search(&q, limit, filter, None))
+            .and_then(|reader| {
+                reader.search(
+                    &q,
+                    limit,
+                    filter,
+                    allowed_ids.as_ref().map(|s| std::sync::Arc::new(s.clone())),
+                )
+            })
             .map(|ans| cv_search::Found {
                 hits: ans.hits,
                 source: Source::Index,
@@ -1270,7 +1366,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
                 total: ans.total,
             })
     } else {
-        searcher.search(&q, filter, limit, source, live_bytes)
+        searcher.search_allowed(&q, filter, allowed_ids.as_ref(), limit, source, live_bytes)
     };
     let found = match result {
         Ok(found) => found,
@@ -1322,6 +1418,20 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
     ];
     if let Some(n) = note {
         headers.push(("X-Cv-Search-Note", header_safe(&n)));
+    }
+    if let Some(ref env) = auth_envelope {
+        headers.push(("X-Cv-Authority-Status", env.status.as_str().to_string()));
+        if want_authority {
+            return (
+                200,
+                json!({
+                    "hits": rows,
+                    "total": found.total,
+                    "authority": env,
+                }),
+                headers,
+            );
+        }
     }
     (200, json!(rows), headers)
 }

@@ -768,3 +768,151 @@ fn archive_opensession_middle_edit_and_jsonl_inode_or_same_size_edit_recapture_c
         "{alpha_shown}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // 1. Remote box (`remote_w`): archive a >120 KiB native JSONL session + betasess.
+    let remote_w = world("topo-remote");
+    let alpha_path = remote_w.transcript("alphasess");
+    let mut big_body = fs::read_to_string(&alpha_path).unwrap();
+    let pad = "x".repeat(420);
+    for i in 0..250 {
+        big_body.push_str(&format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "uuid": format!("ru-{i}"),
+                "timestamp": "2026-06-10T10:00:00Z",
+                "message": {"role": "user", "content": format!("initial remote turn {i} {pad}")}
+            })
+        ));
+    }
+    assert!(big_body.len() > 120 * 1024);
+    fs::write(&alpha_path, &big_body).unwrap();
+    let (ok, code, out, err) = remote_w.cv_env(&["archive", "sync"], &[("CV_PRODUCER_ID", "remote-box")]);
+    assert!(ok, "remote initial sync exited {code}: {out}\n{err}");
+    let remote_packs_dir = remote_w.cv_home.join("packs");
+    let init_packs = pack_files(&remote_packs_dir);
+    assert_eq!(init_packs.len(), 1);
+
+    // 2. Hub (`hub_w`, zero local transcripts): pull Gen 1 from `remote-box` via `--pull` + `--frozen --export-delta`.
+    let hub_w = cv_testkit::World::new("topo-hub");
+    let fake_ssh = hub_w.base.join("fake-ssh.sh");
+    fs::write(
+        &fake_ssh,
+        "#!/bin/sh\nshift 5\nHOME=\"$FAKE_REMOTE_HOME\" XDG_CONFIG_HOME=\"$FAKE_REMOTE_HOME/.config\" CLUSTERVISION_HOME=\"$FAKE_REMOTE_CV_HOME\" CV_PRODUCER_ID=\"remote-box\" exec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cv_bin = env!("CARGO_BIN_EXE_cv");
+    let pull_env = [
+        ("CV_SSH_BIN", fake_ssh.to_str().unwrap()),
+        ("CV_REMOTE_BIN", cv_bin),
+        ("FAKE_REMOTE_HOME", remote_w.home.to_str().unwrap()),
+        ("FAKE_REMOTE_CV_HOME", remote_w.cv_home.to_str().unwrap()),
+    ];
+    let (ok, code, pull1_out, pull1_err) = hub_w.cv_env(&["archive", "sync", "--pull", "remote-box"], &pull_env);
+    assert!(ok, "pull 1 exited {code}: {pull1_out}\n{pull1_err}");
+    assert!(
+        pull1_out.contains("pulled 2 new event(s)") && pull1_out.contains("generation 1"),
+        "{pull1_out}"
+    );
+
+    // Append ~4 KiB (`narwhal-delta-marker`) to `alphasess` on `remote_w`, archive only the delta,
+    // and DELETE `init_packs[0]` (>120 KiB) on `remote_w` to prove `--pull` reads ONLY the O(delta) pack!
+    let appended = format!(
+        "{}\n",
+        json!({
+            "type": "assistant",
+            "uuid": "ra-delta-1",
+            "timestamp": "2026-06-10T10:05:00Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": format!("narwhal-delta-marker {}", "y".repeat(3500))}]}
+        })
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&alpha_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, appended.as_bytes()))
+        .unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&alpha_path)
+        .and_then(|f| f.set_modified(bumped))
+        .unwrap();
+    let (ok, code, out2, err2) = remote_w.cv_env(&["archive", "sync"], &[("CV_PRODUCER_ID", "remote-box")]);
+    assert!(ok, "remote delta sync exited {code}: {out2}\n{err2}");
+    fs::remove_file(&init_packs[0]).unwrap();
+
+    let (ok, code, pull2_out, pull2_err) = hub_w.cv_env(&["archive", "sync", "--pull", "remote-box"], &pull_env);
+    assert!(ok, "pull 2 (O(delta)) exited {code}: {pull2_out}\n{pull2_err}");
+    assert!(
+        pull2_out.contains("pulled 1 new event(s)") && pull2_out.contains("generation 2"),
+        "{pull2_out}"
+    );
+
+    // 3. Credential-free ephemeral sandbox (`sbx_w`): `--spool <dir> --seal` + idempotent `--ingest-spool <dir>`.
+    let sbx_w = world("topo-sbx");
+    let beta_sbx = fs::read_to_string(sbx_w.transcript("betasess"))
+        .unwrap()
+        .replace("quokka", "pangolin-sandbox-marker");
+    fs::write(sbx_w.transcript("betasess"), beta_sbx).unwrap();
+    let spool_dir = hub_w.base.join("sbx-spool");
+    let (ok, code, spool_out, spool_err) = sbx_w.cv_env(
+        &["archive", "sync", "--spool", spool_dir.to_str().unwrap(), "--seal"],
+        &[("CV_PRODUCER_ID", "sbx-ephemeral")],
+    );
+    assert!(ok, "spool --seal exited {code}: {spool_out}\n{spool_err}");
+    assert!(spool_out.contains("[SEALED]"), "{spool_out}");
+
+    let (ing1, _) = hub_w.cv_ok(&["archive", "sync", "--ingest-spool", spool_dir.to_str().unwrap()]);
+    assert!(
+        ing1.contains("2 accepted, 0 replayed") && ing1.contains("generation 3"),
+        "{ing1}"
+    );
+    let (ing2, _) = hub_w.cv_ok(&["archive", "sync", "--ingest-spool", spool_dir.to_str().unwrap()]);
+    assert!(
+        ing2.contains("0 accepted, 2 replayed") && ing2.contains("generation 3"),
+        "re-ingesting spool must be idempotent: {ing2}"
+    );
+
+    // 4. Semiauthoritative CLI queries (`--as-of`, `--place`, `--max-staleness`):
+    let hub_json = |args: &[&str]| -> Value { serde_json::from_str(&hub_w.cv_ok(args).0).unwrap() };
+
+    let s_at_1 = hub_json(&["search", "narwhal-delta-marker", "--as-of", "1", "--json"]);
+    assert_eq!(s_at_1["total"], 0, "Gen 1 precedes delta append: {s_at_1}");
+    assert_eq!(s_at_1["authority"]["generation"], 1);
+
+    let s_at_2 = hub_json(&["search", "narwhal-delta-marker", "--as-of", "2", "--json"]);
+    assert_eq!(s_at_2["total"], 1, "Gen 2 includes delta append: {s_at_2}");
+    assert_eq!(s_at_2["authority"]["generation"], 2);
+    let alpha_hub_sel = s_at_2["hits"][0]["session_key"].as_str().unwrap().to_owned();
+    let shown = hub_w.cv_ok(&["--frozen", "show", &alpha_hub_sel, "--json"]).0;
+    assert!(
+        shown.contains("initial remote turn 0") && shown.contains("narwhal-delta-marker"),
+        "hub ExtentChain must serve both Gen 1 initial extent (has={}) and Gen 2 delta extent (has={}): head={}",
+        shown.contains("initial remote turn 0"),
+        shown.contains("narwhal-delta-marker"),
+        &shown[..shown.len().min(800)]
+    );
+
+    // Sealed sandbox at final frontier is `Complete` forever even with `--max-staleness 0s`!
+    let sealed_ls = hub_json(&["ls", "--place", "sbx-*", "--max-staleness", "0s", "--json"]);
+    assert_eq!(sealed_ls["authority"]["status"], "complete", "{sealed_ls}");
+    assert_eq!(sealed_ls["authority"]["places"][0]["state"], "sealed", "{sealed_ls}");
+    assert_eq!(sealed_ls["sessions"].as_array().unwrap().len(), 2, "{sealed_ls}");
+
+    // Unsealed disconnected place fails closed with exit code 2 under `--max-staleness 1s`!
+    cv_core::state::hub::HubStore::at_home(&hub_w.cv_home)
+        .enroll_producer("stale-box", "stale-host", &json!({}))
+        .unwrap();
+    let (ok, code, _, stale_err) = hub_w.cv(&["ls", "--place", "stale-box", "--max-staleness", "1s"]);
+    assert!(
+        !ok && code == 2 && stale_err.contains("stale-box"),
+        "violated --max-staleness must fail closed with exit 2: code={code} err={stale_err}"
+    );
+}

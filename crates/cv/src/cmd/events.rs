@@ -13,18 +13,72 @@ pub(crate) fn cmd_events(
     subagents: bool,
     json: bool,
     wide: bool,
+    authority: crate::AuthorityArgs,
 ) -> Result<()> {
     use cv_core::events;
     let want = parse_harness(&harness)?;
-    let (r, _adapter) = resolve(id, want)?;
+    let auth_envelope = crate::cmd::browse::evaluate_cli_authority(&authority, None, None, false, false)?;
 
-    let rows = events::read_ref(&r, kind.as_deref())?;
+    let (r, rows): (cv_core::SessionRef, Vec<events::EventRow>) = if let Some(gen) = authority.as_of {
+        let hub = cv_core::state::hub::HubStore::default_hub()?;
+        let heads = hub.heads_at_generation(Some(gen))?;
+        let matched = heads.into_iter().find(|e| {
+            let h_ok = want.is_none_or(|w| cv_core::Harness::parse(&e.harness) == Some(w));
+            let p_ok = authority
+                .place
+                .as_deref()
+                .is_none_or(|pat| cv_core::query::glob_match(pat, &e.producer_id));
+            let id_ok = e.selector_string() == id
+                || e.selector_string().starts_with(id)
+                || e.session_id == id
+                || e.metadata.get("native_id").and_then(|v| v.as_str()) == Some(id);
+            h_ok && p_ok && id_ok
+        });
+        let Some(entry) = matched else {
+            return crate::util::usage(format!("session {id:?} not found at generation {gen}"));
+        };
+        let Some(backing) = cv_core::custody::backing_from_hub_head(hub.packs_dir(), entry)? else {
+            return crate::util::usage(format!("session {id:?} has no mirrored payload at generation {gen}"));
+        };
+        let mut sink = events::EventSink::new(backing.reference.cwd.clone());
+        cv_core::Adapter::stream(
+            &backing,
+            &backing.reference,
+            &cv_core::Demand::LEAN.with_spans(),
+            &mut sink,
+        )?;
+        let evs = sink.into_events()?;
+        let out_rows = evs
+            .into_iter()
+            .filter(|e| kind.as_deref().is_none_or(|k| e.kind == k))
+            .map(|e| events::EventRow {
+                baggage: None,
+                harness: backing.reference.harness.as_str().to_string(),
+                session_id: backing.reference.id.clone(),
+                msg_idx: e.msg_idx as i64,
+                ts: e.ts,
+                kind: e.kind.to_string(),
+                tool: e.tool,
+                target: e.target,
+                detail: e.detail,
+                parent_id: None,
+                agent_id: None,
+                workflow: None,
+            })
+            .collect();
+        (backing.reference, out_rows)
+    } else {
+        let (r, _adapter) = resolve(id, want)?;
+        let rows = events::read_ref(&r, kind.as_deref())?;
+        (r, rows)
+    };
+
     if json {
         // One array: the session's own events, then (with --subagents) each sub-agent's, tagged.
         // Every row is `rows::event_row` — the same function `/api/session/{h}/{id}/events` prints
         // with, so the two doors cannot drift.
         let mut out: Vec<serde_json::Value> = rows.iter().map(cv_core::rows::event_row).collect();
-        if subagents {
+        if subagents && authority.as_of.is_none() {
             out.extend(
                 subagent_events(cv_core::subagent_tree_of(&r)?, r.harness, kind.as_deref())?
                     .into_iter()
@@ -52,7 +106,17 @@ pub(crate) fn cmd_events(
                     }),
             );
         }
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        if let Some(env) = auth_envelope {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "events": out,
+                    "authority": env,
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
         return Ok(());
     }
     if rows.is_empty() && !subagents {
@@ -204,12 +268,38 @@ fn print_event_row(
     }
 }
 
-pub(crate) fn cmd_touched(path: &str, edits_only: bool, json: bool) -> Result<()> {
-    let rows = cv_core::events::sessions_touching(path, edits_only)?;
+pub(crate) fn cmd_touched(path: &str, edits_only: bool, json: bool, authority: crate::AuthorityArgs) -> Result<()> {
+    let auth_envelope = crate::cmd::browse::evaluate_cli_authority(&authority, None, None, false, false)?;
+    let mut rows = cv_core::events::sessions_touching(path, edits_only)?;
+    if let Some(ref pat) = authority.place {
+        let hub_opt = cv_core::state::hub::HubStore::default_hub().ok();
+        rows.retain(|t| {
+            let p = if cv_core::SessionKey::split_selector(&t.session_id).is_none() {
+                "local".to_string()
+            } else {
+                hub_opt
+                    .as_ref()
+                    .and_then(|h| h.session_head_for(&t.session_id, authority.as_of).ok().flatten())
+                    .map(|e| e.producer_id)
+                    .unwrap_or_else(|| "local".to_string())
+            };
+            cv_core::query::glob_match(pat, &p)
+        });
+    }
     if json {
         // `rows::touched_row`: the same row `/api/touched` serves.
         let out: Vec<serde_json::Value> = rows.iter().map(cv_core::rows::touched_row).collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        if let Some(env) = auth_envelope {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "touched": out,
+                    "authority": env,
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
         return Ok(());
     }
     if rows.is_empty() {

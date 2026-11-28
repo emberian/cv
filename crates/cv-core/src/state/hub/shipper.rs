@@ -10,24 +10,55 @@
 use super::receiver::{
     EnrollRequest, EnrollResponse, IngestBatchRequest, IngestBatchResponse, IngestEventRecord, UploadPackResponse,
 };
-use super::{HubError, PACK_STREAM_CONTENT_TYPE};
+use super::snapshot::ProducerLifecycle;
+use super::{HubError, HubStore, PACK_STREAM_CONTENT_TYPE};
 use crate::config::Config;
 use crate::ir::{Harness, Session};
 use crate::packs::{pack_idx_path, pack_zst_path, PackBuilder, PayloadAddr, SealedPack};
 use crate::publish::Claim;
 use crate::redact::{CompiledProfile, PrincipalPolicy, ScrubProfile, ScrubStats};
 use crate::state::{
-    tables::{CustodyAck, PackManifest as LocalStatePackManifest},
+    tables::{CustodyAck, CustodyCommitRow, PackManifest as LocalStatePackManifest},
     AppendRequest, CaptureInboxRow, DurableReceipt, EventId, StateStore,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Maximum uncompressed payload bytes coalesced into a single outbound `.pack.zst` (8 MiB).
+const MAX_OUTBOUND_PACK_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum commits processed per chunked sync iteration (`<= 8 MiB` JSON batch).
+const MAX_COMMITS_PER_BATCH: usize = 2048;
+/// Magic header for `cv --frozen archive sync --export-delta` binary stdio stream.
+const DELTA_STREAM_MAGIC: &[u8; 8] = b"CVDLT001";
+
+struct TempStageDir(PathBuf);
+
+impl TempStageDir {
+    fn create_in(parent: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(parent)?;
+        let dir = parent.join(format!(".ship-stage-{}", uuid::Uuid::new_v4().simple()));
+        #[cfg(unix)]
+        crate::state::ensure_private_dir_0700(&dir).map_err(std::io::Error::other)?;
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempStageDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn normalize_hub_url_key(url: &str) -> &str {
     url.trim().trim_end_matches('/')
@@ -314,6 +345,23 @@ struct SealedCommitEntry {
     op_id: String,
     envelope: Value,
     payload_addr: Option<PayloadAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delta_extents: Option<Vec<PayloadAddr>>,
+}
+
+impl SealedCommitEntry {
+    fn from_commit_row(r: CustodyCommitRow) -> Self {
+        Self {
+            local_commit_pos: r.local_commit_pos,
+            producer_id: r.producer_id,
+            epoch: r.epoch,
+            seq: r.seq,
+            op_id: r.op_id,
+            envelope: r.envelope,
+            payload_addr: r.payload_addr,
+            delta_extents: r.delta_extents,
+        }
+    }
 }
 
 fn session_envelope(session: &Session) -> Value {
@@ -500,6 +548,7 @@ pub fn seal_local_inbox_to_pack(
                 op_id: row.op_id.clone(),
                 envelope: row.envelope.clone(),
                 payload_addr: new_addr,
+                delta_extents: None,
             });
         }
 
@@ -610,6 +659,7 @@ impl Shipper {
         };
         let mut metadata = self.cfg.producer_metadata.clone();
         scrub_json_value_in_place(&mut metadata, &compiled, &profile, repo_root, &mut enroll_stats);
+        attach_policy_metadata(&mut metadata, &self.cfg.producer_id, &profile);
         let req = EnrollRequest {
             producer_id: self.cfg.producer_id.clone(),
             host_label,
@@ -707,250 +757,158 @@ impl Shipper {
             .compile()
             .map_err(|e| HubError::InvalidArgument(format!("invalid scrub profile: {e:#}")))?;
 
-        let existing_watermarks: BTreeMap<(String, String), u64> = if self.cfg.force_reship {
+        let mut existing_watermarks: BTreeMap<String, u64> = if self.cfg.force_reship {
             BTreeMap::new()
         } else {
             store
-                .custody_acks_for(&self.cfg.target_name)?
+                .ship_cursors_for(&self.cfg.target_name)?
                 .into_iter()
-                .map(|ack| ((ack.producer_id, ack.epoch), ack.contiguous_seq))
+                .map(|cur| (cur.epoch, cur.contiguous_seq))
                 .collect()
         };
 
-        let all_local = collect_local_commits(store, local_packs_dir)?;
-        report.events_examined = all_local.len();
+        loop {
+            let pending_rows: Vec<SealedCommitEntry> =
+                match store.pending_custody_commits(&existing_watermarks, MAX_COMMITS_PER_BATCH)? {
+                    Some(rows) => rows.into_iter().map(SealedCommitEntry::from_commit_row).collect(),
+                    None => collect_local_commits(store, local_packs_dir)?
+                        .into_iter()
+                        .filter(|c| c.seq > existing_watermarks.get(&c.epoch).copied().unwrap_or(0))
+                        .take(MAX_COMMITS_PER_BATCH)
+                        .collect(),
+                };
 
-        let pending: Vec<SealedCommitEntry> = all_local
-            .into_iter()
-            .filter(|c| {
-                let acked = existing_watermarks
-                    .get(&(self.cfg.producer_id.clone(), c.epoch.clone()))
-                    .or_else(|| existing_watermarks.get(&(c.producer_id.clone(), c.epoch.clone())))
-                    .copied()
-                    .unwrap_or(0);
-                c.seq > acked
-            })
-            .collect();
-
-        if pending.is_empty() {
-            return Ok(report);
-        }
-
-        // Scrub & filter every pending commit BEFORE building outbound packs or wire envelopes.
-        struct PreparedItem {
-            commit: SealedCommitEntry,
-            scrubbed_envelope: Value,
-            scrubbed_payload: Option<Vec<u8>>,
-        }
-
-        let mut prepared: Vec<PreparedItem> = Vec::with_capacity(pending.len());
-        let mut has_any_payload = false;
-
-        for commit in pending {
-            let loaded_session = load_commit_session(&commit, local_packs_dir)?;
-            let is_session = loaded_session.is_some() || is_session_upsert_envelope(&commit.envelope);
-
-            if !is_session {
-                if !non_session_envelope_matches_filter(&commit.envelope, &profile) {
-                    report.sessions_filtered_out += 1;
-                    prepared.push(PreparedItem {
-                        commit,
-                        scrubbed_envelope: json!({ "kind": "filtered_out" }),
-                        scrubbed_payload: None,
-                    });
-                    continue;
-                }
-                let env_cwd = commit.envelope.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-                let raw_repo_root = profile.repo_root.as_deref().or(env_cwd.as_deref());
-                let mut scrubbed_envelope = commit.envelope.clone();
-                if let Some(profile) = commit.envelope["profile"].as_str() {
-                    scrubbed_envelope["profile"] = json!(crate::blake3_hex(profile.as_bytes()));
-                }
-                let mut env_stats = ScrubStats::default();
-                scrub_json_value_in_place(
-                    &mut scrubbed_envelope,
-                    &compiled,
-                    &profile,
-                    raw_repo_root,
-                    &mut env_stats,
-                );
-                report.redactions_applied += env_stats.total();
-                prepared.push(PreparedItem {
-                    commit,
-                    scrubbed_envelope,
-                    scrubbed_payload: None,
-                });
-                continue;
+            if pending_rows.is_empty() {
+                break;
             }
+            report.events_examined += pending_rows.len();
+            let fetched_len = pending_rows.len();
 
-            let candidate_session = match loaded_session {
-                Some(ref s) => s.clone(),
-                None => stub_session_from_envelope(&commit.envelope),
-            };
-
-            if !profile.matches_session(&candidate_session) {
-                report.sessions_filtered_out += 1;
-                prepared.push(PreparedItem {
-                    commit,
-                    scrubbed_envelope: json!({ "kind": "filtered_out" }),
-                    scrubbed_payload: None,
-                });
-                continue;
-            }
-
-            report.sessions_admitted += 1;
-            let raw_repo_root = profile.repo_root.as_deref().or(candidate_session.cwd.as_deref());
-            let (scrubbed_session, mut stats) = compiled
-                .scrub_session(&candidate_session)
-                .map_err(|e| HubError::Pack(format!("scrubbing session failed: {e:#}")))?;
-
-            let scrubbed_envelope = build_scrubbed_envelope(
-                &commit.envelope,
-                &scrubbed_session,
-                &compiled,
+            let stage_dir = TempStageDir::create_in(local_packs_dir)?;
+            let prepared_batch = prepare_and_pack_commits(
+                &pending_rows,
+                local_packs_dir,
+                stage_dir.path(),
+                &self.cfg.producer_id,
+                &self.cfg.target_name,
                 &profile,
-                raw_repo_root,
-                &mut stats,
-            );
-            report.redactions_applied += stats.total();
-            let scrubbed_payload = if loaded_session.is_some() {
-                let bytes = serde_json::to_vec(&scrubbed_session)?;
-                has_any_payload = true;
-                Some(bytes)
-            } else {
-                None
-            };
+                &compiled,
+            )?;
+            report.sessions_admitted += prepared_batch.sessions_admitted;
+            report.sessions_filtered_out += prepared_batch.sessions_filtered_out;
+            report.redactions_applied += prepared_batch.redactions_applied;
 
-            prepared.push(PreparedItem {
-                commit,
-                scrubbed_envelope,
-                scrubbed_payload,
-            });
-        }
-
-        // Stage & upload deterministic, content-addressed outbound Zstd-Seekable packs FIRST
-        // (`publish-before-reference`!). Using a per-payload content-addressed `out_pack_id`
-        // ensures `PayloadAddr` is a pure function of `scrubbed_payload`, invariant across
-        // retries, `force_reship`, and batch boundaries.
-        let mut item_addrs: Vec<Option<PayloadAddr>> = vec![None; prepared.len()];
-        let mut uploaded_packs: BTreeMap<String, (PayloadAddr, String)> = BTreeMap::new();
-
-        if has_any_payload {
-            let outbound_dir = local_packs_dir.join(".ship-outbound");
-            std::fs::create_dir_all(&outbound_dir)?;
-            for (idx, item) in prepared.iter().enumerate() {
-                let Some(ref bytes) = item.scrubbed_payload else {
-                    continue;
-                };
-                let payload_hex = blake3::hash(bytes).to_hex();
-                let out_pack_id = format!("ship-{}", &payload_hex.as_str()[..24]);
-
-                if let Some((existing_addr, _)) = uploaded_packs.get(&out_pack_id) {
-                    item_addrs[idx] = Some(existing_addr.clone());
-                    continue;
-                }
-
-                let out_zst =
-                    pack_zst_path(&outbound_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                if out_zst.is_file() {
-                    let _ = std::fs::remove_file(&out_zst);
-                }
-                let out_idx =
-                    pack_idx_path(&outbound_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                if out_idx.is_file() {
-                    let _ = std::fs::remove_file(&out_idx);
-                }
-
-                let mut builder =
-                    PackBuilder::create(&outbound_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                let addr = builder
-                    .append_record("payload:0", bytes)
-                    .map_err(|e| HubError::Pack(format!("{e:#}")))?;
-                builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
-
-                let upload_res = self.upload_pack_files(&outbound_dir, &out_pack_id);
-                let _ = std::fs::remove_file(&out_zst);
-                let _ = std::fs::remove_file(&out_idx);
-                let (upload_resp, upload_ack) = match upload_res {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        let _ = std::fs::remove_dir(&outbound_dir);
-                        return Err(e);
-                    }
-                };
+            let mut uploaded_packs: BTreeMap<String, String> = BTreeMap::new();
+            for pack_id in &prepared_batch.pack_ids {
+                let (upload_resp, upload_ack) = self.upload_pack_files(stage_dir.path(), pack_id)?;
                 report.transport_acks.push(upload_ack);
-
                 if !upload_resp.durable_fsynced {
-                    let _ = std::fs::remove_dir(&outbound_dir);
                     return Err(HubError::Transport {
                         status: Some(200),
-                        message: format!("hub did not confirm durable fsync for pack `{out_pack_id}`"),
+                        message: format!("hub did not confirm durable fsync for pack `{pack_id}`"),
                     });
                 }
                 report.uploaded_pack_id = Some(upload_resp.pack.pack_id.clone());
                 report.uploaded_pack_digest = Some(upload_resp.pack.blake3_digest.clone());
-                item_addrs[idx] = Some(addr.clone());
-                uploaded_packs.insert(upload_resp.pack.pack_id, (addr, upload_resp.pack.blake3_digest));
+                uploaded_packs.insert(upload_resp.pack.pack_id, upload_resp.pack.blake3_digest);
             }
-            let _ = std::fs::remove_dir(&outbound_dir);
+
+            // Chunk wire events so no single HTTP POST exceeds 8 MiB JSON.
+            let mut chunk_events = Vec::new();
+            let mut chunk_bytes = 2usize;
+            for ev in prepared_batch.wire_events {
+                let ev_len = serde_json::to_vec(&ev)?.len() + 1;
+                if !chunk_events.is_empty() && chunk_bytes + ev_len > MAX_OUTBOUND_PACK_BYTES {
+                    self.submit_and_verify_chunk(
+                        store,
+                        chunk_events,
+                        &uploaded_packs,
+                        &mut existing_watermarks,
+                        &mut report,
+                    )?;
+                    chunk_events = Vec::new();
+                    chunk_bytes = 2;
+                }
+                chunk_bytes += ev_len;
+                chunk_events.push(ev);
+            }
+            if !chunk_events.is_empty() {
+                self.submit_and_verify_chunk(
+                    store,
+                    chunk_events,
+                    &uploaded_packs,
+                    &mut existing_watermarks,
+                    &mut report,
+                )?;
+            }
+
+            if self.cfg.force_reship || fetched_len < MAX_COMMITS_PER_BATCH {
+                break;
+            }
         }
 
-        // Build `IngestBatchRequest` referencing the already-published outbound pack addresses.
-        let mut wire_events = Vec::with_capacity(prepared.len());
-        for (item, addr) in prepared.iter().zip(item_addrs) {
-            let event_id = EventId::new(self.cfg.producer_id.clone(), item.commit.epoch.clone(), item.commit.seq);
-            let op_id = format!(
-                "ship:{}:{}:{}:{}",
-                self.cfg.target_name, self.cfg.producer_id, item.commit.epoch, item.commit.seq
-            );
-            let rec = IngestEventRecord::new(event_id, op_id, item.scrubbed_envelope.clone(), addr)?;
-            wire_events.push(rec);
-        }
+        Ok(report)
+    }
 
-        let batch_req = IngestBatchRequest { events: wire_events };
+    fn submit_and_verify_chunk(
+        &self,
+        store: &StateStore,
+        events: Vec<IngestEventRecord>,
+        uploaded_packs: &BTreeMap<String, String>,
+        existing_watermarks: &mut BTreeMap<String, u64>,
+        report: &mut ShipReport,
+    ) -> Result<(), HubError> {
+        let referenced_in_chunk: BTreeSet<String> = events
+            .iter()
+            .flat_map(|ev| {
+                let mut ids = Vec::new();
+                if let Some(ref addr) = ev.payload_addr {
+                    ids.push(addr.pack_id.clone());
+                }
+                if let Some(arr) = ev.envelope.get("delta_extents").and_then(Value::as_array) {
+                    for v in arr {
+                        if let Some(pid) = v.get("pack_id").and_then(Value::as_str) {
+                            ids.push(pid.to_string());
+                        }
+                    }
+                }
+                ids
+            })
+            .collect();
+
+        let batch_req = IngestBatchRequest { events };
         let (ingest_resp, ingest_ack) = self.send_ingest_batch(&batch_req)?;
         report.transport_acks.push(ingest_ack);
-        report.events_shipped = batch_req.events.len();
-
+        report.events_shipped += batch_req.events.len();
         report.hub_snapshot_id = ingest_resp.publication_id.clone();
         report.hub_generation = ingest_resp.hub_generation;
 
-        // Stage-2 Durable Hub Custody Verification:
-        // Record `StateStore::record_custody_ack` ONLY if:
-        // 1. `ingest_resp.durable_fsynced == true`, AND
-        // 2. For every outbound pack referenced, the hub echoed its exact verified BLAKE3 digest
-        //    in `ingest_resp.verified_pack_digests`!
         if !ingest_resp.durable_fsynced {
             return Err(HubError::Transport {
                 status: Some(200),
                 message: "hub did not confirm durable fsync for ingest batch".into(),
             });
         }
-        for (up_id, (_, up_digest)) in &uploaded_packs {
-            let verified = ingest_resp.verified_pack_digests.get(up_id);
-            if verified != Some(up_digest) {
-                return Err(HubError::Transport {
-                    status: Some(200),
-                    message: format!(
-                        "hub custody verification failed for pack `{up_id}`: expected digest {up_digest}, got {verified:?}"
-                    ),
-                });
+        for up_id in &referenced_in_chunk {
+            if let Some(up_digest) = uploaded_packs.get(up_id) {
+                let verified = ingest_resp.verified_pack_digests.get(up_id);
+                if verified != Some(up_digest) {
+                    return Err(HubError::Transport {
+                        status: Some(200),
+                        message: format!(
+                            "hub custody verification failed for pack `{up_id}`: expected digest {up_digest}, got {verified:?}"
+                        ),
+                    });
+                }
             }
         }
 
-        // Map hub `(producer_id, epoch, contiguous_seq)` back to the highest local `local_commit_pos`
-        // covered by `seq <= contiguous_seq` so `StateStore::is_pack_evictable` unlocks ONLY when
-        // the hub's gap-free contiguous frontier covers the sealed local pack!
-        let all_commits_now = collect_local_commits(store, local_packs_dir)?;
         for hub_wm in &ingest_resp.custody_acks {
             if hub_wm.contiguous_seq == 0 {
                 continue;
             }
-            let max_commit_pos = all_commits_now
-                .iter()
-                .filter(|c| c.epoch == hub_wm.epoch && c.seq <= hub_wm.contiguous_seq)
-                .map(|c| c.local_commit_pos)
-                .max();
+            existing_watermarks.insert(hub_wm.epoch.clone(), hub_wm.contiguous_seq);
+            let max_commit_pos = store.max_commit_pos_at_or_below(&hub_wm.epoch, hub_wm.contiguous_seq)?;
             let ack = CustodyAck {
                 target_hub: self.cfg.target_name.clone(),
                 producer_id: self.cfg.producer_id.clone(),
@@ -960,11 +918,12 @@ impl Shipper {
                 pack_id: None,
                 acked_at: hub_wm.acked_at,
             };
-            store.record_custody_ack(&ack)?;
+            if !crate::env::frozen() {
+                store.record_custody_ack(&ack)?;
+            }
             report.durable_custody_acks.push(ack);
         }
-
-        Ok(report)
+        Ok(())
     }
 }
 
@@ -1068,6 +1027,7 @@ fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<V
                         op_id,
                         envelope,
                         payload_addr,
+                        delta_extents: None,
                     });
                 }
             } else {
@@ -1080,6 +1040,7 @@ fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<V
                         op_id,
                         envelope: json!({ "kind": "noop" }),
                         payload_addr: None,
+                        delta_extents: None,
                     });
                 }
             }
@@ -1099,6 +1060,7 @@ fn collect_local_commits(store: &StateStore, local_packs_dir: &Path) -> Result<V
             op_id: row.op_id,
             envelope: row.envelope,
             payload_addr,
+            delta_extents: None,
         });
     }
     out.sort_by_key(|c| c.local_commit_pos);
@@ -1253,7 +1215,20 @@ fn hash_principal_json_value(val: &mut Value, salt: Option<&str>) {
         }
     }
     let hex = hasher.finalize().to_hex();
-    *val = Value::String(format!("sha256:{}", &hex.as_str()[..24]));
+    *val = Value::String(format!("blake3:{}", hex.as_str()));
+}
+
+fn scrub_json_envelope_in_place(
+    val: &mut Value,
+    compiled: &CompiledProfile,
+    profile: &ScrubProfile,
+    repo_root: Option<&Path>,
+    stats: &mut ScrubStats,
+) {
+    scrub_json_children(val, compiled, profile, repo_root, stats, true);
+    if profile.classes.assignments {
+        stats.secrets.assignments += crate::redact::secrets::fields(val, "");
+    }
 }
 
 fn scrub_json_value_in_place(
@@ -1263,7 +1238,7 @@ fn scrub_json_value_in_place(
     repo_root: Option<&Path>,
     stats: &mut ScrubStats,
 ) {
-    scrub_json_children(val, compiled, profile, repo_root, stats);
+    scrub_json_children(val, compiled, profile, repo_root, stats, false);
     if profile.classes.assignments {
         stats.secrets.assignments += crate::redact::secrets::fields(val, "");
     }
@@ -1275,6 +1250,7 @@ fn scrub_json_children(
     profile: &ScrubProfile,
     repo_root: Option<&Path>,
     stats: &mut ScrubStats,
+    exempt_root_tags: bool,
 ) {
     match val {
         Value::String(s) => {
@@ -1284,7 +1260,7 @@ fn scrub_json_children(
         }
         Value::Array(items) => {
             for item in items {
-                scrub_json_children(item, compiled, profile, repo_root, stats);
+                scrub_json_children(item, compiled, profile, repo_root, stats, false);
             }
         }
         Value::Object(map) => {
@@ -1304,13 +1280,13 @@ fn scrub_json_children(
                 PrincipalPolicy::Keep => {}
             }
             for (k, v) in map.iter_mut() {
-                if k == "kind" || k == "harness" {
+                if exempt_root_tags && (k == "kind" || k == "harness") {
                     continue;
                 }
                 if k == "principal" && !matches!(profile.principal, PrincipalPolicy::Keep) {
                     continue;
                 }
-                scrub_json_children(v, compiled, profile, repo_root, stats);
+                scrub_json_children(v, compiled, profile, repo_root, stats, false);
             }
         }
         _ => {}
@@ -1417,6 +1393,1015 @@ fn build_scrubbed_envelope(
     }
 
     out
+}
+
+pub(crate) fn hash_cwd_filter_prefix(producer_id: &str, raw_prefix: &str) -> String {
+    let norm = raw_prefix
+        .trim_end_matches("/**")
+        .trim_end_matches("/*")
+        .trim_end_matches('/');
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cv-cwd-filter-v1:");
+    hasher.update(producer_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(norm.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn attach_policy_metadata(metadata: &mut Value, producer_id: &str, profile: &ScrubProfile) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let mut classes = Vec::new();
+    if profile.classes.api_keys {
+        classes.push("api_keys");
+    }
+    if profile.classes.private_keys {
+        classes.push("private_keys");
+    }
+    if profile.classes.jwts {
+        classes.push("jwts");
+    }
+    if profile.classes.emails {
+        classes.push("emails");
+    }
+    if profile.classes.blobs {
+        classes.push("blobs");
+    }
+    if profile.classes.assignments {
+        classes.push("assignments");
+    }
+    let scrub_ruleset = if classes.is_empty() && !profile.rewrite_home && !profile.rewrite_repo {
+        "none".to_string()
+    } else {
+        let doc = json!({
+            "classes": &classes,
+            "rewrite_home": profile.rewrite_home,
+            "rewrite_repo": profile.rewrite_repo,
+            "private_ips": profile.private_ips,
+            "hostnames": profile.hostnames,
+            "ssh_principals": profile.ssh_principals,
+        });
+        let hex = blake3::hash(&super::canonical_json_bytes(&doc).unwrap_or_default()).to_hex();
+        format!("scrub:{}", &hex.as_str()[..16])
+    };
+    let allow_cwd_hashes: Vec<String> = profile
+        .filter
+        .allow_cwds
+        .iter()
+        .map(|p| hash_cwd_filter_prefix(producer_id, &p.to_string_lossy()))
+        .collect();
+    let deny_cwd_hashes: Vec<String> = profile
+        .filter
+        .deny_cwds
+        .iter()
+        .map(|p| hash_cwd_filter_prefix(producer_id, &p.to_string_lossy()))
+        .collect();
+    let raw_filter_doc = json!({
+        "allow_cwds": profile.filter.allow_cwds,
+        "deny_cwds": profile.filter.deny_cwds,
+        "harnesses": profile.filter.harnesses,
+        "tags": profile.filter.tags,
+    });
+    let is_unfiltered = profile.filter.allow_cwds.is_empty()
+        && profile.filter.deny_cwds.is_empty()
+        && profile.filter.harnesses.is_empty()
+        && profile.filter.tags.is_empty();
+    let filter_digest = if is_unfiltered {
+        "unfiltered".to_string()
+    } else {
+        let hex = blake3::hash(&super::canonical_json_bytes(&raw_filter_doc).unwrap_or_default()).to_hex();
+        format!("blake3:{}", hex.as_str())
+    };
+    let filter_policy = json!({
+        "restrictive": !is_unfiltered,
+        "has_allow_cwds": !allow_cwd_hashes.is_empty(),
+        "allow_cwd_hashes": allow_cwd_hashes,
+        "deny_cwd_hashes": deny_cwd_hashes,
+        "harnesses": profile.filter.harnesses,
+    });
+    let obj = metadata.as_object_mut().expect("object");
+    obj.entry("scrub_ruleset".to_string())
+        .or_insert_with(|| json!(scrub_ruleset));
+    obj.entry("scrubbed_classes".to_string())
+        .or_insert_with(|| json!(classes));
+    obj.entry("filter_digest".to_string())
+        .or_insert_with(|| json!(filter_digest));
+    obj.entry("filter_policy".to_string()).or_insert(filter_policy);
+}
+
+fn scrub_jsonl_slice(
+    raw: &[u8],
+    compiled: &CompiledProfile,
+    profile: &ScrubProfile,
+    repo_root: Option<&Path>,
+    stats: &mut ScrubStats,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        let has_nl = line.ends_with(b"\n");
+        let body = if has_nl { &line[..line.len() - 1] } else { line };
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        if body.is_empty() {
+            if has_nl {
+                out.push(b'\n');
+            }
+            continue;
+        }
+        if let Ok(mut val) = serde_json::from_slice::<Value>(body) {
+            scrub_json_value_in_place(&mut val, compiled, profile, repo_root, stats);
+            if let Ok(encoded) = serde_json::to_vec(&val) {
+                out.extend_from_slice(&encoded);
+                if has_nl {
+                    out.push(b'\n');
+                }
+                continue;
+            }
+        }
+        let lossy = String::from_utf8_lossy(body);
+        let clean = compiled.scrub_text_cow(&lossy, repo_root, stats);
+        out.extend_from_slice(clean.as_bytes());
+        if has_nl {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+enum OutboundRecordKind {
+    None,
+    Projection {
+        anchor: String,
+        bytes: Vec<u8>,
+    },
+    InitialNativeExtent {
+        anchor: String,
+        bytes: Vec<u8>,
+        file_name: String,
+        layout: Vec<String>,
+    },
+    DeltaExtent {
+        anchor: String,
+        bytes: Vec<u8>,
+    },
+}
+
+struct PreparedBatch {
+    pack_ids: Vec<String>,
+    wire_events: Vec<IngestEventRecord>,
+    sessions_admitted: usize,
+    sessions_filtered_out: usize,
+    redactions_applied: usize,
+}
+
+fn outbound_session_anchor(producer_id: &str, raw_envelope: &Value, harness: Harness, native_id: &str) -> String {
+    let outbound_profile = raw_envelope
+        .get("profile")
+        .and_then(Value::as_str)
+        .map(|p| PathBuf::from(crate::blake3_hex(p.as_bytes())))
+        .unwrap_or_default();
+    let key = crate::SessionKey {
+        producer: producer_id.to_string(),
+        profile: outbound_profile,
+        harness,
+        native_id: native_id.to_string(),
+    };
+    crate::custody::archive_anchor(&key)
+}
+
+fn prepare_and_pack_commits(
+    pending: &[SealedCommitEntry],
+    local_packs_dir: &Path,
+    stage_dir: &Path,
+    producer_id: &str,
+    target_name: &str,
+    profile: &ScrubProfile,
+    compiled: &CompiledProfile,
+) -> Result<PreparedBatch, HubError> {
+    struct StagedEvent {
+        epoch: String,
+        seq: u64,
+        scrubbed_envelope: Value,
+        record: OutboundRecordKind,
+    }
+
+    let mut staged_events: Vec<StagedEvent> = Vec::with_capacity(pending.len());
+    let mut sessions_admitted = 0usize;
+    let mut sessions_filtered_out = 0usize;
+    let mut redactions_applied = 0usize;
+
+    for commit in pending {
+        let explicit_kind = commit.envelope.get("kind").and_then(Value::as_str);
+
+        // Fast-path O(delta) shipping for appended JSONL extents (`session_delta` or single-extent native JSONL)!
+        let delta_addrs: Option<Vec<PayloadAddr>> = commit.delta_extents.clone().or_else(|| {
+            commit
+                .envelope
+                .get("delta_extents")
+                .and_then(|v| serde_json::from_value::<Vec<PayloadAddr>>(v.clone()).ok())
+        });
+        if explicit_kind == Some("session_delta") && delta_addrs.as_ref().is_some_and(|d| !d.is_empty()) {
+            let stub = stub_session_from_envelope(&commit.envelope);
+            if !profile.matches_session(&stub) {
+                sessions_filtered_out += 1;
+                staged_events.push(StagedEvent {
+                    epoch: commit.epoch.clone(),
+                    seq: commit.seq,
+                    scrubbed_envelope: json!({ "kind": "filtered_out" }),
+                    record: OutboundRecordKind::None,
+                });
+                continue;
+            }
+            sessions_admitted += 1;
+            let raw_repo_root = profile.repo_root.as_deref().or(stub.cwd.as_deref());
+            let (scrubbed_stub, mut stats) = compiled
+                .scrub_session(&stub)
+                .map_err(|e| HubError::Pack(format!("scrubbing delta stub failed: {e:#}")))?;
+
+            let mut combined_raw = Vec::new();
+            for ext in delta_addrs.as_ref().expect("non-empty") {
+                let pack = SealedPack::open(local_packs_dir, &ext.pack_id)
+                    .map_err(|e| HubError::Pack(format!("opening local delta pack `{}`: {e:#}", ext.pack_id)))?;
+                let slice = pack
+                    .read_payload(ext)
+                    .map_err(|e| HubError::Pack(format!("reading local delta pack `{}`: {e:#}", ext.pack_id)))?;
+                combined_raw.extend_from_slice(&slice);
+            }
+            let scrubbed_slice = scrub_jsonl_slice(&combined_raw, compiled, profile, raw_repo_root, &mut stats);
+            let mut scrubbed_env = build_scrubbed_envelope(
+                &commit.envelope,
+                &scrubbed_stub,
+                compiled,
+                profile,
+                raw_repo_root,
+                &mut stats,
+            );
+            scrubbed_env["kind"] = json!("session_delta");
+            let file_name = commit
+                .envelope
+                .get("file_name")
+                .and_then(Value::as_str)
+                .unwrap_or("session.jsonl")
+                .to_string();
+            let layout: Vec<String> = commit
+                .envelope
+                .get("layout")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            scrubbed_env["file_name"] = json!(file_name);
+            if !layout.is_empty() {
+                scrubbed_env["layout"] = json!(layout);
+            }
+            redactions_applied += stats.total();
+            let anchor = outbound_session_anchor(producer_id, &commit.envelope, stub.harness, &stub.id);
+            staged_events.push(StagedEvent {
+                epoch: commit.epoch.clone(),
+                seq: commit.seq,
+                scrubbed_envelope: scrubbed_env,
+                record: OutboundRecordKind::DeltaExtent {
+                    anchor,
+                    bytes: scrubbed_slice,
+                },
+            });
+            continue;
+        }
+
+        // Fast-path O(initial_extent) native JSONL shipping when filter.tags is empty and principal is not embedded in Session IR:
+        if let Some(custody_val) = commit.envelope.get("custody") {
+            if let Ok(crate::custody::CustodyKind::NativeExtents {
+                extents,
+                file_name,
+                layout,
+                ..
+            }) = serde_json::from_value::<crate::custody::CustodyKind>(custody_val.clone())
+            {
+                if extents.len() == 1 && file_name.ends_with(".jsonl") && profile.filter.tags.is_empty() {
+                    let stub = stub_session_from_envelope(&commit.envelope);
+                    if !profile.matches_session(&stub) {
+                        sessions_filtered_out += 1;
+                        staged_events.push(StagedEvent {
+                            epoch: commit.epoch.clone(),
+                            seq: commit.seq,
+                            scrubbed_envelope: json!({ "kind": "filtered_out" }),
+                            record: OutboundRecordKind::None,
+                        });
+                        continue;
+                    }
+                    sessions_admitted += 1;
+                    let raw_repo_root = profile.repo_root.as_deref().or(stub.cwd.as_deref());
+                    let (scrubbed_stub, mut stats) = compiled
+                        .scrub_session(&stub)
+                        .map_err(|e| HubError::Pack(format!("scrubbing native stub failed: {e:#}")))?;
+                    let ext = &extents[0];
+                    let pack = SealedPack::open(local_packs_dir, &ext.pack_id)
+                        .map_err(|e| HubError::Pack(format!("opening local pack `{}`: {e:#}", ext.pack_id)))?;
+                    let raw_bytes = pack
+                        .read_payload(ext)
+                        .map_err(|e| HubError::Pack(format!("reading local pack `{}`: {e:#}", ext.pack_id)))?;
+                    let scrubbed_bytes = scrub_jsonl_slice(&raw_bytes, compiled, profile, raw_repo_root, &mut stats);
+                    let scrubbed_env = build_scrubbed_envelope(
+                        &commit.envelope,
+                        &scrubbed_stub,
+                        compiled,
+                        profile,
+                        raw_repo_root,
+                        &mut stats,
+                    );
+                    redactions_applied += stats.total();
+                    let anchor = outbound_session_anchor(producer_id, &commit.envelope, stub.harness, &stub.id);
+                    staged_events.push(StagedEvent {
+                        epoch: commit.epoch.clone(),
+                        seq: commit.seq,
+                        scrubbed_envelope: scrubbed_env,
+                        record: OutboundRecordKind::InitialNativeExtent {
+                            anchor,
+                            bytes: scrubbed_bytes,
+                            file_name,
+                            layout,
+                        },
+                    });
+                    continue;
+                }
+            }
+        }
+
+        let loaded_session = load_commit_session(commit, local_packs_dir)?;
+        let is_session = loaded_session.is_some() || is_session_upsert_envelope(&commit.envelope);
+
+        if !is_session {
+            if !non_session_envelope_matches_filter(&commit.envelope, profile) {
+                sessions_filtered_out += 1;
+                staged_events.push(StagedEvent {
+                    epoch: commit.epoch.clone(),
+                    seq: commit.seq,
+                    scrubbed_envelope: json!({ "kind": "filtered_out" }),
+                    record: OutboundRecordKind::None,
+                });
+                continue;
+            }
+            let env_cwd = commit.envelope.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+            let raw_repo_root = profile.repo_root.as_deref().or(env_cwd.as_deref());
+            let mut scrubbed_envelope = commit.envelope.clone();
+            if let Some(p) = commit.envelope["profile"].as_str() {
+                scrubbed_envelope["profile"] = json!(crate::blake3_hex(p.as_bytes()));
+            }
+            let mut env_stats = ScrubStats::default();
+            scrub_json_envelope_in_place(&mut scrubbed_envelope, compiled, profile, raw_repo_root, &mut env_stats);
+            redactions_applied += env_stats.total();
+            staged_events.push(StagedEvent {
+                epoch: commit.epoch.clone(),
+                seq: commit.seq,
+                scrubbed_envelope,
+                record: OutboundRecordKind::None,
+            });
+            continue;
+        }
+
+        let candidate_session = match loaded_session {
+            Some(ref s) => s.clone(),
+            None => stub_session_from_envelope(&commit.envelope),
+        };
+        if !profile.matches_session(&candidate_session) {
+            sessions_filtered_out += 1;
+            staged_events.push(StagedEvent {
+                epoch: commit.epoch.clone(),
+                seq: commit.seq,
+                scrubbed_envelope: json!({ "kind": "filtered_out" }),
+                record: OutboundRecordKind::None,
+            });
+            continue;
+        }
+
+        sessions_admitted += 1;
+        let raw_repo_root = profile.repo_root.as_deref().or(candidate_session.cwd.as_deref());
+        let (scrubbed_session, mut stats) = compiled
+            .scrub_session(&candidate_session)
+            .map_err(|e| HubError::Pack(format!("scrubbing session failed: {e:#}")))?;
+        let scrubbed_envelope = build_scrubbed_envelope(
+            &commit.envelope,
+            &scrubbed_session,
+            compiled,
+            profile,
+            raw_repo_root,
+            &mut stats,
+        );
+        redactions_applied += stats.total();
+        let record = if loaded_session.is_some() {
+            let bytes = serde_json::to_vec(&scrubbed_session)?;
+            let anchor = format!("payload:{}:{}", commit.epoch, commit.seq);
+            OutboundRecordKind::Projection { anchor, bytes }
+        } else {
+            OutboundRecordKind::None
+        };
+        staged_events.push(StagedEvent {
+            epoch: commit.epoch.clone(),
+            seq: commit.seq,
+            scrubbed_envelope,
+            record,
+        });
+    }
+
+    // Coalesce outbound payload records into multi-record Zstd-Seekable packs (`<= 8 MiB` per pack,
+    // flushing whenever an anchor repeats inside the same pack so `RecordIndex` anchors stay unique),
+    // naming each pack `ship-<64hex_blake3>`!
+    struct PackGroup {
+        indices: Vec<usize>,
+        anchors_and_bytes: Vec<(String, Vec<u8>)>,
+        seen_anchors: BTreeSet<String>,
+        total_bytes: usize,
+    }
+    let mut groups: Vec<PackGroup> = Vec::new();
+    for (idx, item) in staged_events.iter().enumerate() {
+        let (anchor, bytes) = match &item.record {
+            OutboundRecordKind::None => continue,
+            OutboundRecordKind::Projection { anchor, bytes }
+            | OutboundRecordKind::InitialNativeExtent { anchor, bytes, .. }
+            | OutboundRecordKind::DeltaExtent { anchor, bytes, .. } => (anchor.clone(), bytes.clone()),
+        };
+        let needs_new_group = match groups.last() {
+            None => true,
+            Some(g) => {
+                g.seen_anchors.contains(&anchor)
+                    || (!g.indices.is_empty() && g.total_bytes + bytes.len() > MAX_OUTBOUND_PACK_BYTES)
+            }
+        };
+        if needs_new_group {
+            groups.push(PackGroup {
+                indices: Vec::new(),
+                anchors_and_bytes: Vec::new(),
+                seen_anchors: BTreeSet::new(),
+                total_bytes: 0,
+            });
+        }
+        let g = groups.last_mut().expect("just pushed");
+        g.total_bytes += bytes.len();
+        g.seen_anchors.insert(anchor.clone());
+        g.indices.push(idx);
+        g.anchors_and_bytes.push((anchor, bytes));
+    }
+
+    let mut resolved_addrs: Vec<Option<PayloadAddr>> = vec![None; staged_events.len()];
+    let mut pack_ids: Vec<String> = Vec::new();
+    let mut seen_pack_ids: BTreeSet<String> = BTreeSet::new();
+
+    for group in groups {
+        let mut group_hasher = blake3::Hasher::new();
+        for (anchor, bytes) in &group.anchors_and_bytes {
+            group_hasher.update(&(anchor.len() as u64).to_le_bytes());
+            group_hasher.update(anchor.as_bytes());
+            group_hasher.update(&(bytes.len() as u64).to_le_bytes());
+            group_hasher.update(bytes);
+        }
+        let pack_hex = group_hasher.finalize().to_hex();
+        let out_pack_id = format!("ship-{}", pack_hex.as_str());
+
+        if seen_pack_ids.insert(out_pack_id.clone()) {
+            let mut builder =
+                PackBuilder::create(stage_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            let mut group_addrs = Vec::with_capacity(group.indices.len());
+            for (anchor, bytes) in &group.anchors_and_bytes {
+                let addr = builder
+                    .append_record(anchor, bytes)
+                    .map_err(|e| HubError::Pack(format!("{e:#}")))?;
+                group_addrs.push(addr);
+            }
+            builder.seal(Claim::New).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            for (ev_idx, addr) in group.indices.into_iter().zip(group_addrs) {
+                resolved_addrs[ev_idx] = Some(addr);
+            }
+            pack_ids.push(out_pack_id);
+        } else {
+            let sealed = SealedPack::open(stage_dir, &out_pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?;
+            for (ev_idx, (anchor, _)) in group.indices.into_iter().zip(group.anchors_and_bytes) {
+                let span = sealed
+                    .record_index()
+                    .get(&anchor)
+                    .ok_or_else(|| HubError::Pack(format!("missing record `{anchor}` in `{out_pack_id}`")))?;
+                resolved_addrs[ev_idx] = Some(span.clone().into_addr(&out_pack_id));
+            }
+        }
+    }
+
+    let mut wire_events = Vec::with_capacity(staged_events.len());
+    for (mut item, addr) in staged_events.into_iter().zip(resolved_addrs) {
+        let wire_addr = match (&item.record, addr) {
+            (OutboundRecordKind::InitialNativeExtent { file_name, layout, .. }, Some(a)) => {
+                let custody = crate::custody::CustodyKind::NativeExtents {
+                    extents: vec![a.clone()],
+                    total_bytes: a.length,
+                    prefix_blake3: a.digest_hex(),
+                    file_name: file_name.clone(),
+                    layout: layout.clone(),
+                };
+                item.scrubbed_envelope["custody"] = serde_json::to_value(&custody)?;
+                Some(a)
+            }
+            (OutboundRecordKind::DeltaExtent { .. }, Some(a)) => {
+                item.scrubbed_envelope["delta_extents"] = json!([a.clone()]);
+                Some(a)
+            }
+            (_, other) => other,
+        };
+        let event_id = EventId::new(producer_id.to_string(), item.epoch.clone(), item.seq);
+        let op_id = format!("ship:{target_name}:{producer_id}:{}:{}", item.epoch, item.seq);
+        wire_events.push(IngestEventRecord::new(
+            event_id,
+            op_id,
+            item.scrubbed_envelope,
+            wire_addr,
+        )?);
+    }
+
+    Ok(PreparedBatch {
+        pack_ids,
+        wire_events,
+        sessions_admitted,
+        sessions_filtered_out,
+        redactions_applied,
+    })
+}
+
+// ───────────────────── Spool & Agentless SSH `--frozen` Delta Topologies ─────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SpoolBatchManifest {
+    pub producer_id: String,
+    pub host_label: String,
+    pub producer_metadata: Value,
+    pub pack_ids: Vec<String>,
+    pub batch: IngestBatchRequest,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SpoolExportReport {
+    pub events_spooled: usize,
+    pub packs_written: usize,
+    pub sealed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SpoolIngestReport {
+    pub batches_ingested: usize,
+    pub events_accepted: usize,
+    pub events_replayed: usize,
+    pub hub_generation: Option<u64>,
+    pub publication_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeltaExportReport {
+    pub events_exported: usize,
+    pub packs_exported: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeltaIngestReport {
+    pub events_accepted: usize,
+    pub events_replayed: usize,
+    pub hub_generation: Option<u64>,
+    pub publication_id: Option<String>,
+}
+
+/// Format an `epoch -> contiguous_seq` watermark map into a shell-safe ASCII token (`"0"` if empty).
+pub fn format_watermark(watermarks: &BTreeMap<String, u64>) -> String {
+    if watermarks.is_empty() {
+        return "0".to_string();
+    }
+    let parts: Vec<String> = watermarks
+        .iter()
+        .filter(|(_, &seq)| seq > 0)
+        .map(|(epoch, seq)| {
+            let mut hex = String::with_capacity(epoch.len() * 2);
+            for b in epoch.as_bytes() {
+                hex.push_str(&format!("{b:02x}"));
+            }
+            format!("{hex}:{seq}")
+        })
+        .collect();
+    if parts.is_empty() {
+        "0".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
+/// Parse a watermark token produced by [`format_watermark`].
+pub fn parse_watermark(raw: &str) -> Result<BTreeMap<String, u64>, HubError> {
+    let s = raw.trim();
+    if s.is_empty() || s == "0" {
+        return Ok(BTreeMap::new());
+    }
+    let mut out = BTreeMap::new();
+    for item in s.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((hex_ep, seq_str)) = item.split_once(':') else {
+            return Err(HubError::InvalidArgument(format!("invalid watermark segment {item:?}")));
+        };
+        if !hex_ep.len().is_multiple_of(2) {
+            return Err(HubError::InvalidArgument(format!(
+                "invalid epoch hex in watermark {item:?}"
+            )));
+        }
+        let mut bytes = Vec::with_capacity(hex_ep.len() / 2);
+        for i in (0..hex_ep.len()).step_by(2) {
+            let b = u8::from_str_radix(&hex_ep[i..i + 2], 16)
+                .map_err(|_| HubError::InvalidArgument(format!("invalid hex in watermark {item:?}")))?;
+            bytes.push(b);
+        }
+        let epoch =
+            String::from_utf8(bytes).map_err(|_| HubError::InvalidArgument("non-UTF8 epoch in watermark".into()))?;
+        let seq: u64 = seq_str
+            .parse()
+            .map_err(|_| HubError::InvalidArgument(format!("invalid seq in watermark {item:?}")))?;
+        out.insert(epoch, seq);
+    }
+    Ok(out)
+}
+
+/// Credential-free sandbox spool export (`cv archive sync --spool <DIR> [--seal]`): scrubs unsent
+/// local commits and writes sealed `.pack.{zst,idx.json}` + `batches/batch-*.json` into `spool_dir`
+/// without any hub URL or bearer token.
+pub fn export_to_spool(
+    store: &StateStore,
+    local_packs_dir: &Path,
+    spool_dir: &Path,
+    producer_id: &str,
+    host_label: &str,
+    profile: &ScrubProfile,
+    seal: bool,
+) -> Result<SpoolExportReport, HubError> {
+    if !crate::env::frozen() && store.inbox_count()? > 0 {
+        let _ = seal_local_inbox_to_pack(store, local_packs_dir, None)?;
+    }
+    let compiled = profile
+        .compile()
+        .map_err(|e| HubError::InvalidArgument(format!("invalid scrub profile: {e:#}")))?;
+
+    let spool_packs_dir = spool_dir.join("packs");
+    let spool_batches_dir = spool_dir.join("batches");
+    std::fs::create_dir_all(&spool_packs_dir)?;
+    std::fs::create_dir_all(&spool_batches_dir)?;
+
+    let target_key = format!("spool:{}", spool_dir.display());
+    let mut watermarks: BTreeMap<String, u64> = store
+        .ship_cursors_for(&target_key)?
+        .into_iter()
+        .map(|c| (c.epoch, c.contiguous_seq))
+        .collect();
+
+    let mut report = SpoolExportReport {
+        sealed: seal,
+        ..Default::default()
+    };
+    let mut latest_epoch = String::new();
+    let mut latest_seq = 0u64;
+    for (ep, &sq) in &watermarks {
+        if (ep.as_str(), sq) >= (latest_epoch.as_str(), latest_seq) {
+            latest_epoch = ep.clone();
+            latest_seq = sq;
+        }
+    }
+
+    let pending_rows: Vec<SealedCommitEntry> = match store.pending_custody_commits(&watermarks, usize::MAX)? {
+        Some(rows) => rows.into_iter().map(SealedCommitEntry::from_commit_row).collect(),
+        None => collect_local_commits(store, local_packs_dir)?
+            .into_iter()
+            .filter(|c| c.seq > watermarks.get(&c.epoch).copied().unwrap_or(0))
+            .collect(),
+    };
+
+    let mut enroll_stats = ScrubStats::default();
+    let clean_host = if host_label.is_empty() {
+        String::new()
+    } else {
+        compiled
+            .scrub_text_cow(host_label, profile.repo_root.as_deref(), &mut enroll_stats)
+            .into_owned()
+    };
+
+    if !pending_rows.is_empty() || seal {
+        let prepared = if pending_rows.is_empty() {
+            PreparedBatch {
+                pack_ids: Vec::new(),
+                wire_events: Vec::new(),
+                sessions_admitted: 0,
+                sessions_filtered_out: 0,
+                redactions_applied: 0,
+            }
+        } else {
+            prepare_and_pack_commits(
+                &pending_rows,
+                local_packs_dir,
+                &spool_packs_dir,
+                producer_id,
+                "spool",
+                profile,
+                &compiled,
+            )?
+        };
+
+        for ev in &prepared.wire_events {
+            let entry = watermarks.entry(ev.event_id.epoch.clone()).or_insert(0);
+            if ev.event_id.seq > *entry {
+                *entry = ev.event_id.seq;
+            }
+            if (ev.event_id.epoch.as_str(), ev.event_id.seq) >= (latest_epoch.as_str(), latest_seq) {
+                latest_epoch = ev.event_id.epoch.clone();
+                latest_seq = ev.event_id.seq;
+            }
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut prod_meta = json!({});
+        attach_policy_metadata(&mut prod_meta, producer_id, profile);
+        if seal {
+            prod_meta["lifecycle"] = serde_json::to_value(ProducerLifecycle::Sealed {
+                sealed_at_ms: now_ms,
+                final_epoch: latest_epoch.clone(),
+                final_seq: latest_seq,
+            })?;
+        }
+
+        let batch_id = format!("batch-{now_ms}-{}", &uuid::Uuid::now_v7().simple().to_string()[..12]);
+        let manifest = SpoolBatchManifest {
+            producer_id: producer_id.to_string(),
+            host_label: clean_host,
+            producer_metadata: prod_meta,
+            pack_ids: prepared.pack_ids.clone(),
+            batch: IngestBatchRequest {
+                events: prepared.wire_events,
+            },
+        };
+        let tmp_path = spool_batches_dir.join(format!(".{batch_id}.tmp"));
+        let final_path = spool_batches_dir.join(format!("{batch_id}.json"));
+        std::fs::write(&tmp_path, serde_json::to_vec_pretty(&manifest)?)?;
+        crate::state::set_restrictive_file_mode(&tmp_path);
+        std::fs::rename(&tmp_path, &final_path)?;
+
+        if !crate::env::frozen() {
+            for (ep, &sq) in &watermarks {
+                if sq > 0 {
+                    store.advance_ship_cursor(&target_key, producer_id, ep, sq, now_ms)?;
+                }
+            }
+        }
+        report.events_spooled = manifest.batch.events.len();
+        report.packs_written = prepared.pack_ids.len();
+    }
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeltaStreamPackDesc {
+    pack_id: String,
+    idx_len: u64,
+    zst_len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeltaStreamHeader {
+    producer_id: String,
+    host_label: String,
+    producer_metadata: Value,
+    packs: Vec<DeltaStreamPackDesc>,
+    batch: IngestBatchRequest,
+}
+
+/// Export scrubbed commits strictly after `watermark_str` to `writer` (`CVDLT001` binary framing).
+/// 100% read-only on `store` and `local_packs_dir` — safe under `cv --frozen`!
+pub fn export_delta_stream<W: Write>(
+    store: &StateStore,
+    local_packs_dir: &Path,
+    producer_id: &str,
+    host_label: &str,
+    profile: &ScrubProfile,
+    watermark_str: &str,
+    mut writer: W,
+) -> Result<DeltaExportReport, HubError> {
+    let watermarks = parse_watermark(watermark_str)?;
+    let compiled = profile
+        .compile()
+        .map_err(|e| HubError::InvalidArgument(format!("invalid scrub profile: {e:#}")))?;
+
+    let pending_rows: Vec<SealedCommitEntry> = match store.pending_custody_commits(&watermarks, usize::MAX)? {
+        Some(rows) => rows.into_iter().map(SealedCommitEntry::from_commit_row).collect(),
+        None => collect_local_commits(store, local_packs_dir)?
+            .into_iter()
+            .filter(|c| c.seq > watermarks.get(&c.epoch).copied().unwrap_or(0))
+            .collect(),
+    };
+
+    let temp_parent = std::env::temp_dir();
+    let stage_dir = TempStageDir::create_in(&temp_parent)?;
+    let prepared = if pending_rows.is_empty() {
+        PreparedBatch {
+            pack_ids: Vec::new(),
+            wire_events: Vec::new(),
+            sessions_admitted: 0,
+            sessions_filtered_out: 0,
+            redactions_applied: 0,
+        }
+    } else {
+        prepare_and_pack_commits(
+            &pending_rows,
+            local_packs_dir,
+            stage_dir.path(),
+            producer_id,
+            "pull",
+            profile,
+            &compiled,
+        )?
+    };
+
+    let mut enroll_stats = ScrubStats::default();
+    let clean_host = if host_label.is_empty() {
+        String::new()
+    } else {
+        compiled
+            .scrub_text_cow(host_label, profile.repo_root.as_deref(), &mut enroll_stats)
+            .into_owned()
+    };
+    let mut prod_meta = json!({});
+    attach_policy_metadata(&mut prod_meta, producer_id, profile);
+
+    let mut pack_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(prepared.pack_ids.len());
+    let mut pack_descs: Vec<DeltaStreamPackDesc> = Vec::with_capacity(prepared.pack_ids.len());
+    for pack_id in &prepared.pack_ids {
+        let idx_bytes =
+            std::fs::read(pack_idx_path(stage_dir.path(), pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
+        let zst_bytes =
+            std::fs::read(pack_zst_path(stage_dir.path(), pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
+        pack_descs.push(DeltaStreamPackDesc {
+            pack_id: pack_id.clone(),
+            idx_len: idx_bytes.len() as u64,
+            zst_len: zst_bytes.len() as u64,
+        });
+        pack_blobs.push((idx_bytes, zst_bytes));
+    }
+
+    let events_exported = prepared.wire_events.len();
+    let packs_exported = pack_descs.len();
+    let header = DeltaStreamHeader {
+        producer_id: producer_id.to_string(),
+        host_label: clean_host,
+        producer_metadata: prod_meta,
+        packs: pack_descs,
+        batch: IngestBatchRequest {
+            events: prepared.wire_events,
+        },
+    };
+    let header_bytes = serde_json::to_vec(&header)?;
+    writer.write_all(DELTA_STREAM_MAGIC)?;
+    writer.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+    writer.write_all(&header_bytes)?;
+    for (idx_bytes, zst_bytes) in pack_blobs {
+        writer.write_all(&idx_bytes)?;
+        writer.write_all(&zst_bytes)?;
+    }
+    writer.flush()?;
+
+    Ok(DeltaExportReport {
+        events_exported,
+        packs_exported,
+    })
+}
+
+impl HubStore {
+    /// Idempotently ingest a sandbox spool directory written by [`export_to_spool`].
+    pub fn ingest_spool_dir(&self, spool_dir: &Path) -> Result<SpoolIngestReport, HubError> {
+        let batches_dir = spool_dir.join("batches");
+        let packs_dir = spool_dir.join("packs");
+        if !batches_dir.is_dir() {
+            return Err(HubError::InvalidArgument(format!(
+                "spool directory `{}` has no `batches/` subdirectory",
+                spool_dir.display()
+            )));
+        }
+        let mut batch_files: Vec<PathBuf> = std::fs::read_dir(&batches_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.starts_with('.') && n.ends_with(".json"))
+            })
+            .collect();
+        batch_files.sort();
+
+        let mut report = SpoolIngestReport::default();
+        for batch_path in batch_files {
+            let raw = std::fs::read(&batch_path)?;
+            let manifest: SpoolBatchManifest = serde_json::from_slice(&raw)?;
+            self.enroll_producer(&manifest.producer_id, &manifest.host_label, &manifest.producer_metadata)?;
+            for pack_id in &manifest.pack_ids {
+                let idx_bytes =
+                    std::fs::read(pack_idx_path(&packs_dir, pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
+                let zst_bytes =
+                    std::fs::read(pack_zst_path(&packs_dir, pack_id).map_err(|e| HubError::Pack(format!("{e:#}")))?)?;
+                self.upload_pack_bytes(pack_id, Some(&manifest.producer_id), None, &idx_bytes, &zst_bytes)?;
+            }
+            if !manifest.batch.events.is_empty() {
+                let resp = self.ingest_batch(&manifest.batch)?;
+                report.events_accepted += resp.accepted_count;
+                report.events_replayed += resp.replayed_count;
+                report.hub_generation = resp.hub_generation;
+                report.publication_id = resp.publication_id;
+            } else {
+                let latest = self.latest_generation_fast()?;
+                report.hub_generation = latest.as_ref().map(|(g, _)| *g);
+                report.publication_id = latest.map(|(_, pid)| pid);
+            }
+            report.batches_ingested += 1;
+        }
+        Ok(report)
+    }
+
+    /// Build the current pull watermark token for `producer_or_host` from `hub_frontiers`.
+    pub fn pull_watermark_for(&self, producer_or_host: &str) -> Result<String, HubError> {
+        let status = self.hub_status()?;
+        let matched_producers: BTreeSet<String> = status
+            .producers
+            .iter()
+            .filter(|p| {
+                p.producer_id == producer_or_host
+                    || p.host_label == producer_or_host
+                    || p.metadata.get("ssh_target").and_then(Value::as_str) == Some(producer_or_host)
+            })
+            .map(|p| p.producer_id.clone())
+            .collect();
+        let mut wm = BTreeMap::new();
+        for f in &status.frontiers {
+            if f.producer_id == producer_or_host || matched_producers.contains(&f.producer_id) {
+                wm.insert(f.epoch.clone(), f.contiguous_seq);
+            }
+        }
+        Ok(format_watermark(&wm))
+    }
+
+    /// Ingest a `CVDLT001` binary delta stream produced by [`export_delta_stream`].
+    pub fn ingest_delta_stream<R: Read>(
+        &self,
+        mut reader: R,
+        ssh_target_hint: Option<&str>,
+    ) -> Result<DeltaIngestReport, HubError> {
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != DELTA_STREAM_MAGIC {
+            return Err(HubError::InvalidArgument(
+                "remote delta stream missing CVDLT001 magic header".into(),
+            ));
+        }
+        let mut len_buf = [0u8; 8];
+        reader.read_exact(&mut len_buf)?;
+        let header_len = u64::from_le_bytes(len_buf);
+        if header_len > 64 * 1024 * 1024 {
+            return Err(HubError::InvalidArgument("delta stream header exceeds 64 MiB".into()));
+        }
+        let mut header_bytes = vec![0u8; header_len as usize];
+        reader.read_exact(&mut header_bytes)?;
+        let mut header: DeltaStreamHeader = serde_json::from_slice(&header_bytes)?;
+        if let Some(hint) = ssh_target_hint {
+            if !header.producer_metadata.is_object() {
+                header.producer_metadata = json!({});
+            }
+            header.producer_metadata["ssh_target"] = json!(hint);
+        }
+        self.enroll_producer(&header.producer_id, &header.host_label, &header.producer_metadata)?;
+
+        for desc in &header.packs {
+            if desc.idx_len > 64 * 1024 * 1024 || desc.zst_len > 512 * 1024 * 1024 {
+                return Err(HubError::Pack(format!(
+                    "oversized pack `{}` in delta stream",
+                    desc.pack_id
+                )));
+            }
+            let mut idx_bytes = vec![0u8; desc.idx_len as usize];
+            reader.read_exact(&mut idx_bytes)?;
+            let mut zst_bytes = vec![0u8; desc.zst_len as usize];
+            reader.read_exact(&mut zst_bytes)?;
+            self.upload_pack_bytes(&desc.pack_id, Some(&header.producer_id), None, &idx_bytes, &zst_bytes)?;
+        }
+
+        if header.batch.events.is_empty() {
+            let latest = self.latest_generation_fast()?;
+            return Ok(DeltaIngestReport {
+                events_accepted: 0,
+                events_replayed: 0,
+                hub_generation: latest.as_ref().map(|(g, _)| *g),
+                publication_id: latest.map(|(_, pid)| pid),
+            });
+        }
+        let resp = self.ingest_batch(&header.batch)?;
+        Ok(DeltaIngestReport {
+            events_accepted: resp.accepted_count,
+            events_replayed: resp.replayed_count,
+            hub_generation: resp.hub_generation,
+            publication_id: resp.publication_id,
+        })
+    }
 }
 
 #[cfg(test)]
