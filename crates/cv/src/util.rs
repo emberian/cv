@@ -167,12 +167,7 @@ pub(crate) fn require_session_file(r: &cv_core::SessionRef, adapter: &dyn cv_cor
 /// as a harness when it actually names one; otherwise the whole string is the id and `fallback`
 /// (a `--harness` flag) applies. Every command that takes an id accepts this form.
 pub(crate) fn split_harness_id(spec: &str, fallback: Option<Harness>) -> (Option<Harness>, &str) {
-    if let Some((head, rest)) = spec.split_once(':') {
-        if let Some(h) = Harness::parse(head) {
-            return (Some(h), rest);
-        }
-    }
-    (fallback, spec)
+    cv_core::custody::split_harness_id(spec, fallback)
 }
 
 /// The one way a command turns an id into a session: `harness:id` or a unique id prefix, optionally

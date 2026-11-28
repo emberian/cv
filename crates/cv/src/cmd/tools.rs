@@ -44,45 +44,70 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
     let want = crate::util::parse_harness(&harness)?;
     let view = super::place::current();
     let source = view.as_ref().map(|v| v.resolve(id, want)).transpose()?;
-    let (forest, agent) = if let (Some(v), Some(src)) = (&view, source.filter(|s| s.entry.is_some())) {
+    let (forest, agent) = if let (Some(v), Some(src)) = (&view, source.as_ref().filter(|s| s.entry.is_some())) {
         let entry = src.entry.as_ref().unwrap();
         v.omit(
             &entry.producer_id,
             "worker_inventory",
             "Only collected worker transcripts carry tool evidence.",
         );
-        let mut inputs = vec![(cv_core::tools::ORCHESTRATOR, "orchestrator", None, src)];
-        for s in v.children(src) {
+        let children = v.children(src)?;
+        let mut inputs = vec![(
+            cv_core::tools::ORCHESTRATOR.to_owned(),
+            "orchestrator".to_owned(),
+            None,
+            src,
+        )];
+        for s in &children {
             let m = &s.entry.as_ref().unwrap().metadata;
             inputs.push((
-                super::place::View::agent_id(s),
-                m["agent_type"].as_str().unwrap_or("agent"),
-                m["workflow"].as_str(),
+                super::place::View::agent_id(s).to_owned(),
+                m["agent_type"].as_str().unwrap_or("agent").to_owned(),
+                m["workflow"].as_str().map(str::to_owned),
                 s,
             ));
         }
-        inputs.retain(|(_, _, w, _)| workflow.as_deref().is_none_or(|q| w.is_some_and(|w| w.starts_with(q))));
+        inputs.retain(|(_, _, w, _)| {
+            workflow
+                .as_deref()
+                .is_none_or(|q| w.as_deref().is_some_and(|w| w.starts_with(q)))
+        });
         if let Some(q) = &agent {
-            inputs.retain(|(id, _, _, _)| id.starts_with(q));
-            anyhow::ensure!(inputs.len() == 1, "missing or ambiguous collected agent {q:?}");
+            let bare = q.strip_prefix("agent-").unwrap_or(q);
+            let exact: Vec<_> = inputs
+                .iter()
+                .filter(|(aid, ..)| aid == q || aid == bare)
+                .cloned()
+                .collect();
+            if !exact.is_empty() {
+                inputs = exact;
+            } else {
+                inputs.retain(|(aid, ..)| aid.starts_with(bare) || aid.starts_with(q));
+            }
+            if inputs.is_empty() {
+                return crate::util::usage(format!("no collected agent {q:?} in the selected places"));
+            }
+            if inputs.len() > 1 {
+                return crate::util::usage(format!("ambiguous collected agent {q:?} in the selected places"));
+            }
         }
-        let selected = agent.as_ref().and_then(|_| inputs.first().map(|t| t.0.to_owned()));
+        let selected = agent.as_ref().and_then(|_| inputs.first().map(|t| t.0.clone()));
         let mut hist = Vec::new();
         let mut events = Vec::new();
-        for (id, ty, w, s) in inputs {
+        for (aid, ty, w, s) in inputs {
             let reader = v.adapter(s)?;
             if timeline {
                 events.extend(cv_core::tools::timeline_from_reader(
                     reader.as_ref(),
                     &s.r,
-                    id,
+                    &aid,
                     tool.as_deref(),
                 )?);
             } else {
                 hist.push(cv_core::tools::AgentTools {
-                    agent: id.into(),
-                    agent_type: ty.into(),
-                    workflow: w.map(str::to_owned),
+                    agent: aid,
+                    agent_type: ty,
+                    workflow: w,
                     histogram: cv_core::tools::ToolHistogram::from_stream_selected(
                         reader.as_ref(),
                         &s.r,
@@ -98,7 +123,7 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
         (ForestTools { agents: hist }, selected)
     } else {
         let r = match source {
-            Some(s) => s.r.clone(),
+            Some(s) => s.r,
             None => crate::util::resolve(id, want)?.0,
         };
 

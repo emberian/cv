@@ -95,60 +95,159 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     }
     let view = super::place::current();
     if let Some(v) = &view {
-        if review && (v.pinned || (sessions.is_empty() && !v.envelope.borrow().includes("local"))) {
+        if review && (v.pinned() || (sessions.is_empty() && !v.inner.envelope.borrow().includes("local"))) {
             return crate::util::usage("checkout review needs the current local checkout");
         }
-        let mut selected = Vec::new();
         if sessions.is_empty() && !review {
-            let terms = query_tokens(query);
-            for src in &v.sources {
-                if let Some(e) = src.entry.as_ref().filter(|_| src.r.path.as_os_str().is_empty()) {
-                    v.omit(
-                        &e.producer_id,
-                        "missing_payload",
-                        "A session has no collected payload for recall.",
-                    );
-                    continue;
+            if !v.pinned() {
+                let mut allowed = HashSet::new();
+                for src in v.sources()? {
+                    if let Some(e) = src.entry.as_ref().filter(|_| src.r.path.as_os_str().is_empty()) {
+                        v.omit(
+                            &e.producer_id,
+                            "missing_payload",
+                            "A session has no collected payload for recall.",
+                        );
+                        continue;
+                    }
+                    allowed.insert(src.r.id.clone());
+                    allowed.insert(src.r.session_selector());
                 }
-                let mut sink = cv_core::scan::ScanSink::new(&src.r.path, cv_core::scan::Matcher::new(terms.clone(), 0));
-                v.adapter(src)?
-                    .try_stream(&src.r, &cv_core::Demand::LEAN.with_spans(), &mut sink)?;
-                sink.matcher.finish();
-                let matched = (0..terms.len()).filter(|i| sink.matcher.found(*i)).count();
-                if matched > 0 {
-                    selected.push((matched, src));
+                let (hits, collapsed) = recall_allowed(query, limit, all, Some(&allowed))?;
+                collapsed_copies = collapsed;
+                let matched = !hits.is_empty();
+                for hit in hits {
+                    let source = resolve_hit(&hit).and_then(|(session, adapter)| {
+                        let selector = Some(session.session_selector());
+                        build_source(session, adapter.as_ref(), query, excerpt_bytes, selector, redact)
+                    });
+                    match source {
+                        Ok(source) => sources.push(source),
+                        Err(error) => {
+                            eprintln!("cv pack: skipping {} ({}): {error:#}", short_id(&hit.id), hit.harness)
+                        }
+                    }
+                }
+                if matched && sources.is_empty() {
+                    bail!(
+                        "recall matched sessions but none could be read back from disk (stale index? run `cv index`)"
+                    );
+                }
+            } else {
+                let mut terms = query_tokens(query);
+                if terms.is_empty() {
+                    terms = literal_query(query).split_whitespace().map(str::to_owned).collect();
+                }
+                let mut raw_hits: Vec<(usize, cv_core::custody::ScopedSource, Option<String>)> = Vec::new();
+                if !terms.is_empty() {
+                    for src in v.sources()? {
+                        if let Some(e) = src.entry.as_ref().filter(|_| src.r.path.as_os_str().is_empty()) {
+                            v.omit(
+                                &e.producer_id,
+                                "missing_payload",
+                                "A session has no collected payload for recall.",
+                            );
+                            continue;
+                        }
+                        let mut sink =
+                            cv_core::scan::ScanSink::new(&src.r.path, cv_core::scan::Matcher::new(terms.clone(), 0));
+                        let streamed =
+                            v.adapter(src)?
+                                .try_stream(&src.r, &cv_core::Demand::LEAN.with_spans(), &mut sink)?;
+                        sink.matcher.finish();
+                        let matched = (0..terms.len()).filter(|i| sink.matcher.found(*i)).count();
+                        if matched > 0 {
+                            let derived = cv_core::lineage::derived_from_session(&streamed).map(|d| {
+                                if let Some((_, suffix)) = cv_core::SessionKey::split_selector(&src.r.id) {
+                                    if cv_core::SessionKey::split_selector(d).is_none() {
+                                        return format!("{d}@{suffix}");
+                                    }
+                                }
+                                d.to_owned()
+                            });
+                            raw_hits.push((matched, src.clone(), derived));
+                        }
+                    }
+                }
+                raw_hits.sort_by(|(a, x, _), (b, y, _)| {
+                    b.cmp(a)
+                        .then_with(|| y.r.updated_at.cmp(&x.r.updated_at))
+                        .then_with(|| x.r.id.cmp(&y.r.id))
+                });
+                let candidates: Vec<(cv_core::custody::ScopedSource, Option<String>)> = if all || raw_hits.len() <= 1 {
+                    raw_hits.into_iter().take(limit).map(|(_, s, d)| (s, d)).collect()
+                } else {
+                    let derived_map: HashMap<(String, String), String> = raw_hits
+                        .iter()
+                        .filter_map(|(_, s, d)| Some(((s.r.harness.to_string(), s.r.id.clone()), d.as_ref()?.clone())))
+                        .collect();
+                    let (kept, collapsed) = cv_core::lineage::collapse_derived_chains_with_lookup(
+                        raw_hits,
+                        |(_, s, d)| cv_core::lineage::ChainMeta {
+                            harness: s.r.harness.to_string(),
+                            id: s.r.id.clone(),
+                            derived_from: d.clone(),
+                            message_count: s.r.message_count,
+                            updated_at: s.r.updated_at.map(|t| t.timestamp()),
+                            size_bytes: None,
+                        },
+                        |h, pid| derived_map.get(&(h.to_owned(), pid.to_owned())).cloned(),
+                    );
+                    collapsed_copies = collapsed;
+                    let mut seen_titles: HashSet<(String, Option<String>)> = HashSet::new();
+                    let mut picked = Vec::with_capacity(limit.min(kept.len()));
+                    for (_, s, d) in kept {
+                        if let Some(t) = s.r.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                            let cwd_str = s.r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+                            if !seen_titles.insert((t.to_lowercase(), cwd_str)) {
+                                continue;
+                            }
+                        }
+                        picked.push((s, d));
+                        if picked.len() >= limit {
+                            break;
+                        }
+                    }
+                    picked
+                };
+                for (src, _) in candidates {
+                    let selector = Some(src.r.session_selector());
+                    let adapter = v.adapter(&src)?;
+                    sources.push(build_source(
+                        src.r,
+                        adapter.as_ref(),
+                        query,
+                        excerpt_bytes,
+                        selector,
+                        redact,
+                    )?);
                 }
             }
-            selected.sort_by(|(a, x), (b, y)| {
-                b.cmp(a)
-                    .then_with(|| y.r.updated_at.cmp(&x.r.updated_at))
-                    .then_with(|| x.r.id.cmp(&y.r.id))
-            });
-            selected.truncate(limit);
         } else {
             let mut seen = HashSet::new();
+            let mut selected = Vec::new();
             for spec in sessions {
                 let src = v.resolve(spec, None)?;
                 if seen.insert(src.r.session_selector()) {
-                    selected.push((0, src));
+                    selected.push(src);
                 }
             }
-        }
-        for (_, src) in selected {
-            if review && src.entry.is_some() {
-                return crate::util::usage("checkout review requires a local checkout");
+            for src in selected {
+                if review && src.entry.is_some() {
+                    return crate::util::usage("checkout review requires a local checkout");
+                }
+                if review {
+                    continue;
+                }
+                let selector = Some(src.r.session_selector());
+                let adapter = v.adapter(&src)?;
+                let source = if use_overview {
+                    build_overview_source(src.r, excerpt_bytes, selector, redact)
+                } else {
+                    build_source(src.r, adapter.as_ref(), query, excerpt_bytes, selector, redact)
+                };
+                sources.push(source?);
             }
-            if review {
-                continue;
-            }
-            let selector = Some(src.r.session_selector());
-            let adapter = v.adapter(src)?;
-            let source = if use_overview {
-                build_overview_source(src.r.clone(), excerpt_bytes, selector, redact)
-            } else {
-                build_source(src.r.clone(), adapter.as_ref(), query, excerpt_bytes, selector, redact)
-            };
-            sources.push(source?);
         }
     }
     if (view.is_none() || review) && !sessions.is_empty() {
@@ -160,7 +259,8 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 let (harness, id) = crate::util::split_harness_id(spec, None);
                 let (session, adapter) = if let Some(v) = &view {
                     let src = v.resolve(spec, None)?;
-                    (src.r.clone(), v.adapter(src)?)
+                    let adapter = v.adapter(&src)?;
+                    (src.r, adapter)
                 } else {
                     crate::cmd::distill::resolve_source(id, harness)?
                 };
@@ -248,7 +348,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         let mut file_digests = cv_core::task::FileDigests::default();
         for s in &mut sources {
             if view.as_ref().is_none_or(|v| {
-                !v.pinned && v.envelope.borrow().includes("local") && !cv_core::custody::is_pack_ref(&s.session)
+                !v.pinned() && v.inner.envelope.borrow().includes("local") && !cv_core::custody::is_pack_ref(&s.session)
             }) {
                 s.verified = cv_core::events::workspace::observed_edits(s.session.harness.as_str(), &s.session.id)?;
                 let blobs = cv_core::events::workspace::observed_file_blobs(s.session.harness.as_str(), &s.session.id)?;
@@ -278,6 +378,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         }
         if let Some(v) = &view {
             let peers: Vec<_> = v
+                .inner
                 .envelope
                 .borrow()
                 .places
@@ -295,7 +396,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
         }
         let replay = if view
             .as_ref()
-            .is_none_or(|v| !v.pinned && v.envelope.borrow().includes("local"))
+            .is_none_or(|v| !v.pinned() && v.inner.envelope.borrow().includes("local"))
         {
             Some(cv_core::lanes::replay_tasks_readonly()?)
         } else {
@@ -443,6 +544,15 @@ const FTS_WEIGHT: f32 = 2.0;
 const SEM_WEIGHT: f32 = 1.0;
 
 fn recall(task: &str, limit: usize, all: bool) -> Result<(Vec<cv_search::Hit>, Vec<cv_core::lineage::CollapsedCopy>)> {
+    recall_allowed(task, limit, all, None)
+}
+
+fn recall_allowed(
+    task: &str,
+    limit: usize,
+    all: bool,
+    allowed_ids: Option<&HashSet<String>>,
+) -> Result<(Vec<cv_search::Hit>, Vec<cv_core::lineage::CollapsedCopy>)> {
     let fetch = if all {
         limit.saturating_mul(4).max(20)
     } else {
@@ -451,7 +561,7 @@ fn recall(task: &str, limit: usize, all: bool) -> Result<(Vec<cv_search::Hit>, V
     let searcher = cv_search::Searcher;
     let mut ranked: Vec<(f32, Vec<cv_search::Hit>)> = Vec::new();
 
-    match fts_recall_in(&searcher, &cv_search::default_tantivy_dir(), task, fetch) {
+    match fts_recall_in(&searcher, &cv_search::default_tantivy_dir(), task, fetch, allowed_ids) {
         Ok(found) => {
             for note in &found.notes {
                 match note {
@@ -478,29 +588,38 @@ fn recall(task: &str, limit: usize, all: bool) -> Result<(Vec<cv_search::Hit>, V
 /// Tantivy's `QueryParser` treats as field/range syntax; when `QueryParser` rejects the raw task,
 /// fall back to its sanitized literal terms, and when conjunctive matching finds nothing, relax
 /// multi-word tasks to `OR`.
-fn fts_recall_in(searcher: &cv_search::Searcher, dir: &Path, task: &str, fetch: usize) -> Result<cv_search::Found> {
+fn fts_recall_in(
+    searcher: &cv_search::Searcher,
+    dir: &Path,
+    task: &str,
+    fetch: usize,
+    allowed_ids: Option<&HashSet<String>>,
+) -> Result<cv_search::Found> {
     let filter = cv_search::SearchFilter::default();
-    let initial = match searcher.search_in(dir, task, filter, fetch, cv_search::Source::Index, None) {
-        Ok(found) => found,
-        Err(e) if cv_search::is_invalid_text_query(&e) => {
-            let lit = literal_query(task);
-            if lit.is_empty() {
-                return Ok(cv_search::Found {
-                    hits: Vec::new(),
-                    source: cv_search::Source::Index,
-                    notes: Vec::new(),
-                    total: 0,
-                });
+    let initial =
+        match searcher.search_in_allowed(dir, task, filter, allowed_ids, fetch, cv_search::Source::Index, None) {
+            Ok(found) => found,
+            Err(e) if cv_search::is_invalid_text_query(&e) => {
+                let lit = literal_query(task);
+                if lit.is_empty() {
+                    return Ok(cv_search::Found {
+                        hits: Vec::new(),
+                        source: cv_search::Source::Index,
+                        notes: Vec::new(),
+                        total: 0,
+                    });
+                }
+                searcher.search_in_allowed(dir, &lit, filter, allowed_ids, fetch, cv_search::Source::Index, None)?
             }
-            searcher.search_in(dir, &lit, filter, fetch, cv_search::Source::Index, None)?
-        }
-        Err(e) => return Err(e),
-    };
+            Err(e) => return Err(e),
+        };
     if !initial.hits.is_empty() {
         return Ok(initial);
     }
     if let Some(q) = or_query(task) {
-        if let Ok(relaxed) = searcher.search_in(dir, &q, filter, fetch, cv_search::Source::Index, None) {
+        if let Ok(relaxed) =
+            searcher.search_in_allowed(dir, &q, filter, allowed_ids, fetch, cv_search::Source::Index, None)
+        {
             if !relaxed.hits.is_empty() {
                 return Ok(relaxed);
             }
@@ -794,10 +913,37 @@ fn build_source(
 ) -> Result<PackSource> {
     // Carry the resolved source through the read, including path-selected duplicate IDs.
     let mut resolved = session.clone();
-    let (excerpt, excerpt_range, rows) = if let Some(v) = super::place::current() {
-        let (excerpt, range) =
-            best_window_observing(adapter, &session, task, excerpt_bytes, None, Some(&mut resolved))?;
-        (excerpt, range, v.event_rows(v.source_for(&session)?)?)
+    let (excerpt, excerpt_range, rows) = if super::place::current().is_some() {
+        // Single-pass stream: score the excerpt window AND extract tool/file events in one pass
+        // instead of decompressing and streaming the session revision twice.
+        let mut ev_sink = cv_core::events::EventSink::new(session.cwd.clone()).with_source(session.path.clone());
+        let (excerpt, range) = best_window_with_event_sink(
+            adapter,
+            &session,
+            task,
+            excerpt_bytes,
+            &mut ev_sink,
+            Some(&mut resolved),
+        )?;
+        let rows = ev_sink
+            .into_events()?
+            .into_iter()
+            .map(|e| cv_core::events::EventRow {
+                baggage: None,
+                harness: resolved.harness.to_string(),
+                session_id: resolved.id.clone(),
+                msg_idx: e.msg_idx as i64,
+                ts: e.ts,
+                kind: e.kind.into(),
+                tool: e.tool,
+                target: e.target,
+                detail: e.detail,
+                agent_id: None,
+                parent_id: None,
+                workflow: None,
+            })
+            .collect();
+        (excerpt, range, rows)
     } else {
         let (excerpt, range) =
             best_window_and_ingest_meta(adapter, &session, task, excerpt_bytes, Some(&mut resolved))?;
@@ -842,9 +988,37 @@ fn build_overview_source(
     };
     let (overview, session, rows) = if let Some(v) = super::place::current() {
         let src = v.source_for(&session)?;
-        let parsed = v.adapter(src)?.parse(&session)?;
+        let parsed = v.adapter(&src)?.parse(&session)?;
         let overview = cv_core::overview::from_session(&parsed, &opts)?;
-        (overview, session, v.event_rows(src)?)
+        // Extract events directly from the already-parsed session in memory rather than
+        // decompressing the custody pack a second time.
+        let mut ev_sink = cv_core::events::EventSink::new(parsed.cwd.clone()).with_source(session.path.clone());
+        cv_core::MessageSink::meta(&mut ev_sink, &parsed);
+        for msg in &parsed.messages {
+            let _ = cv_core::MessageSink::message(&mut ev_sink, msg.clone());
+        }
+        let mut updated_ref: cv_core::SessionRef = serde_json::from_value(overview.session.clone())?;
+        updated_ref.id = session.id.clone();
+        updated_ref.path = session.path.clone();
+        let rows = ev_sink
+            .into_events()?
+            .into_iter()
+            .map(|e| cv_core::events::EventRow {
+                baggage: None,
+                harness: updated_ref.harness.to_string(),
+                session_id: updated_ref.id.clone(),
+                msg_idx: e.msg_idx as i64,
+                ts: e.ts,
+                kind: e.kind.into(),
+                tool: e.tool,
+                target: e.target,
+                detail: e.detail,
+                agent_id: None,
+                parent_id: None,
+                workflow: None,
+            })
+            .collect();
+        (overview, updated_ref, rows)
     } else {
         let overview = cv_core::overview::read(&session, &opts)?;
         let session = serde_json::from_value(overview.session.clone())?;
@@ -1152,6 +1326,87 @@ fn best_window(
     limit: usize,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
     best_window_observing(adapter, r, task, limit, None, None)
+}
+
+fn best_window_with_event_sink(
+    adapter: &dyn cv_core::Adapter,
+    r: &cv_core::SessionRef,
+    task: &str,
+    limit: usize,
+    events: &mut cv_core::events::EventSink,
+    metadata: Option<&mut cv_core::SessionRef>,
+) -> Result<(Excerpt, Option<(usize, usize)>)> {
+    let needle = task.to_lowercase();
+    let words = query_tokens(task);
+
+    struct CombinedSink<'a> {
+        events: &'a mut cv_core::events::EventSink,
+        words: Vec<String>,
+        needle: String,
+        resolver: Resolver,
+        limit: usize,
+        window: cv_core::api::MessageWindow<(Role, cv_core::ir::Origin, String, bool)>,
+        error: Option<anyhow::Error>,
+    }
+    impl MessageSink for CombinedSink<'_> {
+        fn meta(&mut self, session: &Session) {
+            self.events.meta(session);
+        }
+        fn dependency(&mut self, path: &Path) {
+            self.events.dependency(path);
+        }
+        fn take_error(&mut self) -> Option<anyhow::Error> {
+            self.error.take().or_else(|| self.events.take_error())
+        }
+        fn message(&mut self, m: Message) -> Flow {
+            let (text, cut) = match capped_text(&m, &self.resolver, self.limit) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.error = Some(error);
+                    return Flow::Stop;
+                }
+            };
+            let role = m.role;
+            let origin = m.origin;
+            if self.events.message(m) == Flow::Stop {
+                return Flow::Stop;
+            }
+            if text.trim().is_empty() {
+                self.window.skip();
+                return Flow::Continue;
+            }
+            let low = text.to_lowercase();
+            let mut score = lexical_score(&low, &self.needle, self.words.iter().map(String::as_str));
+            if role == Role::Tool {
+                score /= 2;
+            }
+            self.window.scored((role, origin, text, cut), score);
+            Flow::Continue
+        }
+    }
+
+    let mut sink = CombinedSink {
+        events,
+        words,
+        needle,
+        resolver: Resolver::new(Some(r.path.clone())),
+        limit,
+        window: cv_core::api::MessageWindow::best(),
+        error: None,
+    };
+    let meta = adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
+    if let Some(r) = metadata {
+        r.cwd = meta.cwd.or_else(|| r.cwd.take());
+        r.title = meta.title.or_else(|| r.title.take());
+        r.created_at = meta.created_at.or(r.created_at);
+        r.updated_at = meta.updated_at.or(r.updated_at);
+    }
+    let selected = sink.window.finish();
+    let range = selected
+        .first()
+        .zip(selected.last())
+        .map(|((lo, _), (hi, _))| (*lo, hi + 1));
+    Ok((selected.into_iter().map(|(_, value)| value).collect(), range))
 }
 
 fn best_window_observing(

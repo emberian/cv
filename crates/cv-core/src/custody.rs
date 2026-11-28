@@ -938,6 +938,828 @@ pub fn is_pack_ref(r: &SessionRef) -> bool {
     SessionKey::split_selector(&r.id).is_some() && r.path.to_string_lossy().ends_with(".pack.zst")
 }
 
+impl Backing {
+    /// True when this custody entry is a local archive or echoed self-shipped hub copy of a live
+    /// transcript currently present on disk in `live_triples` (`(profile, harness, native_id)`).
+    pub(crate) fn is_local_shadow_of(
+        &self,
+        live_triples: &std::collections::HashSet<(PathBuf, Harness, String)>,
+        local_shipped_producers: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let is_local_origin =
+            self.source == "custody_pack" || local_shipped_producers.contains(self.key.producer.as_str());
+        is_local_origin
+            && live_triples.contains(&(self.key.profile.clone(), self.key.harness, self.key.native_id.clone()))
+    }
+}
+
+/// Split an optional `<harness>:<id>` prefix off an id when the head names a known [`Harness`].
+pub fn split_harness_id(spec: &str, fallback: Option<Harness>) -> (Option<Harness>, &str) {
+    if let Some((head, rest)) = spec.split_once(':') {
+        if let Some(h) = Harness::parse(head) {
+            return (Some(h), rest);
+        }
+    }
+    (fallback, spec)
+}
+
+/// Next lexicographic UTF-8 string strictly greater than every string starting with `prefix`.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let code = last as u32;
+        let next = if code == 0xD7FF {
+            char::from_u32(0xE000)
+        } else if code < 0x10FFFF {
+            char::from_u32(code + 1)
+        } else {
+            None
+        };
+        if let Some(c) = next {
+            chars.push(c);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+fn map_hub_head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::state::hub::SessionRevisionEntry> {
+    let payload_str: Option<String> = r.get(12)?;
+    let custody_str: Option<String> = r.get(13)?;
+    let meta_str: String = r.get(14)?;
+    Ok(crate::state::hub::SessionRevisionEntry {
+        producer_id: r.get(0)?,
+        session_id: r.get(1)?,
+        harness: r.get(2)?,
+        revision: r.get(3)?,
+        title: r.get(4)?,
+        cwd: r.get(5)?,
+        model: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+        message_count: r.get::<_, i64>(9)? as u64,
+        epoch: r.get(10)?,
+        event_seq: r.get::<_, i64>(11)? as u64,
+        payload_addr: payload_str.and_then(|s| serde_json::from_str(&s).ok()),
+        custody: custody_str.and_then(|s| serde_json::from_str(&s).ok()),
+        metadata: serde_json::from_str(&meta_str).unwrap_or_else(|_| serde_json::json!({})),
+    })
+}
+
+fn dedup_hub_heads(rows: Vec<crate::state::hub::SessionRevisionEntry>) -> Vec<crate::state::hub::SessionRevisionEntry> {
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    rows.into_iter()
+        .filter(|e| seen.insert((e.producer_id.clone(), e.session_id.clone())))
+        .collect()
+}
+
+/// Typed failure modes when evaluating place/generation/staleness constraints across CLI and HTTP.
+#[derive(Debug)]
+pub enum AuthorityEvalError {
+    BadDuration(String),
+    GenerationNotFound(String),
+    Staleness(crate::state::hub::StalenessViolation),
+    Hub(crate::state::hub::HubError),
+}
+
+/// Shared place, generation, and staleness evaluator for CLI commands and HTTP `/api/*` routes.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_authority(
+    place_glob: Option<&str>,
+    as_of_spec: Option<&str>,
+    max_staleness: Option<&str>,
+    cwd_filter: Option<&str>,
+    query_str: Option<&str>,
+    has_negation: bool,
+    indexed_only: bool,
+) -> std::result::Result<(Option<u64>, crate::state::hub::AuthorityEnvelope), AuthorityEvalError> {
+    use crate::state::hub::{parse_duration_ms, AuthorityQueryContext, HubError, HubStore};
+    let max_staleness_ms = match max_staleness {
+        Some(raw) => Some(parse_duration_ms(raw).map_err(AuthorityEvalError::BadDuration)?),
+        None => None,
+    };
+    let hub = HubStore::default_hub().map_err(AuthorityEvalError::Hub)?;
+    let as_of_gen = match as_of_spec {
+        Some(spec) => match hub.resolve_generation(Some(spec)) {
+            Ok(Some(rec)) => Some(rec.generation),
+            Ok(None) | Err(HubError::NotFound(_)) => {
+                return Err(AuthorityEvalError::GenerationNotFound(spec.to_owned()))
+            }
+            Err(e) => return Err(AuthorityEvalError::Hub(e)),
+        },
+        None => None,
+    };
+    let ctx = AuthorityQueryContext {
+        place_glob,
+        as_of_gen,
+        max_staleness_ms,
+        cwd_filter,
+        query_str,
+        has_negation,
+        indexed_only,
+        include_local: as_of_gen.is_none(),
+    };
+    let env = hub.check_authority(&ctx).map_err(AuthorityEvalError::Staleness)?;
+    Ok((as_of_gen, env))
+}
+
+impl crate::state::hub::HubStore {
+    /// Indexed `O(log N)` resolution of session heads matching `id` (canonical selector,
+    /// `producer:harness:id`, exact native/session ID, or unique prefix), optionally pinned to
+    /// `as_of_gen` and constrained to `scope`.
+    pub fn resolve_session_heads(
+        &self,
+        id: &str,
+        harness: Option<Harness>,
+        as_of_gen: Option<u64>,
+        scope: Option<&crate::state::hub::AuthorityEnvelope>,
+    ) -> std::result::Result<Vec<crate::state::hub::SessionRevisionEntry>, crate::state::hub::HubError> {
+        use crate::state::hub::HubError;
+        if id.is_empty() {
+            return Ok(Vec::new());
+        }
+        const COLS: &str = "producer_id, session_id, harness, revision, title, cwd, model,
+                            created_at, updated_at, message_count, epoch, event_seq,
+                            payload_addr_json, custody_json, metadata_json";
+        let result = self.state_store().read_in(|conn| {
+            if !conn.table_exists(None, "hub_session_heads")? {
+                return Ok(None);
+            }
+            if let Some(g) = as_of_gen {
+                if !conn.table_exists(None, "hub_generations")? {
+                    return Ok(None);
+                }
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM hub_generations WHERE generation = ?1)",
+                    [g as i64],
+                    |r| r.get(0),
+                )?;
+                if !exists {
+                    return Ok(None);
+                }
+            }
+            let query_rows = |where_clause: &str, params: &[&dyn rusqlite::ToSql]| {
+                let sql = format!(
+                    "SELECT {COLS} FROM hub_session_heads
+                     WHERE {where_clause}
+                     ORDER BY gen_from DESC, updated_at DESC, producer_id ASC, session_id ASC"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params, map_hub_head_row)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            };
+
+            let g_i64 = as_of_gen.map(|g| g as i64);
+            let raw_candidates = if SessionKey::split_selector(id).is_some() {
+                match g_i64 {
+                    None => query_rows("selector = ?1 AND gen_to IS NULL", &[&id])?,
+                    Some(ref g) => query_rows(
+                        "selector = ?1 AND gen_from <= ?2 AND (gen_to IS NULL OR gen_to > ?2)",
+                        &[&id, g],
+                    )?,
+                }
+            } else if let Some((prod, _)) = id.split_once(':').filter(|(p, _)| Harness::parse(p).is_none()) {
+                match g_i64 {
+                    None => query_rows("producer_id = ?1 AND +gen_to IS NULL", &[&prod])?,
+                    Some(ref g) => query_rows(
+                        "producer_id = ?1 AND gen_from <= ?2 AND (gen_to IS NULL OR gen_to > ?2)",
+                        &[&prod, g],
+                    )?,
+                }
+            } else if let Some(hi) = prefix_upper_bound(id) {
+                let primary = match g_i64 {
+                    None => query_rows("selector >= ?1 AND selector < ?2 AND +gen_to IS NULL", &[&id, &hi])?,
+                    Some(ref g) => query_rows(
+                        "selector >= ?1 AND selector < ?2 AND gen_from <= ?3 AND (gen_to IS NULL OR gen_to > ?3)",
+                        &[&id, &hi, g],
+                    )?,
+                };
+                if primary.is_empty() {
+                    // Fallback for pre-V8 SQL-migrated rows whose `selector` used `prod:harness:id`.
+                    match g_i64 {
+                        None => query_rows("session_id >= ?1 AND session_id < ?2 AND gen_to IS NULL", &[&id, &hi])?,
+                        Some(ref g) => query_rows(
+                            "session_id >= ?1 AND session_id < ?2 AND gen_from <= ?3 AND (gen_to IS NULL OR gen_to > ?3)",
+                            &[&id, &hi, g],
+                        )?,
+                    }
+                } else {
+                    primary
+                }
+            } else {
+                match g_i64 {
+                    None => query_rows("selector >= ?1 AND +gen_to IS NULL", &[&id])?,
+                    Some(ref g) => query_rows(
+                        "selector >= ?1 AND gen_from <= ?2 AND (gen_to IS NULL OR gen_to > ?2)",
+                        &[&id, g],
+                    )?,
+                }
+            };
+            Ok(Some(dedup_hub_heads(raw_candidates)))
+        })?;
+
+        let candidates = match (as_of_gen, result.flatten()) {
+            (Some(g), None) => return Err(HubError::NotFound(format!("generation {g} not found"))),
+            (_, Some(rows)) => rows,
+            (None, None) => Vec::new(),
+        };
+
+        let filtered: Vec<_> = candidates
+            .into_iter()
+            .filter(|e| {
+                harness.is_none_or(|h| Harness::parse(&e.harness) == Some(h))
+                    && scope.is_none_or(|s| s.includes(&e.producer_id))
+            })
+            .collect();
+
+        let matches_id = |e: &crate::state::hub::SessionRevisionEntry, exact_only: bool| {
+            let native = e
+                .metadata
+                .get("native_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&e.session_id);
+            let sel = e.selector_string();
+            let human_key = format!("{}:{}:{}", e.producer_id, e.harness, native);
+            let prod_sess = format!("{}:{}", e.producer_id, e.session_id);
+            if exact_only {
+                sel == id || e.session_id == id || native == id || human_key == id || prod_sess == id
+            } else {
+                sel.starts_with(id)
+                    || native.starts_with(id)
+                    || e.session_id.starts_with(id)
+                    || human_key.starts_with(id)
+                    || prod_sess.starts_with(id)
+            }
+        };
+
+        let exact: Vec<_> = filtered.iter().filter(|e| matches_id(e, true)).cloned().collect();
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        Ok(filtered.into_iter().filter(|e| matches_id(e, false)).collect())
+    }
+
+    /// Indexed `O(|sessions_of_producer|)` lookup of collected child worker transcripts under `parent`.
+    pub fn children_of_head(
+        &self,
+        parent: &crate::state::hub::SessionRevisionEntry,
+        as_of_gen: Option<u64>,
+    ) -> std::result::Result<Vec<crate::state::hub::SessionRevisionEntry>, crate::state::hub::HubError> {
+        let native = parent
+            .metadata
+            .get("native_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&parent.session_id)
+            .to_owned();
+        let selector = parent.selector_string();
+        let rows = self
+            .state_store()
+            .read_in(|conn| {
+                if !conn.table_exists(None, "hub_session_heads")? {
+                    return Ok(Vec::new());
+                }
+                const COLS: &str = "producer_id, session_id, harness, revision, title, cwd, model,
+                                    created_at, updated_at, message_count, epoch, event_seq,
+                                    payload_addr_json, custody_json, metadata_json";
+                let found = match as_of_gen {
+                    None => {
+                        let mut stmt = conn.prepare(&format!(
+                            "SELECT {COLS} FROM hub_session_heads
+                             WHERE producer_id = ?1 AND +gen_to IS NULL
+                               AND json_extract(metadata_json, '$.parent_id') IN (?2, ?3)
+                             ORDER BY gen_from DESC, updated_at DESC, session_id ASC"
+                        ))?;
+                        let mapped = stmt.query_map(
+                            rusqlite::params![parent.producer_id, native, selector],
+                            map_hub_head_row,
+                        )?;
+                        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+                    }
+                    Some(g) => {
+                        let mut stmt = conn.prepare(&format!(
+                            "SELECT {COLS} FROM hub_session_heads
+                             WHERE producer_id = ?1
+                               AND gen_from <= ?4 AND (gen_to IS NULL OR gen_to > ?4)
+                               AND json_extract(metadata_json, '$.parent_id') IN (?2, ?3)
+                             ORDER BY gen_from DESC, updated_at DESC, session_id ASC"
+                        ))?;
+                        let mapped = stmt.query_map(
+                            rusqlite::params![parent.producer_id, native, selector, g as i64],
+                            map_hub_head_row,
+                        )?;
+                        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+                    }
+                };
+                Ok(dedup_hub_heads(found))
+            })?
+            .unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .filter(|child| child.metadata["profile"] == parent.metadata["profile"])
+            .collect())
+    }
+
+    /// Producer IDs in `scope` that have at least one metadata-only session head without a
+    /// mirrored payload at `as_of_gen`.
+    pub fn uncollected_producers(
+        &self,
+        as_of_gen: Option<u64>,
+        scope: &crate::state::hub::AuthorityEnvelope,
+    ) -> std::result::Result<Vec<String>, crate::state::hub::HubError> {
+        let rows = self
+            .state_store()
+            .read_in(|conn| {
+                if !conn.table_exists(None, "hub_session_heads")? {
+                    return Ok(Vec::new());
+                }
+                let prods: Vec<String> = match as_of_gen {
+                    None => {
+                        let mut stmt = conn.prepare(
+                            "SELECT DISTINCT producer_id FROM hub_session_heads
+                             WHERE gen_to IS NULL AND payload_addr_json IS NULL AND custody_json IS NULL
+                             ORDER BY producer_id",
+                        )?;
+                        let mapped = stmt.query_map([], |r| r.get(0))?;
+                        mapped.collect::<rusqlite::Result<_>>()?
+                    }
+                    Some(g) => {
+                        let mut stmt = conn.prepare(
+                            "SELECT DISTINCT producer_id FROM hub_session_heads
+                             WHERE gen_from <= ?1 AND (gen_to IS NULL OR gen_to > ?1)
+                               AND payload_addr_json IS NULL AND custody_json IS NULL
+                             ORDER BY producer_id",
+                        )?;
+                        let mapped = stmt.query_map([g as i64], |r| r.get(0))?;
+                        mapped.collect::<rusqlite::Result<_>>()?
+                    }
+                };
+                Ok(prods)
+            })?
+            .unwrap_or_default();
+        Ok(rows.into_iter().filter(|p| scope.includes(p)).collect())
+    }
+
+    /// Producer IDs captured locally in this `CLUSTERVISION_HOME` (`"local"` plus any explicit
+    /// `$CV_PRODUCER_ID` recorded in `custody_commits`), used to suppress self-shipped duplicates
+    /// when a query spans both live `"local"` transcripts and the local hub.
+    pub fn local_shipped_producers(
+        &self,
+    ) -> std::result::Result<std::collections::BTreeSet<String>, crate::state::hub::HubError> {
+        let mut out = std::collections::BTreeSet::from(["local".to_owned()]);
+        if let Some(extra) = self.state_store().read_in(|conn| {
+            if !conn.table_exists(None, "custody_commits")? {
+                return Ok(Vec::new());
+            }
+            let mut stmt = conn.prepare_cached("SELECT DISTINCT producer_id FROM custody_commits")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })? {
+            out.extend(extra);
+        }
+        Ok(out)
+    }
+}
+
+/// Indexed `O(log N)` lookup across local `custody_heads` and active `hub_session_heads` for `id`,
+/// replacing `O(|S_fleet|)` `inventory()` table scans in `cv_core::find`.
+pub fn matching_backings(id: &str, harness: Option<Harness>) -> Result<Vec<Backing>> {
+    if id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(home) = crate::env::Env::current().cv_home() else {
+        return Ok(Vec::new());
+    };
+    let db_path = home.join("state.db");
+    let meta = match std::fs::metadata(&db_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = BTreeMap::new();
+    let hub = crate::state::hub::HubStore::at_home(&home);
+    match hub.resolve_session_heads(id, harness, None, None) {
+        Ok(heads) => {
+            for entry in heads {
+                if let Some(backing) = backing_from_hub_head(hub.packs_dir(), entry)? {
+                    rows.insert(backing.reference.id.clone(), backing);
+                }
+            }
+        }
+        Err(crate::state::hub::HubError::State(crate::state::StateError::NewerSchema { .. })) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let store = crate::state::StateStore::at_dir(&home);
+    let local_vals: Option<Vec<serde_json::Value>> = store
+        .read_in(|conn| {
+            if !crate::state::tables::custody_heads_fresh(conn)? {
+                return Ok(None);
+            }
+            let raw: Vec<String> = if SessionKey::split_selector(id).is_some() {
+                let mut stmt = conn.prepare("SELECT entry_json FROM custody_heads WHERE selector = ?1")?;
+                let r = stmt.query_map([id], |row| row.get(0))?;
+                r.collect::<rusqlite::Result<_>>()?
+            } else if let Some(hi) = prefix_upper_bound(id) {
+                let mut stmt =
+                    conn.prepare("SELECT entry_json FROM custody_heads WHERE selector >= ?1 AND selector < ?2")?;
+                let r = stmt.query_map([id, hi.as_str()], |row| row.get(0))?;
+                r.collect::<rusqlite::Result<_>>()?
+            } else {
+                let mut stmt = conn.prepare("SELECT entry_json FROM custody_heads WHERE selector >= ?1")?;
+                let r = stmt.query_map([id], |row| row.get(0))?;
+                r.collect::<rusqlite::Result<_>>()?
+            };
+            let mut decoded = Vec::with_capacity(raw.len());
+            for s in raw {
+                decoded.push(serde_json::from_str(&s)?);
+            }
+            Ok(Some(decoded))
+        })?
+        .flatten();
+
+    let local_entries: Vec<ArchivedSessionEntry> = match local_vals {
+        Some(vals) => vals
+            .into_iter()
+            .map(|v| serde_json::from_value(v).context("decoding custody head"))
+            .collect::<Result<_>>()?,
+        None => committed_entries(&home, false)?.0.into_values().collect(),
+    };
+    for entry in local_entries {
+        let (selector, backing) = backing_from_local_head(&home, entry)?;
+        if harness.is_none_or(|h| h == backing.reference.harness)
+            && (selector == id
+                || backing.key.native_id.starts_with(id)
+                || SessionKey::split_selector(&selector).is_some_and(|(n, _)| n.starts_with(id)))
+        {
+            rows.insert(selector, backing);
+        }
+    }
+    Ok(rows.into_values().collect())
+}
+
+/// Resolution errors inside a place/generation-scoped view (`ScopedView`).
+#[derive(Debug)]
+pub enum ScopedResolveError {
+    NotFound(String),
+    Ambiguous(String),
+    Other(anyhow::Error),
+}
+
+/// One local or hub-replicated session selected under an [`AuthorityEnvelope`].
+#[derive(Clone)]
+pub struct ScopedSource {
+    pub r: SessionRef,
+    pub entry: Option<crate::state::hub::SessionRevisionEntry>,
+}
+
+/// Shared place- and generation-scoped session view used by both CLI commands and HTTP `/api/*`.
+///
+/// Point and prefix resolutions (`resolve`, `children`, `child`) execute in `O(log N)` via SQLite
+/// indexes without materializing the fleet; multi-session enumerations (`sources`) populate lazily
+/// once and deduplicate live local transcripts against local custody and self-shipped hub echoes.
+pub struct ScopedView {
+    sources: std::cell::OnceCell<Vec<ScopedSource>>,
+    pub envelope: std::cell::RefCell<crate::state::hub::AuthorityEnvelope>,
+    pub pinned: bool,
+    hub: crate::state::hub::HubStore,
+}
+
+impl ScopedView {
+    pub fn new(
+        hub: crate::state::hub::HubStore,
+        authority: crate::state::hub::AuthorityEnvelope,
+        pinned: bool,
+    ) -> Self {
+        Self {
+            sources: std::cell::OnceCell::new(),
+            envelope: std::cell::RefCell::new(authority),
+            pinned,
+            hub,
+        }
+    }
+
+    pub fn hub(&self) -> &crate::state::hub::HubStore {
+        &self.hub
+    }
+
+    /// Deduplicated session inventory across the selected places and generation, materialized on demand.
+    pub fn sources(&self) -> Result<&[ScopedSource]> {
+        if let Some(existing) = self.sources.get() {
+            return Ok(existing.as_slice());
+        }
+        let include_local = !self.pinned && self.envelope.borrow().includes("local");
+        let generation = self.envelope.borrow().generation;
+        let mut built = Vec::new();
+        let mut seen_selectors = std::collections::HashSet::new();
+        let mut live_triples = std::collections::HashSet::new();
+
+        if include_local {
+            for r in crate::live_sessions() {
+                if !r.path.starts_with(self.hub.packs_dir()) {
+                    seen_selectors.insert(r.session_selector());
+                    live_triples.insert((SessionKey::local(&r).profile, r.harness, r.id.clone()));
+                    built.push(ScopedSource { r, entry: None });
+                }
+            }
+            if let Some(home) = crate::env::Env::current().cv_home() {
+                let db_path = home.join("state.db");
+                if db_path.is_file() {
+                    for (_, entry) in head_entries(&home)? {
+                        let (selector, backing) = backing_from_local_head(&home, entry)?;
+                        if !backing.is_local_shadow_of(&live_triples, &Default::default())
+                            && seen_selectors.insert(selector)
+                        {
+                            built.push(ScopedSource {
+                                r: backing.reference,
+                                entry: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if generation != 0 {
+            let local_prods = if include_local {
+                self.hub.local_shipped_producers()?
+            } else {
+                Default::default()
+            };
+            for entry in self.hub.heads_at_generation(Some(generation))? {
+                if !self.envelope.borrow().includes(&entry.producer_id) {
+                    continue;
+                }
+                let sel = entry.selector_string();
+                if !seen_selectors.insert(sel) {
+                    continue;
+                }
+                if local_prods.contains(&entry.producer_id) {
+                    if let Some(k) = entry.session_key_struct() {
+                        if live_triples.contains(&(k.profile, k.harness, k.native_id)) {
+                            continue;
+                        }
+                    }
+                }
+                if let Some(r) = crate::api::hub_head_to_ref(self.hub.packs_dir(), &entry) {
+                    built.push(ScopedSource { r, entry: Some(entry) });
+                }
+            }
+        }
+
+        let _ = self.sources.set(built);
+        Ok(self.sources.get().expect("just initialized").as_slice())
+    }
+
+    pub fn resolve(
+        &self,
+        spec: &str,
+        harness: Option<Harness>,
+    ) -> std::result::Result<ScopedSource, ScopedResolveError> {
+        let (want, id) = split_harness_id(spec, harness);
+        let native_of = |s: &ScopedSource| {
+            s.entry
+                .as_ref()
+                .and_then(|e| e.session_key_struct())
+                .map(|k| k.native_id)
+                .unwrap_or_else(|| s.r.id.clone())
+        };
+        let pick_from = |candidates: Vec<ScopedSource>| -> std::result::Result<ScopedSource, ScopedResolveError> {
+            let exact: Vec<_> = candidates
+                .iter()
+                .filter(|s| {
+                    s.r.id == id || s.r.session_selector() == id || native_of(s) == id || s.r.path == Path::new(id)
+                })
+                .cloned()
+                .collect();
+            let hits = if exact.is_empty() {
+                candidates
+                    .into_iter()
+                    .filter(|s| s.r.id.starts_with(id) || native_of(s).starts_with(id))
+                    .collect()
+            } else {
+                exact
+            };
+            match hits.as_slice() {
+                [s] => Ok(s.clone()),
+                [] => Err(ScopedResolveError::NotFound(spec.to_owned())),
+                _ => Err(ScopedResolveError::Ambiguous(spec.to_owned())),
+            }
+        };
+
+        if let Some(loaded) = self.sources.get() {
+            let cands = loaded
+                .iter()
+                .filter(|s| want.is_none_or(|h| s.r.harness == h))
+                .cloned()
+                .collect();
+            return pick_from(cands);
+        }
+
+        let include_local = !self.pinned && self.envelope.borrow().includes("local");
+        let generation = self.envelope.borrow().generation;
+        let mut candidates = Vec::new();
+        let mut live_triple: Option<(PathBuf, Harness, String)> = None;
+        let mut seen_selectors = std::collections::HashSet::new();
+
+        if include_local {
+            let local_found = if Path::new(id).is_file() && !Path::new(id).starts_with(self.hub.packs_dir()) {
+                crate::find(id, want)
+            } else {
+                match crate::find_top_level_cheap(id, want) {
+                    Ok((Some(hit), _)) => Ok(Some(hit)),
+                    Ok((None, exhausted)) => crate::find_top_level_escalate(id, want, exhausted),
+                    Err(e) => Err(e),
+                }
+            };
+            match local_found {
+                Ok(Some((r, _))) if !r.path.starts_with(self.hub.packs_dir()) => {
+                    seen_selectors.insert(r.session_selector());
+                    if !is_pack_ref(&r) {
+                        live_triple = Some((SessionKey::local(&r).profile, r.harness, r.id.clone()));
+                    }
+                    candidates.push(ScopedSource { r, entry: None });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.starts_with("ambiguous session") || msg.contains("sessions have a sub-agent matching") {
+                        return Err(ScopedResolveError::Ambiguous(spec.to_owned()));
+                    }
+                    return Err(ScopedResolveError::Other(e));
+                }
+            }
+        }
+
+        if generation != 0 {
+            let local_prods = if live_triple.is_some() {
+                self.hub
+                    .local_shipped_producers()
+                    .map_err(|e| ScopedResolveError::Other(e.into()))?
+            } else {
+                Default::default()
+            };
+            let heads = self
+                .hub
+                .resolve_session_heads(id, want, Some(generation), Some(&self.envelope.borrow()))
+                .map_err(|e| ScopedResolveError::Other(e.into()))?;
+            for entry in heads {
+                if !seen_selectors.insert(entry.selector_string()) {
+                    continue;
+                }
+                if let Some(ref lt) = live_triple {
+                    if local_prods.contains(&entry.producer_id) {
+                        if let Some(k) = entry.session_key_struct() {
+                            if &(k.profile, k.harness, k.native_id) == lt {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if let Some(r) = crate::api::hub_head_to_ref(self.hub.packs_dir(), &entry) {
+                    candidates.push(ScopedSource { r, entry: Some(entry) });
+                }
+            }
+        }
+
+        pick_from(candidates)
+    }
+
+    pub fn source_for(&self, r: &SessionRef) -> Result<ScopedSource> {
+        if let Some(loaded) = self.sources.get() {
+            if let Some(found) = loaded
+                .iter()
+                .find(|s| s.r.id == r.id && s.r.harness == r.harness && s.r.path == r.path)
+            {
+                return Ok(found.clone());
+            }
+        }
+        let generation = (self.envelope.borrow().generation != 0).then_some(self.envelope.borrow().generation);
+        if r.path.starts_with(self.hub.packs_dir()) || self.pinned {
+            if let Some(entry) = self.hub.session_head_for(&r.id, generation)? {
+                if self.envelope.borrow().includes(&entry.producer_id) {
+                    return Ok(ScopedSource {
+                        r: r.clone(),
+                        entry: Some(entry),
+                    });
+                }
+            }
+        } else if !self.pinned && self.envelope.borrow().includes("local") {
+            return Ok(ScopedSource {
+                r: r.clone(),
+                entry: None,
+            });
+        }
+        anyhow::bail!("session is outside the selected places")
+    }
+
+    pub fn adapter(&self, src: &ScopedSource) -> Result<Box<dyn Adapter>> {
+        if let Some(entry) = &src.entry {
+            return Ok(Box::new(
+                backing_from_hub_head(self.hub.packs_dir(), entry.clone())?
+                    .context("revision payload was not collected")?,
+            ));
+        }
+        backing_for(&src.r)?
+            .or_else(|| crate::harness::for_harness(src.r.harness))
+            .context("session reader unavailable")
+    }
+
+    pub fn children(&self, parent: &ScopedSource) -> Result<Vec<ScopedSource>> {
+        let Some(p) = &parent.entry else {
+            return Ok(Vec::new());
+        };
+        let generation = (self.envelope.borrow().generation != 0).then_some(self.envelope.borrow().generation);
+        let mut out = Vec::new();
+        for entry in self.hub.children_of_head(p, generation)? {
+            if let Some(r) = crate::api::hub_head_to_ref(self.hub.packs_dir(), &entry) {
+                out.push(ScopedSource { r, entry: Some(entry) });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn child(&self, parent: &ScopedSource, id: &str) -> std::result::Result<ScopedSource, ScopedResolveError> {
+        let bare = id.strip_prefix("agent-").unwrap_or(id);
+        let children = self.children(parent).map_err(ScopedResolveError::Other)?;
+        let exact: Vec<_> = children
+            .iter()
+            .filter(|s| Self::agent_id(s) == bare || s.r.id == id)
+            .cloned()
+            .collect();
+        let hits = if exact.is_empty() {
+            children
+                .into_iter()
+                .filter(|s| Self::agent_id(s).starts_with(bare))
+                .collect()
+        } else {
+            exact
+        };
+        match hits.as_slice() {
+            [s] => Ok(s.clone()),
+            [] => Err(ScopedResolveError::NotFound(id.to_owned())),
+            _ => Err(ScopedResolveError::Ambiguous(id.to_owned())),
+        }
+    }
+
+    pub fn agent_id(src: &ScopedSource) -> &str {
+        src.entry
+            .as_ref()
+            .and_then(|e| {
+                e.metadata["agent_id"]
+                    .as_str()
+                    .or_else(|| e.metadata["native_id"].as_str())
+                    .or(Some(&e.session_id))
+            })
+            .unwrap_or(&src.r.id)
+            .trim_start_matches("agent-")
+    }
+
+    pub fn events(&self, src: &ScopedSource) -> Result<Vec<crate::events::Event>> {
+        let mut sink = crate::events::EventSink::new(src.r.cwd.clone()).with_source(src.r.path.clone());
+        self.adapter(src)?
+            .try_stream(&src.r, &Demand::LEAN.with_spans(), &mut sink)?;
+        sink.into_events()
+    }
+
+    pub fn event_rows(&self, src: &ScopedSource) -> Result<Vec<crate::events::EventRow>> {
+        Ok(self
+            .events(src)?
+            .into_iter()
+            .map(|e| crate::events::EventRow {
+                baggage: None,
+                harness: src.r.harness.to_string(),
+                session_id: src.r.id.clone(),
+                msg_idx: e.msg_idx as i64,
+                ts: e.ts,
+                kind: e.kind.into(),
+                tool: e.tool,
+                target: e.target,
+                detail: e.detail,
+                agent_id: None,
+                parent_id: None,
+                workflow: None,
+            })
+            .collect())
+    }
+
+    pub fn omit(&self, place: &str, reason: &str, detail: &str) {
+        let mut env = self.envelope.borrow_mut();
+        let omission = crate::state::hub::AuthorityOmission {
+            place_id: place.into(),
+            reason: reason.into(),
+            detail: detail.into(),
+        };
+        if !env.omissions.contains(&omission) {
+            env.omissions.push(omission);
+        }
+        env.status = crate::state::hub::AuthorityStatus::Partial;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,5 +1956,138 @@ mod tests {
             assert!(!path.exists(), "{} is a view, not a file", path.display());
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #tooth Single-session hub resolution uses the selector B-tree index (`SEARCH ... USING INDEX
+    /// idx_hub_session_heads_selector`) rather than scanning the fleet, and `ScopedView` suppresses
+    /// self-shipped hub echoes of live local sessions while keeping distinct remote producers separate.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resolve_session_heads_uses_btree_index_and_deduplicates_self_shipped_local_echoes() {
+        use crate::state::hub::{AuthorityQueryContext, HubStore, IngestBatchRequest, IngestEventRecord};
+        use crate::state::EventId;
+
+        let w = crate::test_world("scoped-view-index-and-dedup");
+        let live_path = w.write_session(
+            "sharedsess",
+            &[serde_json::json!({
+                "type": "user",
+                "uuid": "u0",
+                "timestamp": "2026-06-01T00:00:00Z",
+                "message": {"role": "user", "content": "local live copy"}
+            })],
+        );
+        let live_ref = SessionRef::new("sharedsess", Harness::Claude, &live_path);
+        let local_key = SessionKey::local(&live_ref);
+
+        let hub = HubStore::at_home(&w.cv_home);
+        // Record `"self-box"` in local `custody_commits` to model a host that ships to its own hub.
+        {
+            let conn = hub.state_store().open_writable().unwrap();
+            conn.execute(
+                "INSERT INTO custody_commits(local_commit_pos, producer_id, epoch, seq, op_id, envelope_json, committed_at)
+                 VALUES (1, 'self-box', 'ep-1', 1, 'op-local', '{}', 1)",
+                [],
+            )
+            .unwrap();
+            // Verify SQLite's query planner uses `idx_hub_session_heads_selector` for prefix range seeks
+            // (`+gen_to IS NULL` prevents `idx_hub_session_heads_live_updated` from scanning all live heads).
+            let mut eqp = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT selector FROM hub_session_heads
+                     WHERE selector >= ?1 AND selector < ?2 AND +gen_to IS NULL",
+                )
+                .unwrap();
+            let hi = prefix_upper_bound("shared").unwrap();
+            let plan: Vec<String> = eqp
+                .query_map(["shared", hi.as_str()], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|d| d.contains("idx_hub_session_heads_selector")),
+                "expected B-tree index seek, got plan: {plan:?}"
+            );
+        }
+
+        // Ingest both the echoed `"self-box"` copy (same profile/harness/native_id as `live_ref`)
+        // and a distinct `"remote-peer"` session into the hub.
+        hub.ingest_batch(&IngestBatchRequest {
+            events: vec![
+                IngestEventRecord::new(
+                    EventId::new("self-box", "ep-1", 1),
+                    "echo-1",
+                    serde_json::json!({
+                        "kind": "session_upsert",
+                        "session_id": "sharedsess",
+                        "harness": "claude",
+                        "revision": "r1",
+                        "message_count": 1,
+                        "updated_at": "2026-06-01T00:00:00Z",
+                        "metadata": {
+                            "native_id": "sharedsess",
+                            "profile": local_key.profile,
+                        }
+                    }),
+                    None,
+                )
+                .unwrap(),
+                IngestEventRecord::new(
+                    EventId::new("remote-peer", "ep-1", 1),
+                    "rem-1",
+                    serde_json::json!({
+                        "kind": "session_upsert",
+                        "session_id": "remotesess",
+                        "harness": "claude",
+                        "revision": "r1",
+                        "message_count": 3,
+                        "updated_at": "2026-06-01T00:01:00Z",
+                        "metadata": {
+                            "native_id": "remotesess",
+                            "profile": "/remote/.claude",
+                        }
+                    }),
+                    None,
+                )
+                .unwrap(),
+            ],
+        })
+        .unwrap();
+
+        let env = hub
+            .compute_authority(&AuthorityQueryContext {
+                include_local: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(env.includes("local") && env.includes("self-box") && env.includes("remote-peer"));
+        let view = ScopedView::new(hub.clone(), env, false);
+
+        // Point/prefix resolution runs without initializing `view.sources` (`OnceCell` stays unset)
+        // and resolves `"sharedsess"` uniquely to the live local session rather than colliding with
+        // `"self-box"`'s echoed hub head!
+        let resolved_shared = view.resolve("shared", None).unwrap();
+        assert!(
+            resolved_shared.entry.is_none(),
+            "live local copy must win without ambiguity"
+        );
+        assert_eq!(resolved_shared.r.id, "sharedsess");
+        let resolved_remote = view.resolve("remote", None).unwrap();
+        assert_eq!(resolved_remote.entry.as_ref().unwrap().producer_id, "remote-peer");
+        assert!(
+            view.sources.get().is_none(),
+            "point/prefix resolve must not materialize the fleet source list"
+        );
+
+        // Full enumeration (`view.sources()`) also deduplicates `"self-box"`'s echo once.
+        let all = view.sources().unwrap();
+        assert_eq!(
+            all.iter()
+                .filter(|s| s.r.id == "sharedsess" || s.r.id.starts_with("sharedsess@"))
+                .count(),
+            1,
+            "self-shipped echo must not duplicate live local session"
+        );
     }
 }

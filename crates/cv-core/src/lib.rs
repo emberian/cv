@@ -488,17 +488,35 @@ pub fn try_sessions_for(harness: Option<Harness>) -> Result<Vec<SessionRef>> {
 }
 
 #[cfg(feature = "sqlite")]
+pub(crate) fn live_sessions() -> Vec<SessionRef> {
+    let mut refs = sessions_impl().0;
+    refs.retain(|r| r.path.exists());
+    refs
+}
+
+#[cfg(feature = "sqlite")]
 fn extend_with_custody(refs: &mut Vec<SessionRef>, harness: Option<Harness>) -> Result<()> {
     let backings = custody::inventory()?;
     if !backings.is_empty() {
         refs.retain(|r| r.path.exists());
         let live: std::collections::HashSet<_> = refs.iter().map(SessionRef::session_selector).collect();
-        refs.extend(
-            backings
-                .into_iter()
-                .map(|b| b.reference)
-                .filter(|r| harness.is_none_or(|h| h == r.harness) && !live.contains(&r.id)),
-        );
+        let live_triples: std::collections::HashSet<_> = refs
+            .iter()
+            .map(|r| (SessionKey::local(r).profile, r.harness, r.id.clone()))
+            .collect();
+        let local_prods = crate::state::hub::HubStore::default_hub()
+            .ok()
+            .and_then(|h| h.local_shipped_producers().ok())
+            .unwrap_or_default();
+        refs.extend(backings.into_iter().filter_map(|b| {
+            if harness.is_some_and(|h| h != b.reference.harness) || live.contains(&b.reference.id) {
+                return None;
+            }
+            if b.is_local_shadow_of(&live_triples, &local_prods) {
+                return None;
+            }
+            Some(b.reference)
+        }));
     }
     Ok(())
 }
@@ -1094,14 +1112,7 @@ fn find_inner(id: &str, harness: Option<Harness>) -> Result<(Option<FoundSession
 
     // A selector can identify an archived twin even when a live session shares its native ID.
     #[cfg(feature = "sqlite")]
-    let archived = custody::inventory()?
-        .into_iter()
-        .filter(|b| {
-            harness.is_none_or(|h| h == b.reference.harness)
-                && (b.reference.id == id
-                    || SessionKey::split_selector(&b.reference.id).is_some_and(|(native, _)| native.starts_with(id)))
-        })
-        .collect::<Vec<_>>();
+    let archived = custody::matching_backings(id, harness)?;
     // A qualified lookup's universe is one harness. Its complete enumeration resolves prefixes
     // without opening unrelated stores; scoped publication must not stamp a full-fleet sync.
     if let Some(h) = harness {

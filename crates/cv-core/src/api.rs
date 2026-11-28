@@ -296,67 +296,82 @@ pub fn hub_head_to_ref(
 }
 
 #[cfg(feature = "sqlite")]
-fn evaluate_api_authority(
-    params: &Query,
-    resolved_as_of_gen: Option<u64>,
-    has_negation: bool,
-    indexed_only: bool,
-) -> Result<crate::state::hub::AuthorityEnvelope, (u16, Value)> {
-    let max_staleness_ms = match params.get("max_staleness") {
-        Some(raw) => match crate::state::hub::parse_duration_ms(&raw) {
-            Ok(ms) => Some(ms),
-            Err(e) => return Err(err(400, &e)),
-        },
-        None => None,
-    };
-    let place = params.get("place").or_else(|| params.get("producer"));
-    let cwd = params.get("cwd");
-    let q_str = params.get("q");
-    let hub = crate::state::hub::HubStore::default_hub().map_err(|e| err(503, &e.to_string()))?;
-    let ctx = crate::state::hub::AuthorityQueryContext {
-        place_glob: place.as_deref(),
-        as_of_gen: resolved_as_of_gen,
-        max_staleness_ms,
-        cwd_filter: cwd.as_deref(),
-        query_str: q_str.as_deref(),
-        has_negation,
-        indexed_only,
-        include_local: resolved_as_of_gen.is_none(),
-    };
-    hub.check_authority(&ctx).map_err(|v| {
-        (
+fn api_authority_error(err: crate::custody::AuthorityEvalError) -> (u16, Value) {
+    use crate::custody::AuthorityEvalError;
+    use crate::state::hub::HubError;
+    match err {
+        AuthorityEvalError::BadDuration(msg) => self::err(400, &msg),
+        AuthorityEvalError::GenerationNotFound(spec) => self::err(404, &format!("snapshot `{spec}` not found")),
+        AuthorityEvalError::Staleness(v) => (
             503,
             json!({
                 "error": v.message,
                 "authority": v.authority,
             }),
-        )
-    })
+        ),
+        AuthorityEvalError::Hub(HubError::InvalidArgument(msg)) => self::err(400, &msg),
+        AuthorityEvalError::Hub(HubError::NotFound(msg)) => self::err(404, &msg),
+        AuthorityEvalError::Hub(other) => self::err(503, &other.to_string()),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn evaluate_api_query_authority(
+    params: &Query,
+    has_negation: bool,
+    indexed_only: bool,
+) -> Result<(Option<u64>, crate::state::hub::AuthorityEnvelope), (u16, Value)> {
+    let place = params.get("place").or_else(|| params.get("producer"));
+    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+    let max_staleness = params.get("max_staleness");
+    let cwd = params.get("cwd");
+    let q_str = params.get("q");
+    crate::custody::evaluate_authority(
+        place.as_deref(),
+        as_of.as_deref(),
+        max_staleness.as_deref(),
+        cwd.as_deref(),
+        q_str.as_deref(),
+        has_negation,
+        indexed_only,
+    )
+    .map_err(api_authority_error)
+}
+
+#[cfg(feature = "sqlite")]
+fn has_authority_params(params: &Query) -> bool {
+    params.get("place").or_else(|| params.get("producer")).is_some()
+        || params.get("as_of").or_else(|| params.get("snapshot")).is_some()
+        || params.get("max_staleness").is_some()
+        || params.flag("authority")
+}
+
+#[cfg(feature = "sqlite")]
+fn scoped_view_from_params(params: &Query) -> Result<Option<crate::custody::ScopedView>, (u16, Value)> {
+    if !has_authority_params(params) {
+        return Ok(None);
+    }
+    let (as_of_gen, env) = evaluate_api_query_authority(params, false, false)?;
+    let hub = crate::state::hub::HubStore::default_hub().map_err(|e| err(503, &e.to_string()))?;
+    Ok(Some(crate::custody::ScopedView::new(hub, env, as_of_gen.is_some())))
+}
+
+#[cfg(feature = "sqlite")]
+fn scoped_resolve_reply(error: crate::custody::ScopedResolveError) -> (u16, Value) {
+    match error {
+        crate::custody::ScopedResolveError::NotFound(_) => err(404, "session not found"),
+        crate::custody::ScopedResolveError::Ambiguous(spec) => err(400, &format!("ambiguous session id {spec:?}")),
+        crate::custody::ScopedResolveError::Other(e) => err(500, &e.to_string()),
+    }
 }
 
 /// `GET /api/places?place=&as_of=&max_staleness=` — enrolled places, watermarks, and authority status.
 fn places(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
-    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
     #[cfg(feature = "sqlite")]
     {
-        let resolved_as_of = match as_of {
-            Some(ref spec) => {
-                let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
-                    return err(404, &format!("snapshot `{spec}` not found"));
-                };
-                match hub.resolve_generation(Some(spec)) {
-                    Ok(Some(g)) => Some(g.generation),
-                    Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
-                        return err(404, &format!("snapshot `{spec}` not found"))
-                    }
-                    Err(e) => return err(400, &e.to_string()),
-                }
-            }
-            None => None,
-        };
-        match evaluate_api_authority(&params, resolved_as_of, false, false) {
-            Ok(env) => ok(json!({
+        match evaluate_api_query_authority(&params, false, false) {
+            Ok((_, env)) => ok(json!({
                 "places": env.places,
                 "authority": env,
             })),
@@ -365,7 +380,7 @@ fn places(query: &str) -> (u16, Value) {
     }
     #[cfg(not(feature = "sqlite"))]
     {
-        let _ = (params, as_of);
+        let _ = params;
         ok(json!({
             "places": [],
             "authority": {
@@ -393,6 +408,7 @@ fn sessions(query: &str) -> (u16, Value) {
     };
     let cwd = params.get("cwd");
     let place = params.get("place").or_else(|| params.get("producer"));
+    #[cfg(not(feature = "sqlite"))]
     let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
     let parsed_q = match params.get("q") {
         Some(raw) if !raw.trim().is_empty() => match crate::query::SessionQuery::parse(&raw) {
@@ -410,26 +426,33 @@ fn sessions(query: &str) -> (u16, Value) {
         Err(error) => return err(400, &error),
     };
 
-    #[allow(unused_mut)]
-    let mut resolved_as_of_gen: Option<u64> = None;
+    #[cfg(feature = "sqlite")]
+    let (resolved_as_of_gen, scope) = if has_authority_params(&params) {
+        let has_neg = parsed_q.as_ref().is_some_and(crate::query::SessionQuery::has_negation);
+        match evaluate_api_query_authority(&params, has_neg, false) {
+            Ok((g, env)) => (g, Some(env)),
+            Err(reply) => return reply,
+        }
+    } else {
+        (None, None)
+    };
+    #[cfg(not(feature = "sqlite"))]
+    let resolved_as_of_gen: Option<u64> = if as_of.is_some() {
+        return err(400, "as_of requires sqlite support");
+    } else {
+        None
+    };
+
     #[allow(unused_mut)]
     let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    let mut refs: Vec<SessionRef> = if let Some(ref spec) = as_of {
+    let mut refs: Vec<SessionRef> = if let Some(gen) = resolved_as_of_gen {
         #[cfg(feature = "sqlite")]
         {
             let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
-                return err(404, &format!("snapshot `{spec}` not found"));
+                return err(404, "snapshot not found");
             };
-            let gen_rec = match hub.resolve_generation(Some(spec)) {
-                Ok(Some(g)) => g,
-                Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
-                    return err(404, &format!("snapshot `{spec}` not found"))
-                }
-                Err(e) => return err(400, &e.to_string()),
-            };
-            resolved_as_of_gen = Some(gen_rec.generation);
-            let heads = match hub.heads_at_generation(Some(gen_rec.generation)) {
+            let heads = match hub.heads_at_generation(Some(gen)) {
                 Ok(h) => h,
                 Err(e) => return err(500, &e.to_string()),
             };
@@ -449,8 +472,8 @@ fn sessions(query: &str) -> (u16, Value) {
         }
         #[cfg(not(feature = "sqlite"))]
         {
-            let _ = spec;
-            return err(400, "as_of requires sqlite support");
+            let _ = gen;
+            unreachable!()
         }
     } else {
         // The fast catalog read (~ms when warm); transparently escalates to a full scan when cold.
@@ -459,13 +482,26 @@ fn sessions(query: &str) -> (u16, Value) {
         if let Ok(hub) = crate::state::hub::HubStore::default_hub() {
             if let Ok(heads) = hub.heads_at_generation(None) {
                 if !heads.is_empty() {
-                    let seen: std::collections::HashSet<String> = live.iter().map(|r| r.id.clone()).collect();
+                    let local_prods = hub.local_shipped_producers().unwrap_or_default();
+                    let live_triples: std::collections::HashSet<_> = live
+                        .iter()
+                        .filter(|r| !crate::custody::is_pack_ref(r))
+                        .map(|r| (crate::SessionKey::local(r).profile, r.harness, r.id.clone()))
+                        .collect();
+                    let seen: std::collections::HashSet<String> =
+                        live.iter().map(SessionRef::session_selector).collect();
                     for entry in &heads {
                         let sel = entry.selector_string();
                         selector_places.insert(sel.clone(), entry.producer_id.clone());
                         if !seen.contains(&sel) {
-                            if let Some(r) = hub_head_to_ref(hub.packs_dir(), entry) {
-                                live.push(r);
+                            let is_shadow = local_prods.contains(&entry.producer_id)
+                                && entry
+                                    .session_key_struct()
+                                    .is_some_and(|k| live_triples.contains(&(k.profile, k.harness, k.native_id)));
+                            if !is_shadow {
+                                if let Some(r) = hub_head_to_ref(hub.packs_dir(), entry) {
+                                    live.push(r);
+                                }
                             }
                         }
                     }
@@ -485,16 +521,6 @@ fn sessions(query: &str) -> (u16, Value) {
                 .is_some_and(|c| c.to_string_lossy().contains(needle.as_str()))
         });
     }
-    #[cfg(feature = "sqlite")]
-    let scope = if place.is_some() || params.get("max_staleness").is_some() || params.flag("authority") {
-        let has_neg = parsed_q.as_ref().is_some_and(crate::query::SessionQuery::has_negation);
-        match evaluate_api_authority(&params, resolved_as_of_gen, has_neg, false) {
-            Ok(env) => Some(env),
-            Err(reply) => return reply,
-        }
-    } else {
-        None
-    };
     if let Some(ref _pattern) = place {
         refs.retain(|r| {
             let p = selector_places.get(&r.id).map_or("local", String::as_str);
@@ -618,42 +644,20 @@ fn hub_session_json(
         }
         Err(e) => return Some(err(400, &e.to_string())),
     };
-    let entry = if let Ok(Some(exact)) = hub.session_head_for(id, Some(gen_rec.generation)) {
-        if Harness::parse(&exact.harness) != Some(want_harness) {
-            return None;
-        }
-        exact
-    } else {
-        let heads = match hub.heads_at_generation(Some(gen_rec.generation)) {
-            Ok(h) => h,
-            Err(e) => return Some(err(500, &e.to_string())),
-        };
-        let matches: Vec<_> = heads
-            .into_iter()
-            .filter(|e| {
-                if Harness::parse(&e.harness) != Some(want_harness) {
-                    return false;
-                }
-                let native_id = e.metadata.get("native_id").and_then(Value::as_str);
-                let human_key = format!("{}:{}:{}", e.producer_id, e.harness, native_id.unwrap_or(&e.session_id));
-                e.selector_string() == id
-                    || e.session_id == id
-                    || native_id == Some(id)
-                    || human_key == id
-                    || format!("{}:{}", e.producer_id, e.session_id) == id
-            })
-            .collect();
-        if matches.is_empty() {
+    let matches = match hub.resolve_session_heads(id, Some(want_harness), Some(gen_rec.generation), None) {
+        Ok(m) => m,
+        Err(e) => return Some(err(500, &e.to_string())),
+    };
+    let entry = match matches.as_slice() {
+        [one] => one.clone(),
+        [] => {
             return if as_of_spec.is_some() {
                 Some(err(404, "session not found"))
             } else {
                 None
             };
         }
-        if matches.len() > 1 {
-            return Some(err(400, &format!("ambiguous session id {id:?}")));
-        }
-        matches.into_iter().next().expect("len == 1")
+        _ => return Some(err(400, &format!("ambiguous session id {id:?}"))),
     };
 
     match crate::custody::backing_from_hub_head(hub.packs_dir(), entry.clone()) {
@@ -893,150 +897,79 @@ pub fn session_in_places(r: &SessionRef, scope: &crate::state::hub::AuthorityEnv
     };
     Ok(scope.includes(place.as_deref().unwrap_or("local")))
 }
-/// `GET /api/session/{harness}/{id}/events?kind=&as_of=&max_staleness=&authority=1` — the session's
+/// `GET /api/session/{harness}/{id}/events?kind=&place=&as_of=&max_staleness=&authority=1` — the session's
 /// extracted tool events (file edits/reads, commands, errors) from the event catalog, in transcript
 /// order, as `cv events --json` rows. A stale or missing catalog row is (re)ingested on the spot.
 fn session_events(harness: &str, id: &str, query: &str) -> (u16, Value) {
     use crate::events;
     let params = Query::parse(query);
     let kind = params.get("kind");
-    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+
+    #[cfg(not(feature = "sqlite"))]
+    if params.get("as_of").or_else(|| params.get("snapshot")).is_some() {
+        return err(400, "as_of requires sqlite support");
+    }
 
     #[cfg(feature = "sqlite")]
-    if let Some(ref spec) = as_of {
+    if let Some(view) = match scoped_view_from_params(&params) {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    } {
         let Some(want_harness) = Harness::parse(harness) else {
             return err(400, &format!("unknown harness {harness:?}"));
         };
-        let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
-            return err(404, &format!("snapshot `{spec}` not found"));
+        let src = match view.resolve(id, Some(want_harness)) {
+            Ok(s) => s,
+            Err(e) => return scoped_resolve_reply(e),
         };
-        let gen_rec = match hub.resolve_generation(Some(spec)) {
-            Ok(Some(g)) => g,
-            Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
-                return err(404, &format!("snapshot `{spec}` not found"))
+        let rows = if view.pinned || src.entry.is_some() {
+            if src.r.path.as_os_str().is_empty() {
+                return err(404, "session payload not mirrored");
             }
-            Err(e) => return err(400, &e.to_string()),
+            match view.event_rows(&src) {
+                Ok(mut rows) => {
+                    if let Some(ref k) = kind {
+                        rows.retain(|r| &r.kind == k);
+                    }
+                    rows
+                }
+                Err(e) => return err(500, &format!("event extraction failed: {e:#}")),
+            }
+        } else {
+            match events::read_ref(&src.r, kind.as_deref()) {
+                Ok(rows) => rows,
+                Err(e) => return err(500, &format!("event catalog: {e:#}")),
+            }
         };
-        let env = match evaluate_api_authority(&params, Some(gen_rec.generation), false, false) {
-            Ok(env) => env,
-            Err(reply) => return reply,
-        };
-        let heads = match hub.heads_at_generation(Some(gen_rec.generation)) {
-            Ok(h) => h,
-            Err(e) => return err(500, &e.to_string()),
-        };
-        let mut matches = heads.into_iter().filter(|e| {
-            env.includes(&e.producer_id)
-                && Harness::parse(&e.harness) == Some(want_harness)
-                && (e.selector_string() == id
-                    || e.session_id == id
-                    || e.metadata.get("native_id").and_then(Value::as_str) == Some(id))
-        });
-        let Some(entry) = matches.next() else {
-            return err(404, "session not found");
-        };
-        if matches.next().is_some() {
-            return err(400, "ambiguous session id");
-        }
-        let Some(backing) = crate::custody::backing_from_hub_head(hub.packs_dir(), entry)
-            .ok()
-            .flatten()
-        else {
-            return err(404, "session payload not mirrored");
-        };
-        let mut sink = events::EventSink::new(backing.reference.cwd.clone());
-        if let Err(e) = crate::Adapter::stream(
-            &backing,
-            &backing.reference,
-            &crate::Demand::LEAN.with_spans(),
-            &mut sink,
-        ) {
-            return err(500, &format!("event extraction failed: {e:#}"));
-        }
-        let extracted = match sink.into_events() {
-            Ok(evs) => evs,
-            Err(e) => return err(500, &format!("event extraction failed: {e:#}")),
-        };
-        let out: Vec<Value> = extracted
-            .into_iter()
-            .filter(|e| kind.as_deref().is_none_or(|k| e.kind == k))
-            .map(|e| {
-                crate::rows::event_row(&events::EventRow {
-                    baggage: None,
-                    harness: backing.reference.harness.as_str().to_string(),
-                    session_id: backing.reference.id.clone(),
-                    msg_idx: e.msg_idx as i64,
-                    ts: e.ts,
-                    kind: e.kind.to_string(),
-                    tool: e.tool,
-                    target: e.target,
-                    detail: e.detail,
-                    parent_id: None,
-                    agent_id: None,
-                    workflow: None,
-                })
-            })
-            .collect();
+        let out: Vec<Value> = rows.iter().map(crate::rows::event_row).collect();
         if params.flag("authority") {
-            return ok(json!({ "events": out, "authority": env }));
+            return ok(json!({ "events": out, "authority": *view.envelope.borrow() }));
         }
         return ok(json!(out));
     }
-
-    #[cfg(not(feature = "sqlite"))]
-    if as_of.is_some() {
-        return err(400, "as_of requires sqlite support");
-    }
-    #[cfg(feature = "sqlite")]
-    let auth_opt = if params.get("place").or_else(|| params.get("producer")).is_some()
-        || params.get("max_staleness").is_some()
-        || params.flag("authority")
-    {
-        match evaluate_api_authority(&params, None, false, false) {
-            Ok(env) => Some(env),
-            Err(reply) => return reply,
-        }
-    } else {
-        None
-    };
 
     let (r, _) = match lookup(harness, id) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    #[cfg(feature = "sqlite")]
-    if let Some(scope) = &auth_opt {
-        match session_in_places(&r, scope) {
-            Ok(true) => {}
-            Ok(false) => return err(404, "session not found in selected places"),
-            Err(e) => return err(500, &e.to_string()),
-        }
-    }
     let rows = match events::read_ref(&r, kind.as_deref()) {
         Ok(rows) => rows,
         Err(e) => return err(500, &format!("event catalog: {e:#}")),
     };
     let out: Vec<Value> = rows.iter().map(crate::rows::event_row).collect();
-    #[cfg(feature = "sqlite")]
-    if let Some(env) = auth_opt {
-        if params.flag("authority") {
-            return ok(json!({ "events": out, "authority": env }));
-        }
-    }
     ok(json!(out))
 }
 
 /// Projected rows of one session, selected the way every `show --kind` view selects them:
 /// `start`/`end`, `first`, and `last` select projected rows; `around` selects by original
 /// transcript index/message ID, with `context` rows on either side.
-fn kind_rows<T>(
-    harness: &str,
-    id: &str,
-    query: &str,
+fn kind_rows_from<T>(
+    r: &SessionRef,
+    adapter: &dyn crate::Adapter,
+    params: &Query,
     read: impl FnOnce(&dyn crate::Adapter, &SessionRef) -> anyhow::Result<Vec<T>>,
     index: impl Fn(&T) -> usize,
 ) -> Result<Vec<T>, (u16, Value)> {
-    let params = Query::parse(query);
     let number = |key| params.unsigned(key).map_err(|e| err(400, &e));
     let start = number("start")?;
     let end = number("end")?;
@@ -1057,20 +990,19 @@ fn kind_rows<T>(
     if end.is_some_and(|end| end < start.unwrap_or(0)) {
         return Err(err(400, "end must be >= start"));
     }
-    let (r, adapter) = lookup(harness, id)?;
     let around = match around {
         None => None,
         Some(value) => {
             let at = match parse_around(&value).map_err(|e| err(400, &e))? {
                 Around::Index(index) => index,
-                Around::Id(id) => message_index(adapter.as_ref(), &r, &id)
+                Around::Id(id) => message_index(adapter, r, &id)
                     .map_err(|e| err(500, &format!("stream failed: {e:#}")))?
                     .ok_or_else(|| err(400, &format!("no message {id:?} in session {}", r.id)))?,
             };
             Some((at, nearby.unwrap_or(5)))
         }
     };
-    let rows = read(adapter.as_ref(), &r).map_err(|e| err(500, &format!("stream failed: {e:#}")))?;
+    let rows = read(adapter, r).map_err(|e| err(500, &format!("stream failed: {e:#}")))?;
     Ok(crate::context::window(
         rows,
         crate::context::ContextWindow {
@@ -1083,6 +1015,18 @@ fn kind_rows<T>(
     ))
 }
 
+fn kind_rows<T>(
+    harness: &str,
+    id: &str,
+    query: &str,
+    read: impl FnOnce(&dyn crate::Adapter, &SessionRef) -> anyhow::Result<Vec<T>>,
+    index: impl Fn(&T) -> usize,
+) -> Result<Vec<T>, (u16, Value)> {
+    let params = Query::parse(query);
+    let (r, adapter) = lookup(harness, id)?;
+    kind_rows_from(&r, adapter.as_ref(), &params, read, index)
+}
+
 /// Saved usage and compaction rows ([`kind_rows`] selection). Returns the same array as
 /// `show --kind context --json`.
 fn context(harness: &str, id: &str, query: &str) -> (u16, Value) {
@@ -1092,8 +1036,51 @@ fn context(harness: &str, id: &str, query: &str) -> (u16, Value) {
     }
 }
 
-/// The file-touch timeline ([`kind_rows`] selection): the same array as `show --kind files --json`.
+/// The file-touch timeline ([`kind_rows`] selection): the same array as `show --kind files --json`,
+/// supporting `?place=&as_of=&max_staleness=&authority=1`.
 fn files(harness: &str, id: &str, query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    #[cfg(not(feature = "sqlite"))]
+    if params.get("as_of").or_else(|| params.get("snapshot")).is_some() {
+        return err(400, "as_of requires sqlite support");
+    }
+    #[cfg(feature = "sqlite")]
+    if let Some(view) = match scoped_view_from_params(&params) {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    } {
+        let Some(want_harness) = Harness::parse(harness) else {
+            return err(400, &format!("unknown harness {harness:?}"));
+        };
+        let src = match view.resolve(id, Some(want_harness)) {
+            Ok(s) => s,
+            Err(e) => return scoped_resolve_reply(e),
+        };
+        if src.entry.is_some() && src.r.path.as_os_str().is_empty() {
+            return err(404, "session payload not mirrored");
+        }
+        let adapter = match view.adapter(&src) {
+            Ok(a) => a,
+            Err(e) => return err(500, &format!("session reader unavailable: {e:#}")),
+        };
+        let checkout = !view.pinned && !crate::custody::is_pack_ref(&src.r);
+        return match kind_rows_from(
+            &src.r,
+            adapter.as_ref(),
+            &params,
+            |a, r| crate::files::read_with_checkout(a, r, checkout),
+            |touch| touch.msg_idx,
+        ) {
+            Ok(rows) => {
+                if params.flag("authority") {
+                    ok(json!({ "files": rows, "authority": *view.envelope.borrow() }))
+                } else {
+                    ok(json!(rows))
+                }
+            }
+            Err(error) => error,
+        };
+    }
     match kind_rows(harness, id, query, crate::files::read, |touch| touch.msg_idx) {
         Ok(rows) => ok(json!(rows)),
         Err(error) => error,
@@ -1189,37 +1176,17 @@ fn touched(query: &str) -> (u16, Value) {
         return err(400, "missing path parameter");
     };
     let place = params.get("place").or_else(|| params.get("producer"));
+    #[cfg(not(feature = "sqlite"))]
     let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
 
     #[cfg(feature = "sqlite")]
-    let resolved_as_of = match as_of {
-        Some(ref spec) => {
-            let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
-                return err(404, &format!("snapshot `{spec}` not found"));
-            };
-            match hub.resolve_generation(Some(spec)) {
-                Ok(Some(g)) => Some(g.generation),
-                Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
-                    return err(404, &format!("snapshot `{spec}` not found"))
-                }
-                Err(e) => return err(400, &e.to_string()),
-            }
-        }
-        None => None,
-    };
-
-    #[cfg(feature = "sqlite")]
-    let auth_opt = if place.is_some()
-        || params.get("max_staleness").is_some()
-        || params.flag("authority")
-        || resolved_as_of.is_some()
-    {
-        match evaluate_api_authority(&params, resolved_as_of, false, false) {
-            Ok(env) => Some(env),
+    let (resolved_as_of, auth_opt) = if has_authority_params(&params) {
+        match evaluate_api_query_authority(&params, false, false) {
+            Ok((g, env)) => (g, Some(env)),
             Err(reply) => return reply,
         }
     } else {
-        None
+        (None, None)
     };
 
     #[cfg(feature = "sqlite")]
@@ -1284,14 +1251,39 @@ fn touched(query: &str) -> (u16, Value) {
     ok(json!(out))
 }
 
-/// `GET /api/blame?file=<path>[&lines=a,b]` — git-to-session code provenance with content-hunk,
-/// commit-SHA, and time-window correlation, matching `cv blame --json`.
+/// `GET /api/blame?file=<path>[&lines=a,b][&place=&as_of=&max_staleness=&authority=1]` —
+/// git-to-session code provenance with content-hunk, commit-SHA, and time-window correlation,
+/// matching `cv blame --json`.
 fn blame(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let Some(file) = params.get("file") else {
         return err(400, "missing file parameter");
     };
     let lines = params.get("lines");
+    #[cfg(not(feature = "sqlite"))]
+    if params.get("as_of").or_else(|| params.get("snapshot")).is_some() {
+        return err(400, "as_of requires sqlite support");
+    }
+    #[cfg(feature = "sqlite")]
+    if let Some(view) = match scoped_view_from_params(&params) {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    } {
+        return match crate::blame::blame_scoped(&view, &file, lines.as_deref()) {
+            Ok(report) => match serde_json::to_value(report) {
+                Ok(v) => {
+                    if params.flag("authority") {
+                        ok(json!({ "blame": v, "authority": *view.envelope.borrow() }))
+                    } else {
+                        ok(v)
+                    }
+                }
+                Err(e) => err(500, &format!("blame serialization failed: {e}")),
+            },
+            Err(e) if e.downcast_ref::<crate::blame::BlameInputError>().is_some() => err(400, &e.to_string()),
+            Err(e) => err(500, &format!("blame failed: {e:#}")),
+        };
+    }
     match crate::blame::blame(&file, lines.as_deref()) {
         Ok(report) => match serde_json::to_value(report) {
             Ok(v) => ok(v),

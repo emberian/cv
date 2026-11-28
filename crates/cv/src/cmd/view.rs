@@ -284,7 +284,7 @@ fn file_line(t: &cv_core::files::FileTouch) -> String {
 
 /// `show --kind files`: the session's file touches in message order, sliced like other kinds.
 fn print_files(r: &SessionRef, adapter: &dyn Adapter, win: KindWindow, json: bool) -> Result<()> {
-    let checkout = super::place::current().is_none_or(|v| !v.pinned && !cv_core::custody::is_pack_ref(r));
+    let checkout = super::place::current().is_none_or(|v| !v.pinned() && !cv_core::custody::is_pack_ref(r));
     let mut rows = cv_core::files::read_with_checkout(adapter, r, checkout)?;
     if let Some((start, end)) = win.pre_compaction {
         rows.retain(|t| t.msg_idx >= start && end.is_none_or(|end| t.msg_idx < end));
@@ -412,11 +412,12 @@ pub(crate) fn cmd_show(
             (child.session.clone(), adapter, Some(child))
         } else {
             let target = if let Some(a) = &agent {
-                scope.child(parent, a)?
+                scope.child(&parent, a)?
             } else {
                 parent
             };
-            (target.r.clone(), scope.adapter(target)?, None)
+            let adapter = scope.adapter(&target)?;
+            (target.r, adapter, None)
         }
     } else {
         resolve_show_target(id, parse_harness(&harness)?, agent.as_deref())?

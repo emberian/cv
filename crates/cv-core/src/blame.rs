@@ -905,6 +905,136 @@ pub fn blame(file: &str, lines: Option<&str>) -> Result<BlameReport> {
     blame_from(file, lines, None, false)
 }
 
+/// Compute structured blame provenance inside a place- or generation-scoped [`crate::custody::ScopedView`],
+/// shared between `cv blame` and `GET /api/blame`.
+#[cfg(feature = "sqlite")]
+pub fn blame_scoped(view: &crate::custody::ScopedView, file: &str, lines: Option<&str>) -> Result<BlameReport> {
+    let transcript_only = view.pinned || !view.envelope.borrow().includes("local");
+    if transcript_only {
+        if lines.is_some() {
+            return Err(BlameInputError(
+                "line attribution requires a recorded Git revision; the selected places supplied transcript edits"
+                    .into(),
+            )
+            .into());
+        }
+        view.omit(
+            "*",
+            "git_revision",
+            "The hub cut contains transcript edits without a Git revision.",
+        );
+    }
+
+    // Fast O(log N) indexed path when querying current hub places whose file events are already
+    // committed to `events.db` at the published generation.
+    let gen = view.envelope.borrow().generation;
+    let indexed_gen = view.envelope.borrow().indexed_generation;
+    if !view.pinned && transcript_only && gen > 0 && indexed_gen >= gen {
+        for prod in view.hub().uncollected_producers(None, &view.envelope.borrow())? {
+            view.omit(&prod, "missing_payload", "Edit evidence was not collected.");
+        }
+        let read = |abs: &str, rel: &str| -> Result<Vec<EditHunkEvent>> {
+            let mut rows = events::edits_with_hunks_touching_file(abs, rel)?;
+            rows.retain(|item| {
+                if crate::SessionKey::split_selector(&item.edit.session_id).is_none() {
+                    return false;
+                }
+                view.hub()
+                    .session_head_for(&item.edit.session_id, None)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|h| view.envelope.borrow().includes(&h.producer_id))
+            });
+            Ok(rows)
+        };
+        return blame_from(file, lines, Some(&read), true);
+    }
+
+    let mut edits = Vec::new();
+    for src in view.sources()? {
+        if let Some(e) = src.entry.as_ref().filter(|_| src.r.path.as_os_str().is_empty()) {
+            view.omit(&e.producer_id, "missing_payload", "Edit evidence was not collected.");
+            continue;
+        }
+        let parent_id = src
+            .entry
+            .as_ref()
+            .and_then(|e| e.metadata["parent_id"].as_str().map(str::to_owned));
+        for e in view.events(src)?.into_iter().filter(|e| e.kind == "file_edit") {
+            edits.push(EditHunkEvent {
+                hunk_hashes: e.hunk_hashes,
+                edit: EditEvent {
+                    harness: src.r.harness.to_string(),
+                    session_id: src.r.id.clone(),
+                    msg_idx: e.msg_idx as i64,
+                    ts: e.ts,
+                    target: e.target,
+                    title: src.r.title.clone(),
+                    cwd: src.r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    created_at: src.r.created_at.map(|t| t.timestamp()),
+                    updated_at: src.r.updated_at.map(|t| t.timestamp()),
+                    parent_id: parent_id.clone(),
+                },
+            });
+        }
+        // Local top-level sessions keep sub-agent transcripts in sidecars rather than top-level
+        // discovery; stream them too so sub-agent file edits are never dropped under `--place`.
+        if src.entry.is_none() {
+            if let Some(adapter) = crate::harness::for_harness(src.r.harness) {
+                if let Ok(subs) = crate::subagent_tree_of(&src.r) {
+                    for sub in subs {
+                        let mut sink = crate::events::EventSink::new(sub.session.cwd.clone())
+                            .with_source(sub.session.path.clone());
+                        if adapter
+                            .try_stream(&sub.session, &crate::Demand::LEAN.with_spans(), &mut sink)
+                            .is_ok()
+                        {
+                            if let Ok(sub_evs) = sink.into_events() {
+                                for e in sub_evs.into_iter().filter(|e| e.kind == "file_edit") {
+                                    edits.push(EditHunkEvent {
+                                        hunk_hashes: e.hunk_hashes,
+                                        edit: EditEvent {
+                                            harness: sub.session.harness.to_string(),
+                                            session_id: sub.session.id.clone(),
+                                            msg_idx: e.msg_idx as i64,
+                                            ts: e.ts,
+                                            target: e.target,
+                                            title: sub.description.clone().or_else(|| src.r.title.clone()),
+                                            cwd: sub
+                                                .session
+                                                .cwd
+                                                .as_ref()
+                                                .or(src.r.cwd.as_ref())
+                                                .map(|p| p.to_string_lossy().into_owned()),
+                                            created_at: sub.session.created_at.map(|t| t.timestamp()),
+                                            updated_at: sub.session.updated_at.map(|t| t.timestamp()),
+                                            parent_id: Some(src.r.id.clone()),
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let read = |abs: &str, rel: &str| {
+        let suffix = format!("/{}", rel.trim_start_matches('/').to_lowercase());
+        Ok(edits
+            .iter()
+            .filter(|e| {
+                e.edit
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| t == abs || t == rel || t.to_lowercase().ends_with(&suffix))
+            })
+            .cloned()
+            .collect())
+    };
+    blame_from(file, lines, Some(&read), transcript_only)
+}
+
 type EditReader<'a> = dyn Fn(&str, &str) -> Result<Vec<EditHunkEvent>> + 'a;
 
 /// Git describes the local checkout. A historical hub cut has only the collected edit evidence.

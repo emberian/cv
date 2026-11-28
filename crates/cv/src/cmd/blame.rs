@@ -5,60 +5,17 @@ use cv_core::blame::{self, BlameReport, CommitBlame, SessionAttribution, Strengt
 use cv_core::ir::{truncate, Harness};
 
 pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool, json: bool) -> Result<()> {
-    let report = if let Some(v) = super::place::current() {
-        let transcript_only = v.pinned || !v.envelope.borrow().includes("local");
-        if transcript_only {
-            if lines.is_some() {
-                return crate::util::usage(
-                    "line attribution requires a recorded Git revision; the selected places supplied transcript edits",
-                );
-            }
-            v.omit(
-                "*",
-                "git_revision",
-                "The hub cut contains transcript edits without a Git revision.",
-            );
-        }
-        let mut edits = Vec::new();
-        for src in &v.sources {
-            if let Some(e) = src.entry.as_ref().filter(|_| src.r.path.as_os_str().is_empty()) {
-                v.omit(&e.producer_id, "missing_payload", "Edit evidence was not collected.");
-                continue;
-            }
-            for e in v.events(src)?.into_iter().filter(|e| e.kind == "file_edit") {
-                edits.push(cv_core::events::EditHunkEvent {
-                    hunk_hashes: e.hunk_hashes,
-                    edit: cv_core::events::EditEvent {
-                        harness: src.r.harness.to_string(),
-                        session_id: src.r.id.clone(),
-                        msg_idx: e.msg_idx as i64,
-                        ts: e.ts,
-                        target: e.target,
-                        title: src.r.title.clone(),
-                        cwd: src.r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                        created_at: src.r.created_at.map(|t| t.timestamp()),
-                        updated_at: src.r.updated_at.map(|t| t.timestamp()),
-                        parent_id: None,
-                    },
-                });
-            }
-        }
-        let read = |abs: &str, rel: &str| {
-            let suffix = format!("/{}", rel.trim_start_matches('/').to_lowercase());
-            Ok(edits
-                .iter()
-                .filter(|e| {
-                    e.edit
-                        .target
-                        .as_ref()
-                        .is_some_and(|t| t == abs || t == rel || t.to_lowercase().ends_with(&suffix))
-                })
-                .cloned()
-                .collect())
-        };
-        blame::blame_from(file, lines, Some(&read), transcript_only)?
+    let raw = if let Some(v) = super::place::current() {
+        blame::blame_scoped(&v.inner, file, lines)
     } else {
-        blame::blame(file, lines)?
+        blame::blame(file, lines)
+    };
+    let report = match raw {
+        Ok(r) => r,
+        Err(e) => {
+            let inp = e.downcast::<blame::BlameInputError>()?;
+            return crate::util::usage(inp.0);
+        }
     };
     if json {
         super::place::print_json("blame", &report)?;
@@ -125,7 +82,7 @@ pub fn cmd_blame(file: &str, lines: Option<&str>, show: bool, json: bool) -> Res
 }
 
 fn render_event_only(file: &str, report: &BlameReport) -> Result<()> {
-    if super::place::current().is_some_and(|v| v.pinned || !v.envelope.borrow().includes("local")) {
+    if super::place::current().is_some_and(|v| v.pinned() || !v.inner.envelope.borrow().includes("local")) {
         println!("(transcript edit evidence at the selected generation)");
     } else {
         println!("(not inside a git repository — event-catalog matches only, no commit correlation)\n");
@@ -242,7 +199,8 @@ fn show_best(harness: &str, session_id: &str, msg_idx: i64) -> Result<()> {
     let want = Harness::parse(harness);
     let (r, adapter) = if let Some(v) = super::place::current() {
         let src = v.resolve(session_id, want)?;
-        (src.r.clone(), v.adapter(src)?)
+        let adapter = v.adapter(&src)?;
+        (src.r, adapter)
     } else {
         cv_core::find(session_id, want)?
             .with_context(|| format!("session {harness}:{session_id} not found (deleted since indexing?)"))?

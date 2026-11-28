@@ -1000,6 +1000,75 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
     }
     let unselected = hub_json(&["pack", "narwhal", "--place", "sbx-*", "--json"]);
     assert!(unselected["pack"]["content"].is_null(), "{unselected}");
+
+    // Unpinned place-scoped `blame` and `pack` use the committed event/text indexes without
+    // losing revision-2 evidence, and HTTP `/api/*` serves the identical scoped cuts.
+    let current_blame = hub_json(&["blame", "revision-proof.rs", "--place", "remote-box", "--json"]);
+    assert_eq!(
+        current_blame["blame"]["event_only_sessions"].as_array().unwrap().len(),
+        1,
+        "{current_blame}"
+    );
+    let current_pack = hub_json(&[
+        "pack",
+        "narwhal-delta-marker",
+        "--place",
+        "remote-box",
+        "--excerpt-bytes",
+        "500",
+        "--json",
+    ]);
+    assert!(
+        current_pack["pack"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("revision-proof.rs"),
+        "{current_pack}"
+    );
+    {
+        let scope = (*cv_core::env::Env::current()).clone().enter();
+        scope.set("HOME", &hub_w.home);
+        scope.set("CLUSTERVISION_HOME", &hub_w.cv_home);
+        scope.set("CLUSTERVISION_CACHE", hub_w.base.join("cache"));
+        let (st1, f1) = cv_core::api::route_json(
+            &["api", "session", "claude", "alphasess", "files"],
+            "place=remote-box&as_of=1&authority=1",
+        );
+        let (st2, f2) = cv_core::api::route_json(
+            &["api", "session", "claude", "alphasess", "files"],
+            "place=remote-box&as_of=2&authority=1",
+        );
+        assert_eq!((st1, st2), (200, 200));
+        assert!(!f1["files"].to_string().contains("revision-proof.rs"), "{f1}");
+        assert!(f2["files"].to_string().contains("revision-proof.rs"), "{f2}");
+        let (bst, api_blame) = cv_core::api::route_json(
+            &["api", "blame"],
+            "file=revision-proof.rs&place=remote-box&as_of=2&authority=1",
+        );
+        assert_eq!(bst, 200, "{api_blame}");
+        assert_eq!(
+            api_blame["blame"]["event_only_sessions"].as_array().unwrap().len(),
+            1,
+            "{api_blame}"
+        );
+    }
+
+    let never_written = hub_w.base.join("must-not-write-pack.md");
+    let (ok_out, code_out, _, err_out) = hub_w.cv(&[
+        "pack",
+        "narwhal-delta-marker",
+        "--out",
+        never_written.to_str().unwrap(),
+        "--place",
+        "absent",
+        "--max-staleness",
+        "1s",
+    ]);
+    assert!(!ok_out && code_out == 2 && err_out.contains("absent"), "{err_out}");
+    assert!(
+        !never_written.exists(),
+        "--max-staleness must fail closed before creating --out"
+    );
     for cmd in [
         vec!["show", "alphasess", "--kind", "files"],
         vec!["tools", "alphasess"],

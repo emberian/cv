@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Place-scoped CLI and HTTP file/blame views resolve single sessions via B-tree indexes, deduplicate self-shipped echoes, preserve sub-agents, and whisper disconnected peers once.
 - Incremental hub indexing compacts Tantivy segments, commits deletes once, preserves watermarks across retention, and validates native extents and pack ownership on quarantine resolution.
 - `cv distill --session=<harness>` writes to every harness with a verified emitter (Codex, Gemini, Devin, …), sidecar and resume command included; `--delivery=live` stays Antigravity's.
 - A distilled seed attests its pack's human instructions (count, digest, length) and Claude transcripts keep that record, so a second distill demotes entries it cannot vouch for.

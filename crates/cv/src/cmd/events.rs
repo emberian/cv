@@ -18,72 +18,71 @@ pub(crate) fn cmd_events(
     use cv_core::events;
     let want = parse_harness(&harness)?;
     let auth_envelope = crate::cmd::browse::evaluate_cli_authority(&authority, None, None, false, false)?;
-
-    let (r, rows): (cv_core::SessionRef, Vec<events::EventRow>) = if let Some(gen) = authority.as_of {
-        let hub = cv_core::state::hub::HubStore::default_hub()?;
-        let heads = hub.heads_at_generation(Some(gen))?;
-        let mut matches = heads.into_iter().filter(|e| {
-            let h_ok = want.is_none_or(|w| cv_core::Harness::parse(&e.harness) == Some(w));
-            let p_ok = auth_envelope.as_ref().is_none_or(|env| env.includes(&e.producer_id));
-            let id_ok = e.selector_string() == id
-                || e.selector_string().starts_with(id)
-                || e.session_id == id
-                || e.metadata.get("native_id").and_then(|v| v.as_str()) == Some(id);
-            h_ok && p_ok && id_ok
-        });
-        let Some(entry) = matches.next() else {
-            return crate::util::usage(format!("session {id:?} not found at generation {gen}"));
-        };
-        if matches.next().is_some() {
-            return crate::util::usage(format!("ambiguous session id {id:?}"));
+    let scoped_view = match auth_envelope {
+        Some(env) => {
+            let hub = cv_core::state::hub::HubStore::default_hub()?;
+            Some(cv_core::custody::ScopedView::new(hub, env, authority.as_of.is_some()))
         }
-        let Some(backing) = cv_core::custody::backing_from_hub_head(hub.packs_dir(), entry)? else {
-            return crate::util::usage(format!("session {id:?} has no mirrored payload at generation {gen}"));
+        None => None,
+    };
+
+    let mut scoped_children: Vec<cv_core::custody::ScopedSource> = Vec::new();
+    let (r, rows): (cv_core::SessionRef, Vec<events::EventRow>) = if let Some(ref view) = scoped_view {
+        let src = match view.resolve(id, want) {
+            Ok(s) => s,
+            Err(cv_core::custody::ScopedResolveError::NotFound(_)) => {
+                return match authority.as_of {
+                    Some(gen) => crate::util::usage(format!("session {id:?} not found at generation {gen}")),
+                    None => crate::util::usage("session not found in selected places"),
+                };
+            }
+            Err(cv_core::custody::ScopedResolveError::Ambiguous(_)) => {
+                return crate::util::usage(format!("ambiguous session id {id:?}"));
+            }
+            Err(cv_core::custody::ScopedResolveError::Other(e)) => return Err(e),
         };
-        let mut sink = events::EventSink::new(backing.reference.cwd.clone());
-        cv_core::Adapter::stream(
-            &backing,
-            &backing.reference,
-            &cv_core::Demand::LEAN.with_spans(),
-            &mut sink,
-        )?;
-        let evs = sink.into_events()?;
-        let out_rows = evs
-            .into_iter()
-            .filter(|e| kind.as_deref().is_none_or(|k| e.kind == k))
-            .map(|e| events::EventRow {
-                baggage: None,
-                harness: backing.reference.harness.as_str().to_string(),
-                session_id: backing.reference.id.clone(),
-                msg_idx: e.msg_idx as i64,
-                ts: e.ts,
-                kind: e.kind.to_string(),
-                tool: e.tool,
-                target: e.target,
-                detail: e.detail,
-                parent_id: None,
-                agent_id: None,
-                workflow: None,
-            })
-            .collect();
-        (backing.reference, out_rows)
+        if view.pinned || src.entry.is_some() {
+            if src.r.path.as_os_str().is_empty() {
+                return match authority.as_of {
+                    Some(gen) => {
+                        crate::util::usage(format!("session {id:?} has no mirrored payload at generation {gen}"))
+                    }
+                    None => crate::util::usage(format!("session {id:?} has no mirrored payload")),
+                };
+            }
+            if subagents {
+                if let Some(ref entry) = src.entry {
+                    view.omit(
+                        &entry.producer_id,
+                        "worker_inventory",
+                        "Only collected sub-agent transcripts carry event evidence.",
+                    );
+                }
+                scoped_children = view.children(&src)?;
+            }
+            let mut out_rows = view.event_rows(&src)?;
+            if let Some(ref k) = kind {
+                out_rows.retain(|e| &e.kind == k);
+            }
+            (src.r, out_rows)
+        } else {
+            let rows = events::read_ref(&src.r, kind.as_deref())?;
+            (src.r, rows)
+        }
     } else {
         let (r, _adapter) = resolve(id, want)?;
-        if let Some(scope) = &auth_envelope {
-            if !cv_core::api::session_in_places(&r, scope)? {
-                return crate::util::usage("session not found in selected places");
-            }
-        }
         let rows = events::read_ref(&r, kind.as_deref())?;
         (r, rows)
     };
+
+    let use_local_subagents = subagents && authority.as_of.is_none() && !cv_core::custody::is_pack_ref(&r);
 
     if json {
         // One array: the session's own events, then (with --subagents) each sub-agent's, tagged.
         // Every row is `rows::event_row` — the same function `/api/session/{h}/{id}/events` prints
         // with, so the two doors cannot drift.
         let mut out: Vec<serde_json::Value> = rows.iter().map(cv_core::rows::event_row).collect();
-        if subagents && authority.as_of.is_none() {
+        if use_local_subagents {
             out.extend(
                 subagent_events(cv_core::subagent_tree_of(&r)?, r.harness, kind.as_deref())?
                     .into_iter()
@@ -110,13 +109,45 @@ pub(crate) fn cmd_events(
                         })
                     }),
             );
+        } else if subagents {
+            if let Some(ref view) = scoped_view {
+                for child in &scoped_children {
+                    if child.r.path.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let agent_id = cv_core::custody::ScopedView::agent_id(child).to_owned();
+                    let workflow = child
+                        .entry
+                        .as_ref()
+                        .and_then(|e| e.metadata["workflow"].as_str().map(str::to_owned));
+                    for e in view.events(child)? {
+                        if kind.as_deref().is_some_and(|k| e.kind != k) {
+                            continue;
+                        }
+                        out.push(cv_core::rows::event_row(&events::EventRow {
+                            baggage: None,
+                            harness: r.harness.as_str().to_string(),
+                            session_id: r.id.clone(),
+                            msg_idx: e.msg_idx as i64,
+                            ts: e.ts,
+                            kind: e.kind.to_string(),
+                            tool: e.tool,
+                            target: e.target,
+                            detail: e.detail,
+                            parent_id: Some(r.id.clone()),
+                            agent_id: Some(agent_id.clone()),
+                            workflow: workflow.clone(),
+                        }));
+                    }
+                }
+            }
         }
-        if let Some(env) = auth_envelope {
+        if let Some(view) = scoped_view {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "events": out,
-                    "authority": env,
+                    "authority": *view.envelope.borrow(),
                 }))?
             );
         } else {
@@ -153,8 +184,58 @@ pub(crate) fn cmd_events(
     // `--subagents`: descend into the forest and attribute each agent's events to it. Sub-agents
     // aren't in the catalog (there can be thousands), so they're streamed on the spot through an
     // `EventSink` — large tool-result content stays on disk (lazy), only the small rows accumulate.
-    if subagents && authority.as_of.is_none() {
+    if use_local_subagents {
         print_subagent_events(&r, kind.as_deref(), wide)?;
+    } else if subagents {
+        if let Some(ref view) = scoped_view {
+            let mut total = 0usize;
+            for child in &scoped_children {
+                if child.r.path.as_os_str().is_empty() {
+                    continue;
+                }
+                let evs: Vec<_> = view
+                    .events(child)?
+                    .into_iter()
+                    .filter(|e| kind.as_deref().is_none_or(|k| e.kind == k))
+                    .collect();
+                if evs.is_empty() {
+                    continue;
+                }
+                total += evs.len();
+                let meta = child.entry.as_ref().map(|e| &e.metadata);
+                let wf = meta
+                    .and_then(|m| m["workflow"].as_str())
+                    .map(|w| format!(" ⟐{w}"))
+                    .unwrap_or_default();
+                let agent_type = meta.and_then(|m| m["agent_type"].as_str()).unwrap_or("agent");
+                let desc = meta
+                    .and_then(|m| m["description"].as_str())
+                    .or(child.r.title.as_deref())
+                    .map(|d| format!("  — {}", truncate(d, 60)))
+                    .unwrap_or_default();
+                println!(
+                    "\n┌─ sub-agent {}  {}{wf}  ({} event(s)){desc}",
+                    short_id(cv_core::custody::ScopedView::agent_id(child)),
+                    agent_type,
+                    evs.len(),
+                );
+                for e in &evs {
+                    print!("│ ");
+                    print_event_row(
+                        e.msg_idx as i64,
+                        e.ts,
+                        e.kind,
+                        e.tool.as_deref(),
+                        e.target.as_deref(),
+                        e.detail.as_deref(),
+                        wide,
+                    );
+                }
+            }
+            if total > 0 {
+                println!("\n{total} event(s) across {} sub-agent(s)", scoped_children.len());
+            }
+        }
     }
     Ok(())
 }

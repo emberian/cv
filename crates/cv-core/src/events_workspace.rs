@@ -188,7 +188,7 @@ fn stale_peers_in_conn(
 
         let enrolled = ["cwd", "repo", "repo_root"]
             .iter()
-            .any(|key| metadata[*key].as_str().is_some_and(&matches_checkout));
+            .any(|key| metadata[*key].as_str().is_some_and(matches_checkout));
         let policy = &metadata["filter_policy"];
         let in_policy = |cwd: &Path, key: &str| {
             policy[key].as_array().is_some_and(|hashes| {
@@ -210,7 +210,7 @@ fn stale_peers_in_conn(
         if have_heads {
             let mut heads = conn.prepare_cached(
                 "SELECT DISTINCT cwd FROM hub_session_heads
-                 WHERE producer_id = ?1 AND gen_to IS NULL AND cwd IS NOT NULL",
+                 WHERE producer_id = ?1 AND +gen_to IS NULL AND cwd IS NOT NULL",
             )?;
             for dir in heads.query_map([&place], |row| row.get::<_, String>(0))? {
                 if matches_checkout(&dir?) {
@@ -340,29 +340,26 @@ pub fn stale_peer_advisory(
         if let Ok(wconn) = rusqlite::Connection::open(store.path()) {
             let _ = wconn.busy_timeout(std::time::Duration::from_millis(25));
             if let Ok(true) = wconn.table_exists(None, "whispers") {
-                match wconn.execute(
+                if let Ok(0) = wconn.execute(
                     "INSERT INTO whispers(session_id, kind, subject_key, subject_rev, command, status, harness, emitted_at)
                      SELECT ?1, 'stale_peer_edits', ?2, ?3, ?4, 'emitted', ?5, ?6
                      WHERE (SELECT COUNT(*) FROM whispers WHERE session_id = ?1) < 256
                      ON CONFLICT DO NOTHING",
                     rusqlite::params![recipient, subject_key, subject_rev, command, harness, now_ms],
                 ) {
-                    Ok(0) => {
-                        let raced: bool = wconn
-                            .query_row(
-                                "SELECT EXISTS(
-                                    SELECT 1 FROM whispers
-                                    WHERE session_id = ?1 AND kind = 'stale_peer_edits' AND subject_key = ?2 AND subject_rev = ?3
-                                )",
-                                rusqlite::params![recipient, subject_key, subject_rev],
-                                |r| r.get(0),
-                            )
-                            .unwrap_or(false);
-                        if raced {
-                            return Ok(Vec::new());
-                        }
+                    let raced: bool = wconn
+                        .query_row(
+                            "SELECT EXISTS(
+                                SELECT 1 FROM whispers
+                                WHERE session_id = ?1 AND kind = 'stale_peer_edits' AND subject_key = ?2 AND subject_rev = ?3
+                            )",
+                            rusqlite::params![recipient, subject_key, subject_rev],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if raced {
+                        return Ok(Vec::new());
                     }
-                    Ok(_) | Err(_) => {}
                 }
             }
         }

@@ -292,7 +292,7 @@ pub(crate) fn follow_lanes(
     let wait = crate::util::Wait::resolve(true, for_)?;
     let since = lane_since(since)?;
     if let Some(view) = super::place::current() {
-        if view.pinned {
+        if view.pinned() {
             return crate::util::usage("--follow requires a current generation");
         }
         if !matches!(scope, LaneScope::Session { .. }) {
@@ -304,7 +304,7 @@ pub(crate) fn follow_lanes(
             let _scope = super::place::enter(&view.args, None, None, false)?;
             let current = super::place::current().expect("active report scope");
             let rows = scoped_workers(&current, &scope, filter, since, with_tasks)?;
-            let snapshot = serde_json::json!({"lanes":rows,"authority":*current.envelope.borrow()});
+            let snapshot = serde_json::json!({"lanes":rows,"authority":*current.inner.envelope.borrow()});
             let mut comparable = snapshot.clone();
             if let Some(rows) = comparable["lanes"].as_array_mut() {
                 for row in rows {
@@ -468,19 +468,23 @@ fn scoped_workers(
     tasks: bool,
 ) -> Result<Vec<serde_json::Value>> {
     use cv_core::affordance::Kind;
-    let parents = match scope {
+    let parents: Vec<cv_core::custody::ScopedSource> = match scope {
         LaneScope::Session { id, harness } => vec![view.resolve(id, parse_harness(harness)?)?],
         LaneScope::Recent { n, dir } => {
+            let norm_dir = cv_core::tools::classify::normalize_path(dir, None);
             let mut parents: Vec<_> = view
-                .sources
+                .sources()?
                 .iter()
                 .filter(|s| {
-                    s.r.cwd
-                        .as_deref()
-                        .is_some_and(|p| if s.entry.is_some() { p == dir } else { same_dir(p, dir) })
-                        && cv_core::harness::rootless(s.r.harness)
-                            .is_some_and(|a| a.capabilities().lane_stops.is_some())
+                    s.r.cwd.as_deref().is_some_and(|p| {
+                        if s.entry.is_some() {
+                            p == dir || cv_core::tools::classify::normalize_path(p, None) == norm_dir
+                        } else {
+                            same_dir(p, dir)
+                        }
+                    }) && cv_core::harness::rootless(s.r.harness).is_some_and(|a| a.capabilities().lane_stops.is_some())
                 })
+                .cloned()
                 .collect();
             parents.sort_by_key(|s| std::cmp::Reverse(s.r.updated_at.or(s.r.created_at)));
             parents.truncate(*n);
@@ -488,41 +492,114 @@ fn scoped_workers(
         }
     };
     let mut rows = Vec::new();
-    for parent in parents {
+    for parent in &parents {
         if let Some(e) = &parent.entry {
             view.omit(
                 &e.producer_id,
                 "worker_liveness",
                 "Worker process state, stop journals and task bindings are local to the producer.",
             );
-            if parent.r.path.as_os_str().is_empty() {
-                continue;
-            }
-            let a = view.adapter(parent)?;
-            let mut calls = std::collections::BTreeMap::new();
-            for row in cv_core::affordance::read_evidence(a.as_ref(), &parent.r, false)? {
-                if !matches!(row.kind, Kind::SubagentSpawn | Kind::SubagentReturn) {
-                    continue;
+            let children = view.children(parent)?;
+            let mut children_by_tool_use: std::collections::HashMap<String, &cv_core::custody::ScopedSource> =
+                std::collections::HashMap::new();
+            let mut unmatched_children = Vec::new();
+            for child in &children {
+                if let Some(tid) = child
+                    .entry
+                    .as_ref()
+                    .and_then(|ce| ce.metadata["tool_use_id"].as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    children_by_tool_use.insert(tid.to_owned(), child);
+                } else {
+                    unmatched_children.push(child);
                 }
-                let id = row
-                    .tool_use_id
-                    .clone()
-                    .unwrap_or_else(|| format!("message-{}", row.index.unwrap_or_default()));
-                calls.insert(id, row);
             }
-            for (id, row) in calls {
-                let returned = row.kind == Kind::SubagentReturn;
-                if since.is_some_and(|t| row.timestamp.is_none_or(|ts| ts < t))
+
+            let mut matched_tool_ids = std::collections::HashSet::new();
+            if !parent.r.path.as_os_str().is_empty() {
+                let a = view.adapter(parent)?;
+                let mut calls = std::collections::BTreeMap::new();
+                for row in cv_core::affordance::read_evidence(a.as_ref(), &parent.r, false)? {
+                    if !matches!(row.kind, Kind::SubagentSpawn | Kind::SubagentReturn) {
+                        continue;
+                    }
+                    let id = row
+                        .tool_use_id
+                        .clone()
+                        .unwrap_or_else(|| format!("message-{}", row.index.unwrap_or_default()));
+                    calls.insert(id, row);
+                }
+                for (id, row) in calls {
+                    matched_tool_ids.insert(id.clone());
+                    let returned = row.kind == Kind::SubagentReturn;
+                    let child = children_by_tool_use.get(&id).copied();
+                    let ts = row
+                        .timestamp
+                        .or_else(|| child.and_then(|c| c.r.updated_at.or(c.r.created_at)));
+                    if since.is_some_and(|t| ts.is_none_or(|ts| ts < t))
+                        || !match filter {
+                            LaneFilter::All => true,
+                            LaneFilter::Done => returned,
+                            _ => false,
+                        }
+                    {
+                        continue;
+                    }
+                    let mut obj = serde_json::json!({
+                        "parent_id": parent.r.id,
+                        "place": e.producer_id,
+                        "tool_use_id": id,
+                        "status": if returned { "returned" } else { "unknown" },
+                        "timestamp": ts,
+                        "summary": row.summary,
+                    });
+                    if let Some(c) = child {
+                        obj["agent_id"] = super::place::View::agent_id(c).into();
+                        obj["session_id"] = c.r.id.clone().into();
+                    }
+                    rows.push(obj);
+                }
+            }
+
+            // Include collected child worker transcripts (e.g. workflow sub-agents) that had no
+            // matching SubagentSpawn/SubagentReturn tool_use block in the parent transcript.
+            for (tid, child) in children_by_tool_use {
+                if !matched_tool_ids.contains(&tid) {
+                    unmatched_children.push(child);
+                }
+            }
+            for child in unmatched_children {
+                let meta = child.entry.as_ref().map(|ce| &ce.metadata);
+                let result_status = meta.and_then(|m| m["result_status"].as_str());
+                let done = matches!(result_status, Some("done" | "completed" | "returned"));
+                let ts = child.r.updated_at.or(child.r.created_at);
+                if since.is_some_and(|t| ts.is_none_or(|ts| ts < t))
                     || !match filter {
                         LaneFilter::All => true,
-                        LaneFilter::Done => returned,
+                        LaneFilter::Done => done,
                         _ => false,
                     }
                 {
                     continue;
                 }
-                rows.push(serde_json::json!({"parent_id":parent.r.id,"place":e.producer_id,"tool_use_id":id,
-                    "status":if returned {"returned"} else {"unknown"}, "timestamp":row.timestamp,"summary":row.summary}));
+                let summary = meta
+                    .and_then(|m| m["result_summary"].as_str().or_else(|| m["description"].as_str()))
+                    .or(child.r.title.as_deref())
+                    .unwrap_or("");
+                let mut obj = serde_json::json!({
+                    "parent_id": parent.r.id,
+                    "place": e.producer_id,
+                    "agent_id": super::place::View::agent_id(child),
+                    "session_id": child.r.id,
+                    "status": result_status.unwrap_or("unknown"),
+                    "timestamp": ts,
+                    "summary": summary,
+                });
+                if let Some(tid) = meta.and_then(|m| m["tool_use_id"].as_str()).filter(|s| !s.is_empty()) {
+                    obj["tool_use_id"] = tid.into();
+                }
+                rows.push(obj);
             }
         } else {
             let mut workers = cv_core::lanes::lanes_of(&parent.r)?;

@@ -244,29 +244,23 @@ pub(crate) fn evaluate_cli_authority(
     if !authority.is_active() {
         return Ok(None);
     }
-    let max_staleness_ms = match authority.max_staleness.as_deref() {
-        Some(raw) => Some(cv_core::state::hub::parse_duration_ms(raw).map_err(crate::util::UsageError)?),
-        None => None,
-    };
-    let hub = cv_core::state::hub::HubStore::default_hub()?;
-    if let Some(g) = authority.as_of {
-        if hub.resolve_generation(Some(&g.to_string()))?.is_none() {
-            return crate::util::usage(format!("hub generation `{g}` not found"));
-        }
-    }
-    let ctx = cv_core::state::hub::AuthorityQueryContext {
-        place_glob: authority.place.as_deref(),
-        as_of_gen: authority.as_of,
-        max_staleness_ms,
+    let as_of_str = authority.as_of.map(|g| g.to_string());
+    match cv_core::custody::evaluate_authority(
+        authority.place.as_deref(),
+        as_of_str.as_deref(),
+        authority.max_staleness.as_deref(),
         cwd_filter,
         query_str,
         has_negation,
         indexed_only,
-        include_local: authority.as_of.is_none(),
-    };
-    match hub.check_authority(&ctx) {
-        Ok(env) => Ok(Some(env)),
-        Err(violation) => crate::util::usage(violation.message),
+    ) {
+        Ok((_, env)) => Ok(Some(env)),
+        Err(cv_core::custody::AuthorityEvalError::BadDuration(msg)) => crate::util::usage(msg),
+        Err(cv_core::custody::AuthorityEvalError::GenerationNotFound(spec)) => {
+            crate::util::usage(format!("hub generation `{spec}` not found"))
+        }
+        Err(cv_core::custody::AuthorityEvalError::Staleness(v)) => crate::util::usage(v.message),
+        Err(cv_core::custody::AuthorityEvalError::Hub(e)) => Err(e.into()),
     }
 }
 
