@@ -4018,7 +4018,7 @@ fn find_swarm_registry(app_data_dir: &Path, session_id: &str, parent_hint: Optio
         let Some(dir_id) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if dir_id == session_id || parent_hint == Some(dir_id.as_str()) {
+        if dir_id.starts_with('.') || dir_id == session_id || parent_hint == Some(dir_id.as_str()) {
             continue;
         }
         if let Some(reg) = check_brain(&dir_id) {
@@ -4103,7 +4103,7 @@ fn find_sidecar_parent(app_data_dir: &Path, child_id: &str) -> Option<String> {
         let Some(dir_id) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if dir_id == child_id {
+        if dir_id.starts_with('.') || dir_id == child_id {
             continue;
         }
         if brain_root

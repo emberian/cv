@@ -806,10 +806,13 @@ pub(super) fn publish_staged_app_root(
     }
     let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
     let bak_tag = format!(".bak-{}", uuid::Uuid::new_v4().simple());
+    // Hidden names: discovery lists every visible `brain/` directory as a conversation,
+    // so a backup that outlives a crash must not read as one.
     let backup_path = |target: &Path| -> PathBuf {
-        let mut os = target.as_os_str().to_os_string();
-        os.push(&bak_tag);
-        PathBuf::from(os)
+        let mut name = std::ffi::OsString::from(".");
+        name.push(target.file_name().unwrap_or_default());
+        name.push(&bak_tag);
+        target.with_file_name(name)
     };
     let mut installed = Vec::new();
     let result = (|| -> Result<()> {
@@ -963,6 +966,18 @@ mod replace_tests {
         let err = publish_staged_app_root(make_stage()?, &out, &spec, Claim::Replace, |root| {
             // #tooth A second publisher cannot replace or restore this installation.
             assert!(probe_summary_unlocked(root).is_err());
+            // #tooth A backup is never a visible sibling that discovery would list as a conversation.
+            let mut backups = 0;
+            for sub in ["brain", "conversations", "annotations"] {
+                for entry in fs::read_dir(root.join(sub))? {
+                    let name = entry?.file_name().to_string_lossy().into_owned();
+                    if name.contains(".bak-") {
+                        assert!(name.starts_with('.'), "visible backup: {name}");
+                        backups += 1;
+                    }
+                }
+            }
+            assert_eq!(backups, 4);
             anyhow::bail!("injected verification failure")
         })
         .unwrap_err();
