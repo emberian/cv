@@ -128,6 +128,7 @@ class CvFleet extends HTMLElement {
   constructor() {
     super();
     this._base = this._read(BASE_LS) || DEFAULT_BASE;
+    this._originTokens = new Map();
     this._paused = false;
     this._timer = null;
     this._inflight = false;
@@ -189,9 +190,50 @@ class CvFleet extends HTMLElement {
     this._inflight = false;
   }
 
+  _targetOrigin() {
+    try {
+      const base = (this._base || DEFAULT_BASE).trim();
+      const locOrigin = typeof location !== "undefined" ? location.origin : "";
+      const resolved = locOrigin && locOrigin !== "null" ? new URL(base, locOrigin) : new URL(base);
+      return resolved.origin && resolved.origin !== "null" ? resolved.origin : "";
+    } catch {
+      return "";
+    }
+  }
+
+  _isSameOrigin() {
+    if (typeof location === "undefined" || !location.origin || location.origin === "null") return false;
+    return this._targetOrigin() === location.origin;
+  }
+
+  _headersForBase(extra = {}) {
+    if (this._isSameOrigin()) return authHeaders(extra);
+    const origin = this._targetOrigin();
+    const scoped = origin ? (this._originTokens.get(origin) || "") : "";
+    return scoped ? { ...extra, Authorization: `Bearer ${scoped}` } : { ...extra };
+  }
+
+  _tokenForCurrentBase() {
+    if (this._isSameOrigin()) return getAuthToken();
+    const origin = this._targetOrigin();
+    return origin ? (this._originTokens.get(origin) || "") : "";
+  }
+
+  _setTokenForCurrentBase(tok) {
+    const trimmed = (tok || "").trim();
+    if (this._isSameOrigin()) {
+      setAuthToken(trimmed);
+      return;
+    }
+    const origin = this._targetOrigin();
+    if (!origin) return;
+    if (trimmed) this._originTokens.set(origin, trimmed);
+    else this._originTokens.delete(origin);
+  }
+
   async _fetchJson(path, signal) {
     const url = this._base.replace(/\/+$/, "") + path;
-    const resp = await fetch(url, { signal, headers: authHeaders({ Accept: "application/json" }) });
+    const resp = await fetch(url, { signal, headers: this._headersForBase({ Accept: "application/json" }) });
     if (resp.status === 401) throw new Error(`${path} → HTTP 401 (enter bearer token in toolbar)`);
     if (!resp.ok) throw new Error(`${path} → HTTP ${resp.status}`);
     return resp.json();
@@ -250,18 +292,20 @@ class CvFleet extends HTMLElement {
     this._closeStream();
     // A static export has no server; an environment without EventSource polls instead.
     if (this._staticMode || typeof EventSource !== "function" || !this._laneTarget()) return;
-    if (!getAuthToken()) { this._attachStream(); return; }
+    const hdrs = this._headersForBase();
+    if (!hdrs.Authorization) { this._attachStream(); return; }
     // EventSource sends no headers, and the server refuses a query-string bearer: exchange the
     // bearer for the HttpOnly reader cookie first. Until then (or if refused) lanes are polled.
     const opening = this._opening = {};
-    fetch(this._base.replace(/\/+$/, "") + "/api/auth", { headers: authHeaders(), credentials: "include" })
+    const credentials = this._isSameOrigin() ? "include" : "same-origin";
+    fetch(this._base.replace(/\/+$/, "") + "/api/auth", { headers: hdrs, credentials })
       .then((resp) => { if (resp.ok && this._opening === opening && !this._es) this._attachStream(); })
       .catch(() => {});
   }
 
   _attachStream() {
     let es;
-    try { es = new EventSource(this._streamUrl(), { withCredentials: true }); } catch { return; }
+    try { es = new EventSource(this._streamUrl(), { withCredentials: this._isSameOrigin() }); } catch { return; }
     this._es = es;
     es.onopen = () => { if (this._es === es) this._live = true; };
     // EventSource retries on its own; until it reconnects, the poll timer fetches lanes.
@@ -392,7 +436,7 @@ class CvFleet extends HTMLElement {
     const baseEl = this.querySelector(".fleet-base");
     if (baseEl) baseEl.value = this._base;
     const tokEl = this.querySelector(".fleet-token");
-    if (tokEl) tokEl.value = getAuthToken();
+    if (tokEl) tokEl.value = this._tokenForCurrentBase();
     this._wireToolbar();
   }
 
@@ -555,17 +599,27 @@ class CvFleet extends HTMLElement {
 
   _wireToolbar() {
     const baseEl = this.querySelector(".fleet-base");
-    baseEl?.addEventListener("change", () => { this._base = baseEl.value.trim() || DEFAULT_BASE; this._write(BASE_LS, this._base); });
-    baseEl?.addEventListener("keydown", (e) => { if (e.key === "Enter") { this._base = baseEl.value.trim() || DEFAULT_BASE; this._write(BASE_LS, this._base); this._start(); } });
-
     const tokEl = this.querySelector(".fleet-token");
-    tokEl?.addEventListener("change", () => { setAuthToken(tokEl.value); });
-    tokEl?.addEventListener("keydown", (e) => { if (e.key === "Enter") { setAuthToken(tokEl.value); this._start(); } });
+    const syncBase = () => {
+      this._base = baseEl.value.trim() || DEFAULT_BASE;
+      this._write(BASE_LS, this._base);
+      if (tokEl) tokEl.value = this._tokenForCurrentBase();
+    };
+    baseEl?.addEventListener("change", syncBase);
+    baseEl?.addEventListener("keydown", (e) => { if (e.key === "Enter") { syncBase(); this._start(); } });
+
+    tokEl?.addEventListener("change", () => { this._setTokenForCurrentBase(tokEl.value); });
+    tokEl?.addEventListener("keydown", (e) => { if (e.key === "Enter") { this._setTokenForCurrentBase(tokEl.value); this._start(); } });
 
     this.querySelector("[data-fleet-connect]")?.addEventListener("click", () => {
-      this._base = (this.querySelector(".fleet-base")?.value || this._base).trim() || DEFAULT_BASE;
+      const nextBase = (this.querySelector(".fleet-base")?.value || this._base).trim() || DEFAULT_BASE;
+      const baseChanged = nextBase !== this._base;
+      this._base = nextBase;
       this._write(BASE_LS, this._base);
-      if (tokEl) setAuthToken(tokEl.value);
+      if (tokEl) {
+        if (baseChanged) tokEl.value = this._tokenForCurrentBase();
+        else this._setTokenForCurrentBase(tokEl.value);
+      }
       this._paused = false;
       this._start();
     });

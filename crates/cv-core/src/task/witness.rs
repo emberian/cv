@@ -179,123 +179,8 @@ fn diary_refs(text: &str) -> impl Iterator<Item = EvidenceRef> + '_ {
     })
 }
 
-fn strip_receipt_tokens(text: &str) -> String {
-    text.split_whitespace()
-        .filter(|w| {
-            !w.trim_matches(|c: char| matches!(c, '`' | '[' | ']' | '(' | ')' | '.' | ',' | ';' | ':'))
-                .starts_with("receipt:")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn asserts_success(text: &str) -> bool {
-    use std::sync::LazyLock;
-    static EXPLICIT_FAIL: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i)\b(?:[1-9]\d*\s+(?:failed|failures?|errors?)|exit(?:\s+code|\s+status)?\s+[1-9]\d*|non-?zero)\b",
-        )
-        .unwrap()
-    });
-    static ZERO_FAIL: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:0|zero|no)\s+(?:failed|failures?)\b").unwrap());
-    static ZERO_DIAG: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:0|zero|no)\s+(?:errors?|warnings?)\b").unwrap());
-    static EXIT_ZERO: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\b(?:exit(?:ed)?(?:\s+with)?(?:\s+code|\s+status)?|status|rc)\s+0\b").unwrap()
-    });
-    static PASS_SUBJECT: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\b(?:tests?|checks?|suites?|gates?|clippy|builds?|ci|validation|all)\s+pass\b").unwrap()
-    });
-    static GREEN_CLAUSE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i)\b(?:all\s+green|(?:tests?|checks?|suites?|gates?|clippy|builds?|ci)\b[^.\n;]*\bgreen|\bgreen\b[^.\n;]*\b(?:tests?|checks?|suites?|gates?|clippy|builds?|ci))\b",
-        )
-        .unwrap()
-    });
-
-    static REPAIRED: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\b(?:fix(?:ed|ing)?|resolved?|address(?:ed)?|repair(?:ed)?)\b").unwrap()
-    });
-    static NO_REGRESSIONS: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:no|zero|0)\s+(?:new\s+)?regressions?\b").unwrap());
-
-    fn clause_asserts_success(clause: &str) -> bool {
-        let had_zero_fail = ZERO_FAIL.is_match(clause);
-        let clause = NO_REGRESSIONS.replace_all(clause, " ");
-        let zero_scrubbed = ZERO_FAIL.replace_all(&clause, " ");
-        let scrubbed = ZERO_DIAG.replace_all(&zero_scrubbed, " ");
-        let words: Vec<String> = scrubbed
-            .to_ascii_lowercase()
-            .replace("non-zero", "nonzero")
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
-            .filter(|w| !w.is_empty())
-            .map(str::to_string)
-            .collect();
-        if words.is_empty() {
-            return false;
-        }
-        let negated = words.iter().any(|w| {
-            w.ends_with("n't")
-                || matches!(
-                    w.as_str(),
-                    "not"
-                        | "no"
-                        | "never"
-                        | "neither"
-                        | "nor"
-                        | "without"
-                        | "cannot"
-                        | "unable"
-                        | "fail"
-                        | "fails"
-                        | "failed"
-                        | "failing"
-                        | "failure"
-                        | "failures"
-                        | "error"
-                        | "errors"
-                        | "broken"
-                        | "nonzero"
-                        | "unsuccessful"
-                        | "panic"
-                        | "panicked"
-                )
-        });
-        if negated {
-            return false;
-        }
-        had_zero_fail
-            || words == ["pass"]
-            || words == ["green"]
-            || words
-                .iter()
-                .any(|w| matches!(w.as_str(), "passed" | "passes" | "succeeded" | "succeeds"))
-            || EXIT_ZERO.is_match(&scrubbed)
-            || PASS_SUBJECT.is_match(&scrubbed)
-            || GREEN_CLAUSE.is_match(&scrubbed)
-    }
-
-    let stripped = strip_receipt_tokens(text);
-    let mut asserted = false;
-    for raw_clause in stripped.split(['\n', ';', '.']) {
-        let clause = raw_clause.trim();
-        if clause.is_empty() {
-            continue;
-        }
-        // A failure count in a clause is an honest report unless that clause says it was repaired.
-        if EXPLICIT_FAIL.is_match(clause) {
-            if REPAIRED.is_match(clause) {
-                continue;
-            }
-            return false;
-        }
-        asserted |= clause_asserts_success(clause);
-    }
-    asserted
-}
-
-/// An assertion and an outcome are comparable only when the assertion cites that run.
+/// Structured completion claims (`Done` state or an explicit `Claim` envelope) are checked
+/// strictly against verified receipt chains and command exit codes, never prose regexes.
 pub fn completion(t: &TaskProjection) -> Witness {
     let mut w = Witness {
         self_reported: t.state == TaskState::Done,
@@ -303,35 +188,44 @@ pub fn completion(t: &TaskProjection) -> Witness {
     };
     let mut outcomes = std::collections::BTreeMap::new();
     let mut ledger = Ledger::default();
-    // Each source: (note, text, cited evidence, session pointer, claimant).
-    let sources = std::iter::once((
-        "done",
-        t.done_observed.as_deref().unwrap_or(""),
-        t.evidence.as_slice(),
-        None,
-        t.done_by.as_deref(),
-    ))
-    .chain(t.notes.iter().map(|n| {
-        (
-            n.event_id.as_str(),
-            n.text.as_str(),
-            n.claim.as_ref().map_or(&[][..], |c| c.evidence.as_slice()),
-            n.session_ref.as_deref(),
-            Some(n.session_ref.as_deref().unwrap_or(&n.by)),
-        )
-    }))
-    .chain(
-        t.status
-            .iter()
-            .map(|s| (s.event_id.as_str(), s.text.as_str(), &[][..], None, Some(s.by.as_str()))),
-    );
-    for (note, text, evidence, pointer, claimant) in sources {
+    // Each source: (note, text, cited evidence, session pointer, claimant, structured_claim).
+    let sources = (t.state == TaskState::Done)
+        .then_some((
+            "done",
+            t.done_observed.as_deref().unwrap_or(""),
+            t.evidence.as_slice(),
+            None,
+            t.done_by.as_deref(),
+            true,
+        ))
+        .into_iter()
+        .chain(t.notes.iter().map(|n| {
+            (
+                n.event_id.as_str(),
+                n.text.as_str(),
+                n.claim.as_ref().map_or(&[][..], |c| c.evidence.as_slice()),
+                n.session_ref.as_deref(),
+                Some(n.session_ref.as_deref().unwrap_or(&n.by)),
+                n.claim.is_some(),
+            )
+        }))
+        .chain(t.status.iter().map(|s| {
+            (
+                s.event_id.as_str(),
+                s.text.as_str(),
+                &[][..],
+                None,
+                Some(s.by.as_str()),
+                false,
+            )
+        }));
+    for (note, text, evidence, pointer, claimant, structured_claim) in sources {
         let mut latest = std::collections::BTreeMap::new();
         let cited = diary_refs(text)
             .chain(pointer.into_iter().flat_map(diary_refs))
             .collect::<Vec<_>>();
         // The claimant's own latest validation run per command stands beside what it cites, so
-        // an uncited later failure still contradicts a report of success.
+        // an uncited later failure still contradicts a completion claim.
         let own = claimant.map(|c| ledger.validation_runs(c)).unwrap_or_default();
         for recorded in evidence
             .iter()
@@ -339,31 +233,29 @@ pub fn completion(t: &TaskProjection) -> Witness {
             .filter_map(|reference| ledger.recorded(reference))
             .chain(own)
         {
-            {
-                let Recorded {
-                    event,
-                    session,
+            let Recorded {
+                event,
+                session,
+                seq,
+                anchored,
+                outcome,
+            } = recorded;
+            if anchored && !w.chain_anchored.contains(&event) {
+                w.chain_anchored.push(event.clone())
+            }
+            if let Some(run) = outcome {
+                let last = latest.entry((session.clone(), run.command_key.clone())).or_insert((
                     seq,
-                    anchored,
-                    outcome,
-                } = recorded;
-                if anchored && !w.chain_anchored.contains(&event) {
-                    w.chain_anchored.push(event.clone())
+                    event.clone(),
+                    run.exit_code,
+                ));
+                if seq > last.0 {
+                    *last = (seq, event, run.exit_code);
                 }
-                if let Some(run) = outcome {
-                    let last = latest.entry((session.clone(), run.command_key.clone())).or_insert((
-                        seq,
-                        event.clone(),
-                        run.exit_code,
-                    ));
-                    if seq > last.0 {
-                        *last = (seq, event, run.exit_code);
-                    }
-                    outcomes.insert((session, seq), run);
-                }
+                outcomes.insert((session, seq), run);
             }
         }
-        if asserts_success(text) {
+        if structured_claim {
             for (_, receipt, exit_code) in latest.into_values().filter(|v| v.2 != 0) {
                 w.divergence.push(Divergence {
                     note: note.into(),
@@ -442,44 +334,47 @@ mod tests {
         assert_eq!(result.divergence.len(), 1);
         assert_eq!(result.divergence[0].note, note.id);
 
-        // #tooth Multi-word positive outcomes trigger divergence on non-zero receipts, while
-        // negated or honest failure clauses never do.
-        let fail_101 = {
+        // #tooth Divergence depends strictly on structured claims (`claim` / `Done`) and receipt
+        // exit codes, never English prose wording.
+        let (fail_101, fail_cite) = {
             let body = serde_json::json!({"kind":"post","tool":"Bash","command_key":"cargo-test","exit_code":101});
             let (r, _) = state
                 .append_receipt_with_inbox("test2", "claude", body.as_object().unwrap().clone())
                 .unwrap();
-            EvidenceRef::Receipt {
-                event: format!("receipt:claude:test2:{}", r.seq),
-                digest: r.receipt_hash,
-            }
-        };
-        let check_note = |msg: &str| {
-            let o = new_event(None, "me", opened_kind("check", None));
-            let n = new_event(
-                Some(&o.id),
-                "me",
-                TaskEventKind::Noted {
-                    text: msg.into(),
-                    session_ref: None,
-                    claim: Some(
-                        serde_json::from_value(serde_json::json!({"kind":"fact","evidence":[fail_101.clone()]}))
-                            .unwrap(),
-                    ),
+            let ev = format!("receipt:claude:test2:{}", r.seq);
+            let cite = format!("{ev}@{}", r.receipt_hash);
+            (
+                EvidenceRef::Receipt {
+                    event: ev,
+                    digest: r.receipt_hash,
                 },
-            );
-            let model = TaskReducer::reduce(&[o.clone(), n]).unwrap();
-            completion(&model.tasks[&o.id]).divergence.len()
+                cite,
+            )
         };
-        assert_eq!(check_note("cargo test -p clustervision-core passed cleanly"), 1);
-        assert_eq!(check_note("build & clippy green, exit code 0"), 1);
-        assert_eq!(check_note("test result: ok; 14 passed; 0 failed"), 1);
-        assert_eq!(check_note("tests did not pass"), 0);
-        assert_eq!(check_note("suite didn't pass on macOS"), 0);
-        assert_eq!(check_note("14 passed; 1 failed"), 0);
-        // Per-clause: a repaired failure count does not hide a later success claim.
-        assert_eq!(check_note("fixed the 3 failures; all tests pass"), 1);
-        assert_eq!(check_note("all tests pass, no regressions"), 1);
+        let o = new_event(None, "me", opened_kind("check", None));
+        let claimed_fail = new_event(
+            Some(&o.id),
+            "me",
+            TaskEventKind::Noted {
+                text: "status text ignored".into(),
+                session_ref: None,
+                claim: Some(serde_json::from_value(serde_json::json!({"kind":"fact","evidence":[fail_101]})).unwrap()),
+            },
+        );
+        let unclaimed_note = new_event(
+            Some(&o.id),
+            "me",
+            TaskEventKind::Noted {
+                text: format!("diagnostic log {fail_cite}"),
+                session_ref: None,
+                claim: None,
+            },
+        );
+        let model = TaskReducer::reduce(&[o.clone(), claimed_fail, unclaimed_note]).unwrap();
+        let w2 = completion(&model.tasks[&o.id]);
+        assert_eq!(w2.divergence.len(), 1);
+        assert_eq!(w2.observed_outcome.len(), 1);
+        assert_eq!(w2.observed_outcome[0].exit_code, 101);
     }
 
     #[test]

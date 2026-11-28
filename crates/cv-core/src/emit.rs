@@ -603,19 +603,11 @@ fn emit_checked(
                     &opts.parsed_at.demand(),
                 ),
             };
-            let mut report = match reparsed_res {
-                Ok((reparsed, after)) => diff_projected(target, opts.thinking, session, &reparsed, before, after),
-                Err(e) => FidelityReport {
-                    deltas: vec![Divergence {
-                        what: "round_trip".into(),
-                        a: "parseable".into(),
-                        b: format!("re-parse failed ({e:#})"),
-                        expected: false,
-                        why: None,
-                        at: target.as_str().to_string(),
-                    }],
-                },
+            let (reparsed, after) = match reparsed_res {
+                Ok(pair) => pair,
+                Err(e) => anyhow::bail!("re-parsing staged {target} output failed: {e:#}"),
             };
+            let mut report = diff_projected(target, opts.thinking, session, &reparsed, before, after);
             if opts.parsed_at == ParsedAt::Complete && !fidelity::target_holds(target, fidelity::Field::CompleteReparse)
             {
                 report.deltas.push(Divergence {

@@ -83,8 +83,8 @@ pub fn disclose(tier: DisclosureTier, session: &Session) -> anyhow::Result<Discl
     let resolver = session.resolver();
     for message in &session.messages {
         if !matches!(
-            (message.role, message.kind),
-            (Role::User, MessageKind::Prompt) | (Role::Assistant, MessageKind::Reply)
+            (message.role, message.kind, message.origin),
+            (Role::User, MessageKind::Prompt, crate::Origin::Human) | (Role::Assistant, MessageKind::Reply, _)
         ) {
             continue;
         }
@@ -141,7 +141,9 @@ mod tests {
             for key in ["id", "parent_id", "model"] {
                 m[key] = json!("private");
             }
-            m["origin"] = json!("hook");
+            if tier != DisclosureTier::Conversation {
+                m["origin"] = json!("hook");
+            }
             m["timestamp"] = json!("2020-01-01T00:00:00Z");
             m["extra"] = json!({"future":"private"});
             m["usage"] = json!({"input_tokens":12,"output_tokens":42,"cache_read_tokens":9,"cache_creation_tokens":2,"reasoning_tokens":8,"cost_usd":0.3});
@@ -182,6 +184,23 @@ mod tests {
                 DisclosureTier::Full => unreachable!(),
             }
             assert_ne!(expected, serde_json::to_vec(&disclose(tier, &changed)?)?);
+        }
+
+        // Imported or hook-seeded user prompts are not human turns and must not leak at Conversation tier.
+        for non_human in ["import", "hook", "harness", "subagent"] {
+            let seeded: Session = serde_json::from_value(json!({
+                "id": "seeded",
+                "harness": "claude",
+                "messages": [
+                    {"role": "user", "kind": "prompt", "origin": non_human, "content": [{"type": "text", "text": "imported seed"}]},
+                    {"role": "assistant", "kind": "reply", "origin": "model", "content": [{"type": "text", "text": "visible reply"}]}
+                ]
+            }))?;
+            let Disclosed::Conversation(conv) = disclose(DisclosureTier::Conversation, &seeded)? else {
+                unreachable!()
+            };
+            assert_eq!(conv.messages.len(), 1, "origin={non_human} leaked as human prompt");
+            assert_eq!(conv.messages[0].role, Role::Assistant);
         }
         Ok(())
     }

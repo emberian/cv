@@ -17,10 +17,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(super) const SCHEMA: &str = "
+PRAGMA user_version = 1;
 CREATE TABLE trajectory_meta(trajectory_id TEXT PRIMARY KEY,cascade_id TEXT,trajectory_type INTEGER,source INTEGER);
 CREATE TABLE steps(idx INTEGER PRIMARY KEY,step_type INTEGER NOT NULL DEFAULT 0,status INTEGER NOT NULL DEFAULT 0,
  has_subtrajectory NUMERIC NOT NULL DEFAULT false,metadata BLOB,error_details BLOB,permissions BLOB,task_details BLOB,
  render_info BLOB,step_payload BLOB,step_format INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX idx_steps_status ON steps(status);
+CREATE INDEX idx_steps_step_type ON steps(step_type);
 CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY,data BLOB,size INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE trajectory_metadata_blob(id TEXT PRIMARY KEY DEFAULT 'main',data BLOB);
 CREATE TABLE executor_metadata(idx INTEGER PRIMARY KEY,data BLOB);
@@ -807,24 +810,55 @@ pub(super) fn publish_staged_app_root(
             index.display()
         );
     }
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let wal_sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
-        if replace {
-            let _ = fs::remove_file(&wal_sidecar);
-        } else {
-            crate::publish::refuse_existing(&wal_sidecar, "")?;
+    let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let bak_tag = format!(".bak-{}", uuid::Uuid::new_v4().simple());
+    let backup_path = |target: &Path| -> PathBuf {
+        let mut os = target.as_os_str().to_os_string();
+        os.push(&bak_tag);
+        PathBuf::from(os)
+    };
+    let restore_backups = |backups: &[(PathBuf, PathBuf)]| {
+        for (orig, bak) in backups.iter().rev() {
+            let _ = fs::rename(bak, orig);
         }
-    }
+    };
+    let cleanup_backups = |backups: &[(PathBuf, PathBuf)]| {
+        for (_, bak) in backups {
+            if let Ok(meta) = fs::symlink_metadata(bak) {
+                if meta.is_dir() {
+                    let _ = fs::remove_dir_all(bak);
+                } else {
+                    let _ = fs::remove_file(bak);
+                }
+            }
+        }
+    };
+
     if replace {
-        if out.join(&brain).exists() {
-            fs::remove_dir_all(out.join(&brain))?;
+        let mut candidates = vec![
+            out.join(&brain),
+            out.join(&annotations),
+            out.join(&db),
+            out.join(&sidecar),
+        ];
+        for suffix in ["-wal", "-shm", "-journal"] {
+            candidates.push(out.join("conversations").join(format!("{}.db{suffix}", spec.new_id)));
         }
-        for rel in [&annotations, &db, &sidecar] {
-            if out.join(rel).exists() {
-                fs::remove_file(out.join(rel))?;
+        for orig in candidates {
+            if fs::symlink_metadata(&orig).is_ok() {
+                let bak = backup_path(&orig);
+                if let Err(err) = fs::rename(&orig, &bak) {
+                    restore_backups(&backups);
+                    return Err(err.into());
+                }
+                backups.push((orig, bak));
             }
         }
     } else {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let wal_sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
+            crate::publish::refuse_existing(&wal_sidecar, "")?;
+        }
         crate::publish::refuse_existing(&out.join(&brain), "")?;
     }
 
@@ -863,9 +897,82 @@ pub(super) fn publish_staged_app_root(
                 let _ = fs::remove_file(out.join(p));
             }
         }
+        restore_backups(&backups);
+    } else {
+        cleanup_backups(&backups);
     }
     result
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod replace_tests {
+    use super::*;
+
+    #[test]
+    fn replace_restores_original_artifacts_when_verify_fails() -> Result<()> {
+        let world = crate::test_world("antigravity-cold-atomic-replace");
+        let out = world.base.join("root");
+        let id = "aaaaaaaa-1111-4111-8111-111111111111";
+        fs::create_dir_all(out.join("brain").join(id))?;
+        fs::create_dir_all(out.join("conversations"))?;
+        fs::create_dir_all(out.join("annotations"))?;
+        fs::write(out.join("brain").join(id).join("keep.txt"), b"original-brain")?;
+        fs::write(out.join("conversations").join(format!("{id}.db")), b"original-db")?;
+        fs::write(out.join("annotations").join(format!("{id}.pbtxt")), b"original-ann")?;
+
+        let stage = crate::publish::StagedDir::beside(&out, "agy-replace")?;
+        fs::create_dir_all(stage.path().join("brain").join(id))?;
+        fs::create_dir_all(stage.path().join("conversations"))?;
+        fs::create_dir_all(stage.path().join("annotations"))?;
+        fs::write(stage.path().join("brain").join(id).join("keep.txt"), b"staged-brain")?;
+        fs::write(
+            stage.path().join("conversations").join(format!("{id}.db")),
+            b"staged-db",
+        )?;
+        fs::write(
+            stage.path().join("annotations").join(format!("{id}.pbtxt")),
+            b"staged-ann",
+        )?;
+
+        let spec = SummarySpec {
+            new_id: id,
+            trajectory_id: "bbbbbbbb-2222-4222-8222-222222222222",
+            title: "t",
+            step_count: 1,
+            last_user_input_step_index: None,
+            cwd: None,
+            project_id: "",
+            modified: None,
+            last_user_time: None,
+            replace: true,
+        };
+        let err = publish_staged_app_root(stage, &out, &spec, Claim::Replace, |_| {
+            anyhow::bail!("injected verification failure")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("injected verification failure"));
+
+        assert_eq!(
+            fs::read(out.join("brain").join(id).join("keep.txt"))?,
+            b"original-brain"
+        );
+        assert_eq!(
+            fs::read(out.join("conversations").join(format!("{id}.db")))?,
+            b"original-db"
+        );
+        assert_eq!(
+            fs::read(out.join("annotations").join(format!("{id}.pbtxt")))?,
+            b"original-ann"
+        );
+        for sub in ["brain", "conversations", "annotations"] {
+            for entry in fs::read_dir(out.join(sub))? {
+                let name = entry?.file_name();
+                assert!(!name.to_string_lossy().contains(".bak-"), "leftover backup: {name:?}");
+            }
+        }
+        Ok(())
+    }
+}

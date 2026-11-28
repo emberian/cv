@@ -307,100 +307,70 @@ fn rel_posix(path: &Path) -> String {
         .join("/")
 }
 
-fn scrub_bundle_path(
-    raw: &str,
+fn bundle_scrub_profile(
     source_dir: Option<&Path>,
     workspace_cwd: Option<&Path>,
     opts: &crate::redact::RedactOptions,
-    stats: &mut crate::redact::RedactStats,
-) -> String {
-    let expanded = expand(raw);
-    let relativized = if let Some(cwd) = workspace_cwd {
-        if expanded == cwd {
-            Some("$REPO".to_owned())
-        } else {
-            expanded.strip_prefix(cwd).ok().map(|r| {
-                let rel = rel_posix(r);
-                if rel.is_empty() {
-                    "$REPO".to_owned()
-                } else {
-                    format!("$REPO/{rel}")
-                }
-            })
+) -> Result<crate::redact::CompiledProfile> {
+    let mut path_rewrites = Vec::new();
+    if let Some(src_dir) = source_dir {
+        let trimmed = src_dir.to_string_lossy();
+        let trimmed = trimmed.trim_end_matches(['/', '\\']);
+        if trimmed.len() > 1 {
+            path_rewrites.push(crate::redact::PathRewrite {
+                pattern: format!("{}/", regex::escape(trimmed)),
+                replacement: String::new(),
+            });
         }
-    } else {
-        None
+        if let Some(parent) = src_dir.parent() {
+            let p_str = parent.to_string_lossy();
+            let p_trimmed = p_str.trim_end_matches(['/', '\\']);
+            if p_trimmed.len() > 1 && parent.components().count() > 2 {
+                path_rewrites.push(crate::redact::PathRewrite {
+                    pattern: format!("{}/", regex::escape(p_trimmed)),
+                    replacement: String::new(),
+                });
+            }
+        }
     }
-    .or_else(|| {
-        let src_dir = source_dir?;
-        expanded
-            .strip_prefix(src_dir)
-            .ok()
-            .map(rel_posix)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let parent = src_dir.parent()?;
-                expanded
-                    .strip_prefix(parent)
-                    .ok()
-                    .map(rel_posix)
-                    .filter(|s| !s.is_empty())
-            })
-    })
-    .unwrap_or_else(|| {
-        if raw.starts_with('/') || raw.starts_with("~/") || raw.contains('\\') {
-            Path::new(raw)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("redacted-path")
-                .to_owned()
-        } else {
-            raw.to_owned()
-        }
-    });
-    crate::redact::scrub_cow(&relativized, opts, stats).into_owned()
+    crate::redact::ScrubProfile {
+        classes: opts.classes,
+        rewrite_repo: workspace_cwd.is_some(),
+        repo_root: workspace_cwd.map(Path::to_path_buf),
+        rewrite_home: true,
+        path_rewrites,
+        principal: crate::redact::PrincipalPolicy::Drop,
+        ..crate::redact::ScrubProfile::default()
+    }
+    .compile()
 }
 
-fn scrub_session_bundle_paths(
-    session: &mut Session,
-    source_dir: Option<&Path>,
+fn scrub_bundle_path(
+    raw: &str,
+    compiled: &crate::redact::CompiledProfile,
     workspace_cwd: Option<&Path>,
-    opts: &crate::redact::RedactOptions,
-    stats: &mut crate::redact::RedactStats,
-) {
-    session.principal = None;
-    if let Some(cwd) = session.cwd.as_mut() {
-        let s = scrub_bundle_path(&cwd.to_string_lossy(), source_dir, workspace_cwd, opts, stats);
-        *cwd = PathBuf::from(s);
+    stats: &mut crate::redact::ScrubStats,
+) -> String {
+    let expanded = expand(raw);
+    let expanded_str = expanded.to_string_lossy();
+    let rewritten = compiled.scrub_text_cow(&expanded_str, workspace_cwd, stats);
+    if (rewritten.starts_with('/') || rewritten.contains('\\')) && !rewritten.starts_with('$') {
+        let leaf = Path::new(rewritten.as_ref())
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("redacted-path");
+        return compiled.scrub_text_cow(leaf, workspace_cwd, stats).into_owned();
     }
-    if let Some(src) = session.source_path.as_mut() {
-        let s = scrub_bundle_path(&src.to_string_lossy(), source_dir, workspace_cwd, opts, stats);
-        *src = PathBuf::from(s);
-    }
-    for block in session.messages.iter_mut().flat_map(|m| &mut m.content) {
-        match block {
-            Block::ToolResult {
-                details: Some(details), ..
-            } => {
-                for ptr in ["/persistedOutput/path", "/persistedOutput/unresolved"] {
-                    if let Some(val) = details.pointer_mut(ptr) {
-                        if let Some(s) = val.as_str() {
-                            if s.starts_with('/') || s.starts_with("~/") {
-                                *val = Value::String(scrub_bundle_path(s, source_dir, workspace_cwd, opts, stats));
-                            }
-                        }
-                    }
-                }
-            }
-            Block::Image { data_ref: Some(p), .. } if p.starts_with('/') || p.starts_with("~/") => {
-                *p = scrub_bundle_path(p, source_dir, workspace_cwd, opts, stats);
-            }
-            Block::File { path: Some(p), .. } if p.starts_with('/') || p.starts_with("~/") => {
-                *p = scrub_bundle_path(p, source_dir, workspace_cwd, opts, stats);
-            }
-            _ => {}
-        }
+    let normalized = if Path::new(rewritten.as_ref()).is_relative() && !rewritten.starts_with('$') {
+        rel_posix(Path::new(rewritten.as_ref()))
+    } else {
+        rewritten.into_owned()
+    };
+    if normalized.is_empty() {
+        "redacted-path".to_owned()
+    } else {
+        normalized
     }
 }
 
@@ -410,31 +380,67 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
     let source_dir = input.source_path.parent().filter(|p| !p.as_os_str().is_empty());
     let raw_refs = references(input.session);
 
-    let mut stats = crate::redact::RedactStats::default();
+    let mut scrub_stats = crate::redact::ScrubStats::default();
+    let compiled_profile = match input.redact {
+        Some(opts) => Some(bundle_scrub_profile(source_dir, orig_cwd.as_deref(), opts)?),
+        None => None,
+    };
     let redacted;
-    let session = match input.redact {
-        Some(opts) => {
-            let (mut clean, st) = crate::redact::redact_with(input.session, opts)?;
-            stats = st;
-            scrub_session_bundle_paths(&mut clean, source_dir, orig_cwd.as_deref(), opts, &mut stats);
+    let session = match (&compiled_profile, input.redact) {
+        (Some(compiled), Some(_)) => {
+            let (mut clean, mut st) = compiled.scrub_session(input.session)?;
+            if let Some(src) = clean.source_path.as_mut() {
+                let s = scrub_bundle_path(&src.to_string_lossy(), compiled, orig_cwd.as_deref(), &mut st);
+                *src = PathBuf::from(s);
+            }
+            for block in clean.messages.iter_mut().flat_map(|m| &mut m.content) {
+                match block {
+                    Block::ToolResult {
+                        details: Some(details), ..
+                    } => {
+                        for ptr in ["/persistedOutput/path", "/persistedOutput/unresolved"] {
+                            if let Some(val) = details.pointer_mut(ptr) {
+                                if let Some(s) = val.as_str() {
+                                    if s.starts_with('/') || s.starts_with("~/") || s.contains('\\') {
+                                        *val =
+                                            Value::String(scrub_bundle_path(s, compiled, orig_cwd.as_deref(), &mut st));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Block::Image { data_ref: Some(p), .. }
+                        if p.starts_with('/') || p.starts_with("~/") || p.contains('\\') =>
+                    {
+                        *p = scrub_bundle_path(p, compiled, orig_cwd.as_deref(), &mut st);
+                    }
+                    Block::File { path: Some(p), .. }
+                        if p.starts_with('/') || p.starts_with("~/") || p.contains('\\') =>
+                    {
+                        *p = scrub_bundle_path(p, compiled, orig_cwd.as_deref(), &mut st);
+                    }
+                    _ => {}
+                }
+            }
+            scrub_stats = st;
             redacted = clean;
             &redacted
         }
-        None => input.session,
+        _ => input.session,
     };
     let mut git = input.git;
     if let (Some(opts), Some(g)) = (input.redact, git.as_mut()) {
         if let Some(branch) = g.branch.as_mut() {
-            *branch = crate::redact::scrub_cow(branch, opts, &mut stats).into_owned();
+            *branch = crate::redact::scrub_cow(branch, opts, &mut scrub_stats.secrets).into_owned();
         }
         if let Some(remote) = g.remote.as_mut() {
-            *remote = crate::redact::scrub_cow(remote, opts, &mut stats).into_owned();
+            *remote = crate::redact::scrub_cow(remote, opts, &mut scrub_stats.secrets).into_owned();
         }
     }
 
-    let fmt_path = |raw: &str, stats: &mut crate::redact::RedactStats| -> String {
-        match input.redact {
-            Some(opts) => scrub_bundle_path(raw, source_dir, orig_cwd.as_deref(), opts, stats),
+    let fmt_path = |raw: &str, scrub_stats: &mut crate::redact::ScrubStats| -> String {
+        match &compiled_profile {
+            Some(compiled) => scrub_bundle_path(raw, compiled, orig_cwd.as_deref(), scrub_stats),
             None => raw.to_owned(),
         }
     };
@@ -445,7 +451,7 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
     let document = serde_json::to_vec(&crate::harness::opensession::document(session))?;
     pack.append_record(SESSION, &document)?;
 
-    let manifest_source_path = fmt_path(&input.source_path.display().to_string(), &mut stats);
+    let manifest_source_path = fmt_path(&input.source_path.display().to_string(), &mut scrub_stats);
     let mut manifest = Manifest {
         version: FORMAT_VERSION,
         session_id: session.id.clone(),
@@ -461,11 +467,11 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         redactions: None,
     };
     if let Some(sidecar) = input.sidecar {
-        let sidecar_disp = fmt_path(&sidecar.display().to_string(), &mut stats);
+        let sidecar_disp = fmt_path(&sidecar.display().to_string(), &mut scrub_stats);
         match read_bounded_regular(&sidecar, FILE_MAX_BYTES)? {
             Ok(mut bytes) => {
                 if let Some(opts) = input.redact {
-                    match scrub_sidecar(&bytes, opts, &mut stats) {
+                    match scrub_sidecar(&bytes, opts, &mut scrub_stats.secrets) {
                         Ok(clean) => bytes = clean,
                         Err(why) => {
                             manifest.uncaptured.push(UncapturedDep {
@@ -500,7 +506,7 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
     let mut total = 0u64;
     for (raw_path, kind) in raw_refs {
         let local = expand(&raw_path);
-        let disp_path = fmt_path(&raw_path, &mut stats);
+        let disp_path = fmt_path(&raw_path, &mut scrub_stats);
         let uncaptured = |why: String| UncapturedDep {
             path: disp_path.clone(),
             kind: kind.to_owned(),
@@ -527,7 +533,9 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
             match std::str::from_utf8(&bytes) {
                 Ok(text) => {
                     if !(kind == "image" && is_verified_image_magic(&bytes)) {
-                        if let std::borrow::Cow::Owned(clean) = crate::redact::scrub_cow(text, opts, &mut stats) {
+                        if let std::borrow::Cow::Owned(clean) =
+                            crate::redact::scrub_cow(text, opts, &mut scrub_stats.secrets)
+                        {
                             bytes = clean.into_bytes();
                         }
                     }
@@ -553,7 +561,7 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         });
     }
     if let Some(cwd) = &orig_cwd {
-        let cwd_disp = fmt_path(&cwd.display().to_string(), &mut stats);
+        let cwd_disp = fmt_path(&cwd.display().to_string(), &mut scrub_stats);
         manifest.uncaptured.push(UncapturedDep {
             path: cwd_disp,
             kind: "working_tree".into(),
@@ -561,7 +569,7 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         });
     }
     if input.redact.is_some() {
-        manifest.redactions = Some(stats.total());
+        manifest.redactions = Some(scrub_stats.secrets.total());
     }
     pack.append_record(MANIFEST, &serde_json::to_vec_pretty(&manifest)?)?;
     pack.seal(Claim::New)?;

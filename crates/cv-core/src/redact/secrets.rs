@@ -607,8 +607,12 @@ pub(super) fn additional(s: &str, classes: &super::RedactClasses) -> Option<(Str
 }
 
 // Decode a JSON string envelope before examining its credential keys. Preserve clean inputs byte for byte.
+fn has_embedded_candidate(s: &str) -> bool {
+    re!(r"(?i)key|pass|pwd|secret|token|cred|cookie|authorization|httponly|samesite|expires|domain|\\u").is_match(s)
+}
+
 fn embedded(s: &str, depth: usize) -> Option<String> {
-    if !s.trim_start().starts_with(['{', '[', '"']) || !s.contains(':') {
+    if !s.trim_start().starts_with(['{', '[', '"']) || !s.contains(':') || !has_embedded_candidate(s) {
         return None;
     }
     let mut value: Value = serde_json::from_str(s).ok()?;

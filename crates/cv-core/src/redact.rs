@@ -37,7 +37,6 @@
 //!
 //! OWNED BY the redact work.
 
-pub mod pii;
 pub(crate) mod secrets;
 
 /// Scrub an arbitrary JSON credential envelope with the canonical wire marker.
@@ -892,9 +891,16 @@ impl CompiledProfile {
         {
             self.scrub_value(value, repo_root, &mut stats);
         }
-        if let Some(remote) = out.git.as_mut().and_then(|g| g.remote.as_mut()) {
-            if let Cow::Owned(s) = self.scrub_text_cow(remote, repo_root, &mut stats) {
-                *remote = s;
+        if let Some(git) = out.git.as_mut() {
+            if let Some(branch) = git.branch.as_mut() {
+                if let Cow::Owned(s) = self.scrub_text_cow(branch, repo_root, &mut stats) {
+                    *branch = s;
+                }
+            }
+            if let Some(remote) = git.remote.as_mut() {
+                if let Cow::Owned(s) = self.scrub_text_cow(remote, repo_root, &mut stats) {
+                    *remote = s;
+                }
             }
         }
         if self.profile.rewrite_repo || self.profile.rewrite_home || !self.custom.is_empty() {
@@ -1340,11 +1346,12 @@ fn hash_principal_value(v: &mut Value, salt: Option<&str>) {
     }
 }
 
-/// `data:` URIs carry inline payload bytes (often megabytes of base64), not a path or URL.
+/// Inline `data:image/` and `data:audio/` URIs carry binary media bytes rather than paths or text;
+/// other `data:` media types (such as `data:text/plain;base64,...`) are still scrubbed.
 fn is_inline_data_uri(reference: &str) -> bool {
     reference
-        .get(..5)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+        .get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/") || prefix.eq_ignore_ascii_case("data:audio/"))
 }
 
 /// A user home (`/Users/<u>`, `/home/<u>`, `C:\Users\<u>`) that *starts* a path: at the start of
@@ -3072,9 +3079,29 @@ mod tests {
             extensions: Default::default(),
         });
         let inline = format!("data:image/png;base64,{}", "QUJD".repeat(64));
+        let inline_audio = format!("data:audio/ogg;base64,{}", "QUJD".repeat(32));
+        let non_media_data = "data:text/plain;charset=utf-8,/Users/carol/secret.txt".to_string();
+        s.git = Some(crate::ir::GitInfo {
+            branch: Some("wip:/Users/carol/repo".into()),
+            commit: Some("deadbeef".into()),
+            remote: Some("https://10.20.30.40/Users/carol/repo.git".into()),
+            extensions: Default::default(),
+        });
         m.content.push(Block::Image {
             media_type: Some("image/png".into()),
             data_ref: Some(inline.clone()),
+            extensions: Default::default(),
+        });
+        m.content.push(Block::File {
+            mime: Some("audio/ogg".into()),
+            path: None,
+            source: Some(inline_audio.clone()),
+            extensions: Default::default(),
+        });
+        m.content.push(Block::File {
+            mime: Some("text/plain".into()),
+            path: None,
+            source: Some(non_media_data),
             extensions: Default::default(),
         });
         s.messages.push(m);
@@ -3089,6 +3116,7 @@ mod tests {
         }
         assert!(wire.contains("https://example.com/home/page"), "{wire}");
         assert!(wire.contains(&inline), "inline image bytes must stay intact");
+        assert!(wire.contains(&inline_audio), "inline audio bytes must stay intact");
 
         // The secrets-only redactor covers the same fields (a signed URL is a credential carrier).
         let mut signed = Session::new("signed", Harness::Claude);
