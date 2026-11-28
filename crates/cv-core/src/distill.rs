@@ -3998,9 +3998,7 @@ fn matches_named_state(path: &str, named: &[String], session_cwd: Option<&std::p
         let Some(rel_named) = rel_under_cwd(n, session_cwd) else {
             return false;
         };
-        if rel_named.components().count() > 1 {
-            rel_path == rel_named || rel_path.ends_with(&rel_named)
-        } else if n.contains('/') {
+        if n.contains('/') {
             rel_path == rel_named
         } else {
             rel_path.file_name() == rel_named.file_name()
@@ -4045,7 +4043,10 @@ fn session_allows_live_fs(session: &Session) -> bool {
         return false;
     }
     if let Some(sp) = &session.source_path {
-        if sp.components().any(|c| c.as_os_str() == ".custody-view")
+        if sp
+            .file_name()
+            .is_some_and(|n| n.as_encoded_bytes().ends_with(b".pack.zst"))
+            || sp.components().any(|c| c.as_os_str() == ".custody-view")
             || sp
                 .extension()
                 .and_then(|e| e.to_str())
@@ -4067,7 +4068,10 @@ fn session_allows_live_fs(session: &Session) -> bool {
         return false;
     }
     if let Some(cov) = crate::coverage::ReadCoverage::of_session(session) {
-        if !cov.sources.is_empty() && !cov.sources.contains(crate::coverage::ReadCoverage::NATIVE_STORE) {
+        if cov.sources.contains("custody_pack")
+            || cov.sources.contains("hub_snapshot")
+            || !cov.sources.is_empty() && !cov.sources.contains(crate::coverage::ReadCoverage::NATIVE_STORE)
+        {
             return false;
         }
     }
@@ -4100,9 +4104,13 @@ fn note_shell_state(
     // A named state file inside `session_cwd` rewritten in place by a script (`sed -i`,
     // `python3 -`, `perl -i`): the transcript holds no content.
     let rewrites = re(Re::InPlace).is_match(cmd);
-    let hit = named
-        .iter()
-        .find(|p| rewrites && rel_under_cwd(p, session_cwd).is_some() && cmd.contains(basename(p)));
+    let hit = named.iter().find(|p| {
+        rewrites
+            && rel_under_cwd(p, session_cwd).is_some_and(|named_rel| {
+                cmd.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | '=' | ';' | ','))
+                    .any(|word| rel_under_cwd(word, session_cwd).as_ref() == Some(&named_rel))
+            })
+    });
     if let Some(path) = hit.filter(|_| state.as_ref().is_none_or(|st| st.0 != i)) {
         *state = Some((i, path.clone(), "a script, in place".into(), None));
     }
@@ -4278,6 +4286,36 @@ fn ground(
     Ok(g)
 }
 
+/// Open the canonical path one component at a time so a renamed parent cannot
+/// redirect the next lookup through a symlink. Keep the leaf nonblocking until
+/// the caller has verified that the descriptor names a regular file.
+#[cfg(unix)]
+fn open_grounding_file(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let mut parent = std::fs::File::open("/").ok()?;
+    let mut parts = path.strip_prefix("/").ok()?.components().peekable();
+    while let Some(std::path::Component::Normal(part)) = parts.next() {
+        let part = std::ffi::CString::new(part.as_bytes()).ok()?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if parts.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                libc::O_NONBLOCK
+            };
+        // SAFETY: parent owns a live descriptor and part is one NUL-terminated component.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Some(parent)
+}
+
 fn read_bounded_live_state_file(
     path: &str,
     session_cwd: Option<&std::path::Path>,
@@ -4288,51 +4326,24 @@ fn read_bounded_live_state_file(
     if !live_fs.allow || live_fs.max_bytes == 0 {
         return None;
     }
-    let cwd = session_cwd?;
+    let cwd = session_cwd.filter(|p| p.is_absolute())?;
     let canon_cwd = std::fs::canonicalize(cwd).ok()?;
-    if !canon_cwd.is_dir() {
-        return None;
-    }
-    let rel = rel_under_cwd(path, Some(cwd))?;
-    let candidate = cwd.join(&rel);
-    // Reject leaf symlinks upfront before canonicalizing the parent directory.
-    let pre_sym = std::fs::symlink_metadata(&candidate).ok()?;
-    if !pre_sym.file_type().is_file() || pre_sym.len() > live_fs.max_bytes as u64 {
-        return None;
-    }
+    let candidate = cwd.join(rel_under_cwd(path, Some(cwd))?);
     let canon_parent = std::fs::canonicalize(candidate.parent()?).ok()?;
-    if !canon_parent.starts_with(&canon_cwd) {
-        return None;
-    }
+    canon_parent.strip_prefix(&canon_cwd).ok()?;
     let safe_path = canon_parent.join(candidate.file_name()?);
-    if !safe_path.starts_with(&canon_cwd) || safe_path == canon_cwd {
-        return None;
-    }
-    let sym = std::fs::symlink_metadata(&safe_path).ok()?;
-    if !sym.file_type().is_file() || sym.len() > live_fs.max_bytes as u64 {
-        return None;
-    }
     #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&safe_path)
-            .ok()?
-    };
+    let file = open_grounding_file(&safe_path)?;
     #[cfg(not(unix))]
-    let file = std::fs::File::open(&safe_path).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.file_type().is_file() || meta.len() > live_fs.max_bytes as u64 {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if (meta.dev(), meta.ino()) != (sym.dev(), sym.ino()) {
+    let file = {
+        if !std::fs::symlink_metadata(&safe_path).ok()?.is_file() {
             return None;
         }
+        std::fs::File::open(&safe_path).ok()?
+    };
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > live_fs.max_bytes as u64 {
+        return None;
     }
     // Prevent leaking current-disk drift into historical transcripts when the state file was
     // modified long after the session ended.
@@ -7996,6 +8007,17 @@ facts text",
         assert!(!distill_pack(&s_custody, &opts)?
             .head_md
             .contains("LOCAL_WORKSPACE_STATE_OK"));
+
+        // #tooth Native decoding retains its source tag alongside the custody tag.
+        s_custody.source_path = Some(world.base.join("packs/archive.pack.zst"));
+        assert!(!session_allows_live_fs(&s_custody));
+        s_custody.source_path = None;
+        for source in ["custody_pack", "hub_snapshot"] {
+            let mut coverage = crate::coverage::ReadCoverage::default();
+            coverage.sources.extend(["native_store".into(), source.into()]);
+            coverage.attach(&mut s_custody);
+            assert!(!session_allows_live_fs(&s_custody));
+        }
 
         let mut s_remote = make_edit_session(inside_str, inside_str, Some(cwd.clone()), Origin::Human);
         s_remote
