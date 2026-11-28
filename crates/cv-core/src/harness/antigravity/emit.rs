@@ -289,7 +289,10 @@ pub(crate) fn emit_staged(
             resume_hint: resume_hint.clone(),
             ..Default::default()
         };
-        verify(crate::emit::stage::StagedSource::Files { result: &staged })?;
+        verify(crate::emit::stage::StagedSource::Files {
+            result: &staged,
+            destination: &out_dir.join(&rel_db),
+        })?;
     }
 
     let claim = opts.claim();

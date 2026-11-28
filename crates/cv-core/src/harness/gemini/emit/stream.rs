@@ -452,7 +452,10 @@ pub(super) fn emit(
             resume_hint: resume.clone(),
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &path,
+        })?;
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;

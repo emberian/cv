@@ -478,9 +478,46 @@ pub fn emit_verified(
     Ok((result, report.lost_lines()))
 }
 
-/// [`emit_verified`] paired with an IR-prune `.flat.jsonl` sidecar: stages/writes the sidecar
-/// before committing SQLite targets (or rolls back cleanly if sidecar publication fails) so a
-/// reshaped transcript never outlives a failed sidecar write.
+/// Where the `<new_id>.flat.jsonl` sidecar of a session published at `primary` lives.
+fn sidecar_beside(primary: &Path, new_id: &str) -> PathBuf {
+    primary
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join(format!("{new_id}.flat.jsonl"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails the next sidecar claim on this thread, after its bytes are staged.
+    pub(crate) static FAIL_SIDECAR_CLAIM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sidecar_claim_failpoint() -> Result<()> {
+    #[cfg(test)]
+    if FAIL_SIDECAR_CLAIM.with(|flag| flag.replace(false)) {
+        anyhow::bail!("injected sidecar claim failure");
+    }
+    Ok(())
+}
+
+/// How the sidecar joined the transcript's publication.
+enum SidecarStep {
+    /// Its name is claimed and the file it replaced is kept until the transcript is published.
+    Held(PathBuf, crate::publish::Held, bool),
+    /// It rides in the emitter's own staged tree, which installs or rolls it back with the rest.
+    InStage,
+}
+
+/// [`emit_verified`] paired with an IR-prune `.flat.jsonl` sidecar, published as one: the
+/// transcript and its sidecar both take their names, or both names keep what they held, a forced
+/// replacement included.
+///
+/// The sidecar is claimed from the pre-publication verifier, before the transcript, with the file
+/// it replaces kept aside; a transcript that then fails to publish (or to commit, for a SQLite
+/// target) puts that file back. An emitter that installs a whole staged tree carries the sidecar in
+/// it. Only when the sidecar's directory does not exist yet, so there is no earlier output there to
+/// lose, is the transcript published first and retracted if the sidecar cannot follow.
 pub fn emit_verified_with_sidecar(
     session: &Session,
     target: Harness,
@@ -494,14 +531,14 @@ pub fn emit_verified_with_sidecar(
     }
     let out_existed = out_dir.exists();
     let out_was_empty = !out_existed || fs::read_dir(out_dir).is_ok_and(|mut d| d.next().is_none());
+    let claim = opts.claim();
     if let Some(id) = opts.new_id.as_deref() {
         let top_sc = out_dir.join(format!("{id}.flat.jsonl"));
-        if opts.claim() == crate::publish::Claim::New {
+        if claim == crate::publish::Claim::New {
             crate::publish::refuse_existing(&top_sc, "")?;
         }
     }
-    #[cfg_attr(not(feature = "sqlite"), allow(unused_mut))]
-    let mut written_in_verify: Option<PathBuf> = None;
+    let mut step: Option<SidecarStep> = None;
     let emit_res = emit_checked(
         session,
         target,
@@ -509,49 +546,74 @@ pub fn emit_verified_with_sidecar(
         opts,
         opts.strict,
         Some(&mut |staged_src| {
-            #[cfg(feature = "sqlite")]
-            if let stage::StagedSource::Sqlite { result, .. } = staged_src {
-                let sc = result
-                    .path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."))
-                    .join(format!("{}.flat.jsonl", result.new_id));
-                crate::distill::write_sidecar(&sc, sidecar, opts.claim())?;
-                written_in_verify = Some(sc);
+            let (live, staged, in_database) = match &staged_src {
+                stage::StagedSource::Files { result, destination } => (*destination, *result, false),
+                #[cfg(feature = "sqlite")]
+                stage::StagedSource::Sqlite { result, .. } => (result.path.as_path(), *result, true),
+            };
+            if target == Harness::Antigravity {
+                let sc = sidecar_beside(&staged.path, &staged.new_id);
+                crate::distill::write_sidecar(&sc, sidecar, crate::publish::Claim::New)?;
+                step = Some(SidecarStep::InStage);
+                return Ok(());
             }
-            #[cfg(not(feature = "sqlite"))]
-            let _ = staged_src;
+            let sc = sidecar_beside(live, &staged.new_id);
+            if sc.parent().is_some_and(Path::is_dir) {
+                let mut set = crate::publish::Set::new();
+                set.add(crate::distill::stage_sidecar(&sc, sidecar)?, &sc, claim);
+                sidecar_claim_failpoint()?;
+                step = Some(SidecarStep::Held(sc, set.claim()?, in_database));
+            }
             Ok(())
         }),
     );
     let (res, report) = match emit_res {
         Ok(pair) => pair,
         Err(err) => {
-            if let Some(sc) = written_in_verify {
-                let _ = fs::remove_file(sc);
+            let Some(SidecarStep::Held(sc, held, in_database)) = step else {
+                return Err(err);
+            };
+            let err = held.undo(err);
+            if in_database {
+                // A database this emit created is already gone, but the directories made for it
+                // were still holding the sidecar then.
+                remove_created_dirs(&sc, out_dir, out_existed);
             }
             return Err(err);
         }
     };
-    let sidecar_path = match written_in_verify {
-        Some(sc) => sc,
+    let mut lost = report.lost_lines();
+    let sc = sidecar_beside(&res.path, &res.new_id);
+    match step {
+        Some(SidecarStep::Held(claimed, held, _)) => {
+            debug_assert_eq!(claimed, sc, "the sidecar was claimed beside the published transcript");
+            if let Err(err) = held.commit() {
+                lost.push(format!("sidecar {}: {err:#}", claimed.display()));
+            }
+            return Ok((res, Some(claimed), lost));
+        }
+        Some(SidecarStep::InStage) => {}
         None => {
-            let sc = res
-                .path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."))
-                .join(format!("{}.flat.jsonl", res.new_id));
-            if let Err(err) = crate::distill::write_sidecar(&sc, sidecar, opts.claim()) {
+            if let Err(err) = crate::distill::write_sidecar(&sc, sidecar, claim) {
                 let anchor = crate::harness::claude::artifacts::anchor(&res.path, &res.new_id);
                 let _ = retract_emitted(target, out_dir, out_existed, out_was_empty, &res, &anchor);
                 return Err(err);
             }
-            sc
         }
-    };
-    Ok((res, Some(sidecar_path), report.lost_lines()))
+    }
+    Ok((res, Some(sc), lost))
+}
+
+/// Remove the now-empty directories from `path`'s parent up to `out_dir`, which goes too only if
+/// this emit created it.
+fn remove_created_dirs(path: &Path, out_dir: &Path, out_existed: bool) {
+    let mut parent = path.parent();
+    while let Some(dir) = parent {
+        if !dir.starts_with(out_dir) || (dir == out_dir && out_existed) || fs::remove_dir(dir).is_err() {
+            break;
+        }
+        parent = dir.parent();
+    }
 }
 
 /// Like [`emit_verified`] but returns the structured [`FidelityReport`] instead of rendered strings,
@@ -589,10 +651,10 @@ fn emit_checked(
         Some(&mut |staged_src| {
             let before = before_slot.take().context("verifier callback invoked more than once")?;
             let reparsed_res = match &staged_src {
-                stage::StagedSource::Files { result } => reparse_staged_projected(
+                stage::StagedSource::Files { result, destination } => reparse_staged_projected(
                     target,
                     opts.thinking,
-                    stage::StagedSource::Files { result },
+                    stage::StagedSource::Files { result, destination },
                     &opts.parsed_at.demand(),
                 ),
                 #[cfg(feature = "sqlite")]

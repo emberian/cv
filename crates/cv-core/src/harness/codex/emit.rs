@@ -382,7 +382,10 @@ pub(crate) fn emit_staged(
             resume_hint: resume.clone(),
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &file_path,
+        })?;
     }
     crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
 

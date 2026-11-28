@@ -277,7 +277,10 @@ pub(crate) fn emit_staged(
             resume_hint: resume.clone(),
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &session_dir,
+        })?;
     }
     fs::create_dir_all(&session_dir).with_context(|| format!("creating {}", session_dir.display()))?;
     let mut set = crate::publish::Set::new();

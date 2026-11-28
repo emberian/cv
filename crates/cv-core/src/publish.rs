@@ -356,14 +356,22 @@ impl Set {
 
     /// Claim every member, or none (see [`Set`]); then remove the files they replaced.
     pub fn publish(self) -> Result<()> {
-        self.publish_using(swap, |_| Ok(()))
+        self.claim()?.commit()
     }
 
-    fn publish_using(
+    /// Claim every member, or none, and keep the files they replaced until the caller decides:
+    /// [`Held::commit`] removes them, [`Held::undo`] (or dropping the [`Held`]) puts them back.
+    /// This is how a set joins a publication it cannot stage itself: claim, run the other
+    /// publication, then commit or undo on its outcome.
+    pub fn claim(self) -> Result<Held> {
+        self.claim_using(swap, |_| Ok(()))
+    }
+
+    fn claim_using(
         self,
         swap: impl Fn(&Path, &Path) -> Option<io::Result<()>>,
         mut before_claim: impl FnMut(usize) -> io::Result<()>,
-    ) -> Result<()> {
+    ) -> Result<Held> {
         let mut claimed = Vec::with_capacity(self.members.len());
         for (n, (staged, destination, claim)) in self.members.into_iter().enumerate() {
             let result = before_claim(n)
@@ -374,7 +382,20 @@ impl Set {
                 Err(cause) => return Err(undo(claimed, cause)),
             }
         }
-        let kept: Vec<_> = claimed
+        Ok(Held { claimed })
+    }
+}
+
+/// A [`Set`] whose members all hold their names while the files they replaced are still kept.
+/// Dropped undecided, it is undone.
+pub struct Held {
+    claimed: Vec<Claimed>,
+}
+
+impl Held {
+    /// Keep the publication: remove the replaced files.
+    pub fn commit(mut self) -> Result<()> {
+        let kept: Vec<_> = std::mem::take(&mut self.claimed)
             .iter()
             .filter_map(|member| member.replaced.as_ref())
             .filter_map(|old| {
@@ -389,6 +410,22 @@ impl Set {
             kept.join("; ")
         );
         Ok(())
+    }
+
+    /// Undo every claim, last first, and return `cause` with every undo that failed.
+    pub fn undo(mut self, cause: anyhow::Error) -> anyhow::Error {
+        undo(std::mem::take(&mut self.claimed), cause)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for member in std::mem::take(&mut self.claimed).iter().rev() {
+            let _ = match &member.replaced {
+                None => retract_racing(&member.destination, &member.file, || {}),
+                Some(old) => restore(&member.destination, &member.file, old),
+            };
+        }
     }
 }
 
@@ -950,7 +987,7 @@ pub(crate) mod tests {
                     return;
                 }
                 let swap = |from: &Path, to: &Path| if swapping { swap(from, to) } else { None };
-                let error = set.publish_using(swap, |_| Ok(())).unwrap_err();
+                let error = set.claim_using(swap, |_| Ok(())).and_then(Held::commit).unwrap_err();
                 read_only(&b, false);
                 assert!(!format!("{error:#}").contains("undoing"), "{error:#}");
                 assert_eq!(std::fs::read_to_string(&first).ok().as_deref(), before, "{case}");
@@ -995,12 +1032,13 @@ pub(crate) mod tests {
                 return;
             }
             let error = set
-                .publish_using(swap, |n| {
+                .claim_using(swap, |n| {
                     if n == 1 {
                         read_only(&a, true);
                     }
                     Ok(())
                 })
+                .and_then(Held::commit)
                 .unwrap_err();
             read_only(&a, false);
             read_only(&b, false);

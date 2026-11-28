@@ -502,7 +502,7 @@ fn tooth_file_targets_stage_before_publish_leaving_zero_files_and_preserving_for
             &force_strict,
             Some(&mut |staged_src| {
                 #[allow(irrefutable_let_patterns)]
-                if let StagedSource::Files { result } = staged_src {
+                if let StagedSource::Files { result, .. } = staged_src {
                     // Corrupt 1 byte in the staged transcript file before re-parsing!
                     let transcript = if result.path.is_dir() {
                         ["chat_history.jsonl", "api_conversation_history.json"]
@@ -600,7 +600,7 @@ fn tooth_claude_skills_policy_rewrites_inside_stage_before_verification_and_publ
         &opts,
         Some(&mut |staged_src| {
             #[allow(irrefutable_let_patterns)]
-            if let StagedSource::Files { result } = staged_src {
+            if let StagedSource::Files { result, .. } = staged_src {
                 staged_blake3 = Some(blake3::hash(&fs::read(&result.path)?));
             }
             Ok(())
@@ -967,5 +967,167 @@ fn tooth_sqlite_targets_verify_in_same_begin_immediate_tx_and_rollback_force_int
         );
     }
 
+    Ok(())
+}
+
+fn sidecar_session(reply: &str) -> Session {
+    let ts: chrono::DateTime<Utc> = "2026-10-01T12:00:00Z".parse().unwrap();
+    let mut s = Session::new("sidecar-seed", Harness::Claude);
+    s.cwd = Some(PathBuf::from("/work/sidecar-tooth"));
+    s.title = Some("sidecar title".into());
+    s.model = Some("claude-sonnet-4-6".into());
+    s.created_at = Some(ts);
+    s.updated_at = Some(ts);
+    let mut u = Message::new(Role::User);
+    u.timestamp = Some(ts);
+    u.content.push(Block::from_text("sidecar prompt".into()));
+    let mut a = Message::new(Role::Assistant);
+    a.timestamp = Some(ts);
+    a.model = Some("claude-sonnet-4-6".into());
+    a.content.push(Block::from_text(reply.into()));
+    s.messages = vec![u, a];
+    s
+}
+
+fn sidecar_entries(content: &str) -> Vec<crate::distill::Elided> {
+    vec![crate::distill::Elided {
+        tool_use_id: "toolu_sidecar".into(),
+        tool_name: "Bash".into(),
+        input: json!({"command": "ls"}),
+        content: content.into(),
+    }]
+}
+
+fn temporaries_under(dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".cv-"))
+        .map(|entry| entry.into_path())
+        .collect()
+}
+
+/// #tooth A forced replacement through `emit_verified_with_sidecar` publishes the transcript and
+/// its sidecar as one: when the sidecar cannot be claimed, the earlier session and the earlier
+/// sidecar are both byte-for-byte what they were, for every target.
+#[test]
+fn tooth_forced_sidecar_failure_keeps_previous_session_and_sidecar() -> Result<()> {
+    let world = crate::test_world("tooth-sidecar-force");
+    for &target in supported_targets() {
+        let parent = world.base.join(format!("case-{target}"));
+        fs::create_dir_all(&parent)?;
+        let out = parent.join("out");
+        let id = match target {
+            Harness::OpenCode => "ses_11111111222243338444555555",
+            _ => "11111111-2222-4333-8444-555555555555",
+        };
+        let pinned = |force: bool| EmitOptions {
+            new_id: Some(id.into()),
+            force,
+            ..Default::default()
+        };
+        let (seeded, seeded_sc, _) = emit_verified_with_sidecar(
+            &sidecar_session("first reply"),
+            target,
+            &out,
+            &pinned(false),
+            &sidecar_entries("first elided output"),
+        )?;
+        let seeded_sc = seeded_sc.expect("a sidecar is written for elided entries");
+        let first_sidecar = fs::read(&seeded_sc)?;
+        assert!(String::from_utf8_lossy(&first_sidecar).contains("first elided output"));
+        let is_database = seeded.path.extension().is_some_and(|e| e == "db");
+        let first_tree = snapshot_tree(&out)?;
+        let read_back = |what: &str| -> Result<String> {
+            let session = crate::emit::fidelity::reparse_emitted(target, &seeded, &crate::stream::Demand::RICH)?;
+            Ok(format!("{what}: {:?}", session.messages))
+        };
+        let first_read = read_back("session")?;
+        assert!(first_read.contains("first reply"), "{target}: {first_read}");
+
+        if target != Harness::Antigravity {
+            FAIL_SIDECAR_CLAIM.with(|flag| flag.set(true));
+            let failed = emit_verified_with_sidecar(
+                &sidecar_session("second reply"),
+                target,
+                &out,
+                &pinned(true),
+                &sidecar_entries("second elided output"),
+            );
+            assert!(
+                !FAIL_SIDECAR_CLAIM.with(|flag| flag.replace(false)),
+                "{target}: the sidecar is claimed before the transcript is published"
+            );
+            let err = failed.expect_err("an injected sidecar failure fails the emit");
+            assert!(format!("{err:#}").contains("injected sidecar claim failure"), "{err:#}");
+            assert_eq!(fs::read(&seeded_sc)?, first_sidecar, "{target}: previous sidecar intact");
+            assert_eq!(read_back("session")?, first_read, "{target}: previous session intact");
+            if !is_database {
+                assert_eq!(snapshot_tree(&out)?, first_tree, "{target}: previous files intact");
+            }
+            assert_eq!(temporaries_under(&parent), Vec::<PathBuf>::new(), "{target}");
+        }
+
+        let (replaced, replaced_sc, _) = emit_verified_with_sidecar(
+            &sidecar_session("second reply"),
+            target,
+            &out,
+            &pinned(true),
+            &sidecar_entries("second elided output"),
+        )?;
+        assert_eq!(replaced.path, seeded.path, "{target}");
+        assert_eq!(replaced_sc.as_deref(), Some(seeded_sc.as_path()), "{target}");
+        let second_sidecar = fs::read_to_string(&seeded_sc)?;
+        assert!(second_sidecar.contains("second elided output"), "{target}");
+        assert!(!second_sidecar.contains("first elided output"), "{target}");
+        assert!(read_back("session")?.contains("second reply"), "{target}");
+        assert_eq!(temporaries_under(&parent), Vec::<PathBuf>::new(), "{target}");
+    }
+    Ok(())
+}
+
+/// #tooth The sidecar is claimed first, so a transcript that then fails to publish puts the
+/// previous sidecar back, and a fresh emit that fails leaves no sidecar at all.
+#[test]
+fn tooth_failed_transcript_publication_restores_the_claimed_sidecar() -> Result<()> {
+    let world = crate::test_world("tooth-sidecar-restore");
+    let out = world.base.join("out");
+    let opts = |force: bool| EmitOptions {
+        new_id: Some("11111111-2222-4333-8444-555555555555".into()),
+        force,
+        ..Default::default()
+    };
+    let (seeded, seeded_sc, _) = emit_verified_with_sidecar(
+        &sidecar_session("first reply"),
+        Harness::Codex,
+        &out,
+        &opts(false),
+        &sidecar_entries("first elided output"),
+    )?;
+    let seeded_sc = seeded_sc.expect("a sidecar is written for elided entries");
+    let first_sidecar = fs::read(&seeded_sc)?;
+    // A directory holding the transcript's name cannot be renamed over: publication fails after
+    // the sidecar has been claimed.
+    fs::remove_file(&seeded.path)?;
+    fs::create_dir(&seeded.path)?;
+    for force in [true, false] {
+        if !force {
+            fs::remove_file(&seeded_sc)?;
+        }
+        let failed = emit_verified_with_sidecar(
+            &sidecar_session("second reply"),
+            Harness::Codex,
+            &out,
+            &opts(force),
+            &sidecar_entries("second elided output"),
+        );
+        assert!(failed.is_err(), "force={force}");
+        assert!(seeded.path.is_dir(), "force={force}");
+        match force {
+            true => assert_eq!(fs::read(&seeded_sc)?, first_sidecar, "the replaced sidecar is put back"),
+            false => assert!(!seeded_sc.exists(), "a refused emit leaves no sidecar"),
+        }
+        assert_eq!(temporaries_under(&world.base), Vec::<PathBuf>::new(), "force={force}");
+    }
     Ok(())
 }

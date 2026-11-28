@@ -537,7 +537,10 @@ pub(crate) fn emit_staged(
             resume_hint: resume.clone(),
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &path,
+        })?;
     }
     fs::create_dir_all(&chats).with_context(|| format!("creating {}", chats.display()))?;
     match &source {

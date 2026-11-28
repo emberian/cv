@@ -17,8 +17,12 @@ use uuid::Uuid;
 pub(crate) enum StagedSource<'a> {
     /// Staged files inside an isolated temporary directory on the destination filesystem;
     /// `result.path` names the staged primary file or directory so the target's own adapter reads
-    /// the exact bytes about to be published.
-    Files { result: &'a EmitResult },
+    /// the exact bytes about to be published, and `destination` the live name that primary will
+    /// take (nothing has been created there yet).
+    Files {
+        result: &'a EmitResult,
+        destination: &'a Path,
+    },
     /// Uncommitted rows inside a `BEGIN IMMEDIATE` transaction on the target SQLite database;
     /// triggers, autoincrement `rowid`s, and schema migrations have already fired on `conn`.
     #[cfg(feature = "sqlite")]

@@ -1139,7 +1139,7 @@ pub(super) fn reparse_staged_projected(
     opts: &Demand,
 ) -> Result<(Session, Projected)> {
     match staged {
-        super::stage::StagedSource::Files { result } => reparse_projected(target, thinking, result, opts),
+        super::stage::StagedSource::Files { result, .. } => reparse_projected(target, thinking, result, opts),
         #[cfg(feature = "sqlite")]
         super::stage::StagedSource::Sqlite { conn, result } => {
             reparse_sqlite_projected(target, thinking, conn, result, opts)

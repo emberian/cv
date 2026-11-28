@@ -945,7 +945,10 @@ pub(crate) fn emit_with_harness_staged(
             resume_hint: Some(resume.clone()),
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &task_dir,
+        })?;
     }
 
     fs::create_dir_all(&task_dir).with_context(|| format!("creating {}", task_dir.display()))?;

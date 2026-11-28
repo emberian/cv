@@ -413,7 +413,10 @@ fn emit_after_stage_with_verify(
             resume_hint: resume.clone(),
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &file_path,
+        })?;
     }
 
     // All source demands and staged verification complete before creating directories or opening

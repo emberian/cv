@@ -378,7 +378,10 @@ pub(crate) fn emit_staged(
             resume_hint: None,
             ..Default::default()
         };
-        verify_fn(crate::emit::stage::StagedSource::Files { result: &staged_result })?;
+        verify_fn(crate::emit::stage::StagedSource::Files {
+            result: &staged_result,
+            destination: &file_path,
+        })?;
     }
 
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
