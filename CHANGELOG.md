@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Derived search hits retain profile identity, and index-only lineage lookups use recorded metadata without rediscovering live sessions.
 - Context packs count commands shortened during event extraction and include the truncation marker within the 200-byte command limit.
 
 - Place-scoped CLI and HTTP file/blame views resolve single sessions via B-tree indexes, deduplicate self-shipped echoes, preserve sub-agents, and whisper disconnected peers once.

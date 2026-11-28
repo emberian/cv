@@ -488,11 +488,14 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 }
             }
         }
-        let kept_ids: HashSet<(&str, &str)> = sources
+        let kept_ids: HashSet<_> = sources
             .iter()
-            .map(|s| (s.session.harness.as_str(), s.session.id.as_str()))
+            .flat_map(|s| {
+                let harness = s.session.harness.as_str();
+                [(harness, s.session.id.clone()), (harness, s.session.session_selector())]
+            })
             .collect();
-        collapsed_copies.retain(|c| kept_ids.contains(&(c.harness.as_str(), c.kept_id.as_str())));
+        collapsed_copies.retain(|c| kept_ids.contains(&(c.harness.as_str(), c.kept_id.clone())));
         let (rollup, rollup_dropped) = rollup_files(&sources);
         let bounds = Bounds {
             excerpt_bytes,

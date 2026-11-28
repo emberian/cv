@@ -671,14 +671,48 @@ pub fn chain_fetch_limit(limit: usize, all: bool) -> usize {
     }
 }
 
+/// Resolve an indexed identity exactly. Offline searches can use committed custody and recorded
+/// catalog metadata, including the last known message count of a vanished transcript.
+fn chain_reference(harness: &str, id: &str, live: bool) -> Option<cv_core::SessionRef> {
+    let h = cv_core::Harness::parse(harness)?;
+    let exact = |r: &cv_core::SessionRef| r.id == id || native_id(&r.id) == id || r.session_selector() == id;
+    if live {
+        return cv_core::find(id, Some(h)).ok()?.map(|(r, _)| r).filter(exact);
+    }
+    let mut archived = cv_core::custody::matching_backings(id, Some(h))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| b.reference)
+        .filter(exact);
+    if let Some(r) = archived.next() {
+        return archived.next().is_none().then_some(r);
+    }
+    let mut cached = cv_core::catalog::lookup(id, Some(h)).into_iter().filter(exact);
+    let r = cached.next()?;
+    cached.next().is_none().then_some(r)
+}
+
+fn chain_parent(id: &str, r: Option<&cv_core::SessionRef>, live: bool) -> Option<String> {
+    let parent = r
+        .filter(|r| live || cv_core::custody::is_pack_ref(r))
+        .and_then(cv_core::SessionRef::derived_from)
+        .or_else(|| cv_core::lineage::state_derived_from(id))?;
+    Some(match cv_core::SessionKey::split_selector(id) {
+        Some((_, profile)) if cv_core::SessionKey::split_selector(&parent).is_none() => format!("{parent}@{profile}"),
+        _ => parent,
+    })
+}
+
 /// Collapse connected derived-session chains (`distill`, `splice`, `rewind`, `port`, `continues`)
 /// across `hits` down to each chain's fullest representative, keeping sub-agent hits distinct and
-/// respecting `live_allowed` (when `false`, only custody pack refs and `state.db:lineage_edges`
-/// are consulted, never live transcript files on disk).
+/// respecting `live_allowed`. Offline searches use custody, catalog metadata and recorded lineage edges.
 pub fn collapse_hit_chains(hits: Vec<Hit>, live_allowed: bool) -> (Vec<Hit>, Vec<cv_core::lineage::CollapsedCopy>) {
     if hits.len() <= 1 {
         return (hits, Vec::new());
     }
+    // An index-only HTTP request can arrive in a writable server process.
+    let _scope = (!live_allowed && !cv_core::env::frozen())
+        .then(|| cv_core::env::Env::current().as_ref().clone().with_frozen().enter());
     let refs: Vec<Option<cv_core::SessionRef>> = hits
         .iter()
         .map(|h| {
@@ -689,10 +723,7 @@ pub fn collapse_hit_chains(hits: Vec<Hit>, live_allowed: bool) -> (Vec<Hit>, Vec
                 return Some(r.clone());
             }
             let sel = h.session_key.as_deref().unwrap_or(&h.id);
-            cv_core::find(sel, cv_core::Harness::parse(&h.harness))
-                .ok()
-                .flatten()
-                .map(|(r, _)| r)
+            chain_reference(&h.harness, sel, live_allowed)
         })
         .collect();
     let derived: Vec<Option<String>> = hits
@@ -702,11 +733,11 @@ pub fn collapse_hit_chains(hits: Vec<Hit>, live_allowed: bool) -> (Vec<Hit>, Vec
             if h.agent_id.is_some() {
                 return None;
             }
-            refs[idx]
-                .as_ref()
-                .filter(|s| live_allowed || cv_core::custody::is_pack_ref(s))
-                .and_then(|s| s.derived_from())
-                .or_else(|| cv_core::lineage::state_derived_from(&h.id))
+            chain_parent(
+                h.session_key.as_deref().unwrap_or(&h.id),
+                refs[idx].as_ref(),
+                live_allowed,
+            )
         })
         .collect();
     if derived.iter().all(Option::is_none) {
@@ -742,7 +773,7 @@ pub fn collapse_hit_chains(hits: Vec<Hit>, live_allowed: bool) -> (Vec<Hit>, Vec
             id: if h.agent_id.is_some() {
                 format!("subagent:{idx}:{}", h.id)
             } else {
-                h.id.clone()
+                h.session_key.as_ref().unwrap_or(&h.id).clone()
             },
             derived_from: derived[*idx].clone(),
             message_count: counts[*idx],
@@ -752,13 +783,8 @@ pub fn collapse_hit_chains(hits: Vec<Hit>, live_allowed: bool) -> (Vec<Hit>, Vec
             size_bytes: sizes[*idx],
         },
         |harness, pid| {
-            cv_core::find(pid, cv_core::Harness::parse(harness))
-                .ok()
-                .flatten()
-                .map(|(r, _)| r)
-                .filter(|r| live_allowed || cv_core::custody::is_pack_ref(r))
-                .and_then(|r| r.derived_from())
-                .or_else(|| cv_core::lineage::state_derived_from(pid))
+            let reference = chain_reference(harness, pid, live_allowed);
+            chain_parent(pid, reference.as_ref(), live_allowed)
         },
     );
     (kept.into_iter().map(|(_, h)| h).collect(), collapsed)
@@ -858,6 +884,34 @@ mod tests {
                 r
             }),
         };
+
+        let mut twin = make_hit("root-orig", 20);
+        let qualify = |mut hit: Hit, suffix: char| {
+            hit.session_key = Some(format!("{}@{}", hit.id, suffix.to_string().repeat(64)));
+            hit
+        };
+        twin = qualify(twin, 'b');
+        let (kept, dropped) = collapse_hit_chains(
+            vec![
+                qualify(make_hit("child-copy", 2), 'a'),
+                qualify(make_hit("root-orig", 12), 'a'),
+                twin,
+            ],
+            false,
+        );
+        assert_eq!(kept.len(), 2, "the other profile keeps its root");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(kept[0].id, "root-orig");
+
+        let mut indexed = [make_hit("child-copy", 0), make_hit("root-orig", 0)];
+        for hit in &mut indexed {
+            hit.session = None;
+        }
+        assert_eq!(collapse_hit_chains(indexed.into(), false).0.len(), 1);
+        assert!(
+            !dir.join("catalog.db").exists(),
+            "index-only lineage triggered discovery"
+        );
 
         let mut found = Found {
             hits: vec![make_hit("child-copy", 2), make_hit("root-orig", 12)],
