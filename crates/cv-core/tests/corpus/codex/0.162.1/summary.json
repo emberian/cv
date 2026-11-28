@@ -126,7 +126,7 @@
           "exec": {
             "calls": 10,
             "edits": 3,
-            "reads": 0,
+            "reads": 2,
             "commands": 5,
             "errors": 0
           }
