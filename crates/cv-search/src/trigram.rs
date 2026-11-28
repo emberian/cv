@@ -40,7 +40,7 @@ const MANIFEST_VERSION: u32 = 1;
 const PIECE_BYTES: usize = 4096;
 const LEAD_BYTES: usize = 40;
 const TRAIL_BYTES: usize = 120;
-const PREVIEW_CHARS: usize = 240;
+use crate::ingest::text::{self as index_text, Preview};
 
 /// Options governing an exact trigram/substring search.
 #[derive(Clone, Copy, Debug)]
@@ -383,39 +383,6 @@ impl GramAccumulator {
     }
 }
 
-#[derive(Default)]
-struct PreviewAcc {
-    chars: usize,
-    word_open: bool,
-    out: String,
-}
-
-impl PreviewAcc {
-    fn push(&mut self, text: &str) {
-        if self.chars >= PREVIEW_CHARS {
-            return;
-        }
-        for c in text.chars() {
-            if self.chars >= PREVIEW_CHARS {
-                break;
-            }
-            if c.is_whitespace() {
-                self.word_open = false;
-            } else {
-                if !self.word_open && !self.out.is_empty() {
-                    self.out.push(' ');
-                    self.chars += 1;
-                }
-                if self.chars < PREVIEW_CHARS {
-                    self.out.push(c);
-                    self.chars += 1;
-                }
-                self.word_open = true;
-            }
-        }
-    }
-}
-
 struct IndexGramSink {
     primary_path: PathBuf,
     cwd: Option<String>,
@@ -428,7 +395,8 @@ struct IndexGramSink {
     in_context: bool,
     exchange: GramAccumulator,
     context: GramAccumulator,
-    preview: PreviewAcc,
+    preview: String,
+    preview_cursor: Preview,
     err: Option<anyhow::Error>,
     failed: bool,
 }
@@ -447,7 +415,8 @@ impl IndexGramSink {
             in_context: false,
             exchange: GramAccumulator::default(),
             context: GramAccumulator::default(),
-            preview: PreviewAcc::default(),
+            preview: String::new(),
+            preview_cursor: Preview::default(),
             err: None,
             failed: false,
         }
@@ -457,27 +426,8 @@ impl IndexGramSink {
         if self.in_context {
             self.context.feed_str(text);
         } else {
-            self.preview.push(text);
+            self.preview_cursor.push(&mut self.preview, text);
             self.exchange.feed_str(text);
-        }
-    }
-
-    fn record_text(&mut self, text: &cv_core::Text) {
-        match text {
-            cv_core::Text::Span(sp) => {
-                if let Some(path) = sp.source.as_ref().filter(|p| p.as_path() != self.primary_path) {
-                    self.dependencies.record(path);
-                }
-            }
-            cv_core::Text::Source(source) => {
-                if source.path() != self.primary_path {
-                    self.dependencies.record(source.path());
-                }
-                if let Some(reads) = source.dependencies() {
-                    self.dependencies.merge(reads);
-                }
-            }
-            cv_core::Text::Inline(_) => {}
         }
     }
 
@@ -489,77 +439,22 @@ impl IndexGramSink {
     }
 }
 
-impl Searchable for IndexGramSink {
-    fn full(&self) -> bool {
+impl index_text::IndexText for IndexGramSink {
+    const CHUNK_BYTES: usize = PIECE_BYTES;
+    fn sources(&mut self) -> (&Path, &mut cv_core::source::ReadSet) {
+        (&self.primary_path, &mut self.dependencies)
+    }
+    fn failed(&self) -> bool {
         self.failed || self.err.is_some()
     }
-
-    fn str(&mut self, s: &str) {
-        self.push_piece(s);
+    fn push(&mut self, text: &str) {
+        self.push_piece(text);
     }
-
-    fn text(
-        &mut self,
-        text: &cv_core::Text,
-        resolver: &cv_core::Resolver,
-        _: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        if let Some(inline) = text.inline_str() {
-            self.push_piece(inline);
-            return Ok(());
-        }
-        self.record_text(text);
-        text.try_for_each_chunk(resolver, PIECE_BYTES, |part| {
+    fn push_json(&mut self, input: &cv_core::Json) -> Result<()> {
+        index_text::json_pieces(input, |part| {
             self.push_piece(part);
-            anyhow::ensure!(!self.failed && self.err.is_none(), "trigram sink failed");
             Ok(())
         })
-        .context("resolving trigram text")
-    }
-
-    fn json(&mut self, input: &cv_core::Json, _: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-        if let cv_core::Json::Source(range) = input {
-            if range.path() != self.primary_path {
-                self.dependencies.record(range.path());
-            }
-            if let Some(reads) = range.dependencies() {
-                self.dependencies.merge(reads);
-            }
-        }
-        struct JsonWriter<'a>(&'a mut IndexGramSink);
-        impl std::io::Write for JsonWriter<'_> {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                let s =
-                    std::str::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                self.0.push_piece(s);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        input
-            .write_canonical(&mut JsonWriter(self))
-            .context("serializing tool input for trigram index")
-    }
-
-    fn after_block(&mut self, block: &cv_core::Block) -> Result<()> {
-        if let Some(path) = block.persisted_output_path() {
-            self.dependencies.record(Path::new(path));
-            let read = cv_core::lazy::read_pieces_checked(Path::new(path), PIECE_BYTES, |piece| {
-                self.push_piece(piece);
-                Ok(())
-            })
-            .context("reading persisted output for trigram index")?;
-            match read {
-                cv_core::lazy::PersistedHead::Unreadable(reason) => {
-                    anyhow::bail!("reading persisted output {path}: {reason}")
-                }
-                cv_core::lazy::PersistedHead::Text(_) => self.push_piece("\n"),
-                cv_core::lazy::PersistedHead::Absent => {}
-            }
-        }
-        Ok(())
     }
 }
 
@@ -594,13 +489,8 @@ impl MessageSink for IndexGramSink {
             return Flow::Stop;
         }
         let r = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
-        if self.first_prompt.is_none() && m.role == cv_core::Role::User {
-            for b in &m.content {
-                if let cv_core::Block::Text { text, .. } = b {
-                    self.record_text(text);
-                }
-            }
-            match m.prompt_title(&r) {
+        if self.first_prompt.is_none() {
+            match index_text::first_prompt(&m, &r, &self.primary_path, &mut self.dependencies) {
                 Ok(title) => self.first_prompt = title,
                 Err(e) => self.err = Some(e.context("reading trigram label")),
             }
@@ -608,7 +498,7 @@ impl MessageSink for IndexGramSink {
         let copied = matches!((m.timestamp, self.copied_before), (Some(at), Some(before)) if at < before);
         if !copied && self.err.is_none() {
             self.in_context = !m.kind.is_exchange();
-            if let Err(e) = cv_core::projection::searchable(&m.content, &r, self, &mut || Ok(())) {
+            if let Err(e) = index_text::blocks(self, &m.content, &r) {
                 if self.err.is_none() {
                     self.err = Some(e);
                 }
@@ -632,8 +522,7 @@ struct ExtractedDoc {
 fn extract_session_grams(r: &cv_core::SessionRef, prov: &cv_core::events::Provenance) -> Result<ExtractedDoc> {
     let adapter = cv_core::harness::for_harness(r.harness).with_context(|| format!("unknown harness {}", r.harness))?;
     let mut probe = cv_core::source::Probe::default();
-    let before = probe.snapshot(r);
-    let (mtime, size) = before.primary.map_or((0, -1), |id| (id.mtime_ns as i64, id.len as i64));
+    let (before, (mtime, size)) = index_text::snapshot(&mut probe, r, -1);
 
     let mut sink = IndexGramSink::new(r);
     sink.copied_before = adapter.copied_before(r, &mut sink);
@@ -651,14 +540,14 @@ fn extract_session_grams(r: &cv_core::SessionRef, prov: &cv_core::events::Proven
     sink.exchange.finish();
     sink.context.finish();
 
-    let baseline = before.with_reads(&sink.dependencies);
+    let baseline = index_text::completed(&before, r, &sink.dependencies, None);
     let meta = SegmentDocMeta {
         id: r.id.clone(),
         harness: r.harness.as_str().to_string(),
         path: r.path.clone(),
         cwd: sink.cwd.or_else(|| session_meta.cwd.map(|p| p.display().to_string())),
         title,
-        preview: sink.preview.out,
+        preview: sink.preview,
         created_at: r.created_at.or(session_meta.created_at).map(|t| t.timestamp()),
         updated_at: r.updated_at.or(session_meta.updated_at).map(|t| t.timestamp()),
         parent_id: prov.parent_id.clone(),
@@ -1170,22 +1059,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
         resolver: &cv_core::Resolver,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        match text {
-            cv_core::Text::Span(sp) => {
-                if let Some(path) = sp.source.as_ref().filter(|p| p.as_path() != self.primary_path) {
-                    self.dependencies.record(path);
-                }
-            }
-            cv_core::Text::Source(source) => {
-                if source.path() != self.primary_path {
-                    self.dependencies.record(source.path());
-                }
-                if let Some(reads) = source.dependencies() {
-                    self.dependencies.merge(reads);
-                }
-            }
-            cv_core::Text::Inline(_) => {}
-        }
+        self.dependencies.record_text(text, Some(self.primary_path));
         cv_core::stream::stopped(text.try_for_each_chunk(resolver, PIECE_BYTES, |part| {
             check()?;
             self.feed(part.as_bytes());
@@ -1199,14 +1073,7 @@ impl Searchable for VerifyStreamAdapter<'_> {
     }
 
     fn json(&mut self, json: &cv_core::Json, check: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-        if let cv_core::Json::Source(range) = json {
-            if range.path() != self.primary_path {
-                self.dependencies.record(range.path());
-            }
-            if let Some(reads) = range.dependencies() {
-                self.dependencies.merge(reads);
-            }
-        }
+        self.dependencies.record_json(json, Some(self.primary_path));
         struct Writer<'a, 'b> {
             matcher: &'a mut ExactStreamMatcher,
             metered: &'a std::cell::Cell<u64>,
@@ -1351,8 +1218,8 @@ impl MessageSink for VerifySink {
             return Flow::Stop;
         }
         let r = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
-        if self.need_title && self.first_prompt.is_none() && m.role == cv_core::Role::User {
-            match m.prompt_title(&r) {
+        if self.need_title && self.first_prompt.is_none() {
+            match index_text::first_prompt(&m, &r, &self.primary_path, &mut self.dependencies) {
                 Ok(title) => self.first_prompt = title,
                 Err(e) => {
                     self.err = Some(e);

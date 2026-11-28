@@ -56,6 +56,9 @@ use staging::DocumentBatch;
 use sweep::*;
 
 #[cfg(test)]
+use crate::ingest::text::PREVIEW_CHARS;
+use crate::ingest::text::{self as index_text, Preview};
+#[cfg(test)]
 use crate::ingest::AdmittedDocument;
 use crate::ingest::{Admission, Writer};
 use crate::Hit;
@@ -470,8 +473,7 @@ fn index_changed_heads_locked(hub: &cv_core::state::hub::HubStore, dir: &Path) -
             .flatten();
         if let Some(b) = backing {
             let r = b.reference.clone();
-            let source = probe.snapshot(&r);
-            let (mtime, size) = sig(source.primary);
+            let (source, (mtime, size)) = index_text::snapshot(&mut probe, &r, 0);
             jobs.push(Job {
                 backing: Some(Box::new(b)),
                 r,
@@ -1192,7 +1194,7 @@ impl SweepPlanner<'_> {
 
 /// The `(mtime_ns, size)` a doc is stamped with for `primary`; `(0, 0)`, never fresh, when absent.
 fn sig(primary: Option<cv_core::source::FileId>) -> (i64, i64) {
-    primary.map_or((0, 0), |id| (id.mtime_ns as i64, id.len as i64))
+    index_text::signature(primary).unwrap_or_default()
 }
 
 /// The search index's source record payload: its documents live in the index, keyed per index
@@ -1933,10 +1935,6 @@ fn resumes_docs_at(cp: &cv_core::stream::Checkpoint) -> Option<usize> {
     }))
 }
 
-/// Length cap (chars) of the stored head-of-body preview — the snippet fallback when a hit's
-/// source file is gone at query time. ~240 bytes/session keeps the index lean.
-const PREVIEW_CHARS: usize = 240;
-
 impl<'w> ChunkSink<'w> {
     fn new(
         out: &'w mut DocOut<'w>,
@@ -2187,53 +2185,14 @@ impl<'w> ChunkSink<'w> {
     }
 
     /// Grow the stored preview from the head of the body: words joined by single spaces (newlines
-    /// and runs of whitespace collapse away), truncated at [`PREVIEW_CHARS`]. No-op once full, so
+    /// and runs of whitespace collapse away), truncated at [`index_text::PREVIEW_CHARS`]. No-op once full, so
     /// the cost is bounded no matter how large the session is.
     fn extend_preview(&mut self, s: &str) {
         Preview::new(&self.preview).push(&mut self.preview, s);
     }
 
-    fn record_span(&mut self, sp: &cv_core::Span) {
-        if let Some(path) = sp.source.as_ref().filter(|path| path.as_path() != self.primary_path) {
-            self.dependencies.record(path);
-        }
-    }
-    fn record_text(&mut self, text: &cv_core::Text) {
-        match text {
-            cv_core::Text::Span(span) => self.record_span(span),
-            cv_core::Text::Source(source) => {
-                if source.path() != self.primary_path {
-                    self.dependencies.record(source.path());
-                }
-                if let Some(reads) = source.dependencies() {
-                    self.dependencies.merge(reads);
-                }
-            }
-            cv_core::Text::Inline(_) => {}
-        }
-    }
-    /// Append a content `Text`: chunk-resolved from the source for a span (never owned whole), or the
-    /// inline string. `r` is the session resolver (moved out of `self` to avoid a borrow conflict with
-    /// the chunk callback, which mutates `self`).
-    fn append_text(&mut self, r: &cv_core::Resolver, text: &cv_core::Text) {
-        if let Some(text) = text.inline_str() {
-            self.push_chunk(text);
-            return;
-        }
-        self.record_text(text);
-        if let Err(error) = text.try_for_each_chunk(r, CHUNK_BYTES, |s| {
-            self.push_chunk(s);
-            anyhow::ensure!(!self.failed && self.err.is_none(), "search document output failed");
-            Ok(())
-        }) {
-            if !self.failed && self.err.is_none() {
-                self.err = Some(error.context("resolving search text"));
-            }
-        }
-    }
-
     fn append_blocks(&mut self, resolver: &cv_core::Resolver, blocks: &[cv_core::Block]) {
-        if let Err(error) = cv_core::projection::searchable(blocks, resolver, self, &mut || Ok(())) {
+        if let Err(error) = index_text::blocks(self, blocks, resolver) {
             if !self.failed && self.err.is_none() {
                 self.err = Some(error);
             }
@@ -2246,56 +2205,30 @@ impl<'w> ChunkSink<'w> {
     }
 }
 
-impl cv_core::projection::Searchable for ChunkSink<'_> {
-    fn full(&self) -> bool {
+impl index_text::IndexText for ChunkSink<'_> {
+    const CHUNK_BYTES: usize = CHUNK_BYTES;
+    fn sources(&mut self) -> (&Path, &mut cv_core::source::ReadSet) {
+        (&self.primary_path, &mut self.dependencies)
+    }
+    fn failed(&self) -> bool {
         self.failed || self.err.is_some()
     }
-    fn str(&mut self, text: &str) {
-        self.push_chunk(text);
+    fn push(&mut self, s: &str) {
+        self.push_chunk(s);
     }
-    fn text(
-        &mut self,
-        text: &cv_core::Text,
-        resolver: &cv_core::Resolver,
-        _: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<()> {
-        self.append_text(resolver, text);
-        anyhow::ensure!(!self.failed && self.err.is_none(), "search text output failed");
-        Ok(())
-    }
-    fn json(&mut self, input: &cv_core::Json, _: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-        if let cv_core::Json::Source(range) = input {
-            if range.path() != self.primary_path {
-                self.dependencies.record(range.path());
+    fn push_json(&mut self, input: &cv_core::Json) -> Result<()> {
+        let mut preview = Preview::new(&self.preview);
+        index_text::json_pieces(input, |part| {
+            if !self.in_context {
+                preview.push(&mut self.preview, part);
             }
-            if let Some(reads) = range.dependencies() {
-                self.dependencies.merge(reads);
-            }
-        }
-        input
-            .write_canonical(&mut JsonChunks::new(self))
-            .context("serializing tool input for search")
-    }
-    fn after_block(&mut self, block: &cv_core::Block) -> Result<()> {
-        // A persisted-output stub points to text absent from the transcript itself.
-        if let Some(path) = block.persisted_output_path() {
-            self.dependencies.record(Path::new(path));
-            // The whole output, in chunk-sized pieces: what the model saw through the stub is
-            // searchable to its end.
-            let read = cv_core::lazy::read_pieces_checked(Path::new(path), CHUNK_BYTES, |piece| {
-                self.push_chunk(piece);
+            self.push_body(part);
+            if self.failed() {
+                Err(std::io::Error::other("search document output failed"))
+            } else {
                 Ok(())
-            })
-            .context("reading persisted search output")?;
-            match read {
-                cv_core::lazy::PersistedHead::Unreadable(reason) => {
-                    anyhow::bail!("reading persisted search output {path}: {reason}")
-                }
-                cv_core::lazy::PersistedHead::Text(_) => self.push_chunk("\n"),
-                cv_core::lazy::PersistedHead::Absent => {}
             }
-        }
-        Ok(())
+        })
     }
 }
 
@@ -2633,72 +2566,6 @@ fn input_text(r: &cv_core::Resolver, input: &cv_core::Json, key: &str) -> Option
         .flatten()
 }
 
-/// Collapse whitespace across formatter fragments, bounded in Unicode characters.
-struct Preview {
-    chars: usize,
-    word_open: bool,
-}
-impl Preview {
-    fn new(text: &str) -> Self {
-        Self {
-            chars: text.chars().count(),
-            word_open: false,
-        }
-    }
-    fn push(&mut self, out: &mut String, text: &str) {
-        for c in text.chars() {
-            if self.chars >= PREVIEW_CHARS {
-                break;
-            }
-            if c.is_whitespace() {
-                self.word_open = false;
-            } else {
-                if !self.word_open && !out.is_empty() {
-                    out.push(' ');
-                    self.chars += 1;
-                }
-                if self.chars < PREVIEW_CHARS {
-                    out.push(c);
-                    self.chars += 1;
-                }
-                self.word_open = true;
-            }
-        }
-    }
-}
-
-/// Canonical writer fragments are UTF-8; the reducer owns splitting and output failures.
-struct JsonChunks<'a, 'w> {
-    sink: &'a mut ChunkSink<'w>,
-    preview: Preview,
-}
-impl<'a, 'w> JsonChunks<'a, 'w> {
-    fn new(sink: &'a mut ChunkSink<'w>) -> Self {
-        Self {
-            preview: Preview::new(&sink.preview),
-            sink,
-        }
-    }
-}
-impl std::io::Write for JsonChunks<'_, '_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let s =
-            std::str::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if !self.sink.in_context {
-            self.preview.push(&mut self.sink.preview, s);
-        }
-        self.sink.push_body(s);
-        if self.sink.failed || self.sink.err.is_some() {
-            Err(std::io::Error::other("search document output failed"))
-        } else {
-            Ok(bytes.len())
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 impl cv_core::MessageSink for ChunkSink<'_> {
     fn tier(&self) -> cv_core::Tier {
         cv_core::Tier::Facts
@@ -2796,20 +2663,14 @@ impl cv_core::MessageSink for ChunkSink<'_> {
         );
     }
     fn message(&mut self, m: cv_core::Message) -> cv_core::Flow {
-        use cv_core::Block;
         if self.failed || self.err.is_some() {
             return cv_core::Flow::Stop;
         }
         // Move the resolver out so the chunk callbacks (which mutate `self`) don't conflict with it.
         let r = std::mem::replace(&mut self.resolver, cv_core::Resolver::new(None));
         // The first prompt → the title fallback (the core title rule reads a bounded head).
-        if self.first_prompt.is_none() && m.role == cv_core::Role::User {
-            for b in &m.content {
-                if let Block::Text { text, .. } = b {
-                    self.record_text(text);
-                }
-            }
-            match m.prompt_title(&r) {
+        if self.first_prompt.is_none() {
+            match index_text::first_prompt(&m, &r, &self.primary_path, &mut self.dependencies) {
                 Ok(title) => self.first_prompt = title,
                 Err(error) => self.err = Some(error.context("reading search label")),
             }
@@ -3275,8 +3136,7 @@ pub(crate) fn index_refs(dir: &Path, refs: &[cv_core::SessionRef], catalog: bool
         let Some(adapter) = cv_core::harness::for_harness(r.harness) else {
             continue;
         };
-        let source = probe.snapshot(r);
-        let (mtime, size) = sig(source.primary);
+        let (source, (mtime, size)) = index_text::snapshot(&mut probe, r, 0);
         let mut es = catalog.then(|| cv_core::events::SpoolingSink::new(r.cwd.clone()).with_source(r.path.clone()));
         let (_, reads) = index_session_clean(
             &mut writer,
@@ -5681,7 +5541,7 @@ mod tests {
                     Ok(())
                 };
                 let mut sink = ChunkSink::new(&mut out, &f, &r, 1, 1, Default::default());
-                sink.append_text(&cv_core::Resolver::new(None), &text);
+                sink.append_block(&cv_core::Resolver::new(None), &cv_core::Block::from_text(text));
                 assert!(sink.take_error().is_some());
                 assert_eq!(
                     sink.message(cv_core::Message::new(cv_core::Role::User)),
@@ -5720,14 +5580,14 @@ mod tests {
         };
         let mut sink = ChunkSink::new(&mut out, &f, &r, 1, 1, Default::default());
         sink.push_chunk("prefix\n");
-        sink.append_text(
+        sink.append_block(
             &cv_core::Resolver::new(None),
-            &cv_core::Text::Span(cv_core::Span {
+            &cv_core::Block::from_text(cv_core::Text::Span(cv_core::Span {
                 source: Some(path.clone()),
                 offset: 8192,
                 len: text.len() as u64,
                 escaped: false,
-            }),
+            })),
         );
         assert!(sink.take_error().is_some());
         let mut later = cv_core::Message::new(cv_core::Role::User);
@@ -6956,10 +6816,30 @@ mod tests {
         }
         std::fs::write(&p, lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
         let r = sref("adopted", "adopted", p.display().to_string());
-        let refresh = || sweep(&dir, vec![r.clone()], false, false).unwrap();
+        let grams = tmpdir();
+        let refresh = || {
+            let fts = sweep(&dir, vec![r.clone()], false, false).unwrap();
+            let exact = crate::trigram::sync_sessions(&grams, std::slice::from_ref(&r), false, false).unwrap();
+            assert!(exact.unreadable.is_empty());
+            assert_eq!(
+                fts.changed, exact.indexed,
+                "both indexes must observe the same source revision"
+            );
+            fts
+        };
+        let matches = |word| {
+            let fts_hits = text_search(&dir, word, 10).unwrap();
+            let opts = crate::trigram::TrigramOptions {
+                live: crate::LiveRead::Frozen,
+                ..Default::default()
+            };
+            let exact = crate::trigram::search(&grams, word, opts, std::slice::from_ref(&r), None).unwrap();
+            assert_eq!(fts_hits.len(), exact.hits.len(), "search results for {word}");
+            fts_hits.len()
+        };
         std::fs::write(&file, "zanzibar").unwrap();
         assert_eq!(refresh().changed, 1);
-        assert_eq!(text_search(&dir, "zanzibar", 10).unwrap().len(), 1);
+        assert_eq!(matches("zanzibar"), 1);
         assert_eq!(refresh().changed, 0);
         use std::io::Write;
         let appended = serde_json::json!({"type":"user","uuid":"last","sessionId":"adopted",
@@ -6980,15 +6860,15 @@ mod tests {
         ));
         let changed = refresh();
         assert_eq!((changed.changed, changed.resumed), (1, 0));
-        assert!(text_search(&dir, "zanzibar", 10).unwrap().is_empty());
-        assert_eq!(text_search(&dir, "kilimanj", 10).unwrap().len(), 1);
+        assert_eq!(matches("zanzibar"), 0);
+        assert_eq!(matches("kilimanj"), 1);
         std::fs::remove_file(&file).unwrap();
         assert_eq!(refresh().changed, 1);
-        assert!(text_search(&dir, "kilimanj", 10).unwrap().is_empty());
+        assert_eq!(matches("kilimanj"), 0);
         assert_eq!(refresh().changed, 0);
         std::fs::write(&file, "zanzibar").unwrap(); // The resumed read set retains absence too.
         assert_eq!(refresh().changed, 1);
-        assert_eq!(text_search(&dir, "zanzibar", 10).unwrap().len(), 1);
+        assert_eq!(matches("zanzibar"), 1);
         assert_eq!(refresh().changed, 0);
     }
 

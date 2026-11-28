@@ -3,6 +3,8 @@
 //! Tantivy's arena budget excludes its 10,000-document input queue. Each document owns a byte
 //! reservation until Tantivy finishes consuming it, so moving between queues cannot evade this
 //! bound. Parser working sets, worker body buffers, index arenas and merges are separate costs.
+pub(crate) mod text;
+
 use anyhow::{Context, Result};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex};

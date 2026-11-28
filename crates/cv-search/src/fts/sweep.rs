@@ -412,12 +412,8 @@ pub(super) fn run_fed(
                         // untouched so the session is retried next run.
                         // A pass that left a mark over an append-only primary publishes its
                         // baselines though the session was written under it.
-                        let read_at = |reads: &cv_core::source::ReadSet| match job.appended {
-                            Some(sample) => {
-                                job.source
-                                    .with_reads_appended(reads, &cv_core::source::primary_path(&job.r), sample)
-                            }
-                            None => job.source.with_reads(reads),
+                        let read_at = |reads: &cv_core::source::ReadSet| {
+                            index_text::completed(&job.source, &job.r, reads, job.appended)
                         };
                         let source = counted
                             .as_ref()

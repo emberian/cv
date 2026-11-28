@@ -468,6 +468,35 @@ impl ReadSet {
         self.record_as(path, false);
     }
 
+    fn captured(&mut self, path: &Path, dependencies: Option<&ReadSet>, primary: Option<&Path>) {
+        if Some(path) != primary {
+            self.record(path);
+        }
+        if let Some(reads) = dependencies {
+            self.merge(reads);
+        }
+    }
+
+    /// Record the auxiliary sources of demanded text. The primary has its own certificate.
+    pub fn record_text(&mut self, text: &crate::Text, primary: Option<&Path>) {
+        match text {
+            crate::Text::Span(span) => {
+                if let Some(path) = &span.source {
+                    self.captured(path, None, primary);
+                }
+            }
+            crate::Text::Source(source) => self.captured(source.path(), source.dependencies(), primary),
+            crate::Text::Inline(_) => {}
+        }
+    }
+
+    /// Record the auxiliary sources of a demanded JSON value, including its conditional reads.
+    pub fn record_json(&mut self, value: &crate::Json, primary: Option<&Path>) {
+        if let crate::Json::Source(range) = value {
+            self.captured(range.path(), range.dependencies(), primary);
+        }
+    }
+
     /// Record `db` along with its `-wal` and `-journal` SQLite sidecars.
     pub fn record_sqlite(&mut self, db: &Path) {
         self.record(db);
@@ -610,45 +639,15 @@ pub(crate) fn session_reads(session: &crate::Session) -> ReadSet {
 
 /// Record the original and auxiliary sources retained by one message before a consumer demands it.
 pub(crate) fn record_message_reads(message: &crate::Message, primary: Option<&std::path::Path>, reads: &mut ReadSet) {
-    /// A captured source records its path (unless it *is* the primary) plus its dependencies.
-    fn captured(
-        path: &std::path::Path,
-        deps: Option<&ReadSet>,
-        primary: Option<&std::path::Path>,
-        reads: &mut ReadSet,
-    ) {
-        if primary != Some(path) {
-            reads.record(path);
-        }
-        if let Some(deps) = deps {
-            reads.merge(deps);
-        }
-    }
     if let Some(record) = &message.complete_record {
-        if let crate::Json::Source(range) = &record.value {
-            captured(range.path(), range.dependencies(), primary, reads);
-        }
+        reads.record_json(&record.value, primary);
     }
     for block in &message.content {
-        if let crate::Block::ToolUse {
-            input: crate::Json::Source(range),
-            ..
-        } = block
-        {
-            captured(range.path(), range.dependencies(), primary, reads);
-        }
-        let text = match block {
-            crate::Block::Text { text, .. } | crate::Block::Thinking { text, .. } => Some(text),
-            crate::Block::ToolResult { content, .. } => Some(content),
-            _ => None,
-        };
-        match text {
-            Some(crate::Text::Span(span)) => {
-                if let Some(path) = span.source.as_ref().filter(|path| Some(path.as_path()) != primary) {
-                    reads.record(path);
-                }
-            }
-            Some(crate::Text::Source(source)) => captured(source.path(), source.dependencies(), primary, reads),
+        match block {
+            crate::Block::ToolUse { input, .. } => reads.record_json(input, primary),
+            crate::Block::Text { text, .. }
+            | crate::Block::Thinking { text, .. }
+            | crate::Block::ToolResult { content: text, .. } => reads.record_text(text, primary),
             _ => {}
         }
     }
