@@ -33,7 +33,7 @@ fn empty_json_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
-/// Revision-addressed session entry inside a [`SnapshotPublicationManifest`].
+/// Revision-addressed session entry inside a hub generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRevisionEntry {
     pub producer_id: String,
@@ -56,8 +56,54 @@ pub struct SessionRevisionEntry {
     pub event_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_addr: Option<PayloadAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody: Option<crate::custody::CustodyKind>,
     #[serde(default = "empty_json_object", skip_serializing_if = "is_empty_object")]
     pub metadata: Value,
+}
+
+impl SessionRevisionEntry {
+    pub fn session_key_struct(&self) -> Option<crate::SessionKey> {
+        let harness = Harness::parse(&self.harness)?;
+        let native_id = self
+            .metadata
+            .get("native_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.session_id.clone());
+        let profile = self
+            .metadata
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into();
+        Some(crate::SessionKey {
+            producer: self.producer_id.clone(),
+            profile,
+            harness,
+            native_id,
+        })
+    }
+
+    pub fn selector_string(&self) -> String {
+        match self.session_key_struct() {
+            Some(k) => k.selector(),
+            None => format!("{}:{}:{}", self.producer_id, self.harness, self.session_id),
+        }
+    }
+}
+
+/// Compact generation header persisted in `hub_generations` (`O(1)` per published batch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubGenerationRecord {
+    pub generation: u64,
+    pub publication_id: String,
+    pub published_at: i64,
+    pub frontier_digest: String,
+    pub control_revision: u64,
+    pub quarantine_count: u64,
+    pub indexed_generation: u64,
+    pub pinned: bool,
 }
 
 /// Immutable, monotonically numbered fleet read-consistency manifest.
@@ -310,33 +356,46 @@ pub(crate) fn compute_view_manifest_ids(
     Ok(views)
 }
 
-/// Compute deterministic `publication_id` from a snapshot's canonical content.
-pub(crate) fn compute_publication_id(
+/// Compute deterministic `frontier_digest` and `publication_id` in `O(|origins|)` from the
+/// rolling per-origin `(contiguous_seq, frontier_hash)` commitments without scanning fleet sessions.
+pub(crate) fn compute_frontier_digest(
+    origin_hashes: &BTreeMap<(String, String), (u64, String)>,
+) -> Result<String, HubError> {
+    let encoded: BTreeMap<String, Value> = origin_hashes
+        .iter()
+        .map(|((p, e), (seq, h))| (encode_pair_key(p, e), json!([seq, h])))
+        .collect();
+    let bytes = canonical_json_bytes(&Value::Object(encoded.into_iter().collect()))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+pub(crate) fn compute_generation_publication_id(
     interpretation_version: u32,
-    origin_frontier: &BTreeMap<(String, String), u64>,
-    pack_digests: &BTreeMap<String, String>,
-    session_revisions: &BTreeMap<String, SessionRevisionEntry>,
-    view_manifest_ids: &BTreeMap<String, String>,
+    frontier_digest: &str,
     control_revision: u64,
     quarantine_count: u64,
 ) -> Result<String, HubError> {
-    let frontier_encoded: BTreeMap<String, u64> = origin_frontier
-        .iter()
-        .map(|((p, e), &seq)| (encode_pair_key(p, e), seq))
-        .collect();
     let doc = json!({
-        "domain": "cv-hub-snapshot-v1",
+        "domain": "cv-hub-gen-v2",
         "interpretation_version": interpretation_version,
-        "origin_frontier": frontier_encoded,
-        "pack_digests": pack_digests,
-        "session_revisions": session_revisions,
-        "view_manifest_ids": view_manifest_ids,
+        "frontier_digest": frontier_digest,
         "control_revision": control_revision,
         "quarantine_count": quarantine_count,
     });
     let canonical = canonical_json_bytes(&doc)?;
     let hex = blake3::hash(&canonical).to_hex();
     Ok(format!("pub-{}", &hex.as_str()[..24]))
+}
+
+fn roll_frontier_hash(prev: &str, seq: u64, event_digest: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cv-frontier-v2:");
+    hasher.update(prev.as_bytes());
+    hasher.update(b":");
+    hasher.update(seq.to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(event_digest.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Advance the contiguous origin frontier `F(p, e)` incrementally in `O(delta + buffered)` by
@@ -434,8 +493,8 @@ pub(crate) fn advance_frontier_in_tx(
         "INSERT INTO hub_frontiers(
              producer_id, epoch, contiguous_seq, max_received_seq,
              buffered_count, first_conflict_seq, updated_at,
-             control_events, delta_seeded
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1)
+             control_events, delta_seeded, frontier_hash
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, '')
          ON CONFLICT(producer_id, epoch) DO UPDATE SET
              contiguous_seq = excluded.contiguous_seq,
              max_received_seq = excluded.max_received_seq,
@@ -443,6 +502,7 @@ pub(crate) fn advance_frontier_in_tx(
              first_conflict_seq = excluded.first_conflict_seq,
              updated_at = excluded.updated_at,
              control_events = CASE WHEN hub_frontiers.delta_seeded = 0 THEN 0 ELSE hub_frontiers.control_events END,
+             frontier_hash = CASE WHEN hub_frontiers.delta_seeded = 0 THEN '' ELSE hub_frontiers.frontier_hash END,
              delta_seeded = 1",
         rusqlite::params![
             producer_id,
@@ -612,7 +672,7 @@ fn parse_envelope_op(
             }
             return ParsedEnvelopeOp::Ignore;
         }
-        Some("session_upsert") | Some("session_archive") => {}
+        Some("session_upsert") | Some("session_archive") | Some("session_delta") => {}
         None if nested.is_some() => {}
         // Non-session envelopes (`filtered_out`, `receipt`, `hook_receipt`, `lane_start`,
         // `heartbeat`, `noop`, `task_event`, etc.) stay durably committed in `hub_ingested_events`
@@ -648,6 +708,10 @@ fn parse_envelope_op(
         .or_else(|| payload_addr.as_ref().map(PayloadAddr::digest_hex))
         .unwrap_or_else(|| event_digest.to_string());
 
+    let custody = envelope
+        .get("custody")
+        .and_then(|c| serde_json::from_value::<crate::custody::CustodyKind>(c.clone()).ok());
+
     let mut metadata = envelope
         .get("metadata")
         .cloned()
@@ -677,19 +741,24 @@ fn parse_envelope_op(
         epoch: epoch.to_string(),
         event_seq,
         payload_addr,
+        custody,
         metadata,
     }))
 }
 
-/// Seed all pre-v3 `hub_frontiers` rows (`delta_seeded = 0`) into `hub_epoch_sessions`,
-/// `hub_frontier_packs`, and `hub_frontiers.control_events`, then materialize affected producers
-/// into `hub_sessions` before incremental folding or snapshot publication.
-pub(crate) fn ensure_all_frontiers_seeded_in_tx(tx: &Transaction<'_>, now_ms: i64) -> Result<(), HubError> {
+/// Seed all pre-v3 or unhashed `hub_frontiers` rows (`delta_seeded = 0` or `frontier_hash = ''`
+/// with `contiguous_seq > 0`) into `hub_epoch_sessions`, `hub_frontier_packs`,
+/// `hub_frontiers.control_events`, and `hub_frontiers.frontier_hash`, returning any changed
+/// session heads so the next generation publication incorporates them cleanly.
+pub(crate) fn ensure_all_frontiers_seeded_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+) -> Result<Vec<(String, String, Option<SessionRevisionEntry>)>, HubError> {
     let unseeded: Vec<(String, String, u64)> = {
         let mut stmt = tx.prepare(
             "SELECT producer_id, epoch, contiguous_seq
              FROM hub_frontiers
-             WHERE delta_seeded = 0
+             WHERE delta_seeded = 0 OR (contiguous_seq > 0 AND frontier_hash = '')
              ORDER BY producer_id ASC, epoch ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -702,7 +771,7 @@ pub(crate) fn ensure_all_frontiers_seeded_in_tx(tx: &Transaction<'_>, now_ms: i6
         rows.collect::<Result<Vec<_>, _>>()?
     };
     if unseeded.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut touched_by_producer: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -717,7 +786,7 @@ pub(crate) fn ensure_all_frontiers_seeded_in_tx(tx: &Transaction<'_>, now_ms: i6
         )?;
         tx.execute(
             "UPDATE hub_frontiers
-             SET control_events = 0, delta_seeded = 1, updated_at = ?3
+             SET control_events = 0, frontier_hash = '', delta_seeded = 1, updated_at = ?3
              WHERE producer_id = ?1 AND epoch = ?2",
             rusqlite::params![producer_id, epoch, now_ms],
         )?;
@@ -726,10 +795,11 @@ pub(crate) fn ensure_all_frontiers_seeded_in_tx(tx: &Transaction<'_>, now_ms: i6
             touched_by_producer.entry(producer_id).or_default().extend(touched);
         }
     }
+    let mut head_deltas = Vec::new();
     for (producer_id, session_ids) in &touched_by_producer {
-        resolve_producer_sessions_in_tx(tx, producer_id, session_ids)?;
+        head_deltas.extend(resolve_producer_sessions_in_tx(tx, producer_id, session_ids)?);
     }
-    Ok(())
+    Ok(head_deltas)
 }
 
 /// Fold events in `(after_seq, upto_seq]` for `(producer_id, epoch)` into `hub_epoch_sessions`,
@@ -777,9 +847,19 @@ pub(crate) fn fold_origin_range_in_tx(
             .filter(|&ts| ts != i64::MIN))
     };
 
+    let mut frontier_hash: String = tx
+        .query_row(
+            "SELECT frontier_hash FROM hub_frontiers WHERE producer_id = ?1 AND epoch = ?2",
+            rusqlite::params![producer_id, epoch],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+
     let mut added_control_events = 0u64;
     for row in rows {
         let (seq, event_digest, env_str, payload_str) = row?;
+        frontier_hash = roll_frontier_hash(&frontier_hash, seq, &event_digest);
         let envelope: Value = serde_json::from_str(&env_str)?;
         let payload_addr: Option<PayloadAddr> = match payload_str {
             Some(s) => Some(serde_json::from_str(&s)?),
@@ -791,6 +871,19 @@ pub(crate) fn fold_origin_range_in_tx(
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![producer_id, epoch, addr.pack_id],
             )?;
+        }
+        if let Some(custody_val) = envelope.get("custody") {
+            if let Ok(crate::custody::CustodyKind::NativeExtents { extents, .. }) =
+                serde_json::from_value::<crate::custody::CustodyKind>(custody_val.clone())
+            {
+                for ext in extents {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO hub_frontier_packs(producer_id, epoch, pack_id)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![producer_id, epoch, ext.pack_id],
+                    )?;
+                }
+            }
         }
 
         let op = parse_envelope_op(producer_id, epoch, seq, &event_digest, &envelope, payload_addr);
@@ -811,8 +904,73 @@ pub(crate) fn fold_origin_range_in_tx(
                 )?;
                 touched_sessions.insert(session_id);
             }
-            ParsedEnvelopeOp::Upsert(entry) => {
+            ParsedEnvelopeOp::Upsert(mut entry) => {
                 let session_id = entry.session_id.clone();
+                // If this event is an incremental `session_delta` carrying `delta_extents`,
+                // append those extents to the prior epoch/head `NativeExtents` chain!
+                if envelope.get("kind").and_then(Value::as_str) == Some("session_delta") {
+                    if let Some(delta_extents) = envelope
+                        .get("delta_extents")
+                        .and_then(|v| serde_json::from_value::<Vec<PayloadAddr>>(v.clone()).ok())
+                    {
+                        for ext in &delta_extents {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO hub_frontier_packs(producer_id, epoch, pack_id)
+                                 VALUES (?1, ?2, ?3)",
+                                rusqlite::params![producer_id, epoch, ext.pack_id],
+                            )?;
+                        }
+                        let prev_entry: Option<SessionRevisionEntry> = tx
+                            .query_row(
+                                "SELECT entry_json FROM hub_epoch_sessions
+                                 WHERE producer_id = ?1 AND session_id = ?2 AND epoch = ?3 AND is_delete = 0",
+                                rusqlite::params![producer_id, &session_id, epoch],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
+                            .optional()?
+                            .flatten()
+                            .and_then(|raw| serde_json::from_str(&raw).ok())
+                            .or_else(|| {
+                                read_head_entry_in_conn(tx, producer_id, &session_id, None)
+                                    .ok()
+                                    .flatten()
+                            });
+                        let mut extents = match prev_entry.and_then(|p| p.custody) {
+                            Some(crate::custody::CustodyKind::NativeExtents { extents, .. }) => extents,
+                            _ => Vec::new(),
+                        };
+                        for ext in delta_extents {
+                            if !extents.contains(&ext) {
+                                extents.push(ext);
+                            }
+                        }
+                        let total_bytes: u64 = extents.iter().map(|e| e.length).sum();
+                        let file_name = envelope
+                            .get("file_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("session.jsonl")
+                            .to_string();
+                        let layout: Vec<String> = envelope
+                            .get("layout")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        let prefix_blake3 = envelope
+                            .get("prefix_blake3")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if let Some(last) = extents.last().cloned() {
+                            entry.payload_addr = Some(last);
+                        }
+                        entry.custody = Some(crate::custody::CustodyKind::NativeExtents {
+                            extents,
+                            total_bytes,
+                            prefix_blake3,
+                            file_name,
+                            layout,
+                        });
+                    }
+                }
                 let sort_ts_ms = match parse_rfc3339_ms(entry.updated_at.as_deref().or(entry.created_at.as_deref())) {
                     Some(ts) => ts,
                     None => existing_epoch_ts(&session_id)?.unwrap_or(i64::MIN),
@@ -829,14 +987,13 @@ pub(crate) fn fold_origin_range_in_tx(
         }
     }
 
-    if added_control_events > 0 {
-        tx.execute(
-            "UPDATE hub_frontiers
-             SET control_events = control_events + ?1
-             WHERE producer_id = ?2 AND epoch = ?3",
-            rusqlite::params![added_control_events as i64, producer_id, epoch],
-        )?;
-    }
+    tx.execute(
+        "UPDATE hub_frontiers
+         SET control_events = control_events + ?1,
+             frontier_hash = ?2
+         WHERE producer_id = ?3 AND epoch = ?4",
+        rusqlite::params![added_control_events as i64, frontier_hash, producer_id, epoch],
+    )?;
 
     Ok(touched_sessions)
 }
@@ -865,12 +1022,13 @@ pub(crate) fn resolve_producer_sessions_in_tx(
     tx: &Transaction<'_>,
     producer_id: &str,
     session_ids: &BTreeSet<String>,
-) -> Result<(), HubError> {
+) -> Result<Vec<(String, String, Option<SessionRevisionEntry>)>, HubError> {
     let mut stmt = tx.prepare(
         "SELECT epoch, is_delete, sort_ts_ms, event_seq, entry_json
          FROM hub_epoch_sessions
          WHERE producer_id = ?1 AND session_id = ?2",
     )?;
+    let mut head_deltas = Vec::new();
     for session_id in session_ids {
         let mut epoch_rows: Vec<(String, i64, i64, i64, Option<String>)> = stmt
             .query_map(rusqlite::params![producer_id, session_id], |r| {
@@ -914,13 +1072,17 @@ pub(crate) fn resolve_producer_sessions_in_tx(
             }
         }
         let winner = winner.map(|w| (w.is_delete, w.entry_json));
+        let prev_live = read_head_entry_in_conn(tx, producer_id, session_id, None)?;
 
         match winner {
-            None | Some((1, _)) => {
+            None | Some((1, _)) | Some((_, None)) => {
                 tx.execute(
                     "DELETE FROM hub_sessions WHERE producer_id = ?1 AND session_id = ?2",
                     rusqlite::params![producer_id, session_id],
                 )?;
+                if prev_live.is_some() {
+                    head_deltas.push((producer_id.to_string(), session_id.clone(), None));
+                }
             }
             Some((_, Some(entry_json))) => {
                 let entry: SessionRevisionEntry = serde_json::from_str(&entry_json)?;
@@ -952,30 +1114,33 @@ pub(crate) fn resolve_producer_sessions_in_tx(
                         meta_json,
                     ],
                 )?;
-            }
-            Some((_, None)) => {
-                tx.execute(
-                    "DELETE FROM hub_sessions WHERE producer_id = ?1 AND session_id = ?2",
-                    rusqlite::params![producer_id, session_id],
-                )?;
+                if prev_live.as_ref() != Some(&entry) {
+                    head_deltas.push((producer_id.to_string(), session_id.clone(), Some(entry)));
+                }
             }
         }
     }
-    Ok(())
+    Ok(head_deltas)
 }
 
 /// Deterministically rebuild all conflict-free frontier state (`seq <= F(p, e)`) for `producer_id`
 /// from scratch via [`fold_origin_range_in_tx`] + [`resolve_producer_sessions_in_tx`].
-///
-/// Shares the exact per-epoch causal collapse and cross-epoch `(sort_ts_ms, epoch, event_seq)`
-/// total order used by incremental `ingest_batch`, guaranteeing bit-for-bit parity under any batch
-/// arrival order or full `rebuild_from_raw`.
-pub(crate) fn recompute_producer_sessions_in_tx(tx: &Transaction<'_>, producer_id: &str) -> Result<(), HubError> {
+pub(crate) fn recompute_producer_sessions_in_tx(
+    tx: &Transaction<'_>,
+    producer_id: &str,
+) -> Result<Vec<(String, String, Option<SessionRevisionEntry>)>, HubError> {
+    let existing_live_ids: BTreeSet<String> = {
+        let mut stmt =
+            tx.prepare("SELECT session_id FROM hub_session_heads WHERE producer_id = ?1 AND gen_to IS NULL")?;
+        let rows = stmt.query_map([producer_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<BTreeSet<_>, _>>()?
+    };
+
     tx.execute("DELETE FROM hub_sessions WHERE producer_id = ?1", [producer_id])?;
     tx.execute("DELETE FROM hub_epoch_sessions WHERE producer_id = ?1", [producer_id])?;
     tx.execute("DELETE FROM hub_frontier_packs WHERE producer_id = ?1", [producer_id])?;
     tx.execute(
-        "UPDATE hub_frontiers SET control_events = 0, delta_seeded = 1 WHERE producer_id = ?1",
+        "UPDATE hub_frontiers SET control_events = 0, frontier_hash = '', delta_seeded = 1 WHERE producer_id = ?1",
         [producer_id],
     )?;
 
@@ -992,48 +1157,121 @@ pub(crate) fn recompute_producer_sessions_in_tx(tx: &Transaction<'_>, producer_i
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
-    let mut all_touched = BTreeSet::new();
+    let mut all_touched = existing_live_ids;
     for (epoch, contiguous_seq) in epochs {
         let touched = fold_origin_range_in_tx(tx, producer_id, &epoch, 0, contiguous_seq)?;
         all_touched.extend(touched);
     }
-    resolve_producer_sessions_in_tx(tx, producer_id, &all_touched)?;
-    Ok(())
+    resolve_producer_sessions_in_tx(tx, producer_id, &all_touched)
 }
 
-/// Cap unpinned rows in `hub_snapshots` to `max_unpinned` newest generations while retaining all
-/// pinned (`pinned = 1`) snapshots indefinitely.
-pub(crate) fn prune_unpinned_snapshots_in_tx(tx: &Transaction<'_>, max_unpinned: usize) -> Result<usize, HubError> {
+/// Cap unpinned rows in `hub_generations` to `max_unpinned` newest generations while retaining all
+/// pinned (`pinned = 1`) generations and every `hub_session_heads` interval covering any retained
+/// or pinned generation.
+pub(crate) fn prune_unpinned_generations_in_tx(tx: &Transaction<'_>, max_unpinned: usize) -> Result<usize, HubError> {
     let deleted = tx.execute(
-        "DELETE FROM hub_snapshots
+        "DELETE FROM hub_generations
          WHERE pinned = 0
-           AND hub_generation NOT IN (
-               SELECT hub_generation
-               FROM hub_snapshots
+           AND generation NOT IN (
+               SELECT generation
+               FROM hub_generations
                WHERE pinned = 0
-               ORDER BY hub_generation DESC
+               ORDER BY generation DESC
                LIMIT ?1
            )",
         [max_unpinned as i64],
     )?;
+    if deleted > 0 {
+        tx.execute(
+            "DELETE FROM hub_session_heads
+             WHERE gen_to IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM hub_generations g
+                   WHERE g.generation >= hub_session_heads.gen_from
+                     AND g.generation < hub_session_heads.gen_to
+               )",
+            [],
+        )?;
+    }
     Ok(deleted)
 }
 
-/// Build the current coherent [`SnapshotPublicationManifest`] from `tx` and publish a new
-/// monotonic `hub_generation` row into `hub_snapshots` iff the coherent state changed since the
-/// latest published snapshot (or if no snapshot has been published yet and the hub has frontier or
-/// quarantine state).
-pub(crate) fn maybe_publish_snapshot_in_tx(
+fn upsert_head_at_gen_in_tx(
+    tx: &Transaction<'_>,
+    gen: u64,
+    producer_id: &str,
+    session_id: &str,
+    entry_opt: Option<&SessionRevisionEntry>,
+) -> Result<(), HubError> {
+    tx.execute(
+        "UPDATE hub_session_heads
+         SET gen_to = ?1
+         WHERE producer_id = ?2 AND session_id = ?3 AND gen_to IS NULL AND gen_from < ?1",
+        rusqlite::params![gen as i64, producer_id, session_id],
+    )?;
+    // If replacing within the exact same generation (e.g. during rebuild reconciliation), delete the open row at `gen`.
+    tx.execute(
+        "DELETE FROM hub_session_heads
+         WHERE producer_id = ?1 AND session_id = ?2 AND gen_from = ?3 AND gen_to IS NULL",
+        rusqlite::params![producer_id, session_id, gen as i64],
+    )?;
+    if let Some(entry) = entry_opt {
+        let selector = entry.selector_string();
+        let payload_json = match &entry.payload_addr {
+            Some(addr) => Some(serde_json::to_string(addr)?),
+            None => None,
+        };
+        let custody_json = match &entry.custody {
+            Some(c) => Some(serde_json::to_string(c)?),
+            None => None,
+        };
+        let meta_json = serde_json::to_string(&entry.metadata)?;
+        tx.execute(
+            "INSERT INTO hub_session_heads(
+                 producer_id, session_id, selector, gen_from, gen_to,
+                 harness, revision, title, cwd, model, created_at, updated_at,
+                 message_count, epoch, event_seq, payload_addr_json, custody_json, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                entry.producer_id,
+                entry.session_id,
+                selector,
+                gen as i64,
+                entry.harness,
+                entry.revision,
+                entry.title,
+                entry.cwd,
+                entry.model,
+                entry.created_at,
+                entry.updated_at,
+                entry.message_count as i64,
+                entry.epoch,
+                entry.event_seq as i64,
+                payload_json,
+                custody_json,
+                meta_json,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Publish a new monotonic generation into `hub_generations` and update `hub_session_heads` in
+/// `O(|head_deltas| + |origins|)` — zero fleet-wide table scan, zero monolithic `manifest_json`.
+pub(crate) fn publish_generation_delta_in_tx(
     tx: &Transaction<'_>,
     now_ms: i64,
-) -> Result<Option<SnapshotPublicationManifest>, HubError> {
-    ensure_all_frontiers_seeded_in_tx(tx, now_ms)?;
+    extra_deltas: &[(String, String, Option<SessionRevisionEntry>)],
+) -> Result<Option<HubGenerationRecord>, HubError> {
+    let mut all_deltas = ensure_all_frontiers_seeded_in_tx(tx, now_ms)?;
+    all_deltas.extend(extra_deltas.iter().cloned());
 
     let mut origin_frontier: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut origin_hashes: BTreeMap<(String, String), (u64, String)> = BTreeMap::new();
     let mut total_control_events = 0u64;
     {
         let mut stmt = tx.prepare(
-            "SELECT producer_id, epoch, contiguous_seq, control_events
+            "SELECT producer_id, epoch, contiguous_seq, control_events, frontier_hash
              FROM hub_frontiers
              ORDER BY producer_id ASC, epoch ASC",
         )?;
@@ -1043,11 +1281,13 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)? as u64,
                 r.get::<_, i64>(3)? as u64,
+                r.get::<_, String>(4)?,
             ))
         })?;
         for row in rows {
-            let (p, e, seq, ctrl) = row?;
-            origin_frontier.insert((p, e), seq);
+            let (p, e, seq, ctrl, fhash) = row?;
+            origin_frontier.insert((p.clone(), e.clone()), seq);
+            origin_hashes.insert((p, e), (seq, fhash));
             total_control_events = total_control_events.saturating_add(ctrl);
         }
     }
@@ -1059,136 +1299,46 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
     )? as u64;
 
     if origin_frontier.is_empty() && quarantine_count == 0 {
-        return latest_snapshot_in_conn(tx);
-    }
-
-    // Collect every pack referenced by conflict-free frontier events (`hub_frontier_packs`) in
-    // O(|referenced_packs|) without scanning `hub_ingested_events`.
-    let mut pack_digests: BTreeMap<String, String> = BTreeMap::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT DISTINCT fp.pack_id, hp.blake3_digest
-             FROM hub_frontier_packs fp
-             JOIN hub_packs hp ON hp.pack_id = fp.pack_id
-             ORDER BY fp.pack_id ASC",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (pack_id, digest) = row?;
-            pack_digests.insert(pack_id, digest);
-        }
-    }
-
-    let mut session_revisions: BTreeMap<String, SessionRevisionEntry> = BTreeMap::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
-                    created_at, updated_at, message_count, epoch, event_seq,
-                    payload_addr_json, metadata_json
-             FROM hub_sessions
-             ORDER BY producer_id ASC, session_id ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let payload_str: Option<String> = r.get(12)?;
-            let meta_str: String = r.get(13)?;
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<String>>(7)?,
-                r.get::<_, Option<String>>(8)?,
-                r.get::<_, i64>(9)? as u64,
-                r.get::<_, String>(10)?,
-                r.get::<_, i64>(11)? as u64,
-                payload_str,
-                meta_str,
-            ))
-        })?;
-        for row in rows {
-            let (
-                producer_id,
-                session_id,
-                harness,
-                revision,
-                title,
-                cwd,
-                model,
-                created_at,
-                updated_at,
-                message_count,
-                epoch,
-                event_seq,
-                payload_str,
-                meta_str,
-            ) = row?;
-            let payload_addr = match payload_str {
-                Some(s) => Some(serde_json::from_str(&s)?),
-                None => None,
-            };
-            let metadata = serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({}));
-            let key = encode_pair_key(&producer_id, &session_id);
-            session_revisions.insert(
-                key,
-                SessionRevisionEntry {
-                    producer_id,
-                    session_id,
-                    harness,
-                    revision,
-                    title,
-                    cwd,
-                    model,
-                    created_at,
-                    updated_at,
-                    message_count,
-                    epoch,
-                    event_seq,
-                    payload_addr,
-                    metadata,
-                },
-            );
-        }
+        return latest_generation_in_conn(tx);
     }
 
     let interpretation_version = HUB_SNAPSHOT_INTERPRETATION_VERSION;
-    let view_manifest_ids = compute_view_manifest_ids(&origin_frontier, &pack_digests, &session_revisions)?;
+    let frontier_digest = compute_frontier_digest(&origin_hashes)?;
     let control_revision = (origin_frontier.len() as u64)
         .saturating_add(quarantine_count)
         .saturating_add(total_control_events);
-
-    let publication_id = compute_publication_id(
+    let publication_id = compute_generation_publication_id(
         interpretation_version,
-        &origin_frontier,
-        &pack_digests,
-        &session_revisions,
-        &view_manifest_ids,
+        &frontier_digest,
         control_revision,
         quarantine_count,
     )?;
 
-    if let Some(prev) = latest_snapshot_in_conn(tx)? {
-        if prev.publication_id == publication_id {
+    if let Some(prev) = latest_generation_in_conn(tx)? {
+        if prev.publication_id == publication_id
+            || (prev.frontier_digest == frontier_digest
+                && prev.control_revision == control_revision
+                && prev.quarantine_count == quarantine_count
+                && all_deltas.is_empty())
+        {
+            // Reconcile any deltas at `prev.generation` if rebuilding a wiped head projection.
+            for (producer_id, session_id, entry_opt) in &all_deltas {
+                upsert_head_at_gen_in_tx(tx, prev.generation, producer_id, session_id, entry_opt.as_ref())?;
+            }
             return Ok(Some(prev));
         }
     }
 
-    // If an earlier generation already published this exact content-addressed `publication_id`
-    // (for example before and after a revert/delete), disambiguate with the generation suffix so
-    // `hub_snapshots.publication_id` stays globally unique while single-pass and rebuilt latest
-    // snapshots remain identical.
     let existing_same_id: Option<i64> = tx
         .query_row(
-            "SELECT hub_generation FROM hub_snapshots WHERE publication_id = ?1",
+            "SELECT generation FROM hub_generations WHERE publication_id = ?1",
             [&publication_id],
             |r| r.get(0),
         )
         .optional()?;
 
     let next_gen: u64 = tx.query_row(
-        "SELECT COALESCE(MAX(hub_generation), 0) + 1 FROM hub_snapshots",
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM hub_generations",
         [],
         |r| r.get::<_, i64>(0),
     )? as u64;
@@ -1199,49 +1349,237 @@ pub(crate) fn maybe_publish_snapshot_in_tx(
         publication_id
     };
 
-    let manifest = SnapshotPublicationManifest {
-        hub_generation: next_gen,
-        publication_id: final_pub_id.clone(),
+    for (producer_id, session_id, entry_opt) in &all_deltas {
+        upsert_head_at_gen_in_tx(tx, next_gen, producer_id, session_id, entry_opt.as_ref())?;
+    }
+
+    let frontier_encoded: BTreeMap<String, u64> = origin_frontier
+        .iter()
+        .map(|((p, e), &seq)| (encode_pair_key(p, e), seq))
+        .collect();
+    let frontier_json = serde_json::to_string(&frontier_encoded)?;
+
+    tx.execute(
+        "INSERT INTO hub_generations(
+             generation, publication_id, published_at, frontier_digest,
+             control_revision, quarantine_count, indexed_generation, pinned, frontier_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
+        rusqlite::params![
+            next_gen as i64,
+            final_pub_id,
+            now_ms,
+            frontier_digest,
+            control_revision as i64,
+            quarantine_count as i64,
+            frontier_json,
+        ],
+    )?;
+    prune_unpinned_generations_in_tx(tx, MAX_RETAINED_HUB_SNAPSHOTS)?;
+
+    Ok(Some(HubGenerationRecord {
+        generation: next_gen,
+        publication_id: final_pub_id,
         published_at: now_ms,
-        interpretation_version,
-        origin_frontier,
-        pack_digests,
-        session_revisions,
-        view_manifest_ids,
+        frontier_digest,
         control_revision,
         quarantine_count,
-    };
-    let manifest_json = serde_json::to_string(&manifest)?;
-    tx.execute(
-        "INSERT INTO hub_snapshots(hub_generation, publication_id, published_at, manifest_json, pinned)
-         VALUES (?1, ?2, ?3, ?4, 0)",
-        rusqlite::params![next_gen as i64, final_pub_id, now_ms, manifest_json],
-    )?;
-    prune_unpinned_snapshots_in_tx(tx, MAX_RETAINED_HUB_SNAPSHOTS)?;
-
-    Ok(Some(manifest))
+        indexed_generation: 0,
+        pinned: false,
+    }))
 }
 
-pub(crate) fn latest_snapshot_in_conn(conn: &Connection) -> Result<Option<SnapshotPublicationManifest>, HubError> {
+pub(crate) fn latest_generation_in_conn(conn: &Connection) -> Result<Option<HubGenerationRecord>, HubError> {
     let has_table: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_snapshots')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_generations')",
         [],
         |r| r.get(0),
     )?;
     if !has_table {
         return Ok(None);
     }
-    let raw: Option<String> = conn
+    Ok(conn
         .query_row(
-            "SELECT manifest_json FROM hub_snapshots ORDER BY hub_generation DESC LIMIT 1",
+            "SELECT generation, publication_id, published_at, frontier_digest,
+                    control_revision, quarantine_count, indexed_generation, pinned
+             FROM hub_generations
+             ORDER BY generation DESC
+             LIMIT 1",
             [],
+            |r| {
+                Ok(HubGenerationRecord {
+                    generation: r.get::<_, i64>(0)? as u64,
+                    publication_id: r.get(1)?,
+                    published_at: r.get(2)?,
+                    frontier_digest: r.get(3)?,
+                    control_revision: r.get::<_, i64>(4)? as u64,
+                    quarantine_count: r.get::<_, i64>(5)? as u64,
+                    indexed_generation: r.get::<_, i64>(6)? as u64,
+                    pinned: r.get::<_, i64>(7)? != 0,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn map_head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRevisionEntry> {
+    let payload_str: Option<String> = r.get(12)?;
+    let custody_str: Option<String> = r.get(13)?;
+    let meta_str: String = r.get(14)?;
+    let payload_addr = payload_str.and_then(|s| serde_json::from_str(&s).ok());
+    let custody = custody_str.and_then(|s| serde_json::from_str(&s).ok());
+    let metadata = serde_json::from_str(&meta_str).unwrap_or_else(|_| json!({}));
+    Ok(SessionRevisionEntry {
+        producer_id: r.get(0)?,
+        session_id: r.get(1)?,
+        harness: r.get(2)?,
+        revision: r.get(3)?,
+        title: r.get(4)?,
+        cwd: r.get(5)?,
+        model: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+        message_count: r.get::<_, i64>(9)? as u64,
+        epoch: r.get(10)?,
+        event_seq: r.get::<_, i64>(11)? as u64,
+        payload_addr,
+        custody,
+        metadata,
+    })
+}
+
+pub(crate) fn read_head_entry_in_conn(
+    conn: &Connection,
+    producer_id: &str,
+    session_id: &str,
+    as_of_gen: Option<u64>,
+) -> Result<Option<SessionRevisionEntry>, HubError> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_session_heads')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(None);
+    }
+    match as_of_gen {
+        None => Ok(conn
+            .query_row(
+                "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                        created_at, updated_at, message_count, epoch, event_seq,
+                        payload_addr_json, custody_json, metadata_json
+                 FROM hub_session_heads
+                 WHERE producer_id = ?1 AND session_id = ?2 AND gen_to IS NULL",
+                rusqlite::params![producer_id, session_id],
+                map_head_row,
+            )
+            .optional()?),
+        Some(g) => Ok(conn
+            .query_row(
+                "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                        created_at, updated_at, message_count, epoch, event_seq,
+                        payload_addr_json, custody_json, metadata_json
+                 FROM hub_session_heads
+                 WHERE producer_id = ?1 AND session_id = ?2
+                   AND gen_from <= ?3 AND (gen_to IS NULL OR gen_to > ?3)
+                 ORDER BY gen_from DESC
+                 LIMIT 1",
+                rusqlite::params![producer_id, session_id, g as i64],
+                map_head_row,
+            )
+            .optional()?),
+    }
+}
+
+pub(crate) fn materialize_snapshot_in_conn(
+    conn: &Connection,
+    gen_rec: &HubGenerationRecord,
+) -> Result<SnapshotPublicationManifest, HubError> {
+    let frontier_raw: String = conn
+        .query_row(
+            "SELECT frontier_json FROM hub_generations WHERE generation = ?1",
+            [gen_rec.generation as i64],
             |r| r.get(0),
         )
-        .optional()?;
-    match raw {
-        Some(s) => Ok(Some(serde_json::from_str(&s)?)),
-        None => Ok(None),
+        .optional()?
+        .unwrap_or_else(|| "{}".into());
+    let encoded_frontier: BTreeMap<String, u64> = serde_json::from_str(&frontier_raw).unwrap_or_default();
+    let mut origin_frontier = BTreeMap::new();
+    for (k, seq) in encoded_frontier {
+        if let Ok(pair) = super::decode_pair_key(&k) {
+            origin_frontier.insert(pair, seq);
+        }
     }
+
+    let mut session_revisions = BTreeMap::new();
+    let mut referenced_packs = BTreeSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                    created_at, updated_at, message_count, epoch, event_seq,
+                    payload_addr_json, custody_json, metadata_json
+             FROM hub_session_heads
+             WHERE gen_from <= ?1 AND (gen_to IS NULL OR gen_to > ?1)
+             ORDER BY producer_id ASC, session_id ASC",
+        )?;
+        let rows = stmt.query_map([gen_rec.generation as i64], map_head_row)?;
+        for row in rows {
+            let entry = row?;
+            if let Some(ref addr) = entry.payload_addr {
+                referenced_packs.insert(addr.pack_id.clone());
+            }
+            if let Some(crate::custody::CustodyKind::NativeExtents { ref extents, .. }) = entry.custody {
+                for ext in extents {
+                    referenced_packs.insert(ext.pack_id.clone());
+                }
+            }
+            let key = encode_pair_key(&entry.producer_id, &entry.session_id);
+            session_revisions.insert(key, entry);
+        }
+    }
+
+    let latest_gen = latest_generation_in_conn(conn)?.map(|g| g.generation);
+    if latest_gen == Some(gen_rec.generation) {
+        let mut stmt = conn.prepare("SELECT DISTINCT pack_id FROM hub_frontier_packs")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for r in rows {
+            referenced_packs.insert(r?);
+        }
+    }
+
+    let mut pack_digests = BTreeMap::new();
+    for pack_id in referenced_packs {
+        if let Some(digest) = conn
+            .query_row(
+                "SELECT blake3_digest FROM hub_packs WHERE pack_id = ?1",
+                [&pack_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            pack_digests.insert(pack_id, digest);
+        }
+    }
+
+    let view_manifest_ids = compute_view_manifest_ids(&origin_frontier, &pack_digests, &session_revisions)?;
+    Ok(SnapshotPublicationManifest {
+        hub_generation: gen_rec.generation,
+        publication_id: gen_rec.publication_id.clone(),
+        published_at: gen_rec.published_at,
+        interpretation_version: HUB_SNAPSHOT_INTERPRETATION_VERSION,
+        origin_frontier,
+        pack_digests,
+        session_revisions,
+        view_manifest_ids,
+        control_revision: gen_rec.control_revision,
+        quarantine_count: gen_rec.quarantine_count,
+    })
+}
+
+pub(crate) fn latest_snapshot_in_conn(conn: &Connection) -> Result<Option<SnapshotPublicationManifest>, HubError> {
+    let Some(gen_rec) = latest_generation_in_conn(conn)? else {
+        return Ok(None);
+    };
+    Ok(Some(materialize_snapshot_in_conn(conn, &gen_rec)?))
 }
 
 fn missing_ranges_for(
@@ -1514,73 +1852,223 @@ fn entry_to_session_ref(entry: &SessionRevisionEntry) -> SessionRef {
 }
 
 impl HubStore {
-    /// Read-only fast lookup of the latest published `publication_id`, returning `Ok(None)` when
-    /// `state.db` does not exist or has no hub snapshots yet (never creates directories or files).
+    /// Read-only fast lookup of the latest `(generation, publication_id)`, returning `Ok(None)`
+    /// when `state.db` does not exist or has no hub generations yet.
+    pub fn latest_generation_fast(&self) -> Result<Option<(u64, String)>, HubError> {
+        Ok(self
+            .store
+            .read_in(|conn| {
+                let has_table: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_generations')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !has_table {
+                    return Ok(None);
+                }
+                Ok(conn
+                    .query_row(
+                        "SELECT generation, publication_id FROM hub_generations ORDER BY generation DESC LIMIT 1",
+                        [],
+                        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?)
+            })?
+            .flatten())
+    }
+
+    /// Read-only fast lookup of the latest published `publication_id`.
     pub fn latest_publication_id_fast(&self) -> Result<Option<String>, HubError> {
+        Ok(self.latest_generation_fast()?.map(|(_, pub_id)| pub_id))
+    }
+
+    /// Resolve an optional generation selector (`None` -> latest, `"2"` -> `generation = 2`,
+    /// `"pub-..."` -> `publication_id`).
+    pub fn resolve_generation(&self, spec: Option<&str>) -> Result<Option<HubGenerationRecord>, HubError> {
         let Some(conn) = self.store.open_readonly()? else {
-            return Ok(None);
+            return match spec {
+                Some(want) => Err(HubError::NotFound(format!("snapshot `{want}` not found"))),
+                None => Ok(None),
+            };
         };
         let has_table: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_snapshots')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_generations')",
             [],
             |r| r.get(0),
         )?;
         if !has_table {
-            return Ok(None);
+            return match spec {
+                Some(want) => Err(HubError::NotFound(format!("snapshot `{want}` not found"))),
+                None => Ok(None),
+            };
         }
-        Ok(conn
-            .query_row(
-                "SELECT publication_id FROM hub_snapshots ORDER BY hub_generation DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?)
+        match spec.map(str::trim).filter(|s| !s.is_empty()) {
+            None => latest_generation_in_conn(&conn),
+            Some(want) => {
+                let by_gen = want.parse::<u64>().ok();
+                let rec = if let Some(g) = by_gen {
+                    conn.query_row(
+                        "SELECT generation, publication_id, published_at, frontier_digest,
+                                control_revision, quarantine_count, indexed_generation, pinned
+                         FROM hub_generations
+                         WHERE generation = ?1",
+                        [g as i64],
+                        |r| {
+                            Ok(HubGenerationRecord {
+                                generation: r.get::<_, i64>(0)? as u64,
+                                publication_id: r.get(1)?,
+                                published_at: r.get(2)?,
+                                frontier_digest: r.get(3)?,
+                                control_revision: r.get::<_, i64>(4)? as u64,
+                                quarantine_count: r.get::<_, i64>(5)? as u64,
+                                indexed_generation: r.get::<_, i64>(6)? as u64,
+                                pinned: r.get::<_, i64>(7)? != 0,
+                            })
+                        },
+                    )
+                    .optional()?
+                } else {
+                    conn.query_row(
+                        "SELECT generation, publication_id, published_at, frontier_digest,
+                                control_revision, quarantine_count, indexed_generation, pinned
+                         FROM hub_generations
+                         WHERE publication_id = ?1",
+                        [want],
+                        |r| {
+                            Ok(HubGenerationRecord {
+                                generation: r.get::<_, i64>(0)? as u64,
+                                publication_id: r.get(1)?,
+                                published_at: r.get(2)?,
+                                frontier_digest: r.get(3)?,
+                                control_revision: r.get::<_, i64>(4)? as u64,
+                                quarantine_count: r.get::<_, i64>(5)? as u64,
+                                indexed_generation: r.get::<_, i64>(6)? as u64,
+                                pinned: r.get::<_, i64>(7)? != 0,
+                            })
+                        },
+                    )
+                    .optional()?
+                };
+                match rec {
+                    Some(r) => Ok(Some(r)),
+                    None => Err(HubError::NotFound(format!("snapshot `{want}` not found"))),
+                }
+            }
+        }
+    }
+
+    /// Indexed `O(log N)` point query for one session head by `selector` (or `(producer_id, session_id)`),
+    /// optionally pinned to `as_of_gen`. Safe under `--frozen`.
+    pub fn session_head_for(
+        &self,
+        selector: &str,
+        as_of_gen: Option<u64>,
+    ) -> Result<Option<SessionRevisionEntry>, HubError> {
+        Ok(self
+            .store
+            .read_in(|conn| {
+                let has_table: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_session_heads')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !has_table {
+                    return Ok(None);
+                }
+                let row = match as_of_gen {
+                    None => conn
+                        .query_row(
+                            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                                    created_at, updated_at, message_count, epoch, event_seq,
+                                    payload_addr_json, custody_json, metadata_json
+                             FROM hub_session_heads
+                             WHERE selector = ?1 AND gen_to IS NULL",
+                            [selector],
+                            map_head_row,
+                        )
+                        .optional()?,
+                    Some(g) => conn
+                        .query_row(
+                            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                                    created_at, updated_at, message_count, epoch, event_seq,
+                                    payload_addr_json, custody_json, metadata_json
+                             FROM hub_session_heads
+                             WHERE selector = ?1
+                               AND gen_from <= ?2 AND (gen_to IS NULL OR gen_to > ?2)
+                             ORDER BY gen_from DESC
+                             LIMIT 1",
+                            rusqlite::params![selector, g as i64],
+                            map_head_row,
+                        )
+                        .optional()?,
+                };
+                Ok(row)
+            })?
+            .flatten())
+    }
+
+    /// List all session heads visible at `as_of_gen` (`None` = active `gen_to IS NULL` heads).
+    /// Safe under `--frozen`.
+    pub fn heads_at_generation(&self, as_of_gen: Option<u64>) -> Result<Vec<SessionRevisionEntry>, HubError> {
+        if let Some(g) = as_of_gen {
+            let _ = self.resolve_generation(Some(&g.to_string()))?;
+        }
+        Ok(self
+            .store
+            .read_in(|conn| {
+                let has_table: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_session_heads')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !has_table {
+                    return Ok(Vec::new());
+                }
+                match as_of_gen {
+                    None => {
+                        let mut stmt = conn.prepare(
+                            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                                    created_at, updated_at, message_count, epoch, event_seq,
+                                    payload_addr_json, custody_json, metadata_json
+                             FROM hub_session_heads
+                             WHERE gen_to IS NULL
+                             ORDER BY updated_at DESC, producer_id ASC, session_id ASC",
+                        )?;
+                        let rows = stmt.query_map([], map_head_row)?;
+                        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                    }
+                    Some(g) => {
+                        let mut stmt = conn.prepare(
+                            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                                    created_at, updated_at, message_count, epoch, event_seq,
+                                    payload_addr_json, custody_json, metadata_json
+                             FROM hub_session_heads
+                             WHERE gen_from <= ?1 AND (gen_to IS NULL OR gen_to > ?1)
+                             ORDER BY updated_at DESC, producer_id ASC, session_id ASC",
+                        )?;
+                        let rows = stmt.query_map([g as i64], map_head_row)?;
+                        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                    }
+                }
+            })?
+            .unwrap_or_default())
     }
 
     /// Return the latest published [`SnapshotPublicationManifest`], if any.
     pub fn latest_snapshot(&self) -> Result<Option<SnapshotPublicationManifest>, HubError> {
+        self.get_snapshot(None)
+    }
+
+    /// Look up a [`SnapshotPublicationManifest`] by `publication_id` or numeric generation, or the
+    /// latest published generation when `id` is `None`.
+    pub fn get_snapshot(&self, id: Option<&str>) -> Result<Option<SnapshotPublicationManifest>, HubError> {
+        let Some(gen_rec) = self.resolve_generation(id)? else {
+            return Ok(None);
+        };
         let Some(conn) = self.store.open_readonly()? else {
             return Ok(None);
         };
-        latest_snapshot_in_conn(&conn)
-    }
-
-    /// Look up a [`SnapshotPublicationManifest`] by `publication_id`, or the latest published
-    /// snapshot when `id` is `None`.
-    pub fn get_snapshot(&self, id: Option<&str>) -> Result<Option<SnapshotPublicationManifest>, HubError> {
-        let Some(conn) = self.store.open_readonly()? else {
-            return match id {
-                Some(want) => Err(HubError::NotFound(format!("snapshot `{want}` not found"))),
-                None => Ok(None),
-            };
-        };
-        let has_table: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_snapshots')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !has_table {
-            return match id {
-                Some(want) => Err(HubError::NotFound(format!("snapshot `{want}` not found"))),
-                None => Ok(None),
-            };
-        }
-        match id {
-            Some(want) => {
-                let raw: Option<String> = conn
-                    .query_row(
-                        "SELECT manifest_json FROM hub_snapshots WHERE publication_id = ?1",
-                        [want],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let Some(json_str) = raw else {
-                    return Err(HubError::NotFound(format!("snapshot `{want}` not found")));
-                };
-                Ok(Some(serde_json::from_str(&json_str)?))
-            }
-            None => latest_snapshot_in_conn(&conn),
-        }
+        Ok(Some(materialize_snapshot_in_conn(&conn, &gen_rec)?))
     }
 
     /// Build the `GET /api/hub/status` payload.
@@ -1921,6 +2409,7 @@ impl HubStore {
             });
         }
 
+        let mut head_deltas = Vec::new();
         match resolution {
             QuarantineResolution::AcceptExisting => {
                 tx.execute(
@@ -1932,7 +2421,7 @@ impl HubStore {
                 let (fold_after, new_frontier) = advance_frontier_in_tx(&tx, &producer_id, &epoch, now_ms)?;
                 let touched = fold_origin_range_in_tx(&tx, &producer_id, &epoch, fold_after, new_frontier)?;
                 if !touched.is_empty() {
-                    resolve_producer_sessions_in_tx(&tx, &producer_id, &touched)?;
+                    head_deltas.extend(resolve_producer_sessions_in_tx(&tx, &producer_id, &touched)?);
                 }
             }
             QuarantineResolution::AcceptIncoming => {
@@ -2014,11 +2503,15 @@ impl HubStore {
                     rusqlite::params![quarantine_id, now_ms, resolution.as_str()],
                 )?;
                 recompute_frontier_in_tx(&tx, &producer_id, &epoch, now_ms)?;
-                recompute_producer_sessions_in_tx(&tx, &producer_id)?;
+                head_deltas.extend(recompute_producer_sessions_in_tx(&tx, &producer_id)?);
             }
         }
 
-        let snapshot = maybe_publish_snapshot_in_tx(&tx, now_ms)?;
+        let gen_rec = publish_generation_delta_in_tx(&tx, now_ms, &head_deltas)?;
+        let snapshot = match gen_rec {
+            Some(ref g) => Some(materialize_snapshot_in_conn(&tx, g)?),
+            None => None,
+        };
         tx.commit()?;
         Ok(QuarantineResolveResponse {
             quarantine_id,
@@ -2027,12 +2520,12 @@ impl HubStore {
         })
     }
 
-    /// Pin or unpin a published snapshot (`publication_id`) so retention pruning never evicts it.
+    /// Pin or unpin a published generation (`publication_id`) so retention pruning never evicts it.
     pub fn set_snapshot_pinned(&self, publication_id: &str, pinned: bool) -> Result<bool, HubError> {
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
-            "UPDATE hub_snapshots SET pinned = ?1 WHERE publication_id = ?2",
+            "UPDATE hub_generations SET pinned = ?1 WHERE publication_id = ?2",
             rusqlite::params![i64::from(pinned), publication_id],
         )?;
         tx.commit()?;
@@ -2040,9 +2533,7 @@ impl HubStore {
     }
 
     /// Wipe mutable hub projections (`hub_frontiers`, `hub_sessions`, `hub_epoch_sessions`,
-    /// `hub_frontier_packs`) while preserving raw inputs and published snapshot pins. Publications
-    /// retain the durable generation high-water mark; rebuilding a cache must never revoke a
-    /// client's pinned snapshot.
+    /// `hub_frontier_packs`) while preserving raw inputs and published generation intervals.
     pub fn wipe_derived_views(&self) -> Result<(), HubError> {
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2057,15 +2548,13 @@ impl HubStore {
     }
 
     /// Reconstruct `hub_packs` (reconciling `packs/` on disk), `hub_frontiers`, `hub_sessions`,
-    /// and the latest [`SnapshotPublicationManifest`] strictly from raw `hub_ingested_events`,
-    /// `hub_quarantine`, and mirrored `packs/`.
+    /// `hub_session_heads`, and the latest [`SnapshotPublicationManifest`] strictly from raw
+    /// `hub_ingested_events`, `hub_quarantine`, and mirrored `packs/`.
     pub fn rebuild_from_raw(&self) -> Result<Option<SnapshotPublicationManifest>, HubError> {
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_ms = Utc::now().timestamp_millis();
 
-        // Reconcile `hub_packs` from sealed `.pack.idx.json` + `.pack.zst` files in `self.packs_dir`
-        // so rebuild works even if `hub_packs` rows were cleared alongside derived tables.
         if self.packs_dir.is_dir() {
             for entry in std::fs::read_dir(&self.packs_dir)? {
                 let entry = entry?;
@@ -2122,8 +2611,6 @@ impl HubStore {
             }
         }
 
-        // Published manifests are client pins and the durable generation high-water mark.
-        // Rebuild the mutable projections while retaining those immutable publications.
         tx.execute_batch(
             "DELETE FROM hub_sessions;
              DELETE FROM hub_epoch_sessions;
@@ -2147,6 +2634,7 @@ impl HubStore {
             recompute_frontier_in_tx(&tx, producer_id, epoch, now_ms)?;
             producers.insert(producer_id.clone());
         }
+        let mut head_deltas = Vec::new();
         for producer_id in &producers {
             tx.execute(
                 "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)
@@ -2154,10 +2642,14 @@ impl HubStore {
                  ON CONFLICT(producer_id) DO NOTHING",
                 rusqlite::params![producer_id, now_ms],
             )?;
-            recompute_producer_sessions_in_tx(&tx, producer_id)?;
+            head_deltas.extend(recompute_producer_sessions_in_tx(&tx, producer_id)?);
         }
 
-        let rebuilt = maybe_publish_snapshot_in_tx(&tx, now_ms)?;
+        let gen_rec = publish_generation_delta_in_tx(&tx, now_ms, &head_deltas)?;
+        let rebuilt = match gen_rec {
+            Some(ref g) => Some(materialize_snapshot_in_conn(&tx, g)?),
+            None => None,
+        };
         tx.commit()?;
         Ok(rebuilt)
     }

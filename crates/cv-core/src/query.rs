@@ -1329,5 +1329,101 @@ pub use facts::{
     filter_refs, filter_refs_limited, matches_full, matches_streamed, QueryReducer, SessionFacts, TextSets,
 };
 
+/// Evaluate `sq` against `r` and optional hydrated `session`, returning `false` on `Unknown` or error.
+pub fn matches_session_or_ref(sq: &SessionQuery, r: &crate::SessionRef, session: Option<&crate::Session>) -> bool {
+    struct SimpleExt<'a>(Option<&'a crate::Session>);
+    impl ExtFacts for SimpleExt<'_> {
+        fn model(&self, needle: &str, exact: bool) -> anyhow::Result<Tri> {
+            let Some(s) = self.0 else {
+                return Ok(Tri::Unknown);
+            };
+            if let Some(ref m) = s.model {
+                let lower = m.to_lowercase();
+                if if exact { lower == needle } else { lower.contains(needle) } {
+                    return Ok(Tri::True);
+                }
+            }
+            let hit = s.messages.iter().any(|msg| {
+                msg.model.as_deref().is_some_and(|m| {
+                    let lower = m.to_lowercase();
+                    if exact {
+                        lower == needle
+                    } else {
+                        lower.contains(needle)
+                    }
+                })
+            });
+            Ok(Tri::of(hit))
+        }
+
+        fn text(&self, needle: &str) -> anyhow::Result<Tri> {
+            let Some(s) = self.0 else {
+                return Ok(Tri::Unknown);
+            };
+            if s.title.as_deref().is_some_and(|t| t.to_lowercase().contains(needle)) {
+                return Ok(Tri::True);
+            }
+            for msg in &s.messages {
+                for block in &msg.content {
+                    match block {
+                        crate::Block::Text { text, .. } | crate::Block::Thinking { text, .. } => {
+                            if text.to_lowercase().contains(needle) {
+                                return Ok(Tri::True);
+                            }
+                        }
+                        crate::Block::ToolResult { content, .. } => {
+                            if content.to_lowercase().contains(needle) {
+                                return Ok(Tri::True);
+                            }
+                        }
+                        crate::Block::ToolUse { name, input, .. } => {
+                            if name.to_lowercase().contains(needle) {
+                                return Ok(Tri::True);
+                            }
+                            if let Ok(raw) = serde_json::to_string(input) {
+                                if raw.to_lowercase().contains(needle) {
+                                    return Ok(Tri::True);
+                                }
+                            }
+                        }
+                        crate::Block::Image { .. } | crate::Block::File { .. } | crate::Block::Opaque { .. } => {}
+                    }
+                }
+            }
+            Ok(Tri::False)
+        }
+
+        fn tool(&self, name: &str) -> anyhow::Result<Tri> {
+            let Some(s) = self.0 else {
+                return Ok(Tri::Unknown);
+            };
+            let hit = s.messages.iter().any(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, crate::Block::ToolUse { name: n, .. } if n.to_lowercase().contains(name)))
+            });
+            Ok(Tri::of(hit))
+        }
+
+        fn exact(&self, field: FieldId, needle: &str) -> anyhow::Result<Tri> {
+            if field == FieldId::Tool {
+                let Some(s) = self.0 else {
+                    return Ok(Tri::Unknown);
+                };
+                let hit = s.messages.iter().any(|m| {
+                    m.content
+                        .iter()
+                        .any(|b| matches!(b, crate::Block::ToolUse { name: n, .. } if n.to_lowercase() == needle))
+                });
+                return Ok(Tri::of(hit));
+            }
+            Ok(Tri::False)
+        }
+    }
+
+    let ext = SimpleExt(session);
+    sq.matches(&Facts { r, session, ext: &ext }).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests;

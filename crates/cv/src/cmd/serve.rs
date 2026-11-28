@@ -46,7 +46,9 @@ impl ServeOpts {
     }
 }
 
-/// Fleet Hub routes answered when `hub` mode is enabled (`--hub` / `CV_SERVE_HUB=1`).
+/// Fleet Hub control-plane routes answered when `hub` mode is enabled (`--hub` / `CV_SERVE_HUB=1`).
+/// All session listing, hydration, search, events, and touched queries route through the one
+/// unified read API (`/api/{sessions,session,search,touched,...}`).
 #[allow(dead_code)]
 pub(crate) const HUB_ROUTES: &[&str] = &[
     "POST /api/hub/producers",
@@ -58,9 +60,9 @@ pub(crate) const HUB_ROUTES: &[&str] = &[
     "GET /api/hub/quarantine",
     "POST /api/hub/quarantine",
     "GET /api/hub/snapshot",
-    "GET /api/hub/sessions",
-    "GET /api/hub/session/{producer}/{id}",
 ];
+
+type ResidentPreparedIndex = std::sync::RwLock<Option<(FileStamp, std::sync::Arc<cv_search::PreparedIndex>)>>;
 
 /// What one request handler needs to know beyond the request itself.
 struct Ctx {
@@ -74,6 +76,7 @@ struct Ctx {
     /// Whether Fleet Hub endpoints (`/api/hub/*`) are enabled on this server instance.
     hub: bool,
     searcher: cv_search::Searcher,
+    prepared_index: ResidentPreparedIndex,
     stream: std::sync::Arc<StreamHub>,
 }
 
@@ -491,6 +494,7 @@ fn run(
         default_who: who,
         hub,
         searcher: cv_search::Searcher,
+        prepared_index: std::sync::RwLock::new(None),
         stream: std::sync::Arc::new(StreamHub::new()),
     };
     crate::http::serve(listener, limits, move |request| handle(request, &ctx))
@@ -898,7 +902,16 @@ fn handle(request: &mut Request<'_>, ctx: &Ctx) {
                 }
                 Ok(None) => {}
             }
-            let (status, body, extra) = route(false, &parts, query, &q, &ctx.searcher);
+            let (status, body, mut extra) = route(false, &parts, query, &q, &ctx.searcher, &ctx.prepared_index);
+            if status < 400 && !extra.iter().any(|(k, _)| *k == "X-Cv-Snapshot") {
+                let as_of_spec = q.get("as_of").or_else(|| q.get("snapshot"));
+                if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+                    if let Ok(Some(gen_rec)) = hub.resolve_generation(as_of_spec.as_deref()) {
+                        extra.push(("X-Cv-Snapshot", header_safe(&gen_rec.publication_id)));
+                        extra.push(("X-Cv-Hub-Generation", gen_rec.generation.to_string()));
+                    }
+                }
+            }
             request.respond(json_response(status, &body, cors, &extra));
         }
     }
@@ -1087,9 +1100,9 @@ type Reply = (u16, Value, Vec<(&'static str, String)>);
 cv_core::routes! {
     pub(crate) const ROUTES;
     /// Route a decoded read path + raw query string. Never panics.
-    fn route(_post, parts, query: &str, params: &Query, searcher: &cv_search::Searcher) -> Reply {
+    fn route(_post, parts, query: &str, params: &Query, searcher: &cv_search::Searcher, prepared_index: &ResidentPreparedIndex) -> Reply {
         // Routes that carry extra response headers answer here; everything else is header-free.
-        GET ["api", "search"] => search(params, searcher),
+        GET ["api", "search"] => search(params, searcher, prepared_index),
         GET ["api", "stats"] => {
             let (status, body) = stats(params);
             (status, body, Vec::new())
@@ -1165,7 +1178,30 @@ fn stats(params: &Query) -> (u16, Value) {
 /// `live`), with a human sentence in `X-Cv-Search-Note` whenever the answer may be
 /// partial (a stale index, a live scan, a truncation). Both headers are CORS-exposed. The body
 /// stays exactly the CLI's array.
-fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
+fn obtain_prepared_index(
+    cache: &ResidentPreparedIndex,
+    dir: &Path,
+) -> Result<std::sync::Arc<cv_search::PreparedIndex>> {
+    let stamp = file_stamp(&dir.join("meta.json"));
+    if let Ok(guard) = cache.read() {
+        if let Some((cached_stamp, ref reader)) = *guard {
+            if cached_stamp == stamp {
+                return Ok(reader.clone());
+            }
+        }
+    }
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_stamp, ref reader)) = *guard {
+        if cached_stamp == stamp {
+            return Ok(reader.clone());
+        }
+    }
+    let opened = std::sync::Arc::new(cv_search::PreparedIndex::open(dir)?);
+    *guard = Some((stamp, opened.clone()));
+    Ok(opened)
+}
+
+fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &ResidentPreparedIndex) -> Reply {
     let bad = |status, message: &str| {
         let (status, body) = err(status, message);
         (status, body, Vec::new())
@@ -1220,8 +1256,19 @@ fn search(params: &Query, searcher: &cv_search::Searcher) -> Reply {
         Ok(bytes) => bytes.map(|b| b as u64),
         Err(error) => return bad(400, &error),
     };
+    let index_only = flag("index_only") || cv_core::env::frozen() || params.get("as_of").is_some();
+    let tantivy_dir = cv_search::default_tantivy_dir();
     let result = if exact {
         searcher.search_exact(&q, filter, false, limit, live_bytes)
+    } else if !scan && index_only && tantivy_dir.join("meta.json").is_file() {
+        obtain_prepared_index(prepared_index, &tantivy_dir)
+            .and_then(|reader| reader.search(&q, limit, filter, None))
+            .map(|ans| cv_search::Found {
+                hits: ans.hits,
+                source: Source::Index,
+                notes: Vec::new(),
+                total: ans.total,
+            })
     } else {
         searcher.search(&q, filter, limit, source, live_bytes)
     };
@@ -1408,16 +1455,17 @@ fn err(status: u16, msg: &str) -> (u16, Value) {
     (status, json!({ "error": msg }))
 }
 
-fn latest_hub_snapshot_id() -> Option<String> {
+fn latest_hub_generation_header() -> Option<(u64, String)> {
     cv_core::state::hub::HubStore::default_hub()
         .ok()
-        .and_then(|hub| hub.latest_publication_id_fast().ok().flatten())
+        .and_then(|hub| hub.latest_generation_fast().ok().flatten())
 }
 
 fn stamp_latest_snapshot(response: &mut Response<'_>, already_stamped: bool) {
     if !already_stamped {
-        if let Some(pub_id) = latest_hub_snapshot_id() {
+        if let Some((gen, pub_id)) = latest_hub_generation_header() {
             response.add_header("X-Cv-Snapshot", &header_safe(&pub_id));
+            response.add_header("X-Cv-Hub-Generation", &gen.to_string());
         }
     }
 }
@@ -1928,9 +1976,11 @@ fn handle_hub_write(
                 Ok(resp) => {
                     ctx.stream.bump(&["hub", "sessions"]);
                     let mut extra = vec![("Cache-Control", "no-store".to_string())];
-                    if let Some(ref snap) = resp.snapshot {
-                        extra.push(("X-Cv-Snapshot", header_safe(&snap.publication_id)));
-                        extra.push(("X-Cv-Hub-Generation", snap.hub_generation.to_string()));
+                    if let Some(ref pub_id) = resp.publication_id {
+                        extra.push(("X-Cv-Snapshot", header_safe(pub_id)));
+                    }
+                    if let Some(gen) = resp.hub_generation {
+                        extra.push(("X-Cv-Hub-Generation", gen.to_string()));
                     }
                     let out = serde_json::to_value(resp).unwrap_or_else(|_| json!({"error": "serialize failed"}));
                     json_response(200, &out, cors, &extra)
@@ -1992,61 +2042,6 @@ fn handle_hub_get(parts: &[&str], q: &Query) -> Reply {
                         Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
                     }
                 }
-                Err(e) => hub_error_reply(e),
-            }
-        }
-        ["api", "hub", "sessions"] => {
-            let offset = match q.unsigned("offset") {
-                Ok(v) => v.unwrap_or(0),
-                Err(e) => return (400, json!({"error": e}), Vec::new()),
-            };
-            let limit = match q.unsigned("limit") {
-                Ok(v) => v,
-                Err(e) => return (400, json!({"error": e}), Vec::new()),
-            };
-            let snapshot = q.get("snapshot");
-            let producer = q.get("producer");
-            let harness = q.get("harness");
-            let cwd = q.get("cwd");
-            let query_str = q.get("q");
-
-            match hub.query_sessions(
-                snapshot.as_deref(),
-                producer.as_deref(),
-                harness.as_deref(),
-                cwd.as_deref(),
-                query_str.as_deref(),
-                offset,
-                limit,
-            ) {
-                Ok(page) => {
-                    let mut extra = vec![("Cache-Control", "no-store".to_string())];
-                    if let Some(ref sid) = page.snapshot_id {
-                        extra.push(("X-Cv-Snapshot", header_safe(sid)));
-                        extra.push(("X-Cv-Hub-Generation", page.hub_generation.to_string()));
-                    }
-                    match serde_json::to_value(page) {
-                        Ok(val) => (200, val, extra),
-                        Err(e) => (500, json!({"error": e.to_string()}), Vec::new()),
-                    }
-                }
-                Err(e) => hub_error_reply(e),
-            }
-        }
-        ["api", "hub", "session", producer_id, session_id] => {
-            let snapshot = q.get("snapshot");
-            match hub.hydrate_session(producer_id, session_id, snapshot.as_deref()) {
-                Ok((manifest, hydrated)) => match hydrated.to_json() {
-                    Ok(val) => {
-                        let extra = vec![
-                            ("Cache-Control", "no-store".to_string()),
-                            ("X-Cv-Snapshot", header_safe(&manifest.publication_id)),
-                            ("X-Cv-Hub-Generation", manifest.hub_generation.to_string()),
-                        ];
-                        (200, val, extra)
-                    }
-                    Err(e) => hub_error_reply(e),
-                },
                 Err(e) => hub_error_reply(e),
             }
         }
@@ -2384,11 +2379,17 @@ impl StreamHub {
             kinds.push("watch");
         }
         if next.hub_state != guard.stamp.hub_state {
+            let wal_len = next.hub_state.1.len;
             guard.stamp.hub_state = next.hub_state;
             kinds.push("hub");
             // Hook lane runs and stops live in state.db: the lane witnesses may have moved.
             if !kinds.contains(&"lanes") {
                 kinds.push("lanes");
+            }
+            if wal_len >= (16 << 20) {
+                if let Some(home) = cv_core::env::Env::current().cv_home() {
+                    let _ = cv_core::state::StateStore::at_dir(home).checkpoint_wal(false);
+                }
             }
         }
         if !kinds.is_empty() {
@@ -2733,6 +2734,7 @@ mod search_service_tests {
             default_who: None,
             hub: true,
             searcher: cv_search::Searcher,
+            prepared_index: std::sync::RwLock::new(None),
             stream: std::sync::Arc::new(StreamHub::new()),
         };
         let request = |method: &str, path: &str, headers: &[(&str, &str)]| {
@@ -2786,8 +2788,13 @@ mod search_service_tests {
     #[test]
     fn search_rejects_cli_conflicts_before_reading_sources() {
         let _world = crate::test_world("search-conflicts");
+        let prepared = std::sync::RwLock::new(None);
         for flags in ["scan=1&kind=context", "scan=1&kind=all", "scan=1&kind=exchange"] {
-            let (status, body, _) = search(&Query::parse(&format!("q=needle&{flags}")), &cv_search::Searcher);
+            let (status, body, _) = search(
+                &Query::parse(&format!("q=needle&{flags}")),
+                &cv_search::Searcher,
+                &prepared,
+            );
             assert_eq!(status, 400, "{flags}: {body}");
         }
     }

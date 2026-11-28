@@ -11,7 +11,7 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 6;
+pub const STATE_SCHEMA_VERSION: i64 = 7;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -21,6 +21,7 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
     (4, "v4_hook_observations", MIGRATION_V4),
     (5, "v5_file_observations", MIGRATION_V5),
     (6, "v6_hub_producer_credentials", MIGRATION_V6),
+    (7, "v7_hub_generational_mvcc", MIGRATION_V7),
 ];
 
 const MIGRATION_V1: &str = r#"
@@ -380,6 +381,77 @@ ALTER TABLE hub_quarantine ADD COLUMN resolved_at INTEGER;
 ALTER TABLE hub_quarantine ADD COLUMN resolution TEXT;
 "#;
 
+const MIGRATION_V7: &str = r#"
+ALTER TABLE hub_frontiers ADD COLUMN frontier_hash TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS hub_generations (
+    generation         INTEGER PRIMARY KEY,
+    publication_id     TEXT NOT NULL UNIQUE,
+    published_at       INTEGER NOT NULL,
+    frontier_digest    TEXT NOT NULL,
+    control_revision   INTEGER NOT NULL,
+    quarantine_count   INTEGER NOT NULL,
+    indexed_generation INTEGER NOT NULL DEFAULT 0,
+    pinned             INTEGER NOT NULL DEFAULT 0,
+    frontier_json      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_hub_generations_pub_id
+    ON hub_generations(publication_id);
+
+CREATE TABLE IF NOT EXISTS hub_session_heads (
+    producer_id       TEXT NOT NULL,
+    session_id        TEXT NOT NULL,
+    selector          TEXT NOT NULL,
+    gen_from          INTEGER NOT NULL,
+    gen_to            INTEGER,
+    harness           TEXT NOT NULL,
+    revision          TEXT NOT NULL,
+    title             TEXT,
+    cwd               TEXT,
+    model             TEXT,
+    created_at        TEXT,
+    updated_at        TEXT,
+    message_count     INTEGER NOT NULL,
+    epoch             TEXT NOT NULL,
+    event_seq         INTEGER NOT NULL,
+    payload_addr_json TEXT,
+    custody_json      TEXT,
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(producer_id, session_id, gen_from)
+);
+CREATE INDEX IF NOT EXISTS idx_hub_session_heads_live_updated
+    ON hub_session_heads(gen_to, updated_at DESC, producer_id ASC, session_id ASC);
+CREATE INDEX IF NOT EXISTS idx_hub_session_heads_selector
+    ON hub_session_heads(selector, gen_to);
+
+INSERT OR IGNORE INTO hub_generations(
+    generation, publication_id, published_at, frontier_digest,
+    control_revision, quarantine_count, indexed_generation, pinned, frontier_json
+)
+SELECT hub_generation, publication_id, published_at, '', 0, 0, 0, pinned, '{}'
+FROM hub_snapshots;
+
+INSERT OR IGNORE INTO hub_session_heads(
+    producer_id, session_id, selector, gen_from, gen_to,
+    harness, revision, title, cwd, model, created_at, updated_at,
+    message_count, epoch, event_seq, payload_addr_json, custody_json, metadata_json
+)
+SELECT
+    producer_id,
+    session_id,
+    CASE
+        WHEN instr(session_id, ':') > 0 THEN session_id
+        ELSE producer_id || ':' || harness || ':' || session_id
+    END,
+    COALESCE((SELECT MAX(generation) FROM hub_generations), 1),
+    NULL,
+    harness, revision, title, cwd, model, created_at, updated_at,
+    message_count, epoch, event_seq, payload_addr_json, NULL, metadata_json
+FROM hub_sessions;
+
+DROP TABLE IF EXISTS hub_snapshots;
+"#;
+
 /// Tables that converge by presence rather than by `user_version`: every writable open creates
 /// what is missing, whatever version numbering other migrations use, so a store at any version
 /// (including one whose numbers another branch of migrations claimed) gains them exactly once.
@@ -408,6 +480,44 @@ CREATE TABLE IF NOT EXISTS hub_producer_credentials (
     created_at   INTEGER NOT NULL,
     revoked_at   INTEGER
 );
+CREATE TABLE IF NOT EXISTS hub_generations (
+    generation         INTEGER PRIMARY KEY,
+    publication_id     TEXT NOT NULL UNIQUE,
+    published_at       INTEGER NOT NULL,
+    frontier_digest    TEXT NOT NULL,
+    control_revision   INTEGER NOT NULL,
+    quarantine_count   INTEGER NOT NULL,
+    indexed_generation INTEGER NOT NULL DEFAULT 0,
+    pinned             INTEGER NOT NULL DEFAULT 0,
+    frontier_json      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_hub_generations_pub_id
+    ON hub_generations(publication_id);
+CREATE TABLE IF NOT EXISTS hub_session_heads (
+    producer_id       TEXT NOT NULL,
+    session_id        TEXT NOT NULL,
+    selector          TEXT NOT NULL,
+    gen_from          INTEGER NOT NULL,
+    gen_to            INTEGER,
+    harness           TEXT NOT NULL,
+    revision          TEXT NOT NULL,
+    title             TEXT,
+    cwd               TEXT,
+    model             TEXT,
+    created_at        TEXT,
+    updated_at        TEXT,
+    message_count     INTEGER NOT NULL,
+    epoch             TEXT NOT NULL,
+    event_seq         INTEGER NOT NULL,
+    payload_addr_json TEXT,
+    custody_json      TEXT,
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(producer_id, session_id, gen_from)
+);
+CREATE INDEX IF NOT EXISTS idx_hub_session_heads_live_updated
+    ON hub_session_heads(gen_to, updated_at DESC, producer_id ASC, session_id ASC);
+CREATE INDEX IF NOT EXISTS idx_hub_session_heads_selector
+    ON hub_session_heads(selector, gen_to);
 "#;
 
 /// Read `PRAGMA user_version` from `conn`.

@@ -256,6 +256,24 @@ impl StateStore {
         Ok(conn)
     }
 
+    /// Run an opportunistic SQLite WAL checkpoint (`PASSIVE` when `truncate == false`,
+    /// `TRUNCATE` when `truncate == true`). No-ops cleanly under `--frozen` or when `state.db`
+    /// has not been created yet.
+    pub fn checkpoint_wal(&self, truncate: bool) -> Result<Option<(i64, i64)>, StateError> {
+        if crate::env::frozen() || !self.db_path.is_file() {
+            return Ok(None);
+        }
+        let conn = self.open_writable()?;
+        let sql = if truncate {
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        } else {
+            "PRAGMA wal_checkpoint(PASSIVE)"
+        };
+        let (_busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(Some((log_frames, checkpointed_frames)))
+    }
+
     /// Open a read-only SQLite connection without migrations or application writes.
     /// Frozen reads and read-only fallbacks use private temporary snapshots, leaving source
     /// files untouched; ordinary WAL readers may update SQLite coordination sidecars.

@@ -1300,7 +1300,8 @@ fn hub_v7_epoch_supersedes_pre_upgrade_v4_epoch_on_untimestamped_delete_in_any_a
 
         hub.ingest_batch(&IngestBatchRequest { events: first_batch }).unwrap();
         let resp = hub.ingest_batch(&IngestBatchRequest { events: second_batch }).unwrap();
-        let snap = resp.snapshot.expect("snapshot published");
+        assert!(resp.publication_id.is_some());
+        let snap = hub.latest_snapshot().unwrap().expect("snapshot published");
         assert!(
             !snap.session_revisions.contains_key("prod-up:sess-upgraded"),
             "0.19.1 UUIDv7 delete must supersede 0.19.0 UUIDv4 upsert (v4_first={v4_first}): {:?}",

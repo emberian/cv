@@ -1766,6 +1766,31 @@ fn read_custody_heads_in(conn: &rusqlite::Connection) -> Result<Option<Vec<Value
         .map(Some)
 }
 
+impl StateStore {
+    /// Point-query a single session's local `custody_heads` JSON entry by `selector` in `O(log N)`
+    /// without scanning other sessions. Returns `Ok(None)` when `state.db` is absent, `custody_heads`
+    /// is not fresh (`Ok(Some(None))` when fresh and absent), or under `--frozen` on an empty home.
+    pub(crate) fn custody_head_point(&self, selector: &str) -> Result<Option<Option<Value>>, StateError> {
+        self.read_in(|conn| {
+            if !custody_heads_fresh(conn)? {
+                return Ok(None);
+            }
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT entry_json FROM custody_heads WHERE selector = ?1",
+                    [selector],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match raw {
+                Some(s) => Ok(Some(Some(serde_json::from_str(&s)?))),
+                None => Ok(Some(None)),
+            }
+        })
+        .map(|opt| opt.flatten())
+    }
+}
+
 /// Whether `custody_heads` exists and folds exactly the manifests `pack_manifests` holds now (its
 /// watermark's count and newest position). False on a store without the tables.
 pub(super) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {

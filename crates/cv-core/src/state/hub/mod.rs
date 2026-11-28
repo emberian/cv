@@ -21,9 +21,9 @@ pub use shipper::{
     HttpClient, RawHttpResponse, ShipConfig, ShipReport, Shipper, TransportDeliveryAck,
 };
 pub use snapshot::{
-    FrontierStatus, HubSessionRow, HubSessionsPage, HubSnapshotResponse, HubStatusResponse, HydratedHubSession,
-    QuarantineRecord, QuarantineResolution, QuarantineResolveResponse, QuarantineSummary, SessionRevisionEntry,
-    SnapshotPublicationManifest, HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
+    FrontierStatus, HubGenerationRecord, HubSessionRow, HubSessionsPage, HubSnapshotResponse, HubStatusResponse,
+    HydratedHubSession, QuarantineRecord, QuarantineResolution, QuarantineResolveResponse, QuarantineSummary,
+    SessionRevisionEntry, SnapshotPublicationManifest, HUB_SNAPSHOT_INTERPRETATION_VERSION, MAX_RETAINED_HUB_SNAPSHOTS,
 };
 
 /// Metadata for a per-producer capability token stored in `hub_producer_credentials`.

@@ -3,8 +3,8 @@
 //! with gap-free contiguous `(producer, epoch)` frontiers, and loud `409 Conflict` quarantine.
 
 use super::snapshot::{
-    advance_frontier_in_tx, fold_origin_range_in_tx, latest_snapshot_in_conn, maybe_publish_snapshot_in_tx,
-    resolve_producer_sessions_in_tx, SnapshotPublicationManifest,
+    advance_frontier_in_tx, fold_origin_range_in_tx, latest_generation_in_conn, publish_generation_delta_in_tx,
+    resolve_producer_sessions_in_tx,
 };
 use super::{canonical_json_bytes, compute_event_digest, EventId, HubError, HubStore, Producer};
 use crate::packs::{
@@ -173,17 +173,22 @@ pub struct HubCustodyWatermark {
     pub acked_at: i64,
 }
 
-/// Response payload for `POST /api/hub/ingest_batch`.
+/// Compact acknowledgement payload for `POST /api/hub/ingest_batch`.
+///
+/// Deliberately omits the fleet manifest and cross-producer frontiers so response size stays
+/// `O(|touched_origins_in_batch|)` (`~128 B` typical) regardless of fleet session count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestBatchResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_id: Option<String>,
     pub accepted_count: usize,
     pub replayed_count: usize,
     pub durable_fsynced: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub verified_pack_digests: BTreeMap<String, String>,
     pub custody_acks: Vec<HubCustodyWatermark>,
-    #[serde(with = "super::origin_frontier_serde")]
-    pub origin_frontier: BTreeMap<(String, String), u64>,
-    pub snapshot: Option<SnapshotPublicationManifest>,
 }
 
 fn canonical_record_signature(
@@ -763,17 +768,16 @@ impl HubStore {
         }
 
         if req.events.is_empty() {
-            let origin_frontier = current_origin_frontier_in_tx(&tx)?;
-            let snapshot = latest_snapshot_in_conn(&tx)?;
+            let latest = latest_generation_in_conn(&tx)?;
             tx.commit()?;
             return Ok(IngestBatchResponse {
+                hub_generation: latest.as_ref().map(|g| g.generation),
+                publication_id: latest.map(|g| g.publication_id),
                 accepted_count: 0,
                 replayed_count: 0,
                 durable_fsynced: true,
                 verified_pack_digests,
                 custody_acks: Vec::new(),
-                origin_frontier,
-                snapshot,
             });
         }
 
@@ -912,7 +916,7 @@ impl HubStore {
             )?;
         }
 
-        super::snapshot::ensure_all_frontiers_seeded_in_tx(&tx, now_ms)?;
+        let mut head_deltas = super::snapshot::ensure_all_frontiers_seeded_in_tx(&tx, now_ms)?;
 
         let mut touched_sessions_by_producer: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (producer_id, epoch) in &touched_origins {
@@ -926,11 +930,10 @@ impl HubStore {
             }
         }
         for (producer_id, session_ids) in &touched_sessions_by_producer {
-            resolve_producer_sessions_in_tx(&tx, producer_id, session_ids)?;
+            head_deltas.extend(resolve_producer_sessions_in_tx(&tx, producer_id, session_ids)?);
         }
 
-        let snapshot = maybe_publish_snapshot_in_tx(&tx, now_ms)?;
-        let origin_frontier = current_origin_frontier_in_tx(&tx)?;
+        let gen_rec = publish_generation_delta_in_tx(&tx, now_ms, &head_deltas)?;
 
         let mut custody_acks = Vec::with_capacity(touched_origins.len());
         for (producer_id, epoch) in &touched_origins {
@@ -960,13 +963,13 @@ impl HubStore {
         tx.commit()?;
 
         Ok(IngestBatchResponse {
+            hub_generation: gen_rec.as_ref().map(|g| g.generation),
+            publication_id: gen_rec.map(|g| g.publication_id),
             accepted_count: to_insert.len(),
             replayed_count,
             durable_fsynced: true,
             verified_pack_digests,
             custody_acks,
-            origin_frontier,
-            snapshot,
         })
     }
 
@@ -1031,9 +1034,9 @@ impl HubStore {
         if !was_committed {
             let _ = advance_frontier_in_tx(&tx, &event_id.producer_id, &event_id.epoch, now_ms)?;
         }
-        let _ = maybe_publish_snapshot_in_tx(&tx, now_ms)?;
+        let _ = publish_generation_delta_in_tx(&tx, now_ms, &[])?;
 
-        let origin_frontier = current_origin_frontier_in_tx(&tx)?;
+        let origin_frontier = producer_origin_frontier_in_tx(&tx, &event_id.producer_id)?;
         let quarantine_count: u64 = tx.query_row(
             "SELECT COUNT(*) FROM hub_quarantine WHERE resolved_at IS NULL",
             [],
@@ -1052,14 +1055,18 @@ impl HubStore {
     }
 }
 
-fn current_origin_frontier_in_tx(tx: &rusqlite::Transaction<'_>) -> Result<BTreeMap<(String, String), u64>, HubError> {
+fn producer_origin_frontier_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    producer_id: &str,
+) -> Result<BTreeMap<(String, String), u64>, HubError> {
     let mut out = BTreeMap::new();
     let mut stmt = tx.prepare(
         "SELECT producer_id, epoch, contiguous_seq
          FROM hub_frontiers
-         ORDER BY producer_id ASC, epoch ASC",
+         WHERE producer_id = ?1
+         ORDER BY epoch ASC",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([producer_id], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,

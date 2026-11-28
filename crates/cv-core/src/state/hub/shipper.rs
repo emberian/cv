@@ -912,10 +912,8 @@ impl Shipper {
         report.transport_acks.push(ingest_ack);
         report.events_shipped = batch_req.events.len();
 
-        if let Some(ref snap) = ingest_resp.snapshot {
-            report.hub_snapshot_id = Some(snap.publication_id.clone());
-            report.hub_generation = Some(snap.hub_generation);
-        }
+        report.hub_snapshot_id = ingest_resp.publication_id.clone();
+        report.hub_generation = ingest_resp.hub_generation;
 
         // Stage-2 Durable Hub Custody Verification:
         // Record `StateStore::record_custody_ack` ONLY if:
@@ -1824,13 +1822,13 @@ harnesses = ["claude"]
                     .unwrap()
                 } else {
                     serde_json::to_vec(&IngestBatchResponse {
+                        hub_generation: None,
+                        publication_id: None,
                         accepted_count: 1,
                         replayed_count: 0,
                         durable_fsynced: false,
                         verified_pack_digests: BTreeMap::new(),
                         custody_acks: Vec::new(),
-                        origin_frontier: BTreeMap::new(),
-                        snapshot: None,
                     })
                     .unwrap()
                 };

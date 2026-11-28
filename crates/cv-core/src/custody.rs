@@ -714,7 +714,112 @@ pub fn head_entries(home: &Path) -> Result<ArchiveSessionMap> {
     Ok(by_key)
 }
 
+pub(crate) fn backing_from_hub_head(
+    hub_packs_dir: &Path,
+    entry: crate::state::hub::SessionRevisionEntry,
+) -> Result<Option<Backing>> {
+    let custody = entry.custody.clone().unwrap_or(CustodyKind::PortableProjection);
+    let addr = match (&entry.payload_addr, &custody) {
+        (Some(addr), _) => addr.clone(),
+        (None, CustodyKind::NativeExtents { extents, .. }) => {
+            let Some(last) = extents.last() else {
+                return Ok(None);
+            };
+            last.clone()
+        }
+        (None, CustodyKind::PortableProjection) => return Ok(None),
+    };
+    let Some(key) = entry.session_key_struct() else {
+        return Ok(None);
+    };
+    let selector = key.selector();
+    let directory = hub_packs_dir.to_owned();
+    let reference = SessionRef {
+        id: selector,
+        harness: key.harness,
+        path: pack_zst_path(&directory, &addr.pack_id)?,
+        cwd: entry.cwd.map(Into::into),
+        title: entry.title,
+        created_at: entry.created_at.and_then(|t| t.parse().ok()),
+        updated_at: entry.updated_at.and_then(|t| t.parse().ok()),
+        message_count: usize::try_from(entry.message_count).ok(),
+    };
+    Ok(Some(Backing {
+        reference,
+        key,
+        directory,
+        addr,
+        custody,
+        source: "hub_snapshot",
+    }))
+}
+
+fn backing_from_local_head(home: &Path, mut entry: ArchivedSessionEntry) -> Result<(String, Backing)> {
+    let physical = entry.addr.pack_id.clone();
+    normalize(&mut entry, &physical)?;
+    let key = entry.key()?;
+    let selector = key.selector();
+    let directory = home.join("packs");
+    let reference = SessionRef {
+        id: selector.clone(),
+        harness: key.harness,
+        path: pack_zst_path(&directory, &entry.addr.pack_id)?,
+        cwd: entry.cwd.map(Into::into),
+        title: entry.title,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        message_count: Some(entry.message_count),
+    };
+    Ok((
+        selector,
+        Backing {
+            reference,
+            key,
+            directory,
+            addr: entry.addr,
+            custody: entry.custody,
+            source: "custody_pack",
+        },
+    ))
+}
+
+impl crate::state::StateStore {
+    /// Indexed `O(log N)` point lookup for a single session's [`Backing`] by canonical `selector`,
+    /// reading only that session's row from `custody_heads` or `hub_session_heads` (optionally
+    /// pinned to `as_of_gen`). Safe under `--frozen`.
+    pub fn custody_backing_for(&self, selector: &str, as_of_gen: Option<u64>) -> Result<Option<Backing>> {
+        let Some(home) = self.path().parent() else {
+            return Ok(None);
+        };
+        if as_of_gen.is_none() {
+            match self.custody_head_point(selector)? {
+                Some(Some(val)) => {
+                    let entry: ArchivedSessionEntry = serde_json::from_value(val).context("decoding custody head")?;
+                    let (_, backing) = backing_from_local_head(home, entry)?;
+                    return Ok(Some(backing));
+                }
+                Some(None) => {}
+                None => {
+                    if let Some(entry) = committed_entries(home, false)?.0.remove(selector) {
+                        let (_, backing) = backing_from_local_head(home, entry)?;
+                        return Ok(Some(backing));
+                    }
+                }
+            }
+        }
+        let hub = crate::state::hub::HubStore::at_home(home);
+        if let Some(entry) = hub.session_head_for(selector, as_of_gen)? {
+            return backing_from_hub_head(hub.packs_dir(), entry);
+        }
+        Ok(None)
+    }
+}
+
 pub fn inventory() -> Result<Vec<Backing>> {
+    inventory_as_of(None)
+}
+
+pub fn inventory_as_of(as_of_gen: Option<u64>) -> Result<Vec<Backing>> {
     let Some(home) = crate::env::Env::current().cv_home() else {
         return Ok(vec![]);
     };
@@ -729,122 +834,50 @@ pub fn inventory() -> Result<Vec<Backing>> {
     }
     let mut rows = BTreeMap::new();
     let hub = crate::state::hub::HubStore::at_home(&home);
-    let hub_manifest = if crate::env::frozen() {
-        crate::harness::store::sqlite::read(&db_path, |conn, _| {
-            use rusqlite::OptionalExtension as _;
-            let ver = crate::state::current_schema_version(conn)?;
-            if ver == 0 || ver > crate::state::STATE_SCHEMA_VERSION {
-                return Ok(None);
-            }
-            let has_table: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hub_snapshots')",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
-            if !has_table {
-                return Ok(None);
-            }
-            let raw: Option<String> = conn
-                .query_row(
-                    "SELECT manifest_json FROM hub_snapshots ORDER BY hub_generation DESC LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            raw.map(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
-                .transpose()
-        })?
-    } else {
-        match hub.get_snapshot(None) {
-            Ok(m) => m,
-            Err(crate::state::hub::HubError::State(crate::state::StateError::NewerSchema { .. })) => None,
-            Err(e) => return Err(e.into()),
-        }
+    let hub_heads = match hub.heads_at_generation(as_of_gen) {
+        Ok(h) => h,
+        Err(crate::state::hub::HubError::State(crate::state::StateError::NewerSchema { .. })) => Vec::new(),
+        Err(e) => return Err(e.into()),
     };
-    if let Some(manifest) = hub_manifest {
-        for entry in manifest.session_revisions.into_values() {
-            let Some(addr) = entry.payload_addr else { continue };
-            let Some(harness) = Harness::parse(&entry.harness) else {
-                continue;
-            };
-            let key = SessionKey {
-                producer: entry.producer_id,
-                profile: entry
-                    .metadata
-                    .get("profile")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .into(),
-                harness,
-                native_id: entry
-                    .metadata
-                    .get("native_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                    .unwrap_or(entry.session_id),
-            };
-            let selector = key.selector();
-            let directory = hub.packs_dir().to_owned();
-            let reference = SessionRef {
-                id: selector.clone(),
-                harness,
-                path: pack_zst_path(&directory, &addr.pack_id)?,
-                cwd: entry.cwd.map(Into::into),
-                title: entry.title,
-                created_at: entry.created_at.and_then(|t| t.parse().ok()),
-                updated_at: entry.updated_at.and_then(|t| t.parse().ok()),
-                message_count: usize::try_from(entry.message_count).ok(),
-            };
-            rows.insert(
-                selector,
-                Backing {
-                    reference,
-                    key,
-                    directory,
-                    addr,
-                    custody: CustodyKind::PortableProjection,
-                    source: "hub_snapshot",
-                },
-            );
+    for entry in hub_heads {
+        if let Some(backing) = backing_from_hub_head(hub.packs_dir(), entry)? {
+            rows.insert(backing.reference.id.clone(), backing);
         }
     }
-    for (selector, e) in head_entries(&home)? {
-        let key = e.key()?;
-        let directory = home.join("packs");
-        let reference = SessionRef {
-            id: selector.clone(),
-            harness: key.harness,
-            path: pack_zst_path(&directory, &e.addr.pack_id)?,
-            cwd: e.cwd.map(Into::into),
-            title: e.title,
-            created_at: e.created_at,
-            updated_at: e.updated_at,
-            message_count: Some(e.message_count),
-        };
-        rows.insert(
-            selector,
-            Backing {
-                reference,
-                key,
-                directory,
-                addr: e.addr,
-                custody: e.custody,
-                source: "custody_pack",
-            },
-        );
+    if as_of_gen.is_none() {
+        for (_, entry) in head_entries(&home)? {
+            let (selector, backing) = backing_from_local_head(&home, entry)?;
+            rows.insert(selector, backing);
+        }
     }
     Ok(rows.into_values().collect())
 }
 
 pub fn backing_for(r: &SessionRef) -> Result<Option<Box<dyn Adapter>>> {
+    backing_for_as_of(r, None)
+}
+
+pub fn backing_for_as_of(r: &SessionRef, as_of_gen: Option<u64>) -> Result<Option<Box<dyn Adapter>>> {
     if !is_pack_ref(r) {
         return Ok(None);
     }
-    let backing = inventory()?
-        .into_iter()
-        .find(|b| b.reference.id == r.id && b.reference.path == r.path)
+    let Some(home) = crate::env::Env::current().cv_home() else {
+        return Ok(None);
+    };
+    let store = crate::state::StateStore::at_dir(&home);
+    if as_of_gen.is_none() && r.path.starts_with(home.join("hub").join("packs")) {
+        let hub = crate::state::hub::HubStore::at_home(&home);
+        if let Some(entry) = hub.session_head_for(&r.id, None)? {
+            if let Some(b) = backing_from_hub_head(hub.packs_dir(), entry)? {
+                if b.reference.path == r.path {
+                    return Ok(Some(Box::new(b)));
+                }
+            }
+        }
+    }
+    let backing = store
+        .custody_backing_for(&r.id, as_of_gen)?
+        .filter(|b| as_of_gen.is_some() || b.reference.path == r.path)
         .context("custody manifest no longer contains the selected revision")?;
     Ok(Some(Box::new(backing)))
 }

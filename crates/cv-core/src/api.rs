@@ -63,7 +63,7 @@ routes! {
 
         GET ["api", "sessions"] => sessions(query),
 
-        GET ["api", "session", harness, id] => session(harness, id),
+        GET ["api", "session", harness, id] => session(harness, id, query),
 
         GET ["api", "session", harness, id, "head"] => session_head(harness, id),
 
@@ -263,7 +263,60 @@ pub fn inbox_window(
 
 // --- sessions -----------------------------------------------------------------------------------
 
-/// `GET /api/sessions?harness=&cwd=&limit=` — the §3 session rows, filtered, newest activity first.
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let txt = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_ti = ti;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+pub(crate) fn parse_live_ref(r: &SessionRef) -> Option<Session> {
+    if let Ok(Some((found, adapter))) = crate::find(&r.id, Some(r.harness)) {
+        return adapter.parse(&found).ok();
+    }
+    None
+}
+
+#[cfg(feature = "sqlite")]
+fn hub_head_to_ref(packs_dir: &std::path::Path, entry: &crate::state::hub::SessionRevisionEntry) -> Option<SessionRef> {
+    if let Ok(Some(backing)) = crate::custody::backing_from_hub_head(packs_dir, entry.clone()) {
+        return Some(backing.reference);
+    }
+    let harness = Harness::parse(&entry.harness)?;
+    Some(SessionRef {
+        id: entry.selector_string(),
+        harness,
+        path: std::path::PathBuf::new(),
+        cwd: entry.cwd.as_deref().map(std::path::PathBuf::from),
+        title: entry.title.clone(),
+        created_at: entry.created_at.as_deref().and_then(|t| t.parse().ok()),
+        updated_at: entry.updated_at.as_deref().and_then(|t| t.parse().ok()),
+        message_count: usize::try_from(entry.message_count).ok(),
+    })
+}
+
+/// `GET /api/sessions?harness=&cwd=&place=&as_of=&q=&offset=&limit=` — the §3 session rows,
+/// filtered, newest activity first.
 fn sessions(query: &str) -> (u16, Value) {
     let params = Query::parse(query);
     let harness = match params.get("harness") {
@@ -275,13 +328,83 @@ fn sessions(query: &str) -> (u16, Value) {
         None => None,
     };
     let cwd = params.get("cwd");
+    let place = params.get("place").or_else(|| params.get("producer"));
+    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+    let parsed_q = match params.get("q") {
+        Some(raw) if !raw.trim().is_empty() => match crate::query::SessionQuery::parse(&raw) {
+            Ok(sq) => Some(sq),
+            Err(e) => return err(400, &e),
+        },
+        _ => None,
+    };
+    let offset = match params.unsigned("offset") {
+        Ok(v) => v.unwrap_or(0),
+        Err(error) => return err(400, &error),
+    };
     let limit = match params.unsigned("limit") {
         Ok(limit) => limit,
         Err(error) => return err(400, &error),
     };
 
-    // The fast catalog read (~ms when warm); transparently escalates to a full scan when cold.
-    let mut refs = crate::sessions();
+    #[allow(unused_mut)]
+    let mut resolved_as_of_gen: Option<u64> = None;
+    #[allow(unused_mut)]
+    let mut selector_places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    let mut refs: Vec<SessionRef> = if let Some(ref spec) = as_of {
+        #[cfg(feature = "sqlite")]
+        {
+            let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
+                return err(404, &format!("snapshot `{spec}` not found"));
+            };
+            let gen_rec = match hub.resolve_generation(Some(spec)) {
+                Ok(Some(g)) => g,
+                Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
+                    return err(404, &format!("snapshot `{spec}` not found"))
+                }
+                Err(e) => return err(400, &e.to_string()),
+            };
+            resolved_as_of_gen = Some(gen_rec.generation);
+            let heads = match hub.heads_at_generation(Some(gen_rec.generation)) {
+                Ok(h) => h,
+                Err(e) => return err(500, &e.to_string()),
+            };
+            for entry in &heads {
+                selector_places.insert(entry.selector_string(), entry.producer_id.clone());
+            }
+            heads
+                .iter()
+                .filter_map(|e| hub_head_to_ref(hub.packs_dir(), e))
+                .collect()
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = spec;
+            return err(400, "as_of requires sqlite support");
+        }
+    } else {
+        // The fast catalog read (~ms when warm); transparently escalates to a full scan when cold.
+        let mut live = crate::sessions();
+        #[cfg(feature = "sqlite")]
+        if let Ok(hub) = crate::state::hub::HubStore::default_hub() {
+            if let Ok(heads) = hub.heads_at_generation(None) {
+                if !heads.is_empty() {
+                    let seen: std::collections::HashSet<String> = live.iter().map(|r| r.id.clone()).collect();
+                    for entry in &heads {
+                        let sel = entry.selector_string();
+                        selector_places.insert(sel.clone(), entry.producer_id.clone());
+                        if !seen.contains(&sel) {
+                            if let Some(r) = hub_head_to_ref(hub.packs_dir(), entry) {
+                                live.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        live
+    };
+
     if let Some(h) = harness {
         refs.retain(|r| r.harness == h);
     }
@@ -292,24 +415,65 @@ fn sessions(query: &str) -> (u16, Value) {
                 .is_some_and(|c| c.to_string_lossy().contains(needle.as_str()))
         });
     }
+    if let Some(ref pat) = place {
+        refs.retain(|r| {
+            let p = selector_places.get(&r.id).map_or("local", String::as_str);
+            glob_match(pat, p)
+        });
+    }
+    if let Some(ref sq) = parsed_q {
+        refs.retain(|r| {
+            if !sq.prefilter(r) {
+                return false;
+            }
+            if sq.eval(&crate::query::Facts::from_ref(r)).ok() == Some(crate::query::Tri::True) {
+                return true;
+            }
+            let hydrated: Option<Session> = {
+                #[cfg(feature = "sqlite")]
+                {
+                    if resolved_as_of_gen.is_some() {
+                        crate::custody::backing_for_as_of(r, resolved_as_of_gen)
+                            .ok()
+                            .flatten()
+                            .and_then(|a| a.parse(r).ok())
+                    } else {
+                        parse_live_ref(r)
+                    }
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    parse_live_ref(r)
+                }
+            };
+            crate::query::matches_session_or_ref(sq, r, hydrated.as_ref())
+        });
+    }
     refs.sort_by(|a, b| {
         let ka = a.updated_at.or(a.created_at);
         let kb = b.updated_at.or(b.created_at);
-        kb.cmp(&ka)
+        kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
     });
-    if let Some(n) = limit {
-        refs.truncate(n);
-    }
+
+    let sliced: Vec<&SessionRef> = match limit {
+        Some(n) => refs.iter().skip(offset).take(n).collect(),
+        None => refs.iter().skip(offset).collect(),
+    };
     const METADATA_BATCH_SIZE: usize = 256;
     let mut probe = crate::source::Probe::default();
     ok(Value::Array(
-        refs.iter()
+        sliced
+            .into_iter()
             .enumerate()
             .map(|(idx, r)| {
                 if idx > 0 && idx % METADATA_BATCH_SIZE == 0 {
                     probe = crate::source::Probe::default();
                 }
-                let (size, store) = crate::rows::ref_sizes(&mut probe, r);
+                let (size, store) = if r.path.as_os_str().is_empty() {
+                    (None, None)
+                } else {
+                    crate::rows::ref_sizes(&mut probe, r)
+                };
                 crate::rows::session_row_with_store(r, size, store)
             })
             .collect(),
@@ -364,14 +528,144 @@ fn session_overview(harness: &str, id: &str) -> (u16, Value) {
     }
 }
 
-fn session(harness: &str, id: &str) -> (u16, Value) {
-    let (r, adapter) = match lookup(harness, id) {
-        Ok(x) => x,
-        Err(e) => return e,
+#[cfg(feature = "sqlite")]
+fn hub_session_json(
+    hub: &crate::state::hub::HubStore,
+    want_harness: Harness,
+    id: &str,
+    as_of_spec: Option<&str>,
+) -> Option<(u16, Value)> {
+    let gen_rec = match hub.resolve_generation(as_of_spec) {
+        Ok(Some(g)) => g,
+        Ok(None) if as_of_spec.is_none() => return None,
+        Ok(None) | Err(crate::state::hub::HubError::NotFound(_)) => {
+            return Some(err(404, &format!("snapshot `{}` not found", as_of_spec.unwrap_or(""))))
+        }
+        Err(e) => return Some(err(400, &e.to_string())),
     };
-    match complete_session_json(adapter.as_ref(), &r) {
-        Ok(value) => ok(value),
-        Err(error) => err(500, &format!("session read failed: {error:#}")),
+    let entry = if let Ok(Some(exact)) = hub.session_head_for(id, Some(gen_rec.generation)) {
+        if Harness::parse(&exact.harness) != Some(want_harness) {
+            return None;
+        }
+        exact
+    } else {
+        let heads = match hub.heads_at_generation(Some(gen_rec.generation)) {
+            Ok(h) => h,
+            Err(e) => return Some(err(500, &e.to_string())),
+        };
+        let matches: Vec<_> = heads
+            .into_iter()
+            .filter(|e| {
+                if Harness::parse(&e.harness) != Some(want_harness) {
+                    return false;
+                }
+                let native_id = e.metadata.get("native_id").and_then(Value::as_str);
+                let human_key = format!("{}:{}:{}", e.producer_id, e.harness, native_id.unwrap_or(&e.session_id));
+                e.selector_string() == id
+                    || e.session_id == id
+                    || native_id == Some(id)
+                    || human_key == id
+                    || format!("{}:{}", e.producer_id, e.session_id) == id
+            })
+            .collect();
+        if matches.is_empty() {
+            return if as_of_spec.is_some() {
+                Some(err(404, "session not found"))
+            } else {
+                None
+            };
+        }
+        if matches.len() > 1 {
+            return Some(err(400, &format!("ambiguous session id {id:?}")));
+        }
+        matches.into_iter().next().expect("len == 1")
+    };
+
+    match crate::custody::backing_from_hub_head(hub.packs_dir(), entry.clone()) {
+        Ok(Some(backing)) => match complete_session_json(&backing, &backing.reference) {
+            Ok(mut val) => {
+                val["extra"]["cv"]["payload_unavailable"] = json!(false);
+                val["extra"]["cv"]["producer_id"] = json!(entry.producer_id);
+                val["extra"]["cv"]["revision"] = json!(entry.revision);
+                val["extra"]["cv"]["snapshot_id"] = json!(gen_rec.publication_id);
+                val["extra"]["cv"]["hub_generation"] = json!(gen_rec.generation);
+                Some(ok(val))
+            }
+            Err(e) => Some(err(500, &format!("session read failed: {e:#}"))),
+        },
+        Ok(None) => {
+            let native_id = entry
+                .metadata
+                .get("native_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&entry.session_id)
+                .to_string();
+            let mut s = Session::new(native_id, want_harness);
+            s.title = entry.title.clone();
+            s.cwd = entry.cwd.as_deref().map(std::path::PathBuf::from);
+            s.model = entry.model.clone();
+            s.created_at = entry
+                .created_at
+                .as_deref()
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            s.updated_at = entry
+                .updated_at
+                .as_deref()
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let mut val = serde_json::to_value(&s).unwrap_or_else(|_| json!({}));
+            val["extra"]["cv"] = json!({
+                "payload_unavailable": true,
+                "reason": "pack_not_mirrored",
+                "producer_id": entry.producer_id,
+                "session_id": entry.session_id,
+                "revision": entry.revision,
+                "snapshot_id": gen_rec.publication_id,
+                "hub_generation": gen_rec.generation,
+                "message_count": entry.message_count,
+                "metadata": entry.metadata,
+            });
+            Some(ok(val))
+        }
+        Err(e) => Some(err(500, &format!("session read failed: {e:#}"))),
+    }
+}
+
+fn session(harness: &str, id: &str, query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let as_of = params.get("as_of").or_else(|| params.get("snapshot"));
+    let Some(want_harness) = Harness::parse(harness) else {
+        return err(400, &format!("unknown harness {harness:?}"));
+    };
+    #[cfg(feature = "sqlite")]
+    if as_of.is_some() {
+        let Ok(hub) = crate::state::hub::HubStore::default_hub() else {
+            return err(404, "session not found");
+        };
+        return hub_session_json(&hub, want_harness, id, as_of.as_deref())
+            .unwrap_or_else(|| err(404, "session not found"));
+    }
+    #[cfg(not(feature = "sqlite"))]
+    if as_of.is_some() {
+        return err(400, "as_of requires sqlite support");
+    }
+
+    match lookup(harness, id) {
+        Ok((r, adapter)) => match complete_session_json(adapter.as_ref(), &r) {
+            Ok(value) => ok(value),
+            Err(error) => err(500, &format!("session read failed: {error:#}")),
+        },
+        Err((404, _)) => {
+            #[cfg(feature = "sqlite")]
+            if let Ok(hub) = crate::state::hub::HubStore::default_hub() {
+                if let Some(reply) = hub_session_json(&hub, want_harness, id, None) {
+                    return reply;
+                }
+            }
+            err(404, "session not found")
+        }
+        Err(other) => other,
     }
 }
 
