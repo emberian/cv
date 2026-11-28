@@ -428,13 +428,14 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         }
         _ => input.session,
     };
+    // Every text record takes the document's profile: a persisted output, a stashed original or
+    // a file remote names the same local paths the document's own text does.
     let mut git = input.git;
-    if let (Some(opts), Some(g)) = (input.redact, git.as_mut()) {
-        if let Some(branch) = g.branch.as_mut() {
-            *branch = crate::redact::scrub_cow(branch, opts, &mut scrub_stats.secrets).into_owned();
-        }
-        if let Some(remote) = g.remote.as_mut() {
-            *remote = crate::redact::scrub_cow(remote, opts, &mut scrub_stats.secrets).into_owned();
+    if let (Some(compiled), Some(g)) = (&compiled_profile, git.as_mut()) {
+        for field in [g.branch.as_mut(), g.remote.as_mut()].into_iter().flatten() {
+            *field = compiled
+                .scrub_text_cow(field, orig_cwd.as_deref(), &mut scrub_stats)
+                .into_owned();
         }
     }
 
@@ -470,8 +471,8 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
         let sidecar_disp = fmt_path(&sidecar.display().to_string(), &mut scrub_stats);
         match read_bounded_regular(&sidecar, FILE_MAX_BYTES)? {
             Ok(mut bytes) => {
-                if let Some(opts) = input.redact {
-                    match scrub_sidecar(&bytes, opts, &mut scrub_stats.secrets) {
+                if let Some(compiled) = &compiled_profile {
+                    match scrub_sidecar(&bytes, compiled, orig_cwd.as_deref(), &mut scrub_stats) {
                         Ok(clean) => bytes = clean,
                         Err(why) => {
                             manifest.uncaptured.push(UncapturedDep {
@@ -529,12 +530,12 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
                 .push(uncaptured(format!("{} bytes, over the size cap", bytes.len())));
             continue;
         }
-        if let Some(opts) = input.redact {
+        if let Some(compiled) = &compiled_profile {
             match std::str::from_utf8(&bytes) {
                 Ok(text) => {
                     if !(kind == "image" && is_verified_image_magic(&bytes)) {
                         if let std::borrow::Cow::Owned(clean) =
-                            crate::redact::scrub_cow(text, opts, &mut scrub_stats.secrets)
+                            compiled.scrub_text_cow(text, orig_cwd.as_deref(), &mut scrub_stats)
                         {
                             bytes = clean.into_bytes();
                         }
@@ -602,8 +603,9 @@ pub fn write(dest: &Path, input: Input<'_>, claim: Claim) -> Result<Manifest> {
 /// not JSON is scrubbed as text. Lines stay one per entry.
 fn scrub_sidecar(
     bytes: &[u8],
-    opts: &crate::redact::RedactOptions,
-    stats: &mut crate::redact::RedactStats,
+    profile: &crate::redact::CompiledProfile,
+    repo_root: Option<&Path>,
+    stats: &mut crate::redact::ScrubStats,
 ) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(bytes).context("sidecar is not UTF-8")?;
     let mut out = String::with_capacity(text.len());
@@ -611,10 +613,10 @@ fn scrub_sidecar(
         let (body, nl) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
         match serde_json::from_str::<Value>(body) {
             Ok(mut entry) => {
-                crate::redact::scrub_value(&mut entry, opts, stats);
+                profile.scrub_value(&mut entry, repo_root, stats);
                 out.push_str(&serde_json::to_string(&entry)?);
             }
-            Err(_) => out.push_str(&crate::redact::scrub_cow(body, opts, stats)),
+            Err(_) => out.push_str(&profile.scrub_text_cow(body, repo_root, stats)),
         }
         out.push_str(nl);
     }
@@ -845,7 +847,11 @@ mod tests {
         std::fs::create_dir_all(&tool_results)?;
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let persisted = tool_results.join("out.txt");
-        std::fs::write(&persisted, format!("export ANTHROPIC_API_KEY={key}\n"))?;
+        let workspace = world.base.join("secret-workspace");
+        std::fs::write(
+            &persisted,
+            format!("export ANTHROPIC_API_KEY={key}\ncd {}/sub\n", workspace.display()),
+        )?;
         let binary_leak = tool_results.join("raw.bin");
         let mut raw_bytes = vec![0xff, 0xfe, 0x00];
         raw_bytes.extend_from_slice(key.as_bytes());
@@ -856,10 +862,15 @@ mod tests {
         let sidecar = src.join("s.flat.jsonl");
         std::fs::write(
             &sidecar,
-            crate::prune::sidecar_line("toolu_1", "Bash", &Value::Null, &format!("token {key}")) + "\n",
+            crate::prune::sidecar_line(
+                "toolu_1",
+                "Bash",
+                &Value::Null,
+                &format!("token {key} in {}/notes.md", workspace.display()),
+            ) + "\n",
         )?;
         let mut session = Session::new("s", Harness::Codex);
-        session.cwd = Some(world.base.join("secret-workspace"));
+        session.cwd = Some(workspace.clone());
         std::fs::create_dir_all(session.cwd.as_ref().unwrap())?;
         session.principal = Some(Principal::String(format!("alice@example.com ({key})")));
         session.git = Some(GitContext {
@@ -897,7 +908,7 @@ mod tests {
                 sidecar: Some(sidecar),
                 git: Some(GitState {
                     branch: Some(format!("feat-{key}")),
-                    remote: Some(format!("https://x-access-token:{key}@example.com/o/r.git")),
+                    remote: Some(format!("{}/../origin.git#{key}", workspace.display())),
                     from: "recorded".into(),
                     ..GitState::default()
                 }),
@@ -930,10 +941,19 @@ mod tests {
         assert!(!doc.contains(base_str.as_ref()), "doc leaked local path: {doc}");
         let stashed = bundle.stashed("toolu_1")?.unwrap();
         assert!(!stashed.to_string().contains(key) && stashed.to_string().contains("token"));
+        // A captured output and a stashed original name local paths as the document's own text does.
+        assert!(
+            !stashed.to_string().contains(base_str.as_ref()),
+            "sidecar leaked local path: {stashed}"
+        );
         let file = String::from_utf8(bundle.file(persisted.to_str().unwrap())?.unwrap())?;
         assert!(
             !file.contains(key) && file.starts_with("export ANTHROPIC_API_KEY="),
             "{file}"
+        );
+        assert!(
+            !file.contains(base_str.as_ref()),
+            "captured file leaked local path: {file}"
         );
         assert!(bundle.file("tool-results/out.txt")?.is_some());
         assert!(bundle.file(binary_leak.to_str().unwrap())?.is_none());
