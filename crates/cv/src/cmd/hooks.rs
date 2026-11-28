@@ -1657,114 +1657,6 @@ fn context(event: &str, text: String) -> Value {
     json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
 }
 
-/// Known harness transcript store roots from the active environment (`HOME`, `CLAUDE_CONFIG_DIR`,
-/// `CODEX_HOME`, `XDG_DATA_HOME`, etc.), constructed in memory with zero disk discovery.
-fn transcript_store_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let mut push = |p: PathBuf| {
-        roots.push(cv_core::tools::classify::normalize_path(&p, None));
-        roots.push(p);
-    };
-    if let Some(dir) = cv_core::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        push(dir.join("projects"));
-        push(dir.join("transcripts"));
-    }
-    if let Some(dir) = cv_core::env::var_os("CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        push(dir.join("sessions"));
-        push(dir.join("archived_sessions"));
-    }
-    for var in ["ANTIGRAVITY_APP_DATA_DIR", "JETSKI_APP_DATA_DIR"] {
-        if let Some(dir) = cv_core::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from) {
-            push(dir.join("brain"));
-            push(dir.join("conversations"));
-        }
-    }
-    if let Some(dir) = cv_core::env::var_os("HERMES_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        push(dir);
-    }
-    if let Some(dir) = cv_core::env::var_os("OPENCLAW_STATE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        push(dir.join("agents"));
-    }
-    if let Some(xdg) = cv_core::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        for sub in ["opencode", "zed/threads", "goose/sessions", "devin/cli", "kimi"] {
-            push(xdg.join(sub));
-        }
-    }
-    if let Some(home) = crate::util::dirs_home() {
-        for sub in [
-            ".claude/projects",
-            ".claude/transcripts",
-            ".codex/sessions",
-            ".codex/archived_sessions",
-            ".gemini/tmp",
-            ".gemini/antigravity",
-            ".gemini/antigravity-cli",
-            ".local/share/opencode",
-            ".local/share/zed/threads",
-            ".local/share/goose/sessions",
-            ".local/share/devin/cli",
-            ".local/share/kimi",
-            "Library/Application Support/Cursor/User/globalStorage",
-            "Library/Application Support/Cursor/User/workspaceStorage",
-            "Library/Application Support/Zed/threads",
-            "Library/Application Support/Block.block.goose/sessions",
-            ".cursor/chats",
-            ".cursor/acp-sessions",
-            ".hermes",
-            ".openclaw/agents",
-            ".kimi/sessions",
-            ".qwen/projects",
-            ".qwen/tmp",
-            ".continue/sessions",
-            ".pi/agent/sessions",
-            ".grok",
-        ] {
-            push(home.join(sub));
-        }
-    }
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-const SHELL_STORE_MARKERS: &[&str] = &[
-    "/.claude/projects",
-    "/.claude/transcripts",
-    "$CLAUDE_CONFIG_DIR/projects",
-    "${CLAUDE_CONFIG_DIR}/projects",
-    "/.codex/sessions",
-    "/.codex/archived_sessions",
-    "$CODEX_HOME/sessions",
-    "${CODEX_HOME}/sessions",
-    "/.gemini/tmp",
-    "/.gemini/antigravity",
-    "/.local/share/opencode",
-    "/.local/share/devin/cli",
-    "/.local/share/zed/threads",
-    "/.local/share/goose/sessions",
-    "/.hermes",
-    "/.openclaw/agents",
-    "/.kimi/sessions",
-    "/.qwen/projects",
-    "/.continue/sessions",
-    "/.pi/agent/sessions",
-];
-
 fn expand_candidate_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("~/") {
@@ -1791,7 +1683,7 @@ fn expand_candidate_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
 fn hook_nudge(payload: &Value) -> Option<Value> {
     let tool_input = payload.get("tool_input")?;
     let cwd = payload.get("cwd").and_then(Value::as_str).map(Path::new);
-    let roots = transcript_store_roots();
+    let roots = cv_core::harness::transcript_store_roots();
     let hits_root_path = |raw: &str| {
         if raw.trim().is_empty() {
             return false;
@@ -1839,7 +1731,7 @@ fn hook_nudge(payload: &Value) -> Option<Value> {
         if trimmed.starts_with("cv ") || trimmed.contains("/cv ") {
             continue;
         }
-        if SHELL_STORE_MARKERS.iter().any(|m| cmd.contains(m)) {
+        if cv_core::harness::shell_store_markers().any(|m| cmd.contains(m)) {
             return Some(context("PreToolUse", VERB_HINT.to_string()));
         }
         if roots.iter().any(|r| {

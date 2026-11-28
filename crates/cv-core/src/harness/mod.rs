@@ -43,6 +43,7 @@ pub mod pi;
 pub mod qwen;
 pub mod roo;
 pub mod store;
+mod store_roots;
 pub mod wire;
 #[cfg(feature = "sqlite")]
 pub mod zed;
@@ -743,6 +744,7 @@ pub struct PendingAdoption {
 }
 
 pub use crate::publish::validate_session_id;
+pub use store_roots::{shell_store_markers, transcript_store_roots};
 
 pub trait Adapter: Send + Sync {
     /// Decode provider-native asynchronous result envelopes into shared lifecycle evidence.
