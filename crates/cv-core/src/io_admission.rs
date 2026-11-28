@@ -168,7 +168,7 @@ impl IoAdmission {
 
     /// Register a local directory containing sealed immutable pack/segment files eligible for `Mapped` reads.
     pub fn register_sealed_immutable_dir(&self, dir: impl Into<PathBuf>) {
-        let dir = dir.into();
+        let Ok(dir) = dir.into().canonicalize() else { return };
         let mut roots = self.sealed_roots.lock().unwrap_or_else(|e| e.into_inner());
         if !roots.contains(&dir) {
             roots.push(dir);
@@ -177,7 +177,7 @@ impl IoAdmission {
 
     fn is_registered_sealed_path(&self, path: &Path) -> bool {
         let roots = self.sealed_roots.lock().unwrap_or_else(|e| e.into_inner());
-        roots.iter().any(|root| path.starts_with(root))
+        roots.iter().any(|root| path.parent() == Some(root.as_path()))
     }
 
     /// Explicitly configure or override the admission policy for `dev`.
@@ -452,24 +452,28 @@ pub fn byte_source_policy(path: &Path) -> ByteSourcePolicy {
 /// Whether `path` names a sealed immutable artifact owned by `cv` (never a mutable external
 /// harness transcript or untrusted external `.pack.zst`).
 pub fn is_sealed_immutable_path(path: &Path) -> bool {
-    if IoAdmission::global().is_registered_sealed_path(path) {
-        return true;
-    }
+    let is_pack = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".pack.zst"));
     let env = crate::env::Env::current();
-    if let Some(home) = env.cv_home() {
-        if path.starts_with(home.join("packs"))
-            || path.starts_with(home.join("hub").join("packs"))
-            || path.starts_with(home.join("segments"))
-        {
-            return true;
+    for base in [env.cv_home(), env.cv_cache()].into_iter().flatten() {
+        let Ok(rel) = path.strip_prefix(&base) else { continue };
+        if rel.starts_with("segments") || is_pack && (rel.starts_with("packs") || rel.starts_with("hub/packs")) {
+            // Canonicalize only the configured base. A symlink below it must not
+            // turn a mutable external file into a mapping candidate.
+            return base
+                .canonicalize()
+                .ok()
+                .zip(path.canonicalize().ok())
+                .is_some_and(|(base, actual)| base.join(rel) == actual);
         }
     }
-    if let Some(cache) = env.cv_cache() {
-        if path.starts_with(cache.join("packs")) || path.starts_with(cache.join("segments")) {
-            return true;
-        }
-    }
-    false
+    is_pack
+        && path.symlink_metadata().is_ok_and(|m| m.is_file())
+        && path
+            .canonicalize()
+            .is_ok_and(|p| IoAdmission::global().is_registered_sealed_path(&p))
 }
 
 /// Inspect `path` (or its parent directory when `path` does not exist yet) to determine its OS
@@ -559,9 +563,6 @@ fn detect_unix_device_class(path: &Path, dev: DeviceId) -> DeviceClass {
     if dev.0 != 0 {
         // Linux device-number helpers only extract bits and are safe functions.
         let major = libc::major(dev.0 as libc::dev_t);
-        if major == 0 {
-            return DeviceClass::Nvme;
-        }
         let minor = libc::minor(dev.0 as libc::dev_t);
         let sys_path = format!("/sys/dev/block/{major}:{minor}/queue/rotational");
         if let Ok(rot) = std::fs::read_to_string(sys_path) {
@@ -1110,6 +1111,17 @@ mod tests {
         std::fs::create_dir_all(hub_pack.parent().unwrap()).unwrap();
         std::fs::write(&sealed_pack, b"sealed").unwrap();
         std::fs::write(&hub_pack, b"hub-sealed").unwrap();
+
+        // #tooth A traversal or symlink under a pack directory is not a sealed artifact.
+        let outside = home.join("mutable.pack.zst");
+        std::fs::write(&outside, b"mutable").unwrap();
+        assert!(!is_sealed_immutable_path(&home.join("packs/../mutable.pack.zst")));
+        #[cfg(unix)]
+        {
+            let link = home.join("packs/link.pack.zst");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(!is_sealed_immutable_path(&link));
+        }
 
         #[cfg(all(feature = "mmap", not(target_family = "wasm")))]
         {

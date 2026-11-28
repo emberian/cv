@@ -340,6 +340,7 @@ pub(crate) fn scoped<T>(
     if crate::io_admission::byte_source_policy(captured.path()) == crate::io_admission::ByteSourcePolicy::Mapped {
         let file = File::open(captured.path())?;
         captured.check_metadata(file.metadata()?)?;
+        anyhow::ensure!(range.end()? <= captured.len(), "mapping exceeds captured source");
         let map = if range.len == 0 {
             None
         } else {
@@ -585,6 +586,7 @@ impl BufRead for Cursor<'_> {
                     match file.read_at(&mut self.window, self.position) {
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => {
+                            self.window.clear();
                             self.read_error = Some(e.kind());
                             return Err(e);
                         }
@@ -592,6 +594,7 @@ impl BufRead for Cursor<'_> {
                     }
                 };
                 if n == 0 {
+                    self.window.clear();
                     self.read_error = Some(io::ErrorKind::UnexpectedEof);
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "source was truncated"));
                 }
@@ -1162,6 +1165,11 @@ mod io_tests {
             io::ErrorKind::UnexpectedEof
         );
         assert!(source.check_identity().is_err());
+        // #tooth A failed refill must never expose its unused buffer on retry.
+        let mut cursor = source.cursor(Range { offset: 1, len: 5 }).unwrap();
+        for _ in 0..2 {
+            assert_eq!(cursor.fill_buf().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

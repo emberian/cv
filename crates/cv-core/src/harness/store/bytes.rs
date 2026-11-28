@@ -134,8 +134,21 @@ pub(crate) struct Arena {
 struct ArenaState {
     memory: Vec<u8>,
     spill: Option<std::sync::Arc<Spill>>,
-    len: u64,
-    file_exposed: bool,
+    // Once another writer holds the file, only the descriptor can certify its length.
+    private_spill_len: Option<u64>,
+}
+
+impl ArenaState {
+    fn spill(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let spill = Spill::create(true)?;
+        let mut file = spill.file.as_ref().unwrap();
+        file.write_all(&self.memory)?;
+        self.private_spill_len = Some(self.memory.len() as u64);
+        self.memory = Vec::new();
+        self.spill = Some(std::sync::Arc::new(spill));
+        Ok(())
+    }
 }
 
 struct ArenaSink<'a>(&'a Arena);
@@ -147,20 +160,16 @@ impl std::io::Write for ArenaSink<'_> {
             .state
             .lock()
             .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
-        let next_len = state
-            .len
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("arena length overflow"))?;
         if state.spill.is_none() && state.memory.len().saturating_add(bytes.len()) > MEMORY_LIMIT {
-            let spill = Spill::create(true)?;
-            let mut file = spill.file.as_ref().unwrap();
-            file.write_all(&state.memory)?;
-            state.memory = Vec::new();
-            state.spill = Some(std::sync::Arc::new(spill));
+            state.spill()?;
         }
         if let Some(spill) = &state.spill {
             let mut file = spill.file.as_ref().unwrap();
-            file.write_all(bytes)?;
+            let written = file.write(bytes)?;
+            if let Some(len) = &mut state.private_spill_len {
+                *len += written as u64;
+            }
+            return Ok(written);
         } else {
             let required = state.memory.len() + bytes.len();
             if required > state.memory.capacity() {
@@ -176,7 +185,6 @@ impl std::io::Write for ArenaSink<'_> {
             }
             state.memory.extend_from_slice(bytes);
         }
-        state.len = next_len;
         Ok(bytes.len())
     }
 
@@ -226,28 +234,22 @@ impl Arena {
             .state
             .lock()
             .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
-        if state.file_exposed {
-            if let Some(spill) = &state.spill {
-                return Ok(spill.file.as_ref().unwrap().metadata()?.len());
-            }
+        match (&state.spill, state.private_spill_len) {
+            (_, Some(len)) => Ok(len),
+            (Some(spill), None) => Ok(spill.file.as_ref().unwrap().metadata()?.len()),
+            (None, None) => Ok(state.memory.len() as u64),
         }
-        Ok(state.len)
     }
 
     fn file(&self) -> std::io::Result<(std::fs::File, crate::io_admission::DeviceId)> {
-        use std::io::Write;
         let mut state = self
             .state
             .lock()
             .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
         if state.spill.is_none() {
-            let spill = Spill::create(true)?;
-            let mut file = spill.file.as_ref().unwrap();
-            file.write_all(&state.memory)?;
-            state.memory = Vec::new();
-            state.spill = Some(std::sync::Arc::new(spill));
+            state.spill()?;
         }
-        state.file_exposed = true;
+        state.private_spill_len = None;
         let spill = state.spill.as_ref().unwrap();
         Ok((spill.file.as_ref().unwrap().try_clone()?, spill.dev))
     }
@@ -338,18 +340,15 @@ impl std::io::Write for ByteStage {
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| std::io::Error::other("byte stage length overflow"))?;
         if self.spill.is_none() && self.memory.len().saturating_add(bytes.len()) > MEMORY_LIMIT {
-            self.spill = Some(Spill::create(false)?);
-            self.spill
-                .as_mut()
-                .unwrap()
-                .file
-                .as_mut()
-                .unwrap()
-                .write_all(&self.memory)?;
+            let mut spill = Spill::create(false)?;
+            spill.file.as_mut().unwrap().write_all(&self.memory)?;
+            self.spill = Some(spill);
             self.memory = Vec::new();
         }
         if let Some(spill) = &mut self.spill {
-            spill.file.as_mut().unwrap().write_all(bytes)?;
+            let written = spill.file.as_mut().unwrap().write(bytes)?;
+            self.len += written as u64;
+            return Ok(written);
         } else {
             // Vec's geometric growth must not overshoot the memory budget for irregular writes.
             let required = self.memory.len() + bytes.len();
@@ -752,6 +751,12 @@ mod tests {
         let mut tail_check = [0u8; 4];
         assert_eq!(arena.read_at(&mut tail_check, 12).unwrap(), 4);
         assert_eq!(&tail_check, b"last");
+        // #tooth An append through a shared descriptor changes the next range's offset.
+        std::io::Write::write_all(&mut source.file().unwrap(), b"!").unwrap();
+        assert_eq!(
+            source.append(|w| Ok(w.write_all(b"?")?)).unwrap(),
+            (17 + MEMORY_LIMIT as u64, 1)
+        );
         drop(source);
         assert!(!path.exists());
     }
