@@ -448,7 +448,11 @@ fn index_changed_heads_locked(hub: &cv_core::state::hub::HubStore, dir: &Path) -
     let Some((latest, _)) = hub.latest_generation_fast()? else {
         return Ok(0);
     };
-    let (index, f) = open_or_create(dir)?;
+    let initialized = if dir.join("meta.json").is_file() {
+        None
+    } else {
+        Some(open_or_create(dir)?)
+    };
     let consumer = source_consumer(dir)?;
     let after = cv_core::events::hub_index_cursor(&consumer)?;
     if after == latest {
@@ -490,18 +494,25 @@ fn index_changed_heads_locked(hub: &cv_core::state::hub::HubStore, dir: &Path) -
         }
     }
     if !jobs.is_empty() || !removed.is_empty() {
+        let (index, f) = match initialized {
+            Some(pair) => pair,
+            None => open_or_create(dir)?,
+        };
         let mut writer = open_writer(&index, 60_000_000)?;
-        let mut ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
         for selector in &removed {
             writer.delete_term(Term::from_field_text(f.id, selector));
         }
-        writer.commit()?;
-        publish_dependencies(&mut ran, &consumer);
-        anyhow::ensure!(
-            ran.errors == 0 && ran.unreadable.is_empty(),
-            "hub index incomplete: {}",
-            ran.first_error.as_deref().unwrap_or("unreadable session")
-        );
+        if !jobs.is_empty() {
+            let ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
+            anyhow::ensure!(
+                ran.errors == 0 && ran.unreadable.is_empty(),
+                "hub index incomplete: {}",
+                ran.first_error.as_deref().unwrap_or("unreadable session")
+            );
+        } else {
+            writer.commit()?;
+        }
+        compact(dir, &index, &mut writer)?;
     }
     cv_core::events::finish_hub_index(&consumer, generation, &removed)?;
     hub.record_indexed_generation(generation)?;
@@ -11882,5 +11893,131 @@ mod tests {
         assert!(cv_core::resolve_worker_threads(Some(0))
             .unwrap_err()
             .is::<cv_core::BadThreads>());
+    }
+
+    #[test]
+    fn index_changed_heads_compacts_incremental_hub_segments_and_deletes_cleanly() {
+        use cv_core::packs::{pack_idx_path, pack_zst_path, PackBuilder};
+        use cv_core::publish::Claim;
+        use cv_core::state::hub::{HubStore, IngestBatchRequest, IngestEventRecord};
+        use cv_core::state::EventId;
+
+        let w = cv_testkit::World::new("hub-incremental-fts-compact");
+        let hub = HubStore::at_home(&w.cv_home);
+        hub.enroll_producer("remote-a", "box-a", &serde_json::json!({}))
+            .unwrap();
+        let stage = w.base.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        // #tooth `open_writer` uses `NoMergePolicy`; without `compact` in `index_changed_heads`,
+        // `TIER_FANOUT + 1` incremental hub batches would leave `>= TIER_FANOUT` unmerged 1-doc
+        // segments in tier 0.
+        let batches = TIER_FANOUT + 1;
+        for seq in 1..=batches {
+            let sid = format!("sess-{seq}");
+            let pack_id = format!("pack-{seq}");
+            let raw = serde_json::json!({
+                "type": "user",
+                "sessionId": sid,
+                "cwd": "/repo",
+                "message": {
+                    "role": "user",
+                    "content": format!("incrementalneedle token_{seq}"),
+                }
+            })
+            .to_string()
+                + "\n";
+            let mut pb = PackBuilder::create(&stage, &pack_id).unwrap();
+            let addr = pb
+                .append_record(format!("remote-a:claude:{sid}"), raw.as_bytes())
+                .unwrap();
+            pb.seal(Claim::New).unwrap();
+            let idx = std::fs::read(pack_idx_path(&stage, &pack_id).unwrap()).unwrap();
+            let zst = std::fs::read(pack_zst_path(&stage, &pack_id).unwrap()).unwrap();
+            hub.upload_pack_bytes(&pack_id, Some("remote-a"), None, &idx, &zst)
+                .unwrap();
+
+            let env = serde_json::json!({
+                "kind": "session_upsert",
+                "session_id": sid,
+                "harness": "claude",
+                "revision": format!("rev-{seq}"),
+                "cwd": "/repo",
+                "message_count": 1,
+                "custody": cv_core::custody::CustodyKind::NativeExtents {
+                    extents: vec![addr],
+                    total_bytes: raw.len() as u64,
+                    prefix_blake3: cv_core::blake3_hex(raw.as_bytes()),
+                    file_name: format!("{sid}.jsonl"),
+                    layout: Vec::new(),
+                }
+            });
+            let ev = IngestEventRecord::new(
+                EventId::new("remote-a", "ep-1", seq as u64),
+                format!("op-{seq}"),
+                env,
+                None,
+            )
+            .unwrap();
+            hub.ingest_batch(&IngestBatchRequest { events: vec![ev] }).unwrap();
+            let indexed_gen = index_changed_heads(&hub).unwrap();
+            assert_eq!(indexed_gen, seq as u64);
+        }
+
+        let dir = crate::default_tantivy_dir();
+        let (index, _) = open_or_create(&dir).unwrap();
+        let seg_count = index.searchable_segment_ids().unwrap().len();
+        assert!(
+            seg_count < TIER_FANOUT,
+            "incremental hub indexing must compact tier-0 segments (< {TIER_FANOUT}), got {seg_count}"
+        );
+
+        // Delete `sess-1` + upsert `sess-2` in a single generation delta, then advance a
+        // control-only generation and verify watermark carry-forward.
+        let del_seq = (batches + 1) as u64;
+        let del_ev = IngestEventRecord::new(
+            EventId::new("remote-a", "ep-1", del_seq),
+            "op-del-1",
+            serde_json::json!({
+                "kind": "session_delete",
+                "session_id": "sess-1",
+                "harness": "claude",
+            }),
+            None,
+        )
+        .unwrap();
+        hub.ingest_batch(&IngestBatchRequest { events: vec![del_ev] }).unwrap();
+        assert_eq!(index_changed_heads(&hub).unwrap(), del_seq);
+
+        let prepared = PreparedIndex::open(&dir).unwrap();
+        let removed_hits = prepared
+            .search("token_1", 10, crate::SearchFilter::default(), None)
+            .unwrap();
+        assert_eq!(removed_hits.total, 0, "deleted hub selector must leave FTS");
+        let kept_hits = prepared
+            .search("incrementalneedle", 20, crate::SearchFilter::default(), None)
+            .unwrap();
+        assert_eq!(kept_hits.total, batches - 1);
+
+        // Control-only generation (no head changes) preserves `indexed_generation == del_seq`
+        // until `index_changed_heads` advances it cleanly without opening a Tantivy writer.
+        let ctrl_seq = del_seq + 1;
+        let ctrl_ev = IngestEventRecord::new(
+            EventId::new("remote-a", "ep-1", ctrl_seq),
+            "op-ctrl",
+            serde_json::json!({ "kind": "heartbeat" }),
+            None,
+        )
+        .unwrap();
+        hub.ingest_batch(&IngestBatchRequest { events: vec![ctrl_ev] }).unwrap();
+        assert_eq!(
+            hub.resolve_generation(None).unwrap().unwrap().indexed_generation,
+            del_seq
+        );
+        assert_eq!(index_changed_heads(&hub).unwrap(), ctrl_seq);
+        assert_eq!(
+            hub.resolve_generation(None).unwrap().unwrap().indexed_generation,
+            ctrl_seq
+        );
     }
 }

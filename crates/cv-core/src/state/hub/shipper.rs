@@ -2518,9 +2518,17 @@ impl HubStore {
         if header_len > 64 * 1024 * 1024 {
             return Err(HubError::InvalidArgument("delta stream header exceeds 64 MiB".into()));
         }
-        let mut header_bytes = vec![0u8; header_len as usize];
-        reader.read_exact(&mut header_bytes)?;
+        let mut header_bytes = Vec::with_capacity((header_len as usize).min(64 * 1024));
+        reader.by_ref().take(header_len).read_to_end(&mut header_bytes)?;
+        if header_bytes.len() as u64 != header_len {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
         let header: DeltaStreamHeader = serde_json::from_slice(&header_bytes)?;
+        if header.packs.len() > super::receiver::MAX_PACK_RECORDS {
+            return Err(HubError::InvalidArgument(
+                "delta stream pack count exceeds limit".into(),
+            ));
+        }
         validate_source_batch(&header.producer_id, &header.batch)?;
         for desc in &header.packs {
             crate::publish::validate_output_id(&desc.pack_id).map_err(|e| HubError::InvalidArgument(e.to_string()))?;
@@ -2571,7 +2579,7 @@ impl HubStore {
 }
 
 #[cfg(test)]
-mod astra_tests {
+mod transport_tests {
     #[test]
     fn https_transport_verifies_certificate_and_hostname() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -3013,5 +3021,23 @@ harnesses = ["claude"]
             "expected Transport error when durable_fsynced is false, got {err:?}"
         );
         assert!(store.custody_acks_for("hub").unwrap().is_empty());
+    }
+
+    #[test]
+    fn truncated_delta_stream_with_large_declared_header_fails_cleanly() {
+        let world = cv_testkit::World::new("delta-stream-truncated-header");
+        let hub = super::HubStore::at_home(&world.cv_home);
+        // #tooth A 16-byte truncated frame claiming a 64 MiB JSON header must fail with
+        // `UnexpectedEof` via bounded streaming reads rather than pre-allocating 64 MiB upfront.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(super::DELTA_STREAM_MAGIC);
+        frame.extend_from_slice(&(64 * 1024 * 1024u64).to_le_bytes());
+        let err = hub
+            .ingest_delta_stream(std::io::Cursor::new(frame), Some("peer@box"))
+            .unwrap_err();
+        assert!(
+            matches!(err, super::HubError::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected UnexpectedEof, got {err:?}"
+        );
     }
 }

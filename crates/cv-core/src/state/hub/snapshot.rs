@@ -1634,11 +1634,14 @@ pub(crate) fn publish_generation_delta_in_tx(
         .collect();
     let frontier_json = serde_json::to_string(&frontier_encoded)?;
 
+    let authority_inputs = AuthorityInputs::read(tx)?;
+    let inherited_indexed = authority_inputs.indexed_generation;
+
     tx.execute(
         "INSERT INTO hub_generations(
              generation, publication_id, published_at, frontier_digest,
              control_revision, quarantine_count, indexed_generation, pinned, frontier_json, authority_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)",
         rusqlite::params![
             next_gen as i64,
             final_pub_id,
@@ -1646,8 +1649,9 @@ pub(crate) fn publish_generation_delta_in_tx(
             frontier_digest,
             control_revision as i64,
             quarantine_count as i64,
+            inherited_indexed as i64,
             frontier_json,
-            serde_json::to_string(&AuthorityInputs::read(tx)?)?,
+            serde_json::to_string(&authority_inputs)?,
         ],
     )?;
     prune_unpinned_generations_in_tx(tx, MAX_RETAINED_HUB_SNAPSHOTS)?;
@@ -1659,7 +1663,7 @@ pub(crate) fn publish_generation_delta_in_tx(
         frontier_digest,
         control_revision,
         quarantine_count,
-        indexed_generation: 0,
+        indexed_generation: inherited_indexed,
         pinned: false,
     }))
 }
@@ -2702,55 +2706,19 @@ impl HubStore {
                 }
             }
             QuarantineResolution::AcceptIncoming => {
-                if let Some(ref addr_json) = conflicting_payload {
-                    let addr: PayloadAddr = serde_json::from_str(addr_json)?;
-                    let manifest_str: Option<String> = tx
-                        .query_row(
-                            "SELECT manifest_json FROM hub_packs WHERE pack_id = ?1",
-                            [&addr.pack_id],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    let Some(manifest_str) = manifest_str else {
-                        return Err(HubError::MissingPackDependency {
-                            pack_id: addr.pack_id.clone(),
-                            detail: "quarantined incoming payload references unmirrored pack".into(),
-                        });
-                    };
-                    let zst_path =
-                        pack_zst_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
-                            pack_id: addr.pack_id.clone(),
-                            detail: e.to_string(),
-                        })?;
-                    let idx_path =
-                        pack_idx_path(&self.packs_dir, &addr.pack_id).map_err(|e| HubError::MissingPackDependency {
-                            pack_id: addr.pack_id.clone(),
-                            detail: e.to_string(),
-                        })?;
-                    if !zst_path.is_file() || !idx_path.is_file() {
-                        return Err(HubError::MissingPackDependency {
-                            pack_id: addr.pack_id.clone(),
-                            detail: "mirrored pack files missing on disk".into(),
-                        });
-                    }
-                    let manifest = PackManifest::from_json_slice(manifest_str.as_bytes()).map_err(|e| {
-                        HubError::MissingPackDependency {
-                            pack_id: addr.pack_id.clone(),
-                            detail: format!("corrupt stored pack manifest: {e:#}"),
-                        }
-                    })?;
-                    let span_matches = manifest.record_index.records().iter().any(|span| {
-                        span.decoded_offset == addr.decoded_offset
-                            && span.length == addr.length
-                            && span.blake3_digest == addr.blake3_digest
-                    });
-                    if !span_matches {
-                        return Err(HubError::MissingPackDependency {
-                            pack_id: addr.pack_id,
-                            detail: "quarantined PayloadAddr span not present in pack manifest".into(),
-                        });
-                    }
-                }
+                let conflicting_envelope_val: Value = serde_json::from_str(&conflicting_envelope)?;
+                let conflicting_addr: Option<PayloadAddr> =
+                    conflicting_payload.as_deref().map(serde_json::from_str).transpose()?;
+                super::receiver::verify_event_pack_references_in_tx(
+                    &tx,
+                    &self.packs_dir,
+                    &producer_id,
+                    None,
+                    conflicting_addr.as_ref(),
+                    &conflicting_envelope_val,
+                    &mut BTreeMap::new(),
+                    &mut BTreeMap::new(),
+                )?;
                 tx.execute(
                     "INSERT INTO hub_ingested_events(
                          producer_id, epoch, seq, op_id, event_digest,
@@ -2934,25 +2902,39 @@ impl HubStore {
     /// A single committed cut of the changed selectors. Closed heads remain discoverable
     /// after history retention so an offline derived index can still remove them.
     pub fn index_changes_since(&self, after: u64) -> Result<(u64, IndexChanges), HubError> {
+        let read_cut = |conn: &Connection| -> Result<(u64, IndexChanges), HubError> {
+            let Some(g) = latest_generation_in_conn(conn)? else {
+                return Ok((0, Vec::new()));
+            };
+            let mut changes = conn
+                .prepare("SELECT selector FROM hub_index_changes WHERE generation > ?1 ORDER BY generation,selector")?;
+            let mut head = conn.prepare(
+                "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+                created_at, updated_at, message_count, epoch, event_seq,payload_addr_json,custody_json,metadata_json
+                FROM hub_session_heads WHERE selector=?1 AND gen_to IS NULL",
+            )?;
+            let mut out = Vec::new();
+            for row in changes.query_map([after], |r| r.get::<_, String>(0))? {
+                let selector = row?;
+                let entry = head.query_row([&selector], map_head_row).optional()?;
+                out.push((selector, entry));
+            }
+            Ok((g.generation, out))
+        };
+        if let Some(conn) = self.store.open_readonly()? {
+            let tx = conn.unchecked_transaction()?;
+            if !tx.table_exists(None, "hub_generations")? {
+                return Ok((0, Vec::new()));
+            }
+            if tx.table_exists(None, "hub_index_changes")? {
+                return read_cut(&tx);
+            }
+        } else {
+            return Ok((0, Vec::new()));
+        }
         let mut conn = self.store.open_writable()?;
         let tx = conn.transaction()?;
-        let Some(g) = latest_generation_in_conn(&tx)? else {
-            return Ok((0, Vec::new()));
-        };
-        let mut changes =
-            tx.prepare("SELECT selector FROM hub_index_changes WHERE generation > ?1 ORDER BY generation,selector")?;
-        let mut head = tx.prepare(
-            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
-            created_at, updated_at, message_count, epoch, event_seq,payload_addr_json,custody_json,metadata_json
-            FROM hub_session_heads WHERE selector=?1 AND gen_to IS NULL",
-        )?;
-        let mut out = Vec::new();
-        for row in changes.query_map([after], |r| r.get::<_, String>(0))? {
-            let selector = row?;
-            let entry = head.query_row([&selector], map_head_row).optional()?;
-            out.push((selector, entry));
-        }
-        Ok((g.generation, out))
+        read_cut(&tx)
     }
 
     /// Record that the search index has caught up through `indexed_gen`.
@@ -2971,7 +2953,7 @@ impl HubStore {
             tx.execute(
                 "UPDATE hub_generations
                  SET indexed_generation = MAX(indexed_generation, ?1)
-                 WHERE generation = ?1",
+                 WHERE generation >= ?1",
                 [indexed_gen as i64],
             )?;
         }

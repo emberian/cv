@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Incremental hub indexing compacts Tantivy segments, commits deletes once, preserves watermarks across retention, and validates native extents and pack ownership on quarantine resolution.
 - `cv distill --session=<harness>` writes to every harness with a verified emitter (Codex, Gemini, Devin, …), sidecar and resume command included; `--delivery=live` stays Antigravity's.
 - A distilled seed attests its pack's human instructions (count, digest, length) and Claude transcripts keep that record, so a second distill demotes entries it cannot vouch for.
 - `cv doctor` reports `compaction_laundering` (a summary directive that repeats a tool result and no human prompt) and `diary_ledger_divergence` (a final "tests pass" against the recorded runs and edits); `cv lanes --json` carries the latter, and the post-compaction hook points at the former.

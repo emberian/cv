@@ -1362,15 +1362,23 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
             if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
                 if let Ok(heads) = hub.heads_at_generation(None) {
                     for e in heads {
-                        selector_places.insert(e.selector_string(), e.producer_id);
+                        let sel = e.selector_string();
+                        if scope.includes(&e.producer_id) {
+                            ids.insert(sel.clone());
+                        }
+                        if scope.includes("local") {
+                            selector_places.insert(sel, e.producer_id);
+                        }
                     }
                 }
             }
-            for r in cv_core::sessions() {
-                let p = selector_places.get(&r.id).map_or("local", String::as_str);
-                if scope.includes(p) {
-                    ids.insert(r.session_selector());
-                    ids.insert(r.id);
+            if scope.includes("local") {
+                for r in cv_core::sessions() {
+                    let p = selector_places.get(&r.id).map_or("local", String::as_str);
+                    if scope.includes(p) {
+                        ids.insert(r.session_selector());
+                        ids.insert(r.id);
+                    }
                 }
             }
             allowed_ids = Some(ids);
@@ -2011,8 +2019,14 @@ fn handle_hub_write(
                     return json_response(413, &json!({"error": "pack index exceeds 16 MiB limit"}), cors, &[]);
                 }
 
-                let mut idx_bytes = vec![0u8; idx_len];
-                if request.read_exact(&mut idx_bytes).is_err() {
+                let mut idx_bytes = Vec::with_capacity(idx_len.min(64 * 1024));
+                if request
+                    .by_ref()
+                    .take(idx_len as u64)
+                    .read_to_end(&mut idx_bytes)
+                    .is_err()
+                    || idx_bytes.len() != idx_len
+                {
                     return json_response(400, &json!({"error": "truncated pack index stream"}), cors, &[]);
                 }
 

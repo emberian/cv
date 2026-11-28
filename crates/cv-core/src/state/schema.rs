@@ -603,7 +603,8 @@ CREATE TABLE IF NOT EXISTS hub_generations (
     quarantine_count   INTEGER NOT NULL,
     indexed_generation INTEGER NOT NULL DEFAULT 0,
     pinned             INTEGER NOT NULL DEFAULT 0,
-    frontier_json      TEXT NOT NULL DEFAULT '{}'
+    frontier_json      TEXT NOT NULL DEFAULT '{}',
+    authority_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_hub_generations_pub_id
     ON hub_generations(publication_id);
@@ -632,6 +633,26 @@ CREATE INDEX IF NOT EXISTS idx_hub_session_heads_live_updated
     ON hub_session_heads(gen_to, updated_at DESC, producer_id ASC, session_id ASC);
 CREATE INDEX IF NOT EXISTS idx_hub_session_heads_selector
     ON hub_session_heads(selector, gen_to);
+CREATE UNIQUE INDEX IF NOT EXISTS hub_open_session_head
+    ON hub_session_heads(producer_id, session_id) WHERE gen_to IS NULL;
+CREATE TABLE IF NOT EXISTS hub_pull_sources (
+    target      TEXT PRIMARY KEY,
+    producer_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hub_index_changes (
+    selector   TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS hub_index_changes_by_generation
+    ON hub_index_changes(generation, selector);
+CREATE TRIGGER IF NOT EXISTS hub_index_open AFTER INSERT ON hub_session_heads BEGIN
+    INSERT INTO hub_index_changes VALUES(NEW.selector, NEW.gen_from)
+    ON CONFLICT(selector) DO UPDATE SET generation = MAX(generation, excluded.generation);
+END;
+CREATE TRIGGER IF NOT EXISTS hub_index_close AFTER UPDATE OF gen_to ON hub_session_heads WHEN NEW.gen_to IS NOT NULL BEGIN
+    INSERT INTO hub_index_changes VALUES(OLD.selector, NEW.gen_to)
+    ON CONFLICT(selector) DO UPDATE SET generation = MAX(generation, excluded.generation);
+END;
 "#;
 
 /// Read `PRAGMA user_version` from `conn`.

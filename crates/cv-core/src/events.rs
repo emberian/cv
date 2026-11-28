@@ -824,10 +824,11 @@ mod db {
     /// * `idx_events_session` serves [`events_for`] and `record`'s delete; `idx_events_target`
     ///   joins event rows back from a matched target.
     pub(crate) fn open() -> Option<Connection> {
-        let mut conn = crate::catalog::open_db()?;
-        if crate::env::frozen() || conn.is_readonly(rusqlite::MAIN_DB).ok()? {
+        let conn = crate::catalog::open_db()?;
+        if crate::env::frozen() || conn.is_readonly(rusqlite::MAIN_DB).ok()? || schema_current(&conn) {
             return Some(conn);
         }
+        let mut conn = conn;
         if table_has_column(&conn, "event_sessions", "harness") && !has_selector(&conn) {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -880,6 +881,30 @@ mod db {
             crate::env::warn_once("event suffix index", error);
         }
         Some(conn)
+    }
+
+    fn schema_current(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_sessions' AND sql LIKE '%selector%')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_targets' AND sql LIKE '%rev_target%')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='events' AND sql LIKE '%hunk_hashes%')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_event_sessions_native')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_events_session')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_events_target')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_event_targets_suffix')
+                AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_event_targets_rev')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+            && conn
+                .query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM event_targets WHERE rev_target IS NULL)",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
     }
 
     fn reverse_chars(s: &str) -> String {
@@ -1911,9 +1936,9 @@ pub fn hub_index_cursor(consumer: &str) -> Result<u64> {
     use anyhow::Context as _;
     use rusqlite::OptionalExtension;
     let conn = writer_connection().context("opening event catalog")?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS hub_index_cursor(consumer TEXT PRIMARY KEY,generation INTEGER NOT NULL)",
-    )?;
+    if !conn.table_exists(None, "hub_index_cursor")? {
+        return Ok(0);
+    }
     Ok(conn
         .query_row(
             "SELECT generation FROM hub_index_cursor WHERE consumer=?1",
@@ -1928,7 +1953,10 @@ pub fn hub_index_cursor(consumer: &str) -> Result<u64> {
 pub fn finish_hub_index(consumer: &str, generation: u64, removed: &[String]) -> Result<()> {
     use anyhow::Context as _;
     let mut conn = writer_connection().context("opening event catalog")?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hub_index_cursor(consumer TEXT PRIMARY KEY,generation INTEGER NOT NULL)",
+    )?;
     for selector in removed {
         tx.execute(
             "DELETE FROM events WHERE session IN (SELECT id FROM event_sessions WHERE selector=?1)",

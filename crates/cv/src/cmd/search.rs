@@ -34,6 +34,30 @@ fn resolve_allowed_ids(
         return Ok(None);
     }
     let sq = crate::cmd::query::build(filter_query)?;
+    if sq.is_none() {
+        if let Some(scope) = place_scope.filter(|s| !s.includes("local")) {
+            let mut out = std::collections::HashSet::new();
+            if let Ok(hub) = cv_core::state::hub::HubStore::default_hub() {
+                if let Ok(heads) = hub.heads_at_generation(None) {
+                    for e in heads {
+                        if !scope.includes(&e.producer_id) {
+                            continue;
+                        }
+                        if want.is_some_and(|w| w.as_str() != e.harness) {
+                            continue;
+                        }
+                        if let Some(needle) = cwd {
+                            if !e.cwd.as_deref().is_some_and(|p| p.contains(needle)) {
+                                continue;
+                            }
+                        }
+                        out.insert(e.selector_string());
+                    }
+                }
+            }
+            return Ok(Some(out));
+        }
+    }
     let mut candidates = cv_core::try_sessions_for(want)?;
     if let Some(needle) = cwd {
         candidates.retain(|r| r.cwd.as_ref().is_some_and(|p| p.to_string_lossy().contains(needle)));

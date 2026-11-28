@@ -539,6 +539,7 @@ struct WalkRow {
     parent: Option<String>,
     end_reason: Option<String>,
     model_config: Option<String>,
+    prompt_hash: Option<String>,
     /// [`rows_from`]: the digest of every column, and of `(id, model_config, started_at)`.
     digest: u64,
     child: u64,
@@ -621,11 +622,12 @@ fn walk_conn(conn: &Connection) -> Result<Walk> {
     let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
     let at = |name: &str| names.iter().position(|n| n == name);
     let id_at = at("id").context("hermes sessions without id")?;
-    let (title_at, parent_at, end_at, config_at) = (
+    let (title_at, parent_at, end_at, config_at, prompt_hash_at) = (
         at("title"),
         at("parent_session_id"),
         at("end_reason"),
         at("model_config"),
+        at("system_prompt_hash"),
     );
     let (started_at, ended_at, cwd_at, last_at) = (at("started_at"), at("ended_at"), at("cwd"), at("last_activity_at"));
     let lone = |row: &rusqlite::Row<'_>, i: Option<usize>| -> Option<String> {
@@ -675,6 +677,7 @@ fn walk_conn(conn: &Connection) -> Result<Walk> {
             parent: lone(row, parent_at),
             end_reason: lone(row, end_at),
             model_config: lone(row, config_at),
+            prompt_hash: lone(row, prompt_hash_at),
             digest,
             child,
         });
@@ -1009,6 +1012,7 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
         end_reason: Option<String>,
         marked: bool,
         child: u64,
+        prompt_hash: Option<String>,
     }
     let columns = &walk.columns;
     let mut sessions: HashMap<String, Meta> = HashMap::new();
@@ -1024,17 +1028,24 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
                 end_reason: text(&row.end_reason),
                 marked: !lineage_markers(text(&row.model_config).as_deref()).is_empty(),
                 child: row.child,
+                prompt_hash: text(&row.prompt_hash),
             },
         );
     }
     if columns.contains("system_prompt_hash") && table_exists(conn, "system_prompts") {
-        let mut stmt = conn.prepare(
-            "SELECT s.id, sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash",
-        )?;
+        // Scan each distinct shared prompt row once rather than joining and copying `sp.prompt`
+        // once per session across thousands of sessions sharing the same prompt hash.
+        let mut by_hash: HashMap<String, rusqlite::types::Value> = HashMap::new();
+        let mut stmt = conn.prepare("SELECT hash, prompt FROM system_prompts")?;
         let mut prompts = stmt.query([])?;
         while let Some(row) = prompts.next()? {
-            if let Some(meta) = row.get::<_, Option<String>>(0)?.and_then(|id| sessions.get_mut(&id)) {
-                meta.row = fold_value(meta.row, row.get_ref(1)?);
+            if let Some(hash) = row.get::<_, Option<String>>(0)?.filter(|s| !s.is_empty()) {
+                by_hash.insert(hash, row.get::<_, rusqlite::types::Value>(1)?);
+            }
+        }
+        for meta in sessions.values_mut() {
+            if let Some(prompt) = meta.prompt_hash.as_deref().and_then(|h| by_hash.get(h)) {
+                meta.row = fold_value(meta.row, rusqlite::types::ValueRef::from(prompt));
             }
         }
     }
@@ -1170,7 +1181,7 @@ fn fold_large_cell(conn: &Connection, table: &str, col: &str, rowid: i64, digest
         col.replace('"', "\"\""),
         table.replace('"', "\"\"")
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query([rowid])?;
     if let Some(row) = rows.next()? {
         *digest = fold_value(*digest, row.get_ref(0)?);
@@ -1359,7 +1370,7 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
     for (idx, sid) in chain.iter().enumerate() {
         digest = Rows::fold(digest, sid.as_bytes());
         if !session_cols.is_empty() {
-            let mut stmt = conn.prepare(&session_sql)?;
+            let mut stmt = conn.prepare_cached(&session_sql)?;
             let mut rows = stmt.query([sid])?;
             let mut found = 0u64;
             while let Some(row) = rows.next()? {
@@ -1390,7 +1401,7 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
                 "SELECT {rowid_sel}, typeof(sp.prompt), octet_length(sp.prompt), {inline_sel} \
                  FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.id = ?1"
             );
-            let mut stmt = conn.prepare(&prompt_sql)?;
+            let mut stmt = conn.prepare_cached(&prompt_sql)?;
             let mut rows = stmt.query([sid])?;
             if let Some(row) = rows.next()? {
                 digest = Rows::fold(digest, &[1]);
@@ -1419,7 +1430,7 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
             }
         }
         {
-            let mut stmt = conn.prepare(&msg_sql)?;
+            let mut stmt = conn.prepare_cached(&msg_sql)?;
             let mut rows = stmt.query([sid])?;
             while let Some(row) = rows.next()? {
                 count += 1;
@@ -5115,13 +5126,18 @@ mod tests {
         conn.execute("UPDATE messages SET content = ?1 WHERE id = 4", [&big_b])
             .unwrap();
         let rev_b = session_revision(&conn, "s-1").unwrap();
+        let rows_b = rows_conn(&conn).unwrap();
         assert_ne!(rev_a, rev_b, "WITHOUT ROWID overflow edit must move session_revision");
+        assert_ne!(
+            rows_a["s-1"], rows_b["s-1"],
+            "WITHOUT ROWID same-length overflow edit must move rows_conn"
+        );
         let big_c = format!("{big_b}!");
         conn.execute("UPDATE messages SET content = ?1 WHERE id = 4", [&big_c])
             .unwrap();
         let rows_c = rows_conn(&conn).unwrap();
         assert_ne!(
-            rows_a["s-1"], rows_c["s-1"],
+            rows_b["s-1"], rows_c["s-1"],
             "WITHOUT ROWID overflow length edit must move rows_conn"
         );
     }
