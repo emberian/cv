@@ -245,6 +245,11 @@ impl HookReceiver {
     pub fn bind(store: StateStore) -> Result<Self> {
         let path = store.hook_socket_path();
         let socket = super::recorder::bind_restrictive_0600::<UnixDatagram>(&path)?;
+        // The named pipe earlier versions listened on: nothing reads it any more.
+        let pipe = store.path().with_file_name("hooks-v1.fifo");
+        if std::fs::symlink_metadata(&pipe).is_ok_and(|meta| meta.file_type().is_fifo()) {
+            let _ = std::fs::remove_file(pipe);
+        }
         socket.set_nonblocking(true)?;
         buffer(&socket, libc::SO_RCVBUF, QUEUE_BYTES);
         Ok(Self { socket, path, store })

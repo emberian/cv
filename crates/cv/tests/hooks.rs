@@ -1995,7 +1995,13 @@ fn concurrent_large_hook_observations_arrive_whole_over_the_datagram_socket() {
 
     let w = World::in_process("hooks-datagram", cv_core::env::Env::enter_isolated);
     let store = cv_core::state::StateStore::at_dir(&w.cv_home);
+    // What an earlier version's recorder left in the home goes when the socket is bound.
+    fs::create_dir_all(&w.cv_home).unwrap();
+    let pipe = w.cv_home.join("hooks-v1.fifo");
+    let status = std::process::Command::new("mkfifo").arg(&pipe).status().unwrap();
+    assert!(status.success() && pipe.exists());
     let mut rx = cv_core::state::observations::HookReceiver::bind(store.clone()).unwrap();
+    assert!(!pipe.exists());
     w.write_session(
         "dgramsess",
         &[user("dgramsess", "u0", "2026-10-01T10:00:00Z", "spawn the lanes")],
