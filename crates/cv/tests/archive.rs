@@ -892,6 +892,34 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
     // 4. Semiauthoritative CLI queries (`--as-of`, `--place`, `--max-staleness`):
     let hub_json = |args: &[&str]| -> Value { serde_json::from_str(&hub_w.cv_ok(args).0).unwrap() };
 
+    // #tooth Pull and offline ingest publish searchable content and file events at the same cut.
+    let indexed = hub_json(&[
+        "--frozen",
+        "search",
+        "narwhal-delta-marker",
+        "--place",
+        "remote-box",
+        "--live-bytes",
+        "0",
+        "--json",
+    ]);
+    assert_eq!(indexed["total"], 1, "{indexed}");
+    assert_eq!(indexed["authority"]["indexed_generation"], 3, "{indexed}");
+    let touched = hub_json(&["touched", "revision-proof.rs", "--place", "remote-box", "--json"]);
+    assert_eq!(touched["touched"].as_array().unwrap().len(), 1, "{touched}");
+    let spool_hits = hub_json(&[
+        "--frozen",
+        "search",
+        "pangolin-sandbox-marker",
+        "--place",
+        "sbx-*",
+        "--live-bytes",
+        "0",
+        "--json",
+    ]);
+    assert_eq!(spool_hits["total"], 1, "{spool_hits}");
+    assert_eq!(spool_hits["authority"]["status"], "complete", "{spool_hits}");
+
     // #tooth The historical file inventory reads the selected revision, even after the later edit arrived.
     for (generation, count) in [("1", 0), ("2", 1)] {
         let touched = hub_json(&["touched", "revision-proof.rs", "--as-of", generation, "--json"]);

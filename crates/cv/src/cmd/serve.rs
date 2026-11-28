@@ -2128,6 +2128,13 @@ fn handle_hub_write(
                 Ok(resp) => {
                     ctx.stream.bump(&["hub", "sessions"]);
                     let mut extra = vec![("Cache-Control", "no-store".to_string())];
+                    match cv_search::fts::index_changed_heads(&hub) {
+                        Ok(generation) => extra.push(("X-Cv-Indexed-Generation", generation.to_string())),
+                        Err(e) => {
+                            eprintln!("cv serve: hub ingest committed, index update pending: {e:#}");
+                            extra.push(("X-Cv-Index-Status", "pending".into()));
+                        }
+                    }
                     if let Some(ref pub_id) = resp.publication_id {
                         extra.push(("X-Cv-Snapshot", header_safe(pub_id)));
                     }

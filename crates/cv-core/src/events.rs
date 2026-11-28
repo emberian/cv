@@ -1849,6 +1849,105 @@ pub use db::{
 #[cfg(feature = "sqlite")]
 pub(crate) use db::{open as writer_connection, record_spooled_in};
 
+/// Read the immutable consumer identity embedded in a Tantivy schema.
+#[cfg(feature = "sqlite")]
+pub fn fts_schema_consumer(dir: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::read(dir.join("meta.json")) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata)?;
+    Ok(metadata["schema"].as_array().and_then(|fields| {
+        fields.iter().find_map(|field| {
+            let id = field["name"].as_str()?.strip_prefix("cv_consumer_")?;
+            uuid::Uuid::parse_str(id).ok()?;
+            Some(format!("fts:{id}"))
+        })
+    }))
+}
+
+/// Verify the current cache pair when reporting a live watermark. A different or cleared
+/// cache has no coverage, even when the durable hub remembers indexing in another cache.
+#[cfg(feature = "sqlite")]
+pub(crate) fn current_hub_index_cursor() -> Result<u64> {
+    use rusqlite::OptionalExtension;
+    let Some(cache) = crate::env::cv_cache() else {
+        return Ok(0);
+    };
+    let dir = cache.join("tantivy");
+    let db = cache.join("catalog.db");
+    if !dir.join("meta.json").is_file() || !db.is_file() {
+        return Ok(0);
+    }
+    let consumer = match fts_schema_consumer(&dir)? {
+        Some(c) => c,
+        None => match std::fs::read_to_string(dir.join("cv-index-id")) {
+            Ok(id) if !id.trim().is_empty() => format!("fts:{}", id.trim()),
+            Ok(_) => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        },
+    };
+    crate::harness::store::sqlite::open_ro(&db)?.read_snapshot(|conn, _| {
+        if !conn.table_exists(None, "hub_index_cursor")? {
+            return Ok(0);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT generation FROM hub_index_cursor WHERE consumer=?1",
+                [consumer],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    })
+}
+
+/// Per-index catch-up cursor lives with the derived events. Replacing either index or catalog
+/// starts at zero. Advance it only after the Tantivy commit and all event publications succeed.
+#[cfg(feature = "sqlite")]
+pub fn hub_index_cursor(consumer: &str) -> Result<u64> {
+    use anyhow::Context as _;
+    use rusqlite::OptionalExtension;
+    let conn = writer_connection().context("opening event catalog")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hub_index_cursor(consumer TEXT PRIMARY KEY,generation INTEGER NOT NULL)",
+    )?;
+    Ok(conn
+        .query_row(
+            "SELECT generation FROM hub_index_cursor WHERE consumer=?1",
+            [consumer],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+#[cfg(feature = "sqlite")]
+pub fn finish_hub_index(consumer: &str, generation: u64, removed: &[String]) -> Result<()> {
+    use anyhow::Context as _;
+    let mut conn = writer_connection().context("opening event catalog")?;
+    let tx = conn.transaction()?;
+    for selector in removed {
+        tx.execute(
+            "DELETE FROM events WHERE session IN (SELECT id FROM event_sessions WHERE selector=?1)",
+            [selector],
+        )?;
+        tx.execute("DELETE FROM event_sessions WHERE selector=?1", [selector])?;
+        tx.execute(
+            "DELETE FROM source_dependencies WHERE id=?1 AND consumer IN ('events',?2)",
+            rusqlite::params![selector, consumer],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO hub_index_cursor VALUES(?1,?2) ON CONFLICT(consumer) DO UPDATE SET generation=excluded.generation",
+        rusqlite::params![consumer, generation],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(not(feature = "sqlite"))]
 mod db_stub {
     use super::*;

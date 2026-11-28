@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Hub ingest, spool import and SSH pull index changed sessions and their file events, with a durable generation watermark and retryable deletions.
+
 - Antigravity `cv prune` splices across checkpoints, strips `30.26` sludge, accepts `--replace-summary` and `--title`, and stashes snipped tool outputs for `cv cat`.
 - Shared multi-session SQLite stores report `size_bytes: null` and optional `store_bytes` on session rows so listing never multiplies database sizes.
 - OpenCode strips leading UTF-8 BOMs and trailing NUL padding in tree-layout files, skipping empty or NUL-only crash stubs cleanly.

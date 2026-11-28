@@ -11,7 +11,7 @@ use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 9;
+pub const STATE_SCHEMA_VERSION: i64 = 10;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -29,6 +29,24 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "ALTER TABLE hub_generations ADD COLUMN authority_json TEXT;
         CREATE UNIQUE INDEX hub_open_session_head ON hub_session_heads(producer_id,session_id) WHERE gen_to IS NULL;
         CREATE TABLE hub_pull_sources(target TEXT PRIMARY KEY, producer_id TEXT NOT NULL);",
+    ),
+    (
+        10,
+        "v10_hub_index_changes",
+        r#"
+        CREATE TABLE hub_index_changes(selector TEXT PRIMARY KEY, generation INTEGER NOT NULL);
+        CREATE INDEX hub_index_changes_by_generation ON hub_index_changes(generation,selector);
+        INSERT INTO hub_index_changes SELECT selector, MAX(COALESCE(gen_to,gen_from)) FROM hub_session_heads GROUP BY selector;
+        CREATE TRIGGER hub_index_open AFTER INSERT ON hub_session_heads BEGIN
+            INSERT INTO hub_index_changes VALUES(NEW.selector,NEW.gen_from)
+            ON CONFLICT(selector) DO UPDATE SET generation=MAX(generation,excluded.generation);
+        END;
+        CREATE TRIGGER hub_index_close AFTER UPDATE OF gen_to ON hub_session_heads WHEN NEW.gen_to IS NOT NULL BEGIN
+            INSERT INTO hub_index_changes VALUES(OLD.selector,NEW.gen_to)
+            ON CONFLICT(selector) DO UPDATE SET generation=MAX(generation,excluded.generation);
+        END;
+        UPDATE hub_generations SET indexed_generation=0;
+    "#,
     ),
 ];
 

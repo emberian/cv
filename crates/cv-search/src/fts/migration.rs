@@ -137,21 +137,7 @@ impl Drop for Migration {
 
 /// Migration identity lives in the same atomic metadata record as the schema/segments. Ordinary
 /// legacy indexes retain cv-index-id; no consumer can certify a generation before publication.
-pub(super) fn consumer(dir: &Path) -> Result<Option<String>> {
-    let metadata = match std::fs::read(dir.join("meta.json")) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let metadata: serde_json::Value = serde_json::from_slice(&metadata)?;
-    Ok(metadata["schema"].as_array().and_then(|fields| {
-        fields.iter().find_map(|field| {
-            let id = field["name"].as_str()?.strip_prefix("cv_consumer_")?;
-            uuid::Uuid::parse_str(id).ok()?;
-            Some(format!("fts:{id}"))
-        })
-    }))
-}
+pub(super) use cv_core::events::fts_schema_consumer as consumer;
 
 #[cfg(test)]
 mod tests {

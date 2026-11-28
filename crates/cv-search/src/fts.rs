@@ -398,6 +398,7 @@ pub fn index_all(
     strict: bool,
 ) -> Result<(Indexed, Vec<cv_core::SessionRef>)> {
     let default_index = dir == crate::default_tantivy_dir();
+    let _hub_guard = default_index.then(|| lock_hub_index(dir)).transpose()?;
     if default_index {
         cv_core::catalog::record_index_pass();
     }
@@ -414,8 +415,97 @@ pub fn index_all(
         } else {
             sweep_all(dir, rebuild, subagents)?
         };
-        Ok((report(swept, rebuild, strict)?, refs))
+        let indexed = report(swept, rebuild, strict)?;
+        if default_index && indexed.errors == 0 {
+            index_changed_heads_locked(&cv_core::state::hub::HubStore::default_hub()?, dir)?;
+        }
+        Ok((indexed, refs))
     })
+}
+
+// Serializes the cross-store publication with full discovery (including schema swaps).
+fn lock_hub_index(dir: &Path) -> Result<std::fs::File> {
+    let parent = dir.parent().context("missing search directory parent")?;
+    std::fs::create_dir_all(parent)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(".hub-index.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+/// Catch up the default text and event indexes using only changed or deleted hub selectors.
+pub fn index_changed_heads(hub: &cv_core::state::hub::HubStore) -> Result<u64> {
+    anyhow::ensure!(!cv_core::env::frozen(), "cannot index hub heads under --frozen");
+    let dir = crate::default_tantivy_dir();
+    let _guard = lock_hub_index(&dir)?;
+    index_changed_heads_locked(hub, &dir)
+}
+
+fn index_changed_heads_locked(hub: &cv_core::state::hub::HubStore, dir: &Path) -> Result<u64> {
+    let Some((latest, _)) = hub.latest_generation_fast()? else {
+        return Ok(0);
+    };
+    let (index, f) = open_or_create(dir)?;
+    let consumer = source_consumer(dir)?;
+    let after = cv_core::events::hub_index_cursor(&consumer)?;
+    if after == latest {
+        hub.record_indexed_generation(after)?;
+        return Ok(after);
+    }
+    let (generation, changes) = hub.index_changes_since(if after > latest { 0 } else { after })?;
+    let mut removed = Vec::new();
+    let mut jobs = Vec::new();
+    let mut probe = cv_core::source::Probe::default();
+    for (selector, entry) in changes {
+        let backing = entry
+            .map(|e| cv_core::custody::backing_from_hub_head(hub.packs_dir(), e))
+            .transpose()?
+            .flatten();
+        if let Some(b) = backing {
+            let r = b.reference.clone();
+            let source = probe.snapshot(&r);
+            let (mtime, size) = sig(source.primary);
+            jobs.push(Job {
+                backing: Some(Box::new(b)),
+                r,
+                mtime,
+                size,
+                fts: true,
+                events: true,
+                existing: true,
+                grew: false,
+                source,
+                dependencies_fresh: false,
+                prov: Default::default(),
+                mark: None,
+                mark_loaded: true,
+                decoded: None,
+                appended: None,
+            });
+        } else {
+            removed.push(selector);
+        }
+    }
+    if !jobs.is_empty() || !removed.is_empty() {
+        let mut writer = open_writer(&index, 60_000_000)?;
+        let mut ran = run_jobs(&mut writer, &f, jobs, &consumer)?;
+        for selector in &removed {
+            writer.delete_term(Term::from_field_text(f.id, selector));
+        }
+        writer.commit()?;
+        publish_dependencies(&mut ran, &consumer);
+        anyhow::ensure!(
+            ran.errors == 0 && ran.unreadable.is_empty(),
+            "hub index incomplete: {}",
+            ran.first_error.as_deref().unwrap_or("unreadable session")
+        );
+    }
+    cv_core::events::finish_hub_index(&consumer, generation, &removed)?;
+    hub.record_indexed_generation(generation)?;
+    Ok(generation)
 }
 
 /// Discovery beside [`sweep_decoded`], then the full sweep over what discovery found.
@@ -653,6 +743,8 @@ impl DiscoveryMetadata {
 
 /// One session a sweep must read, and what for.
 struct Job {
+    /// A collected interval is immutable even if a concurrent receipt publishes its successor.
+    backing: Option<Box<cv_core::custody::Backing>>,
     r: cv_core::SessionRef,
     mtime: i64,
     size: i64,
@@ -1169,6 +1261,7 @@ impl PlanState {
             return (fts_fresh, None);
         }
         let job = Job {
+            backing: None,
             r: r.clone(),
             mtime,
             size,
@@ -1269,7 +1362,11 @@ fn run_job(
     tx: &std::sync::mpsc::SyncSender<Out>,
     marks: &std::cell::OnceCell<cv_core::resume::Reader>,
 ) -> bool {
-    let adapter = match cv_core::custody::backing_for(&job.r) {
+    let backing = match job.backing.take() {
+        Some(b) => Ok(Some(b as Box<dyn cv_core::Adapter>)),
+        None => cv_core::custody::backing_for(&job.r),
+    };
+    let adapter = match backing {
         Ok(Some(backing)) => backing,
         Ok(None) => match cv_core::harness::for_harness(job.r.harness) {
             Some(a) => a,
@@ -4732,6 +4829,7 @@ mod tests {
         let source = cv_core::source::Probe::default().snapshot(&r);
         let (mtime, size) = sig(source.primary);
         Job {
+            backing: None,
             r,
             mtime,
             size,

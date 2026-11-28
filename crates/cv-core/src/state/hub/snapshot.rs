@@ -15,6 +15,8 @@ use std::path::PathBuf;
 /// Version of the hub envelope-to-projection fold semantics committed in every
 /// [`SnapshotPublicationManifest`]. Decoupled from [`crate::source::VERSION`] so adapter-level
 /// transcript parser tweaks do not invalidate historical fleet snapshot IDs.
+pub type IndexChanges = Vec<(String, Option<SessionRevisionEntry>)>;
+
 pub const HUB_SNAPSHOT_INTERPRETATION_VERSION: u32 = 1;
 
 /// Maximum number of unpinned [`SnapshotPublicationManifest`] rows retained in `hub_snapshots`.
@@ -2929,6 +2931,30 @@ impl HubStore {
         Ok(rebuilt)
     }
 
+    /// A single committed cut of the changed selectors. Closed heads remain discoverable
+    /// after history retention so an offline derived index can still remove them.
+    pub fn index_changes_since(&self, after: u64) -> Result<(u64, IndexChanges), HubError> {
+        let mut conn = self.store.open_writable()?;
+        let tx = conn.transaction()?;
+        let Some(g) = latest_generation_in_conn(&tx)? else {
+            return Ok((0, Vec::new()));
+        };
+        let mut changes =
+            tx.prepare("SELECT selector FROM hub_index_changes WHERE generation > ?1 ORDER BY generation,selector")?;
+        let mut head = tx.prepare(
+            "SELECT producer_id, session_id, harness, revision, title, cwd, model,
+            created_at, updated_at, message_count, epoch, event_seq,payload_addr_json,custody_json,metadata_json
+            FROM hub_session_heads WHERE selector=?1 AND gen_to IS NULL",
+        )?;
+        let mut out = Vec::new();
+        for row in changes.query_map([after], |r| r.get::<_, String>(0))? {
+            let selector = row?;
+            let entry = head.query_row([&selector], map_head_row).optional()?;
+            out.push((selector, entry));
+        }
+        Ok((g.generation, out))
+    }
+
     /// Record that the search index has caught up through `indexed_gen`.
     pub fn record_indexed_generation(&self, indexed_gen: u64) -> Result<(), HubError> {
         if crate::env::frozen() || indexed_gen == 0 {
@@ -3020,7 +3046,14 @@ impl HubStore {
                     generation = g.generation;
                 }
                 inputs = AuthorityInputs::read(&tx)?;
-                indexed_generation = inputs.indexed_generation.min(generation);
+                if inputs.indexed_generation > 0 {
+                    indexed_generation = inputs.indexed_generation.min(generation).min(
+                        crate::events::current_hub_index_cursor().unwrap_or_else(|e| {
+                            crate::env::warn_once("hub index coverage", format_args!("{e:#}"));
+                            0
+                        }),
+                    );
+                }
             }
         } else if ctx.as_of_gen.is_some() {
             return Err(HubError::NotFound("generation not found".into()));

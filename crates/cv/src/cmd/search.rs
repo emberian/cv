@@ -700,6 +700,10 @@ pub(crate) fn cmd_index(
             };
             match (fts_need, trigram_need) {
                 (Some(false), Some(false)) => {
+                    let hub = cv_core::state::hub::HubStore::default_hub()?;
+                    if hub.latest_generation_fast()?.is_some() {
+                        cv_search::fts::index_changed_heads(&hub)?;
+                    }
                     if json {
                         let indexed = cv_search::fts::indexed_top_level_count(&dir).unwrap_or(0);
                         let out = serde_json::json!({
@@ -735,14 +739,7 @@ pub(crate) fn cmd_index(
             if rebuild { "rebuilding" } else { "updating" },
             if subagents { " (+ sub-agent forest)" } else { "" }
         );
-        let hub = cv_core::state::hub::HubStore::default_hub().ok();
-        let before = hub.as_ref().and_then(|h| h.latest_generation_fast().ok().flatten());
         let (indexed, _refs) = cv_search::index_all(None, rebuild, subagents, strict)?;
-        if let (Some(hub), Some((gen, _))) = (hub, before) {
-            if indexed.unreadable.is_empty() && hub.latest_generation_fast()?.is_some_and(|(g, _)| gen == g) {
-                hub.record_indexed_generation(gen)?;
-            }
-        }
         if !json {
             println!(
                 "indexed {} top-level session(s) → {}{}",

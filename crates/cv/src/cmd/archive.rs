@@ -1252,6 +1252,7 @@ pub fn cmd_sync(archive: &Archive, args: SyncArgs) -> Result<()> {
             cv_core::state::hub::HubError::InvalidArgument(msg) => anyhow::Error::from(crate::util::UsageError(msg)),
             other => anyhow::Error::from(other),
         })?;
+        cv_search::fts::index_changed_heads(&hub).context("spool committed; updating search and event indexes")?;
         let gen_note = rep
             .hub_generation
             .map(|g| format!(" · generation {g}"))
@@ -1324,6 +1325,7 @@ pub fn cmd_sync(archive: &Archive, args: SyncArgs) -> Result<()> {
             let _ = child.wait();
         }
         let rep = result.with_context(|| format!("ingesting delta stream pulled from `{ssh_target}`"))?;
+        cv_search::fts::index_changed_heads(&hub).context("pull committed; updating search and event indexes")?;
         let gen_note = rep
             .hub_generation
             .map(|g| format!(" · generation {g}"))

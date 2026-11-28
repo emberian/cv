@@ -547,6 +547,7 @@ fn plan(
             continue;
         };
         let job = Job {
+            backing: None,
             r: r.clone(),
             mtime: fresh.mtime,
             size: fresh.size,
