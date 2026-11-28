@@ -764,6 +764,12 @@ mod tests {
         let mut wire = Value::String(input.to_owned());
         assert!(structured(&mut wire, "") > 0);
         assert!(!wire.as_str().unwrap().contains("DD=="));
+        // A valid base64 credential can consist entirely of letters.
+        let basic = r#"{"note":"Basic YWJjOmRlZmdoaWpr"}"#;
+        assert_eq!(
+            scrub_cow(basic, &opts, &mut RedactStats::default()),
+            r#"{"note":"Basic [REDACTED:api_key]"}"#
+        );
         for envelope in [input.to_owned(), serde_json::to_string(input).unwrap()] {
             let mut stats = RedactStats::default();
             assert!(str_needs_scrub(&envelope, &opts));

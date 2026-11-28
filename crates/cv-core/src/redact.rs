@@ -1956,8 +1956,7 @@ fn rules() -> &'static [Rule] {
                 whole(s, c)
             }),
             rule(Kind::ApiKey, r"(?i)\b(?:basic|token)[ \t]+([A-Za-z0-9._~+/=-]{16,})", |_, c| {
-                let v = c.get(1)?;
-                (!v.as_str().bytes().all(|b| b.is_ascii_alphabetic())).then_some((v.start(), v.end()))
+                value(c, 1)
             }),
             // AWS access key ids (`AKIA` long-term and `ASIA` STS temporary, the whole uppercase
             // run so an overlong key leaves no tail), then the prefix table.
