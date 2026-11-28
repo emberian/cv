@@ -732,10 +732,14 @@ cv distill agent-a5e2da77f3df2384b                      # the markdown pack on s
 cv distill agent-a5e2da77 --pack lane.md                # …to a file
 cv distill agent-a5e2da77 --session --cwd ~/work/repo   # a resumable session: claude -p --resume <id>
 cv distill agent-a5e2da77 --agent-of c1e4d723           # a new sub-agent of that root; SendMessage to the printed id
+cv distill agent-a5e2da77 --session=codex               # the same lane as a Codex session: codex resume <id>
 cv distill agent-a5e2da77 --upto 400 --with agent-a04ff45c --json
 ```
 
-`--upto N` distills as of message N. Emitted agents keep the source agent type, else `general-purpose`.
+`--session=<harness>` writes to any harness with a verified emitter (the targets of
+[`cv port`](#cv-port)) and prints that harness's resume command; `--delivery=live` stays with the
+harnesses that take a seed conversation (`antigravity`). `--upto N` distills as of message N.
+Emitted agents keep the source agent type, else `general-purpose`.
 
 ### `cv adopt`
 

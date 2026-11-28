@@ -689,3 +689,118 @@ fn distill_handoff_modes_shape_the_pack() {
     assert_eq!(report["stats"]["continuation_state"], "post_failure_edit", "{report}");
     assert_eq!(report["stats"]["handoff"], "escalate", "{report}");
 }
+
+/// #tooth `--session <harness>` reaches every harness with a verified emitter, not only the
+/// derived host: the emitted session is the target's own format, read back by its adapter, with
+/// the elided outputs in a sidecar `cv cat` reads through the new session.
+#[test]
+fn distill_session_emits_a_verified_session_of_another_harness_with_its_sidecar() {
+    let w = World::new("distill-session-foreign");
+    let big = format!("FIRST-LINE-OF-ELIDED-OUTPUT\n{}", "elided body line\n".repeat(900));
+    let mut rows = vec![claude::user(
+        "foreign-source",
+        "u0",
+        "2026-10-01T00:00:00Z",
+        "Audit the parser and report what you find.",
+    )];
+    for (i, (id, output)) in [("toolu_old", big.as_str()), ("toolu_mid", "mid"), ("toolu_new", "new")]
+        .into_iter()
+        .enumerate()
+    {
+        rows.push(claude::assistant(
+            &format!("a{i}"),
+            &format!("2026-10-01T00:00:0{}Z", 2 * i + 1),
+            "claude-test",
+            json!([claude::tool_use(id, "Bash", json!({"command": format!("step-{i}"), "description": "step"}))]),
+        ));
+        rows.push(claude::tool_result(
+            &format!("r{i}"),
+            &format!("2026-10-01T00:00:0{}Z", 2 * i + 2),
+            id,
+            output,
+        ));
+    }
+    rows.push(claude::assistant(
+        "a9",
+        "2026-10-01T00:00:09Z",
+        "claude-test",
+        json!([{"type":"text","text":"The parser audit is finished."}]),
+    ));
+    w.write_session("foreign-source", &rows);
+
+    for harness in ["codex", "devin", "gemini"] {
+        // A shared SQLite store is addressed by session id, so it sits where the adapter looks.
+        let out = match harness {
+            "devin" => w.home.join(".local/share/devin/cli"),
+            _ => w.base.join(format!("out-{harness}")),
+        };
+        let (stdout, stderr) = w.cv_ok(&[
+            "distill",
+            "foreign-source",
+            "--keep-last",
+            "1",
+            &format!("--session={harness}"),
+            "--out",
+            out.to_str().unwrap(),
+            "--json",
+        ]);
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let emitted = &report["emitted"];
+        let path = emitted["path"].as_str().unwrap_or_else(|| panic!("{harness}: {report}"));
+        let id = emitted["session_id"].as_str().unwrap();
+        assert_ne!(id, "foreign-source", "{harness}");
+        assert!(
+            emitted["sidecar_path"].as_str().is_some_and(|p| p.ends_with(&format!("{id}.flat.jsonl"))),
+            "{harness}: {emitted}"
+        );
+        let resume = emitted["resume"].as_str().unwrap_or_default();
+        assert!(resume.contains(harness) && !resume.contains("claude"), "{harness}: {resume}");
+        assert!(report["stats"]["elided_outputs"].as_u64().unwrap() >= 1, "{report}");
+
+        // The target's own adapter reads it: the pack carrier, then the tail's real turns.
+        let selector = match harness {
+            "devin" => format!("devin:{id}"),
+            _ => path.to_string(),
+        };
+        let (shown, _) = w.cv_ok(&["show", &selector, "--harness", harness, "--json"]);
+        let session: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        assert_eq!(session["harness"], harness, "{stderr}");
+        let text = session.to_string();
+        assert!(text.contains("[cv distill] You are resuming"), "{harness}: {text}");
+        assert!(text.contains("Audit the parser and report what you find."), "{harness}");
+        assert!(text.contains("The parser audit is finished."), "{harness}");
+        assert!(!text.contains("elided body line\\nelided body line"), "{harness}");
+
+        let (cat, _) = w.cv_ok(&["cat", &selector, "toolu_old", "--harness", harness]);
+        assert_eq!(cat.trim_end(), big.trim_end(), "{harness}");
+    }
+
+    // Every other emit target takes the same route: a session and its sidecar, both published.
+    for harness in ["claude", "hermes", "opencode", "openclaw", "qwen", "grok", "cline", "roo", "continue", "lmstudio"] {
+        let out = w.base.join(format!("all-{harness}"));
+        let (stdout, _) = w.cv_ok(&[
+            "distill",
+            "foreign-source",
+            "--keep-last",
+            "1",
+            &format!("--session={harness}"),
+            "--out",
+            out.to_str().unwrap(),
+            "--json",
+        ]);
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let emitted = &report["emitted"];
+        for key in ["path", "sidecar_path"] {
+            let written = emitted[key].as_str().unwrap_or_else(|| panic!("{harness} {key}: {report}"));
+            assert!(std::path::Path::new(written).exists(), "{harness}: {written}");
+        }
+    }
+
+    // A live seed is a property of the harness, not of `--session`.
+    let (_, code, _, err) = w.cv(&["distill", "foreign-source", "--session=codex", "--delivery=live"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--delivery=live is not supported with --session=codex"), "{err}");
+    let (_, code, _, err) = w.cv(&["distill", "foreign-source", "--session=kimi"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("no verified emitter"), "{err}");
+}

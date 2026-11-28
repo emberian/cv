@@ -525,9 +525,25 @@ pub fn emit_verified_with_sidecar(
     opts: &EmitOptions,
     sidecar: &[crate::distill::Elided],
 ) -> Result<(EmitResult, Option<PathBuf>, Vec<String>)> {
+    let (res, sc, report, uncommitted) = emit_report_with_sidecar(session, target, out_dir, opts, sidecar)?;
+    let mut lost = report.lost_lines();
+    lost.extend(uncommitted);
+    Ok((res, sc, lost))
+}
+
+/// [`emit_verified_with_sidecar`] returning the structured [`FidelityReport`], for a caller that
+/// decides itself which deltas are a loss. The last value is set when the transcript and sidecar
+/// took their names but the file the sidecar replaced could not be discarded.
+pub fn emit_report_with_sidecar(
+    session: &Session,
+    target: Harness,
+    out_dir: &Path,
+    opts: &EmitOptions,
+    sidecar: &[crate::distill::Elided],
+) -> Result<(EmitResult, Option<PathBuf>, FidelityReport, Option<String>)> {
     if sidecar.is_empty() {
-        let (res, lost) = emit_verified(session, target, out_dir, opts)?;
-        return Ok((res, None, lost));
+        let (res, report) = emit_checked(session, target, out_dir, opts, opts.strict, None)?;
+        return Ok((res, None, report, None));
     }
     let out_existed = out_dir.exists();
     let out_was_empty = !out_existed || fs::read_dir(out_dir).is_ok_and(|mut d| d.next().is_none());
@@ -582,15 +598,15 @@ pub fn emit_verified_with_sidecar(
             return Err(err);
         }
     };
-    let mut lost = report.lost_lines();
     let sc = sidecar_beside(&res.path, &res.new_id);
     match step {
         Some(SidecarStep::Held(claimed, held, _)) => {
             debug_assert_eq!(claimed, sc, "the sidecar was claimed beside the published transcript");
-            if let Err(err) = held.commit() {
-                lost.push(format!("sidecar {}: {err:#}", claimed.display()));
-            }
-            return Ok((res, Some(claimed), lost));
+            let uncommitted = held
+                .commit()
+                .err()
+                .map(|err| format!("sidecar {}: {err:#}", claimed.display()));
+            return Ok((res, Some(claimed), report, uncommitted));
         }
         Some(SidecarStep::InStage) => {}
         None => {
@@ -601,7 +617,7 @@ pub fn emit_verified_with_sidecar(
             }
         }
     }
-    Ok((res, Some(sc), lost))
+    Ok((res, Some(sc), report, None))
 }
 
 /// Remove the now-empty directories from `path`'s parent up to `out_dir`, which goes too only if

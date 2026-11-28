@@ -325,7 +325,9 @@ Claude does.
   plant into its own `subagents/`: the file is a new lane in that root's world.
 - **As a headless worker** — `cv distill <lane> --session [--cwd DIR]` writes a new main-thread
   session; `claude -p --resume <id> "<next quest>"` loads it. Add `--fork-session` to question one
-  distilled session repeatedly without growing it.
+  distilled session repeatedly without growing it. `--session=<harness>` hands the lane to another
+  harness instead (`codex`, `gemini`, `devin`, any [`cv port`](cli.md#cv-port) target): the pack
+  and tail are emitted in its format, verified by reading them back, with the sidecar beside them.
 - **As a pack** — `cv distill <lane> --pack lane.md` for a consultant or reviewer that needs to know
   what a lane did, not to *be* it. `--with <other>` (repeatable) appends another lane's findings —
   its own words and its facts, not its brief, ledger or tail — for merge-context.

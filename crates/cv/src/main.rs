@@ -814,7 +814,9 @@ enum Cmd {
         /// Replace an existing --pack file by atomic rename, or retry an uncertain/refused live delivery.
         #[arg(long)]
         force: bool,
-        /// Emit a resumable main-thread session (new id) under the target store or `--out` (`claude` by default, or `--session=antigravity`).
+        /// Emit a resumable main-thread session (new id) under the target store or `--out`: `claude` by
+        /// default, or `--session=<harness>` for any harness cv has a verified emitter for (`codex`,
+        /// `gemini`, `devin`, …). The elided outputs go beside it as `<id>.flat.jsonl`.
         #[arg(long, value_name = "HARNESS", num_args = 0..=1, require_equals = true, default_missing_value = "claude", conflicts_with = "agent_of")]
         session: Option<String>,
         /// With `--session=antigravity`: `cold` writes an offline root; `live` posts to the local language server.
@@ -836,7 +838,7 @@ enum Cmd {
         /// With --session: rehome the new session to this working directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// With --session: write under this directory instead of the Claude store.
+        /// With --session: write under this directory instead of the target harness's store.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Report as JSON on stdout (stats + what was written).

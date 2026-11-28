@@ -3,13 +3,14 @@
 //! `distill` compresses a session (typically a long sub-agent lane) into a context pack plus a
 //! verbatim tail (see [`cv_core::distill`]) and emits it three ways:
 //!  * the markdown pack on stdout or `--pack FILE` — a fresh agent's first message;
-//!  * `--session`: a new resumable Claude session (`claude -p --resume <id> "<next quest>"`);
+//!  * `--session[=<harness>]`: a new resumable session, Claude's by default
+//!    (`claude -p --resume <id> "<next quest>"`) or any harness with a verified emitter;
 //!  * `--agent-of <root>`: a new sub-agent transcript inside a root session's `subagents/` dir, which
 //!    that root resumes by sending it a message (`SendMessage` to the printed agent id).
 //!
 //! The same two destinations serve `cv splice … --session | --agent-of` (a verbatim prefix,
 //! `<id>:..N`, is the fork of a lane): [`Target`], [`target`] and [`emit_to`] are shared. Both
-//! destinations are one `cv_core::emit` of the IR to Claude — the emitter owns resumability
+//! destinations are one verified `cv_core::emit` of the IR — the emitter owns resumability
 //! (threading, open calls, sidechain identity), the selectors here only choose the messages.
 //!
 //! Neither command ever writes to the source session. Elided tool outputs go to a sidecar next to
@@ -84,8 +85,15 @@ pub(crate) fn target_for(
             let h = Harness::parse(raw)
                 .ok_or_else(|| crate::util::UsageError(format!("unknown --session harness: {raw}")))?;
             let seeds = cv_core::harness::rootless(h).is_some_and(|a| a.accepts_seed());
-            if h != cv_core::harness::derived_host() && !seeds {
-                return usage(format!("--session does not support {h}"));
+            if !seeds && !cv_core::emit::supported_targets().contains(&h) {
+                return usage(format!(
+                    "--session does not support {h}: cv has no verified emitter for it; supported: {}",
+                    cv_core::emit::supported_targets()
+                        .iter()
+                        .map(|h| h.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             Some((h, seeds))
         }
@@ -332,7 +340,8 @@ fn resume_hint(id: &str, cwd: Option<&Path>) -> String {
     cv_core::harness::resume_in(cwd, command)
 }
 
-/// Emit an IR session as Claude JSONL to `target`, with the elided outputs as its sidecar.
+/// Emit an IR session to `target`, with the elided outputs as its sidecar: a main-thread session
+/// of any harness with a verified emitter, or a Claude sub-agent transcript.
 pub(crate) fn emit_to(
     ir: &Session,
     target: &Target,
@@ -344,29 +353,52 @@ pub(crate) fn emit_to(
         Target::PackOnly => Ok(Emitted::default()),
         Target::Session { seed: Some(_), .. } => bail!("internal error: seed session targets emit via emit_seed"),
         Target::Session {
-            seed: None, cwd, out, ..
+            harness,
+            seed: None,
+            cwd,
+            out,
         } => {
             let out_dir = match out {
                 Some(d) => d.clone(),
-                None => cv_core::harness::for_harness(cv_core::harness::derived_host())
+                None => cv_core::harness::for_harness(*harness)
                     .and_then(|a| a.root())
-                    .context("Claude Code's store was not found; pass --out <dir>")?,
+                    .with_context(|| format!("{harness}'s store was not found; pass --out <dir>"))?,
+            };
+            // Reasoning signed for one provider does not replay under another: a session leaving
+            // its harness takes the port's replay policy.
+            let thinking = if *harness == ir.harness {
+                cv_core::emit::ThinkingMode::Native
+            } else {
+                cv_core::emit::ThinkingMode::replay_default(
+                    ir.model
+                        .iter()
+                        .chain(ir.messages.iter().filter_map(|m| m.model.as_ref()))
+                        .map(String::as_str),
+                )
             };
             let opts = EmitOptions {
                 new_cwd: cwd.clone(),
+                thinking,
                 ..Default::default()
             };
-            let res = emit_resumable(ir, &out_dir, &opts)?;
-            let sidecar = write_sidecar(&res.path, elided)?;
+            let (res, sidecar, report, uncommitted) =
+                cv_core::emit::emit_report_with_sidecar(ir, *harness, &out_dir, &opts, elided)?;
+            for w in lossy_lines(&report, false).into_iter().chain(uncommitted) {
+                eprintln!("  ⚠ lossy: {w}");
+            }
             let dir = cwd.clone().or_else(|| ir.cwd.clone());
-            let resume = resume_hint(&res.new_id, dir.as_deref());
+            let resume = if *harness == cv_core::harness::derived_host() {
+                Some(resume_hint(&res.new_id, dir.as_deref()))
+            } else {
+                res.resume_hint.clone()
+            };
             record_loom_lineage(ir, &res.new_id);
             Ok(Emitted {
                 session_id: Some(res.new_id),
                 agent_id: None,
                 path: Some(res.path),
                 sidecar_path: sidecar,
-                resume: Some(resume),
+                resume,
                 ..Default::default()
             }
             .sized())
@@ -993,6 +1025,7 @@ mod tests {
             .transpose()?;
         let target = match mode.as_str() {
             "resume" => Target::Session {
+                harness: Harness::Claude,
                 seed: None,
                 cwd: None,
                 out: Some(destination.join("resume")),
