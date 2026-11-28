@@ -524,14 +524,14 @@ pub fn redact(session: &Session) -> anyhow::Result<Session> {
 /// # Scope
 ///
 /// Scrubbed: the title and stored system prompt; every message (all text/thinking/tool blocks via [`redact_message`], plus
-/// each message's harness-specific `extra` map and complete replay record); the session-level `extra` map; and `git.remote` —
+/// each message's harness-specific `extra` map and complete replay record); the session-level `extra` map; and `git.branch` and `git.remote` —
 /// remotes can embed credentials (`https://x-access-token:ghs_…@github.com/o/r.git`). Note that an
 /// scp-style `git@host:…` remote has its `user@host` scrubbed as an email; that's cosmetic, not a
 /// leak.
 ///
 /// Not scrubbed: `cwd` and `source_path` (filesystem paths — a placeholder would corrupt them, and
 /// path privacy is a separate concern from secret redaction), `model`, ids, timestamps, and
-/// `git.branch`/`git.commit` (user-visible refs, not credential carriers). `principal` is also
+/// `git.commit`. `principal` is also
 /// preserved like other identifiers: it is an opaque identity, and its arbitrary object fields
 /// carry no cv-defined semantics. Consumers must apply their own identity privacy policy before
 /// sharing a principal; secret redaction does not anonymize it.
@@ -631,9 +631,11 @@ pub fn redact_credentials_cow(s: &str) -> (Cow<'_, str>, usize) {
     (out, stats.total())
 }
 
-/// Zero-allocation pre-scan over a single `&str`: returns `true` iff [`scrub_cow`] would redact at
-/// least one non-placeholder span under `opts`.
+/// Whether [`scrub_cow`] would redact any part of this string under `opts`.
 pub fn str_needs_scrub(s: &str, opts: &RedactOptions) -> bool {
+    if escaped_envelope(s) {
+        return matches!(scrub_cow(s, opts, &mut RedactStats::default()), Cow::Owned(_));
+    }
     if secrets::additional(s, &opts.classes).is_some() {
         return true;
     }
@@ -1349,9 +1351,28 @@ fn hash_principal_value(v: &mut Value, salt: Option<&str>) {
 /// Inline `data:image/` and `data:audio/` URIs carry binary media bytes rather than paths or text;
 /// other `data:` media types (such as `data:text/plain;base64,...`) are still scrubbed.
 fn is_inline_data_uri(reference: &str) -> bool {
-    reference
-        .get(..11)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/") || prefix.eq_ignore_ascii_case("data:audio/"))
+    let Some((header, body)) = reference.split_once(',') else {
+        return false;
+    };
+    let Some((mime, encoding)) = header.split_once(';') else {
+        return false;
+    };
+    let Some((kind, subtype)) = mime.split_once('/') else {
+        return false;
+    };
+    let raw = body.trim_end_matches('=');
+    let padding = body.len() - raw.len();
+    (kind.eq_ignore_ascii_case("data:image") || kind.eq_ignore_ascii_case("data:audio"))
+        && !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        && encoding.eq_ignore_ascii_case("base64")
+        && raw.len() % 4 != 1
+        && (padding == 0 || padding <= 2 && body.len().is_multiple_of(4))
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
 }
 
 /// A user home (`/Users/<u>`, `/home/<u>`, `C:\Users\<u>`) that *starts* a path: at the start of
@@ -1600,12 +1621,27 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// rule (the order of [`rules`]) wins. An existing placeholder is a rule too (the first), consumed
 /// verbatim, which is what makes the transform idempotent.
 pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
+    // Inspect decoded keys and values before a raw match can replace only the
+    // prefix of an escaped credential. Clean envelopes retain their formatting.
+    if escaped_envelope(s) {
+        if let Ok(mut value) = serde_json::from_str::<Value>(s) {
+            let before = stats.total();
+            scrub_value(&mut value, opts, stats);
+            if stats.total() > before {
+                return Cow::Owned(value.to_string());
+            }
+        }
+    }
     let base = legacy_cow(s, opts, stats);
     if let Some((changed, count)) = secrets::additional(&base, &opts.classes) {
         stats.assignments += count;
         return Cow::Owned(changed);
     }
     base
+}
+
+fn escaped_envelope(s: &str) -> bool {
+    s.trim_start().starts_with(['{', '[', '"']) && s.contains('\\')
 }
 
 fn legacy_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
@@ -1914,10 +1950,14 @@ fn rules() -> &'static [Rule] {
             }),
             // `Bearer <token>`, any case (RFC 7235). Prose guard: "bearer instruments are…" —
             // real tokens are long or contain digits/symbols.
-            rule(Kind::ApiKey, r"(?i)bearer +([A-Za-z0-9_.-]{8,})", |s, c| {
+            rule(Kind::ApiKey, r"(?i)bearer[ \t]+([A-Za-z0-9._~+/=-]{8,})", |s, c| {
                 let t = c.get(1)?.as_str();
                 (t.len() >= 16 || !t.bytes().all(|b| b.is_ascii_alphabetic())).then_some(())?;
                 whole(s, c)
+            }),
+            rule(Kind::ApiKey, r"(?i)\b(?:basic|token)[ \t]+([A-Za-z0-9._~+/=-]{16,})", |_, c| {
+                let v = c.get(1)?;
+                (!v.as_str().bytes().all(|b| b.is_ascii_alphabetic())).then_some((v.start(), v.end()))
             }),
             // AWS access key ids (`AKIA` long-term and `ASIA` STS temporary, the whole uppercase
             // run so an overlong key leaves no tail), then the prefix table.
@@ -3079,6 +3119,9 @@ mod tests {
             extensions: Default::default(),
         });
         let inline = format!("data:image/png;base64,{}", "QUJD".repeat(64));
+        // #tooth A media prefix alone cannot exempt a text payload or malformed reference.
+        assert!(!is_inline_data_uri("data:image/svg+xml,<svg/>"));
+        assert!(!is_inline_data_uri("data:audio/ogg;base64,not binary!"));
         let inline_audio = format!("data:audio/ogg;base64,{}", "QUJD".repeat(32));
         let non_media_data = "data:text/plain;charset=utf-8,/Users/carol/secret.txt".to_string();
         s.git = Some(crate::ir::GitInfo {

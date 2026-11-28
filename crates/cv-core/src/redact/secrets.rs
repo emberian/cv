@@ -136,6 +136,20 @@ fn walk(value: &mut Value, parent: &str, wire: bool) -> usize {
             if !wire && parent != "{jar}" && !context_key(parent) {
                 return 0;
             }
+            if wire && super::escaped_envelope(s) {
+                if let Ok(mut inner) = serde_json::from_str::<Value>(s) {
+                    let changes = structured(&mut inner, "");
+                    if changes != 0 {
+                        let encoded = inner.to_string();
+                        *s = if whole(parent, s, &encoded, true) {
+                            MARK.to_owned()
+                        } else {
+                            encoded
+                        };
+                        return changes;
+                    }
+                }
+            }
             let next = text(s);
             if whole(parent, s, &next, wire) {
                 if s == MARK || redacted_marker(s) {
@@ -549,7 +563,7 @@ pub(super) fn text(s: &str) -> Cow<'_, str> {
         }
         for re in [
             re!(r#"(?i)\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@'"`<>]{1,100}:([^\s@/'"`<>]{1,200})@"#),
-            re!(r"\b(?:Bearer|Basic|Token)\s+([A-Za-z0-9._~+/=-]{16,})"),
+            re!(r"(?i)\b(?:Bearer|Basic|Token)\s+([A-Za-z0-9._~+/=-]{16,})"),
         ] {
             for c in re.captures_iter(s) {
                 let v = c.get(1).unwrap();
@@ -731,6 +745,34 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn escaped_credentials_respect_classes_and_remain_idempotent() {
+        use crate::redact::{scrub_cow, str_needs_scrub, RedactClasses, RedactOptions, RedactStats};
+        let input = r#"[{"note":"bEaR\u0065r AABB1122+CC\/DD==","password":"keepThis123!"}]"#;
+        let opts = RedactOptions {
+            classes: RedactClasses {
+                api_keys: true,
+                ..RedactClasses::none()
+            },
+        };
+        // #tooth Only decoding the ordinary value exposes the entire bearer.
+        let mut keys: Value = serde_json::from_str(r#"{"ApI\u004bEY":"alpha1234!"}"#).unwrap();
+        assert_eq!(fields(&mut keys, ""), 1);
+        assert_eq!(keys["ApIKEY"], "[REDACTED:secret]");
+        let mut wire = Value::String(input.to_owned());
+        assert!(structured(&mut wire, "") > 0);
+        assert!(!wire.as_str().unwrap().contains("DD=="));
+        for envelope in [input.to_owned(), serde_json::to_string(input).unwrap()] {
+            let mut stats = RedactStats::default();
+            assert!(str_needs_scrub(&envelope, &opts));
+            let out = scrub_cow(&envelope, &opts, &mut stats);
+            assert!(!out.contains("AABB") && !out.contains("DD=="), "{out}");
+            assert!(out.contains("keepThis123!"));
+            assert_eq!((stats.total(), stats.api_keys), (1, 1));
+            assert!(!str_needs_scrub(&out, &opts));
+        }
     }
 
     /// #tooth Partially overlapping secret spans fuse into one cut without leaking the trailing secret tail.
