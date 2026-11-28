@@ -57,11 +57,39 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Knobs for [`redact_with`]. Defaults scrub everything.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedactOptions {
     /// Which classes of secret to scrub. Defaults to all of them; narrow it to scrub only some
     /// (e.g. only PEM private keys while leaving identities/fixtures intact).
     pub classes: RedactClasses,
+}
+
+impl RedactOptions {
+    /// Convert these secret-class options into an equivalent [`ScrubProfile`] (with network, path,
+    /// and principal transformations disabled).
+    pub fn to_scrub_profile(&self) -> ScrubProfile {
+        ScrubProfile::from(self)
+    }
+
+    /// Build an infallible [`CompiledProfile`] for these secret-class options.
+    pub fn compile(&self) -> CompiledProfile {
+        CompiledProfile::from_options(self)
+    }
+}
+
+impl From<&RedactOptions> for ScrubProfile {
+    fn from(opts: &RedactOptions) -> Self {
+        Self {
+            classes: opts.classes,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<RedactOptions> for ScrubProfile {
+    fn from(opts: RedactOptions) -> Self {
+        Self::from(&opts)
+    }
 }
 
 const fn default_true() -> bool {
@@ -492,6 +520,23 @@ impl RedactStats {
     }
 }
 
+impl std::ops::AddAssign<&RedactStats> for RedactStats {
+    fn add_assign(&mut self, rhs: &RedactStats) {
+        self.api_keys += rhs.api_keys;
+        self.private_keys += rhs.private_keys;
+        self.jwts += rhs.jwts;
+        self.emails += rhs.emails;
+        self.blobs += rhs.blobs;
+        self.assignments += rhs.assignments;
+    }
+}
+
+impl std::ops::AddAssign for RedactStats {
+    fn add_assign(&mut self, rhs: RedactStats) {
+        *self += &rhs;
+    }
+}
+
 /// Extended redaction & rewrite statistics returned by [`scrub_session_with_profile`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrubStats {
@@ -536,66 +581,8 @@ pub fn redact(session: &Session) -> anyhow::Result<Session> {
 /// carry no cv-defined semantics. Consumers must apply their own identity privacy policy before
 /// sharing a principal; secret redaction does not anonymize it.
 pub fn redact_with(session: &Session, opts: &RedactOptions) -> anyhow::Result<(Session, RedactStats)> {
-    let mut out = session.clone();
-    let resolver = session.resolver();
-    let mut stats = RedactStats::default();
-
-    if let Some(title) = out.title.as_mut() {
-        *title = scrub(title, opts, &mut stats);
-    }
-    if let Some(prompt) = out.system_prompt.as_mut() {
-        if let Cow::Owned(scrubbed) = scrub_cow(prompt, opts, &mut stats) {
-            *prompt = scrubbed;
-        }
-    }
-    for value in out
-        .lineage
-        .extensions
-        .values_mut()
-        .chain(out.git.iter_mut().flat_map(|git| git.extensions.values_mut()))
-    {
-        scrub_value(value, opts, &mut stats);
-    }
-    if let Some(git) = out.git.as_mut() {
-        if let Some(branch) = git.branch.as_mut() {
-            if let Cow::Owned(scrubbed) = scrub_cow(branch, opts, &mut stats) {
-                *branch = scrubbed;
-            }
-        }
-        if let Some(remote) = git.remote.as_mut() {
-            if let Cow::Owned(scrubbed) = scrub_cow(remote, opts, &mut stats) {
-                *remote = scrubbed;
-            }
-        }
-    }
-    if let Some(principal) = out.principal.as_mut() {
-        match principal {
-            crate::ir::Principal::String(s) => {
-                if let Cow::Owned(scrubbed) = scrub_cow(s, opts, &mut stats) {
-                    *s = scrubbed;
-                }
-            }
-            crate::ir::Principal::Object(map) => {
-                for (k, v) in map.iter_mut() {
-                    if opts.classes.assignments {
-                        stats.assignments += secrets::fields(v, k);
-                    }
-                    scrub_value(v, opts, &mut stats);
-                }
-            }
-        }
-    }
-    for (k, v) in out.extra.iter_mut() {
-        scrub_value(v, opts, &mut stats);
-        if opts.classes.assignments {
-            stats.assignments += secrets::fields(v, k);
-        }
-    }
-    for msg in &mut out.messages {
-        redact_message(msg, opts, &mut stats, &resolver)?;
-    }
-
-    Ok((out, stats))
+    let (out, stats) = CompiledProfile::from_options(opts).scrub_session(session)?;
+    Ok((out, stats.secrets))
 }
 
 /// Redact secrets from a single string. The core building block.
@@ -678,14 +665,14 @@ pub fn str_needs_scrub(s: &str, opts: &RedactOptions) -> bool {
 /// Zero-allocation pre-scan over a [`crate::json::JsonView`]: checks string leaves in place without
 /// building a `serde_json::Value` tree. Source identity and bounds are still verified by the view.
 pub fn json_view_needs_scrub(view: crate::json::JsonView<'_>, opts: &RedactOptions) -> anyhow::Result<bool> {
-    json_view_any_str(view, &mut |s| str_needs_scrub(s, opts))
+    CompiledProfile::from_options(opts).json_view_needs_scrub(view, None)
 }
 
 /// Zero-allocation pre-scan over a [`crate::json::Json`] (`Owned` or `Source`) before calling
 /// [`crate::json::Json::make_owned`]. Clean `Json::Source` descriptors stay `Json::Source` with
 /// zero heap cloning while still failing on missing or mutated backing files.
 pub fn json_needs_scrub(json: &crate::json::Json, opts: &RedactOptions) -> anyhow::Result<bool> {
-    json.with_view(|view| json_view_needs_scrub(view, opts))
+    CompiledProfile::from_options(opts).json_needs_scrub(json, None)
 }
 
 fn json_view_any_str(view: crate::json::JsonView<'_>, pred: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<bool> {
@@ -741,101 +728,9 @@ pub fn redact_message(
     stats: &mut RedactStats,
     resolver: &crate::Resolver,
 ) -> anyhow::Result<()> {
-    // Resolve fallibly and pre-scan every source-backed JSON payload before changing text or
-    // statistics. Clean `Json::Source` tool inputs and clean `complete_record`s never allocate an
-    // owned `Value` tree; unreadable or mutated sources still fail upfront.
-    msg.try_materialize_text(resolver)?;
-    let record_dirty = match &msg.complete_record {
-        Some(record) => json_needs_scrub(&record.value, opts)?,
-        None => false,
-    };
-    let mut dirty_inputs = Vec::new();
-    for (idx, block) in msg.content.iter().enumerate() {
-        if let Block::ToolUse { input, .. } = block {
-            if json_needs_scrub(input, opts)? {
-                dirty_inputs.push(idx);
-            }
-        }
-    }
-    for value in msg
-        .extensions
-        .values_mut()
-        .chain(msg.usage.iter_mut().flat_map(|u| u.extensions.values_mut()))
-    {
-        scrub_value(value, opts, stats);
-    }
-    for (idx, block) in msg.content.iter_mut().enumerate() {
-        if let Some(fields) = block.extensions_mut() {
-            for value in fields.values_mut() {
-                scrub_value(value, opts, stats);
-            }
-        }
-        if let Block::Thinking { signature, .. } = block {
-            if signature.as_ref().is_some_and(|sig| str_needs_scrub(sig, opts)) {
-                *signature = None;
-                stats.assignments += 1;
-            }
-        }
-        match block {
-            Block::Opaque { value, .. } => scrub_value(value, opts, stats),
-            Block::Text { text, .. } | Block::Thinking { text, .. } => {
-                // `scrub_cow` borrows when clean, so untouched text (the common case) is not
-                // reallocated — only actually-redacted fields are rewritten.
-                if let Cow::Owned(scrubbed) = scrub_cow(text, opts, stats) {
-                    *text = scrubbed.into();
-                }
-            }
-            Block::ToolUse { input, .. } => {
-                if dirty_inputs.binary_search(&idx).is_ok() {
-                    scrub_value(input.make_owned()?, opts, stats);
-                }
-            }
-            Block::ToolResult { content, details, .. } => {
-                if let Cow::Owned(scrubbed) = scrub_cow(content, opts, stats) {
-                    *content = scrubbed.into();
-                }
-                if let Some(d) = details {
-                    scrub_value(d, opts, stats);
-                }
-            }
-            // A reference is a path or URL (a signed URL carries its credential in the query);
-            // inline `data:` bytes are payload, not text, and stay intact.
-            Block::Image { data_ref, .. } => {
-                if let Some(r) = data_ref.as_mut().filter(|r| !is_inline_data_uri(r)) {
-                    if let Cow::Owned(scrubbed) = scrub_cow(r, opts, stats) {
-                        *r = scrubbed;
-                    }
-                }
-            }
-            Block::File { path, source, .. } => {
-                for r in [path, source].into_iter().flatten() {
-                    if is_inline_data_uri(r) {
-                        continue;
-                    }
-                    if let Cow::Owned(scrubbed) = scrub_cow(r, opts, stats) {
-                        *r = scrubbed;
-                    }
-                }
-            }
-        }
-    }
-    if record_dirty {
-        if let Some(record) = &mut msg.complete_record {
-            let record = std::sync::Arc::make_mut(record);
-            // Redaction invalidates the original replay witness; the scrubbed owned native record
-            // remains available to codec comparison without retaining secret-bearing descriptors.
-            record.projection.clear();
-            scrub_value(record.value.make_owned()?, opts, stats);
-        }
-    }
-    // Harness-specific passthrough fields can carry anything the harness logged (env snapshots,
-    // request metadata) — scrub their string leaves too.
-    for (k, v) in msg.extra.iter_mut() {
-        scrub_value(v, opts, stats);
-        if opts.classes.assignments {
-            stats.assignments += secrets::fields(v, k);
-        }
-    }
+    let mut scrub_stats = ScrubStats::default();
+    CompiledProfile::from_options(opts).scrub_message(msg, None, &mut scrub_stats, resolver)?;
+    *stats += scrub_stats.secrets;
     Ok(())
 }
 
@@ -868,6 +763,39 @@ pub fn scrub_text_with_profile(s: &str, profile: &ScrubProfile) -> anyhow::Resul
 }
 
 impl CompiledProfile {
+    /// Infallible secrets-only compiled profile for [`RedactOptions`].
+    pub fn from_options(opts: &RedactOptions) -> Self {
+        Self {
+            profile: ScrubProfile::from(opts),
+            env_home: None,
+            custom: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn has_network_or_path_rules(&self) -> bool {
+        self.profile.ssh_principals
+            || self.profile.private_ips
+            || self.profile.hostnames
+            || self.profile.rewrite_repo
+            || self.profile.rewrite_home
+            || !self.custom.is_empty()
+    }
+
+    /// Zero-allocation pre-scan over a [`crate::json::JsonView`] under this profile.
+    pub fn json_view_needs_scrub(
+        &self,
+        view: crate::json::JsonView<'_>,
+        repo_root: Option<&Path>,
+    ) -> anyhow::Result<bool> {
+        json_view_any_str(view, &mut |s| self.text_needs_scrub(s, repo_root))
+    }
+
+    /// Zero-allocation pre-scan over a [`crate::json::Json`] (`Owned` or `Source`) under this profile.
+    pub fn json_needs_scrub(&self, json: &crate::json::Json, repo_root: Option<&Path>) -> anyhow::Result<bool> {
+        json.with_view(|v| self.json_view_needs_scrub(v, repo_root))
+    }
+
     /// Scrub a session with zero-allocation `JsonView` pre-scanning on clean `ToolUse` inputs.
     pub fn scrub_session(&self, session: &Session) -> anyhow::Result<(Session, ScrubStats)> {
         let mut out = session.clone();
@@ -974,18 +902,18 @@ impl CompiledProfile {
         stats: &mut ScrubStats,
         resolver: &crate::Resolver,
     ) -> anyhow::Result<()> {
+        // Resolve fallibly and pre-scan every source-backed JSON payload before changing text or
+        // statistics. Clean `Json::Source` tool inputs and clean `complete_record`s never allocate an
+        // owned `Value` tree; unreadable or mutated sources still fail upfront.
         msg.try_materialize_text(resolver)?;
         let record_dirty = match &msg.complete_record {
-            Some(record) => record
-                .value
-                .with_view(|v| json_view_any_str(v, &mut |s| self.text_needs_scrub(s, repo_root)))?,
+            Some(record) => self.json_needs_scrub(&record.value, repo_root)?,
             None => false,
         };
         let mut dirty_inputs = Vec::new();
         for (idx, block) in msg.content.iter().enumerate() {
             if let Block::ToolUse { input, .. } = block {
-                let dirty = input.with_view(|v| json_view_any_str(v, &mut |s| self.text_needs_scrub(s, repo_root)))?;
-                if dirty {
+                if self.json_needs_scrub(input, repo_root)? {
                     dirty_inputs.push(idx);
                 }
             }
@@ -1117,7 +1045,13 @@ impl CompiledProfile {
         if str_needs_scrub(s, &secret_opts) {
             return true;
         }
+        if !self.has_network_or_path_rules() {
+            return false;
+        }
         let mut probe = ScrubStats::default();
+        if escaped_envelope(s) {
+            return matches!(self.scrub_text_cow(s, repo_root, &mut probe), Cow::Owned(_));
+        }
         matches!(
             self.scrub_network_and_paths_cow(s, repo_root, &mut probe),
             Cow::Owned(_)
@@ -1125,10 +1059,24 @@ impl CompiledProfile {
     }
 
     pub fn scrub_text_cow<'a>(&self, s: &'a str, repo_root: Option<&Path>, stats: &mut ScrubStats) -> Cow<'a, str> {
+        // Inspect decoded keys and values before a raw match can replace only the
+        // prefix of an escaped credential or path. Clean envelopes retain their formatting.
+        if escaped_envelope(s) {
+            if let Ok(mut value) = serde_json::from_str::<Value>(s) {
+                let before = stats.total();
+                self.scrub_value(&mut value, repo_root, stats);
+                if stats.total() > before {
+                    return Cow::Owned(value.to_string());
+                }
+            }
+        }
         let secret_opts = RedactOptions {
             classes: self.profile.classes,
         };
-        let step1 = scrub_cow(s, &secret_opts, &mut stats.secrets);
+        let step1 = scrub_plain_cow(s, &secret_opts, &mut stats.secrets);
+        if !self.has_network_or_path_rules() {
+            return step1;
+        }
         match step1 {
             Cow::Borrowed(clean) => self.scrub_network_and_paths_cow(clean, repo_root, stats),
             Cow::Owned(mut changed) => {
@@ -1350,7 +1298,7 @@ fn hash_principal_value(v: &mut Value, salt: Option<&str>) {
 
 /// Inline `data:image/` and `data:audio/` URIs carry binary media bytes rather than paths or text;
 /// other `data:` media types (such as `data:text/plain;base64,...`) are still scrubbed.
-fn is_inline_data_uri(reference: &str) -> bool {
+pub(crate) fn is_inline_data_uri(reference: &str) -> bool {
     let Some((header, body)) = reference.split_once(',') else {
         return false;
     };
@@ -1559,47 +1507,13 @@ fn scrub_ssh_principals_cow<'a>(s: &'a str, count: &mut usize) -> Cow<'a, str> {
     }
 }
 
-/// Recursively scrub JSON strings and object keys. Colliding scrubbed keys retain every value.
-/// Crate-visible so per-block redacting renderers (dataset export) can scrub a tool input without
-/// going through [`redact_message`] on a cloned message.
+/// Recursively scrub JSON strings and object keys via [`CompiledProfile::scrub_value`]. Colliding
+/// scrubbed keys retain every value. Crate-visible so per-block redacting renderers (dataset export)
+/// can scrub a tool input without going through [`redact_message`] on a cloned message.
 pub(crate) fn scrub_value(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
-    // Patterns first, so a recognized credential keeps its specific label.
-    scrub_leaves(v, opts, stats);
-    if opts.classes.assignments {
-        stats.assignments += secrets::fields(v, "");
-    }
-}
-
-fn scrub_leaves(v: &mut Value, opts: &RedactOptions, stats: &mut RedactStats) {
-    match v {
-        Value::String(s) => {
-            if let Cow::Owned(scrubbed) = scrub_cow(s, opts, stats) {
-                *s = scrubbed;
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                scrub_leaves(item, opts, stats);
-            }
-        }
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("thinking")
-                && map
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| str_needs_scrub(s, opts))
-            {
-                map.remove("signature");
-                stats.assignments += 1;
-            }
-            scrub_object_keys(map, |key| scrub_cow(key, opts, stats).into_owned());
-            for val in map.values_mut() {
-                scrub_leaves(val, opts, stats);
-            }
-        }
-        // numbers, bools, null: nothing to scrub.
-        _ => {}
-    }
+    let mut scrub_stats = ScrubStats::default();
+    CompiledProfile::from_options(opts).scrub_value(v, None, &mut scrub_stats);
+    *stats += scrub_stats.secrets;
 }
 
 const PLACEHOLDER_OPEN: &str = "[REDACTED:";
@@ -1616,22 +1530,16 @@ fn scrub(s: &str, opts: &RedactOptions, stats: &mut RedactStats) -> String {
 /// [`scrub`], allocation-aware: returns `Cow::Borrowed(s)` when nothing matched (the overwhelmingly
 /// common case for ordinary transcript text), and copies clean stretches between matches in bulk.
 ///
-/// Uses a fixed stack state array (no heap allocation on clean strings). Each enabled [`Rule`] keeps
-/// its earliest guarded hit at or after the cursor; the leftmost hit wins, and at a tie the earlier
-/// rule (the order of [`rules`]) wins. An existing placeholder is a rule too (the first), consumed
-/// verbatim, which is what makes the transform idempotent.
+/// Routes through [`CompiledProfile::scrub_text_cow`] so escaped JSON envelopes and plain text share
+/// one AST/leaf walker across `RedactOptions` and `ScrubProfile`.
 pub(crate) fn scrub_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
-    // Inspect decoded keys and values before a raw match can replace only the
-    // prefix of an escaped credential. Clean envelopes retain their formatting.
-    if escaped_envelope(s) {
-        if let Ok(mut value) = serde_json::from_str::<Value>(s) {
-            let before = stats.total();
-            scrub_value(&mut value, opts, stats);
-            if stats.total() > before {
-                return Cow::Owned(value.to_string());
-            }
-        }
-    }
+    let mut scrub_stats = ScrubStats::default();
+    let out = CompiledProfile::from_options(opts).scrub_text_cow(s, None, &mut scrub_stats);
+    *stats += scrub_stats.secrets;
+    out
+}
+
+fn scrub_plain_cow<'a>(s: &'a str, opts: &RedactOptions, stats: &mut RedactStats) -> Cow<'a, str> {
     let base = legacy_cow(s, opts, stats);
     if let Some((changed, count)) = secrets::additional(&base, &opts.classes) {
         stats.assignments += count;
@@ -1811,7 +1719,9 @@ fn whole(s: &str, c: &Captures) -> Option<(usize, usize)> {
 /// every run of letters lowercase, UPPERCASE or Capitalized. An encoded credential mixes case
 /// inside a run (`YWJjOmRlZmdoaWpr`) or carries digits or padding.
 fn reads_as_words(candidate: &str) -> bool {
-    !candidate.bytes().any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'='))
+    !candidate
+        .bytes()
+        .any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'='))
         && candidate.split(|c: char| !c.is_ascii_alphabetic()).all(|word| {
             let tail = word.get(1..).unwrap_or("");
             tail.bytes().all(|b| b.is_ascii_lowercase()) || word.bytes().all(|b| b.is_ascii_uppercase())
@@ -3220,5 +3130,68 @@ mod tests {
         compiled.scrub_value(&mut value, None, &mut stats);
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert!(!value.to_string().contains("Users"));
+    }
+
+    #[test]
+    fn redact_options_and_scrub_profile_share_one_walker_and_escaped_envelope_rules() -> anyhow::Result<()> {
+        let mut s = Session::new("single-walker", Harness::Claude);
+        let key = fixture("sk-", "abcDEF1234567890ghijkl");
+        s.title = Some(format!("fix {key}"));
+        s.system_prompt = Some("ping a@b.com".into());
+        s.git = Some(GitInfo {
+            branch: Some(format!("feat/{key}")),
+            commit: Some("0123456789abcdef".into()),
+            remote: Some("https://user:secretpass123@git.example.com/o/r.git".into()),
+            extensions: [(String::from("note"), serde_json::json!(format!("Bearer {key}")))]
+                .into_iter()
+                .collect(),
+        });
+        s.principal = Some(crate::ir::Principal::Object(
+            serde_json::json!({
+                key.clone(): "owner",
+                "api_key": key.clone(),
+                "email": "dev@example.com"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ));
+        let mut m = Message::new(Role::Assistant);
+        m.content
+            .push(Block::from_text(format!("contact dev@example.com with {key}").into()));
+        s.messages.push(m);
+
+        let opts = credential_options();
+        let (via_opts, opts_stats) = redact_with(&s, &opts)?;
+        let (via_profile, prof_stats) = opts.to_scrub_profile().compile()?.scrub_session(&s)?;
+        assert_eq!(serde_json::to_value(&via_opts)?, serde_json::to_value(&via_profile)?);
+        assert_eq!(opts_stats, prof_stats.secrets);
+        assert_eq!(prof_stats.total(), opts_stats.total());
+        assert!(!serde_json::to_string(&via_opts)?.contains(&key));
+        assert!(serde_json::to_string(&via_opts)?.contains("dev@example.com"));
+
+        // Escaped JSON envelopes also obey path/host/IP rules under a full ScrubProfile.
+        let profile = ScrubProfile {
+            private_ips: true,
+            hostnames: true,
+            rewrite_home: true,
+            ..Default::default()
+        };
+        let compiled = profile.compile()?;
+        let escaped = serde_json::to_string(
+            &serde_json::json!({
+                "win": r"C:\Users\carol\keys.json",
+                "host": "vault.internal",
+                "ip": "10.20.30.40"
+            })
+            .to_string(),
+        )?;
+        assert!(compiled.text_needs_scrub(&escaped, None));
+        let mut st = ScrubStats::default();
+        let out = compiled.scrub_text_cow(&escaped, None, &mut st);
+        assert!(!out.contains("carol"), "{out}");
+        assert!(!out.contains("vault.internal"), "{out}");
+        assert!(!out.contains("10.20.30.40"), "{out}");
+        Ok(())
     }
 }

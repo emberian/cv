@@ -227,8 +227,10 @@ fn render_blocks_impl<'a>(
                 match (path.as_deref(), redact.as_mut()) {
                     // The same scrub `redact_message` applies to a file reference, so the
                     // per-block path and redact-then-render stay byte-identical.
-                    (Some(path), Some((opts, stats))) => emit(&crate::redact::scrub_cow(path, opts, stats))?,
-                    (Some(path), None) => emit(path)?,
+                    (Some(path), Some((opts, stats))) if !crate::redact::is_inline_data_uri(path) => {
+                        emit(&crate::redact::scrub_cow(path, opts, stats))?
+                    }
+                    (Some(path), _) => emit(path)?,
                     (None, _) => emit(mime.as_deref().unwrap_or("attachment"))?,
                 }
                 emit("]")?;
