@@ -623,7 +623,7 @@ fn frozen_lanes_resolves_state_tasks_with_zero_filesystem_mutations() {
         ],
     );
 
-    // Seed `state.db` (`lane_runs` via `cv hook lane` + `task_events` via `cv task open|claim`).
+    // Seed `state.db` (`lane_runs` via `cv hook lane`) and `tasks/events.jsonl` (via `cv task open|claim`).
     {
         let payload = json!({
             "hook_event_name": "SubagentStart",

@@ -284,7 +284,7 @@ pub fn visit_tool_ops<'a>(
 }
 
 /// Streaming visitor that also extracts normalized 64-bit line-hunk fingerprints for every
-/// [`ToolOp::FileEdit`] operation (used by [`crate::events`] and derived columnar event segments).
+/// [`ToolOp::FileEdit`] operation (used by [`crate::events`] and [`crate::blame`]).
 pub fn visit_tool_ops_with_hunks<'a>(
     harness: Option<Harness>,
     name: &'a str,

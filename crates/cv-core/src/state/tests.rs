@@ -42,6 +42,18 @@ fn schema_migrations_are_forward_only_and_independent_of_source_version() {
         let mut raw_conn = rusqlite::Connection::open(v1_dir.join("state.db")).unwrap();
         apply_migrations_with(&mut raw_conn, 1, &schema::MIGRATIONS[..1]).unwrap();
         assert_eq!(current_schema_version(&raw_conn).unwrap(), 1);
+        assert!(
+            !raw_conn.table_exists(None, "task_events").unwrap(),
+            "fresh v1 schema must not create zombie task_events"
+        );
+        // Simulate a historical pre-cleanup v1 store carrying stale task_events + task_sync_meta.
+        raw_conn
+            .execute_batch(
+                "CREATE TABLE task_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, raw_json TEXT NOT NULL);
+                 CREATE INDEX idx_task_events_task_id ON task_events(seq);
+                 CREATE TABLE task_sync_meta (slot INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
         raw_conn
             .execute(
                 "INSERT INTO producers(producer_id, host_label, metadata_json, enrolled_at, updated_at)
@@ -54,6 +66,14 @@ fn schema_migrations_are_forward_only_and_independent_of_source_version() {
     {
         let conn = v1_migrated.open_writable().unwrap();
         assert_eq!(current_schema_version(&conn).unwrap(), STATE_SCHEMA_VERSION);
+        assert!(
+            !conn.table_exists(None, "task_events").unwrap(),
+            "forward migration must drop stale task_events"
+        );
+        assert!(
+            !conn.table_exists(None, "task_sync_meta").unwrap(),
+            "forward migration must drop stale task_sync_meta"
+        );
         for name in [
             "hub_packs",
             "hub_ingested_events",

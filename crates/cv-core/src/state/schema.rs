@@ -2,16 +2,16 @@
 //!
 //! Unlike `catalog.db` (which is derived and rebuildable from external transcripts), `state.db`
 //! holds `cv`-owned authoritative facts: enrolled producers, writer epochs, idempotency operation
-//! bindings, the bounded capture inbox, pack manifests & custody acknowledgements, task events,
-//! retired-agent records, lane runs/endpoints, hash-chained tool receipts, and session lineage
-//! edges. Schema evolution is strictly forward-migrated via [`STATE_SCHEMA_VERSION`] and NEVER
-//! coupled to [`crate::source::VERSION`].
+//! bindings, the bounded capture inbox, pack manifests & custody acknowledgements, cached task
+//! folds, retired-agent records, lane runs/endpoints, hash-chained tool receipts, and session
+//! lineage edges. Schema evolution is strictly forward-migrated via [`STATE_SCHEMA_VERSION`] and
+//! NEVER coupled to [`crate::source::VERSION`].
 
 use super::StateError;
 use rusqlite::Connection;
 
 /// Current authoritative `state.db` schema version.
-pub const STATE_SCHEMA_VERSION: i64 = 10;
+pub const STATE_SCHEMA_VERSION: i64 = 11;
 
 /// Ordered forward migrations `(target_version, name, ddl)`.
 pub const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -47,6 +47,13 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         END;
         UPDATE hub_generations SET indexed_generation=0;
     "#,
+    ),
+    (
+        11,
+        "v11_drop_zombie_task_events",
+        "DROP INDEX IF EXISTS idx_task_events_task_id;
+        DROP TABLE IF EXISTS task_events;
+        DROP TABLE IF EXISTS task_sync_meta;",
     ),
 ];
 
@@ -132,17 +139,6 @@ CREATE TABLE IF NOT EXISTS custody_acks (
     PRIMARY KEY(target_hub, producer_id, epoch)
 );
 
-CREATE TABLE IF NOT EXISTS task_events (
-    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id  TEXT NOT NULL UNIQUE,
-    task_id   TEXT NOT NULL,
-    ts        TEXT NOT NULL,
-    by_actor  TEXT NOT NULL,
-    raw_json  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_task_events_task_id
-    ON task_events(task_id, seq);
-
 CREATE TABLE IF NOT EXISTS task_folds (
     slot         INTEGER PRIMARY KEY CHECK (slot = 1),
     upto_seq     INTEGER NOT NULL,
@@ -150,13 +146,6 @@ CREATE TABLE IF NOT EXISTS task_folds (
     applied_json TEXT NOT NULL,
     garbage_json TEXT NOT NULL,
     refused_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS task_sync_meta (
-    slot         INTEGER PRIMARY KEY CHECK (slot = 1),
-    log_len      INTEGER NOT NULL,
-    log_lines    INTEGER NOT NULL,
-    file_id_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS retired_agents (

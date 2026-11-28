@@ -519,7 +519,7 @@ pub(crate) enum TaskCmd {
 
 /// Replay the default store, print any log warnings loudly, return the outcome.
 fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
-    let outcome = cv_core::replay_tasks_frozen_safe()?;
+    let outcome = task::replay()?;
     for w in &outcome.warnings {
         eprintln!("⚠ {}", sanitize_line(w));
     }
@@ -529,14 +529,6 @@ fn replay_loud() -> Result<cv_core::task::ReplayOutcome> {
 /// [`replay_loud`] for a command that reads only the model: the stored fold and the events
 /// appended since ([`cv_core::task::fold`]), with the same warnings, printed the same way.
 fn fold_loud() -> Result<cv_core::task::Folded> {
-    if cv_core::env::frozen() {
-        let outcome = replay_loud()?;
-        return Ok(cv_core::task::Folded {
-            model: outcome.model,
-            warnings: outcome.warnings,
-            quarantined: outcome.quarantined,
-        });
-    }
     let folded = task::fold()?;
     for w in &folded.warnings {
         eprintln!("⚠ {}", sanitize_line(w));

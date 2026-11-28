@@ -755,6 +755,9 @@ impl StateStore {
     pub fn list_pack_manifests(&self) -> Result<Vec<PackManifest>, StateError> {
         Ok(self
             .read_in(|conn| {
+                if !conn.table_exists(None, "pack_manifests")? {
+                    return Ok(Vec::new());
+                }
                 let mut stmt = conn.prepare(
                     "SELECT pack_id, min_commit_pos, max_commit_pos, record_count, byte_len,
                             digest, pack_path, index_meta_json, published_at

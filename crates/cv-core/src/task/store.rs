@@ -199,6 +199,16 @@ impl TaskStore {
     /// `quarantined`, resumed from the log's stored [`Fold`] so only the events appended since
     /// are read and reduced. What the prompt hook and every mutation's target lookup ask.
     pub fn fold(&self) -> Result<Folded> {
+        self.fold_inner(!crate::env::frozen())
+    }
+
+    /// Strictly read-only [`Self::fold`]: consults `task_folds` (via frozen-safe [`StateStore::read_in`])
+    /// and reduces any tail appended to `events.jsonl`, without ever opening `state.db` writable.
+    pub fn fold_readonly(&self) -> Result<Folded> {
+        self.fold_inner(false)
+    }
+
+    fn fold_inner(&self, persist: bool) -> Result<Folded> {
         let path = self.events_path();
         let state = self.state_store_for_fold();
         let mut file = self.open_log()?;
@@ -216,7 +226,8 @@ impl TaskStore {
         let committed = read.committed;
         let mut snapshot = None;
         let take = |reducer: &TaskReducer, refused: &[String], garbage: &[String]| {
-            (committed.offset > from.offset).then(|| (reducer.checkpoint(), refused.to_vec(), garbage.to_vec()))
+            (persist && committed.offset > from.offset)
+                .then(|| (reducer.checkpoint(), refused.to_vec(), garbage.to_vec()))
         };
         let mut new_garbage = read.warnings.into_iter();
         garbage.extend(new_garbage.by_ref().take(committed.warnings));
@@ -599,10 +610,17 @@ impl Fold {
 
     #[cfg(feature = "sqlite")]
     fn stored(path: &Path, file: Option<&File>, state: Option<&crate::state::StateStore>) -> Option<Fold> {
-        let conn = state?.open_readonly().ok()??;
-        let raw: String = conn
-            .query_row("SELECT model_json FROM task_folds WHERE slot = 1", [], |row| row.get(0))
-            .ok()?;
+        let raw: String = state?
+            .read_in(|conn| {
+                if !conn.table_exists(None, "task_folds")? {
+                    return Ok(None);
+                }
+                use rusqlite::OptionalExtension;
+                Ok(conn
+                    .query_row("SELECT model_json FROM task_folds WHERE slot = 1", [], |row| row.get(0))
+                    .optional()?)
+            })
+            .ok()???;
         let Stored {
             path: stored_path,
             prefix,
@@ -687,6 +705,11 @@ pub fn replay() -> Result<ReplayOutcome> {
 /// Convenience: [`TaskStore::fold`] of the default store.
 pub fn fold() -> Result<Folded> {
     TaskStore::default_store().fold()
+}
+
+/// Convenience: strictly read-only [`TaskStore::fold_readonly`] of the default store.
+pub fn fold_readonly() -> Result<Folded> {
+    TaskStore::default_store().fold_readonly()
 }
 
 #[cfg(test)]

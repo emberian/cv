@@ -2280,137 +2280,15 @@ fn lane_or_vanished(
 }
 
 fn task_store_likely_populated() -> bool {
-    let Some(home) = crate::env::Env::current().cv_home() else {
-        return false;
-    };
-    home.join("tasks/events.jsonl").is_file() || home.join("state.db").is_file()
+    crate::env::Env::current()
+        .cv_home()
+        .is_some_and(|home| home.join("tasks/events.jsonl").is_file())
 }
 
-fn is_task_log_header(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|v| v.get("format")?.as_str().map(|f| f == "cv-task-log"))
-        .unwrap_or(false)
-}
-
-/// Replay the default task store strictly read-only without creating SQLite `-wal`/`-shm`
-/// sidecars (safe under `--frozen` and on read-only mounts).
+/// Replay the default task store strictly read-only from `tasks/events.jsonl` without touching
+/// SQLite or lockfiles (safe under `--frozen` and on read-only mounts).
 pub fn replay_tasks_readonly() -> Result<crate::task::ReplayOutcome> {
-    use std::io::{BufRead as _, BufReader};
-
-    let store = crate::task::TaskStore::default_store();
-    let jsonl_path = store.dir().join("events.jsonl");
-    let mut raw_events: Vec<(usize, crate::task::TaskEvent)> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut warnings: Vec<String> = Vec::new();
-
-    match std::fs::File::open(&jsonl_path) {
-        Ok(file) => {
-            let mut reader = BufReader::new(file);
-            let mut buf = Vec::new();
-            let mut line_no = 0usize;
-            loop {
-                buf.clear();
-                let n = reader.read_until(b'\n', &mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                line_no += 1;
-                let Ok(text) = std::str::from_utf8(&buf) else {
-                    warnings.push(format!(
-                        "task log {}: line {line_no} is not valid UTF-8",
-                        jsonl_path.display()
-                    ));
-                    continue;
-                };
-                let line = text.trim();
-                if line.is_empty() || is_task_log_header(line) {
-                    continue;
-                }
-                match serde_json::from_str::<crate::task::TaskEvent>(line) {
-                    Ok(ev) => {
-                        seen_ids.insert(ev.id.clone());
-                        raw_events.push((line_no, ev));
-                    }
-                    Err(_) => {
-                        if buf.ends_with(b"\n") {
-                            let snippet: String = line.chars().take(80).collect();
-                            warnings.push(format!(
-                                "task log {}: line {line_no} is not a valid event: {snippet}",
-                                jsonl_path.display()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    #[cfg(feature = "sqlite")]
-    {
-        let db_path = store.state_store().path().to_path_buf();
-        if std::fs::metadata(&db_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
-            if let Ok(reader) = crate::harness::store::sqlite::open_ro(&db_path) {
-                let _ = reader.read_snapshot(|conn, _reads| {
-                    let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-                    if ver == 0 {
-                        return Ok(());
-                    }
-                    let Ok(mut stmt) = conn.prepare("SELECT seq, raw_json FROM task_events ORDER BY seq ASC") else {
-                        return Ok(());
-                    };
-                    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) else {
-                        return Ok(());
-                    };
-                    for row in rows {
-                        let (seq, raw_json) = row?;
-                        match serde_json::from_str::<crate::task::TaskEvent>(&raw_json) {
-                            Ok(ev) => {
-                                if seen_ids.insert(ev.id.clone()) {
-                                    raw_events.push((seq.max(0) as usize, ev));
-                                }
-                            }
-                            Err(_) => {
-                                let snippet: String = raw_json.chars().take(80).collect();
-                                warnings.push(format!(
-                                    "task store {}: row {} is not a valid event: {}",
-                                    db_path.display(),
-                                    seq,
-                                    snippet
-                                ));
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
-    }
-
-    let mut reducer = crate::task::TaskReducer::new();
-    let mut events = Vec::with_capacity(raw_events.len());
-    let mut quarantined = 0usize;
-    for (line_no, ev) in raw_events {
-        match reducer.apply(&ev) {
-            Ok(()) => events.push(ev),
-            Err(err) => {
-                quarantined += 1;
-                warnings.push(format!(
-                    "task log {}: line {line_no} quarantined: {err}",
-                    jsonl_path.display()
-                ));
-            }
-        }
-    }
-
-    Ok(crate::task::ReplayOutcome {
-        model: reducer.into_model(),
-        events,
-        warnings,
-        quarantined,
-    })
+    crate::task::replay()
 }
 
 fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> Result<Vec<Lane>> {
@@ -2495,8 +2373,8 @@ fn lanes_of_inner(parent: &SessionRef, visited_ancestors: &HashSet<PathBuf>) -> 
     // Best-effort read-only check of task/decision obligations when a task store is present,
     // without creating `-wal`/`-shm` sidecars or failing on broken/directory task logs.
     if !lanes.is_empty() && task_store_likely_populated() {
-        if let Ok(outcome) = replay_tasks_readonly() {
-            populate_task_obligations(&mut lanes, &outcome.model);
+        if let Ok(folded) = crate::task::fold_readonly() {
+            populate_task_obligations(&mut lanes, &folded.model);
         }
     }
 
