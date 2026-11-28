@@ -695,14 +695,15 @@ pub(crate) fn or_archived(
     if rows.iter().any(|b| b.reference.id == id || b.key.native_id == id) {
         rows.retain(|b| b.reference.id == id || b.key.native_id == id);
     }
-    anyhow::ensure!(
-        rows.len() <= 1,
-        "ambiguous session {id}; select one of {}",
-        rows.iter()
-            .map(|b| b.reference.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    if rows.len() > 1 {
+        let ids = rows.iter().map(|b| b.reference.id.clone()).collect();
+        return Err(crate::ResolveError::ambiguous(
+            "session id",
+            id,
+            "archived candidates",
+            ids,
+        ));
+    }
     Ok(rows
         .pop()
         .map(|b| (b.reference.clone(), Box::new(b) as Box<dyn Adapter>)))
@@ -1576,13 +1577,10 @@ impl ScopedView {
                     candidates.push(ScopedSource { r, entry: None });
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.starts_with("ambiguous session") || msg.contains("sessions have a sub-agent matching") {
-                        return Err(ScopedResolveError::Ambiguous(spec.to_owned()));
-                    }
-                    return Err(ScopedResolveError::Other(e));
+                Err(e) if matches!(crate::ResolveError::of(&e), Some(crate::ResolveError::Ambiguous(_))) => {
+                    return Err(ScopedResolveError::Ambiguous(spec.to_owned()));
                 }
+                Err(e) => return Err(ScopedResolveError::Other(e)),
             }
         }
 
