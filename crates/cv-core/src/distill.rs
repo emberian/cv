@@ -34,12 +34,15 @@ use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 mod lifecycle;
-use crate::harness::lifecycle::{Observation, Status, ToolResult as LifecycleResult};
+use crate::harness::lifecycle::Status;
 use crate::sanitize::{
     close_unclosed_fence, is_distill_section_heading, lines_with_endings, neutralize_forged_headers,
 };
 #[cfg(test)]
 use crate::tools::git::quiet_commits;
+use crate::tools::ledger::{
+    gate_failed, gate_verdict, is_gate_command, is_prose_path, observe_tool_result, LedgerStep, VerificationState,
+};
 
 /// A distilled pack is dense with shas, paths, hosts and code: measured on three real lanes
 /// (resumed with Claude Code, harness overhead subtracted) it ran 2.2–2.4 bytes per token, so it is
@@ -145,32 +148,14 @@ impl ContinuationState {
             Self::InProgress => "in_progress",
         }
     }
-}
 
-/// One step of the edit/validation sequence, in transcript order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Step {
-    /// A file-mutating call: its path.
-    Edit(String),
-    /// A build/test command's result: its label, verdict and whether it passed.
-    Validate {
-        label: String,
-        verdict: String,
-        passed: bool,
-    },
-}
-
-fn continuation_state(steps: &[(usize, Step)]) -> ContinuationState {
-    let last = steps.iter().rposition(|(_, s)| matches!(s, Step::Validate { .. }));
-    let Some(at) = last else {
-        return ContinuationState::InProgress;
-    };
-    let edited_after = steps[at + 1..].iter().any(|(_, s)| matches!(s, Step::Edit(_)));
-    match (&steps[at].1, edited_after) {
-        (Step::Validate { passed: false, .. }, true) => ContinuationState::PostFailureEdit,
-        (Step::Validate { passed: false, .. }, false) => ContinuationState::FailingValidation,
-        (_, false) => ContinuationState::VerifiedClean,
-        (_, true) => ContinuationState::InProgress,
+    fn from_verification(state: VerificationState) -> Self {
+        match state {
+            VerificationState::PostFailureEdit => Self::PostFailureEdit,
+            VerificationState::FailingValidation => Self::FailingValidation,
+            VerificationState::VerifiedClean => Self::VerifiedClean,
+            VerificationState::Unvalidated | VerificationState::UnverifiedEdit => Self::InProgress,
+        }
     }
 }
 
@@ -628,7 +613,7 @@ struct Facts {
     ok_at: HashMap<String, usize>,
     gate_at: HashMap<String, usize>,
     /// The edit/validation sequence the continuation state is read from.
-    steps: Vec<(usize, Step)>,
+    steps: Vec<(usize, LedgerStep)>,
     /// Files mutated by tool calls, first edit first, each once.
     edited: Vec<(usize, String)>,
 }
@@ -662,7 +647,7 @@ impl Facts {
                 if !self.edited.iter().any(|(_, p)| p == path) {
                     self.edited.push((i, path.to_owned()));
                 }
-                self.steps.push((i, Step::Edit(path.to_owned())));
+                self.steps.push((i, LedgerStep::Edit(path.to_owned())));
             }
         }
     }
@@ -691,8 +676,6 @@ enum Re {
     Push,
     Path,
     RemoteTarget,
-    GateCmd,
-    Verdict,
     ErrorLine,
     Tip,
     Cd,
@@ -701,12 +684,11 @@ enum Re {
     OpenItem,
     Decision,
     InPlace,
-    GateFailed,
     Heading,
     Definition,
 }
 
-static RES: [OnceLock<Regex>; 18] = [const { OnceLock::new() }; 18];
+static RES: [OnceLock<Regex>; 15] = [const { OnceLock::new() }; 15];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
@@ -721,49 +703,36 @@ fn re(which: Re) -> &'static Regex {
         ),
         Re::Path => (&RES[3], r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)"),
         Re::RemoteTarget => (&RES[4], r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]"),
-        Re::GateCmd => (
-            &RES[5],
-            r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bvitest\b|\bjest\b|\btsc\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
-        ),
-        Re::Verdict => (
-            &RES[6],
-            r"(?i)\berror\b|\bfail|\bpassed\b|\bsuccess|\bcompleted\b|\brc=\d|exit code|✔|✖|\bbuilt\b|test result|declaration uses 'sorry'",
-        ),
         Re::ErrorLine => (
-            &RES[7],
+            &RES[5],
             r"(?i)\berror\b|\bfatal\b|denied|no such file|not found|cannot|can't|failed|refused|timed out|unknown|invalid|conflict|panicked|traceback",
         ),
-        Re::Tip => (&RES[8], r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$"),
-        Re::Cd => (&RES[9], r"\bcd\s+([^\s;&|)']+)"),
+        Re::Tip => (&RES[6], r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$"),
+        Re::Cd => (&RES[7], r"\bcd\s+([^\s;&|)']+)"),
         Re::HeredocTarget => (
-            &RES[10],
+            &RES[8],
             r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
         ),
         // A PID file path: `/abs/…/name.pid`, `~/…`, or `$VAR/…` (how lanes name their own).
-        Re::PidFile => (&RES[11], r"((?:~|\$\{?\w+\}?)?/[\w.@/${}-]*\.pid)\b"),
+        Re::PidFile => (&RES[9], r"((?:~|\$\{?\w+\}?)?/[\w.@/${}-]*\.pid)\b"),
         // A line naming something still open, in the words lanes use for it.
         Re::OpenItem => (
-            &RES[12],
+            &RES[10],
             r"(?i)\bowed\b|\bbatch for\b|\bstill red\b|\bnot done\b|\bwaiting on\b",
         ),
         // A command that rewrites a file in place.
-        Re::InPlace => (&RES[13], r"\bsed\s+-i|\bperl\s+-[a-z]*i|write_text\(|\.write\("),
+        Re::InPlace => (&RES[11], r"\bsed\s+-i|\bperl\s+-[a-z]*i|write_text\(|\.write\("),
         // A line recording an explicit decision or modal constraint (excluding noisy `\bdefault\b`).
         Re::Decision => (
-            &RES[14],
+            &RES[12],
             r"(?i)\bdecided\b|\bruling\b|\bdecision:\s|\bmust\s+not\b|\bshall\s+not\b|\bdo\s+not\s+(?:edit|touch|modify|commit|push|delete|write)\b",
         ),
-        // A build/test run that reported failure in output its tool did not flag as an error.
-        Re::GateFailed => (
-            &RES[15],
-            r"(?m)test result: FAILED|^error(?:\[E\d+\])?:|^FAILED\b|\b[1-9]\d* failed\b|^FAIL\b|Exit code [1-9]",
-        ),
         // A markdown heading, behind an optional `cat -n`-style line number.
-        Re::Heading => (&RES[16], r"(?m)^\s*(?:\d+(?:→|\t))?\s*#{1,6}[ \t]+(\S[^\n]*?)[ \t#]*$"),
+        Re::Heading => (&RES[13], r"(?m)^\s*(?:\d+(?:→|\t))?\s*#{1,6}[ \t]+(\S[^\n]*?)[ \t#]*$"),
         // A definition's name at the start of a code line (behind an optional `cat -n` line number
         // and declaration modifiers).
         Re::Definition => (
-            &RES[17],
+            &RES[14],
             r#"(?m)^\s*(?:\d+\s*(?:→|\t|:|\|)\s*)?(?:(?:pub(?:\s*\([^)\n]*\))?|priv|private|protected|public|internal|crate|export|default|async|unsafe|const|static|abstract|final|virtual|override|inline|extern(?:\s+"[^"\n]*")?)\s+)*(?:fn|struct|enum|trait|union|impl|class|def|interface|func|function|type|mod|module|macro_rules!)(?:<[^>\n]*>)?\s+([A-Za-z_][A-Za-z0-9_]{2,})"#,
         ),
     };
@@ -1694,18 +1663,16 @@ fn analyze_with_policy(
             let out_cow = cache.resolve_tool_result(i, index)?;
             let out = out_cow.as_ref();
             let out_len = out.len();
-            let result = LifecycleResult {
-                message: Some(m),
-                tool: &name,
-                ops: &summary.ops,
-                body: out,
-                status: status.as_deref(),
-                is_error: *is_error,
-                details: details.as_ref(),
-            };
-            let observation = adapter
-                .as_ref()
-                .map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
+            let observation = observe_tool_result(
+                session.harness,
+                Some(m),
+                &name,
+                &summary.ops,
+                out,
+                status.as_deref(),
+                *is_error,
+                details.as_ref(),
+            );
             let observed = lifecycle.result(tool_use_id, observation);
             let result_out = observed.output.as_deref().unwrap_or(out);
             let mut attributed = None;
@@ -2137,7 +2104,8 @@ fn analyze_with_policy(
     let mode = opts.handoff;
     let narrative = mode.is_none_or(HandoffMode::keeps_narrative);
     let escalate = mode == Some(HandoffMode::Escalate);
-    let state = (opts.state_header || mode.is_some()).then(|| continuation_state(&facts.steps));
+    let state = (opts.state_header || mode.is_some())
+        .then(|| ContinuationState::from_verification(VerificationState::from_steps(&facts.steps)));
     let parent = session
         .lineage
         .parent
@@ -2432,9 +2400,12 @@ fn is_agent_authored(heading: &str) -> bool {
 fn render_state(h: &mut String, state: ContinuationState, f: &Facts, mode: Option<HandoffMode>) {
     let mode = mode.map(|m| format!(" · handoff: {}", m.as_str())).unwrap_or_default();
     let _ = writeln!(h, "{STATE_HEAD} — `state: {}`{mode}\n", state.as_str());
-    let last = f.steps.iter().rposition(|(_, s)| matches!(s, Step::Validate { .. }));
-    match last.map(|at| (at, &f.steps[at])) {
-        Some((at, (i, Step::Validate { label, verdict, passed }))) => {
+    let steps = &f.steps;
+    let last = steps
+        .iter()
+        .rposition(|(_, s)| matches!(s, LedgerStep::Validate { .. }));
+    match last.map(|at| (at, &steps[at])) {
+        Some((at, (i, LedgerStep::Validate { label, verdict, passed }))) => {
             let how = if *passed { "passed" } else { "FAILED" };
             let _ = writeln!(
                 h,
@@ -2443,8 +2414,8 @@ fn render_state(h: &mut String, state: ContinuationState, f: &Facts, mode: Optio
                 crate::sanitize::sanitize_line(verdict)
             );
             let mut after: Vec<&str> = Vec::new();
-            for (_, s) in &f.steps[at + 1..] {
-                if let Step::Edit(p) = s {
+            for (_, s) in &steps[at + 1..] {
+                if let LedgerStep::Edit(p) = s {
                     if !after.contains(&p.as_str()) {
                         after.push(p);
                     }
@@ -2467,7 +2438,7 @@ fn render_state(h: &mut String, state: ContinuationState, f: &Facts, mode: Optio
             }
         }
         _ => {
-            let edits = f.steps.iter().filter(|(_, s)| matches!(s, Step::Edit(_))).count();
+            let edits = steps.iter().filter(|(_, s)| matches!(s, LedgerStep::Edit(_))).count();
             let _ = writeln!(
                 h,
                 "- **No validation run recorded** (no build or test command the facts index recognizes); {edits} edit(s)"
@@ -2481,18 +2452,18 @@ fn render_state(h: &mut String, state: ContinuationState, f: &Facts, mode: Optio
 /// validation passed; a validation is checked when it passed; commits are checked.
 fn render_progress(h: &mut String, f: &Facts) {
     let mut rows: Vec<(usize, String)> = Vec::new();
-    let last_pass = f
-        .steps
+    let steps = &f.steps;
+    let last_pass = steps
         .iter()
-        .rposition(|(_, s)| matches!(s, Step::Validate { passed: true, .. }));
+        .rposition(|(_, s)| matches!(s, LedgerStep::Validate { passed: true, .. }));
     let mut k = 0;
-    while k < f.steps.len() {
-        let (i, step) = &f.steps[k];
+    while k < steps.len() {
+        let (i, step) = &steps[k];
         match step {
-            Step::Edit(path) => {
+            LedgerStep::Edit(path) => {
                 // One row per run of consecutive edits to the same file.
                 let mut n = 1;
-                while matches!(f.steps.get(k + n), Some((_, Step::Edit(p))) if p == path) {
+                while matches!(steps.get(k + n), Some((_, LedgerStep::Edit(p))) if p == path) {
                     n += 1;
                 }
                 let verified = last_pass.is_some_and(|at| at > k);
@@ -2502,7 +2473,7 @@ fn render_progress(h: &mut String, f: &Facts) {
                 k += n;
                 continue;
             }
-            Step::Validate { label, verdict, passed } => {
+            LedgerStep::Validate { label, verdict, passed } => {
                 let mark = if *passed { "x" } else { " " };
                 let how = if *passed { "passed" } else { "FAILED" };
                 rows.push((
@@ -2783,7 +2754,7 @@ fn render_reads(h: &mut String, reads: &[(usize, String, String, String)], f: &F
     let later_edit = |i: usize, path: &str| {
         f.steps
             .iter()
-            .any(|(at, step)| *at > i && matches!(step, Step::Edit(p) if p == path))
+            .any(|(at, step)| *at > i && matches!(step, LedgerStep::Edit(p) if p == path))
     };
     let later_error = |i: usize, path: &str| {
         let name = basename(path);
@@ -2821,26 +2792,6 @@ fn render_reads(h: &mut String, reads: &[(usize, String, String, String)], f: &F
 
 /// Distinctive names carried per brick from the `Read` outputs it elides.
 const BRICK_SYMBOLS: usize = 8;
-
-/// Whether `command` runs a build or a test suite: a run whose result is a verdict on the tree.
-pub(crate) fn is_gate_command(command: &str) -> bool {
-    re(Re::GateCmd).is_match(command)
-}
-
-/// Whether build/test output reports a failure its tool did not flag as an error. Line-anchored,
-/// so it reads a whole output or one line of it.
-pub(crate) fn gate_failed(output: &str) -> bool {
-    re(Re::GateFailed).is_match(output)
-}
-
-/// Prose files, whose distinctive names are their headings rather than code definitions.
-pub(crate) fn is_prose_path(path: &str) -> bool {
-    let ext = basename(path)
-        .rsplit_once('.')
-        .map_or("", |(_, e)| e)
-        .to_ascii_lowercase();
-    matches!(ext.as_str(), "md" | "markdown" | "txt" | "rst" | "adoc" | "org")
-}
 
 /// Source-code files whose line-anchored top-level/member definitions are worth indexing.
 fn is_code_path(path: &str) -> bool {
@@ -3699,28 +3650,22 @@ fn scan_result_facts(
         f.ok_at.insert(run.clone(), i);
     }
     let is_gate = if name == "Bash" {
-        command_of(&summary.fields).is_some_and(|c| re(Re::GateCmd).is_match(c))
+        command_of(&summary.fields).is_some_and(is_gate_command)
     } else {
         summary
             .ops
             .iter()
             .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }))
-            && cmds.iter().any(|c| re(Re::GateCmd).is_match(c))
+            && cmds.iter().copied().any(is_gate_command)
     };
     if is_gate {
-        let passed = !is_error && !re(Re::GateFailed).is_match(out);
-        let verdict = out
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| re(Re::Verdict).is_match(l))
-            .or_else(|| out.lines().rev().map(str::trim).find(|l| !l.is_empty()))
-            .unwrap_or("(no output)");
+        let passed = !is_error && !gate_failed(out);
+        let verdict = truncate(gate_verdict(out), 160);
         f.steps.push((
             i,
-            Step::Validate {
+            LedgerStep::Validate {
                 label: label.to_string(),
-                verdict: truncate(verdict, 160),
+                verdict,
                 passed,
             },
         ));
@@ -3785,14 +3730,7 @@ fn scan_result_facts(
         return c;
     }
     if is_gate {
-        let verdict = out
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| re(Re::Verdict).is_match(l))
-            .or_else(|| out.lines().rev().map(str::trim).find(|l| !l.is_empty()))
-            .unwrap_or("(no output)");
-        let verdict = truncate(verdict.trim(), 160);
+        let verdict = truncate(gate_verdict(out).trim(), 160);
         f.gates.push((i, label.to_string(), verdict.clone()));
         if let Some(run) = &run {
             f.gate_at.insert(run.clone(), i);

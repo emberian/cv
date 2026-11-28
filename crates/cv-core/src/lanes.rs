@@ -1571,8 +1571,27 @@ fn tool_summary_for(harness: Option<crate::ir::Harness>, name: &str, input: &cra
     input.with_view(|view| crate::tools::classify::compact_label(harness, name, view, 80))
 }
 
+#[cfg(test)]
 fn tool_endpoint(harness: Option<crate::ir::Harness>, name: &str, input: &crate::json::Json) -> Result<Option<String>> {
-    input.with_view(|view| {
+    let ops = input.with_view(|view| {
+        let mut out = Vec::new();
+        crate::tools::classify::visit_tool_ops(
+            harness,
+            name,
+            view,
+            crate::tools::classify::ClassifyOpts::EVENTS,
+            |sem| out.push(sem.into_owned()),
+        )?;
+        Ok::<_, anyhow::Error>(out)
+    })?;
+    endpoint_from_ops(input, &ops)
+}
+
+fn endpoint_from_ops(
+    input: &crate::json::Json,
+    ops: &[crate::tools::classify::ToolSemantic<'_>],
+) -> Result<Option<String>> {
+    let direct = input.with_view(|view| {
         if !view.is_string()? {
             for key in ["command", "cmd", "script", "CommandLine"] {
                 if let Some(val) = view.get(key)? {
@@ -1582,26 +1601,20 @@ fn tool_endpoint(harness: Option<crate::ir::Harness>, name: &str, input: &crate:
                 }
             }
         }
-        let mut cmds = Vec::new();
-        crate::tools::classify::visit_tool_ops(
-            harness,
-            name,
-            view,
-            crate::tools::classify::ClassifyOpts::EVENTS,
-            |sem| {
-                if let crate::tools::classify::ToolOp::Command { cmd: Some(cmd), .. } = sem.op {
-                    cmds.push(cmd.into_owned());
-                }
-            },
-        )?;
-        for cmd in cmds {
-            let val = serde_json::Value::String(cmd);
+        Ok(None)
+    })?;
+    if direct.is_some() {
+        return Ok(direct);
+    }
+    for sem in ops {
+        if let crate::tools::classify::ToolOp::Command { cmd: Some(cmd), .. } = &sem.op {
+            let val = serde_json::Value::String(cmd.as_ref().to_owned());
             if let Some(ep) = endpoint_from(crate::json::JsonView::from(&val))? {
                 return Ok(Some(ep));
             }
         }
-        Ok(None)
-    })
+    }
+    Ok(None)
 }
 
 /// Locate the existing endpoint grammar without retaining a whole command or an unsuccessful
@@ -1695,32 +1708,14 @@ struct Pass {
     diary_ledger_divergence: Option<crate::doctor::DiaryLedgerDivergence>,
 }
 
-/// A question or approval call: answering it is the operator's move.
-fn is_ask(harness: crate::ir::Harness, name: &str, input: &crate::json::Json) -> Result<bool> {
-    use crate::affordance::Kind;
-    use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
-    let mut ask = false;
-    input.with_view(|view| {
-        visit_tool_ops(Some(harness), name, view, ClassifyOpts::COUNTS, |op| {
-            if let ToolOp::Affordance {
-                kind: Kind::Question | Kind::Approval,
-                ..
-            } = op.op
-            {
-                ask = true;
-            }
-        })
-    })?;
-    Ok(ask)
-}
-
 fn pass(r: &SessionRef) -> Result<Pass> {
+    use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolSemantic};
     let adapter = crate::harness::for_harness(r.harness).context("unsupported lane harness")?;
     let mut p = Pass::default();
     let mut last_board_post: Option<String> = None;
+    let mut last_tool_call: Option<(String, crate::json::Json)> = None;
     let mut seen = HashSet::new();
-    let mut open_tools: HashSet<String> = HashSet::new();
-    let mut asks: HashSet<String> = HashSet::new();
+    let mut calls = crate::tools::ledger::CallTracker::default();
     let mut ledger = crate::doctor::Ledger::default();
     // Only response identity is needed beyond the ordinary IR. Keep source-backed arguments
     // without unrelated raw result metadata; demanded assistant reports retain their full text.
@@ -1730,28 +1725,61 @@ fn pass(r: &SessionRef) -> Result<Pass> {
         r,
         &opts,
         &mut crate::stream::TryFnSink::new(|m: Message| {
-            ledger.observe(Some(r.harness), &m, &resolver)?;
+            let mut ops_by_id: HashMap<String, Vec<ToolSemantic<'static>>> = HashMap::new();
             if m.kind == MessageKind::CompactionBoundary {
-                open_tools.clear();
-                asks.clear();
+                calls.clear();
                 p.ends_in_report = false;
             }
             if m.is_model_visible() {
                 for b in &m.content {
                     match b {
-                        Block::ToolUse { id, name, input, .. } if !id.is_empty() => {
-                            open_tools.insert(id.clone());
-                            if is_ask(r.harness, name, input)? {
-                                asks.insert(id.clone());
+                        Block::ToolUse { id, name, input, .. } => {
+                            let ops = input.with_view(|view| {
+                                let mut out = Vec::new();
+                                visit_tool_ops(
+                                    Some(r.harness),
+                                    name,
+                                    view,
+                                    ClassifyOpts {
+                                        command_limit: Some(4096),
+                                        ..ClassifyOpts::EVENTS
+                                    },
+                                    |sem| out.push(sem.into_owned()),
+                                )?;
+                                Ok::<_, anyhow::Error>(out)
+                            })?;
+                            calls.open_call(id, &ops);
+                            if m.role == Role::Assistant {
+                                p.tool_calls += 1;
+                                last_tool_call = Some((name.clone(), input.clone()));
+                                if name == "post_message" {
+                                    if let Some(posted) = input
+                                        .with_view(|view| {
+                                            view.get("text")?.map(crate::json::JsonView::string).transpose()
+                                        })?
+                                        .flatten()
+                                        .filter(|text| !text.trim().is_empty())
+                                    {
+                                        last_board_post = Some(posted);
+                                    }
+                                }
+                                // Only the lane's OWN shell commands name its endpoint. An `Agent`
+                                // prompt or `Write`n brief carrying `export CV_ENDPOINT=lane:child`
+                                // is the child's export; scanning the whole input joined the parent.
+                                if p.endpoint.is_none() {
+                                    p.endpoint = endpoint_from_ops(input, &ops)?;
+                                }
+                            }
+                            if !id.is_empty() {
+                                ops_by_id.insert(id.clone(), ops);
                             }
                         }
-                        Block::ToolResult { tool_use_id, .. } if !tool_use_id.is_empty() => {
-                            open_tools.remove(tool_use_id);
-                        }
+                        Block::ToolResult { tool_use_id, .. } => calls.close_call(tool_use_id),
                         _ => {}
                     }
                 }
             }
+            ledger.observe_with_ops(&m, &resolver, &ops_by_id)?;
             if m.is_model_visible() && matches!(m.role, Role::User | Role::Assistant) {
                 p.messages += 1;
             }
@@ -1766,10 +1794,9 @@ fn pass(r: &SessionRef) -> Result<Pass> {
                     MessageKind::Reply => crate::forest::reply_text(&m, &resolver)?,
                     _ => None,
                 };
-                let has_text = report.is_some();
                 if calls_a_tool {
                     p.ends_in_report = false;
-                } else if has_text {
+                } else if report.is_some() {
                     p.ends_in_report = true;
                 }
                 if p.model.is_none() {
@@ -1784,39 +1811,21 @@ fn pass(r: &SessionRef) -> Result<Pass> {
                 if let Some(report) = report {
                     p.last_text = Some(report);
                 }
-                for b in &m.content {
-                    if let Block::ToolUse { name, input, .. } = b {
-                        p.tool_calls += 1;
-                        p.last_tool = Some(tool_summary_for(Some(r.harness), name, input)?);
-                        if name == "post_message" {
-                            if let Some(posted) = input
-                                .with_view(|view| view.get("text")?.map(crate::json::JsonView::string).transpose())?
-                                .flatten()
-                                .filter(|text| !text.trim().is_empty())
-                            {
-                                last_board_post = Some(posted);
-                            }
-                        }
-                        // Only the lane's OWN shell commands name its endpoint. An `Agent` prompt
-                        // or a `Write`n brief that carries `export CV_ENDPOINT=lane:child` is the
-                        // CHILD's export; scanning the whole input joined the parent to it.
-                        if p.endpoint.is_none() {
-                            p.endpoint = tool_endpoint(Some(r.harness), name, input)?;
-                        }
-                    }
-                }
             }
             Ok(Flow::Continue)
         }),
     )?;
+    if let Some((name, input)) = last_tool_call {
+        p.last_tool = Some(tool_summary_for(Some(r.harness), &name, &input)?);
+    }
     if p.model.is_none() {
         p.model = session.model.clone();
     }
     if p.last_text.is_none() {
         p.last_text = last_board_post;
     }
-    p.open_tool_calls = open_tools.len();
-    p.pending_ask = asks.iter().any(|id| open_tools.contains(id));
+    p.open_tool_calls = calls.open.len();
+    p.pending_ask = !calls.asks.is_empty();
     p.diary_ledger_divergence = ledger.finish(Some(&r.id));
     Ok(p)
 }

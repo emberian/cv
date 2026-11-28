@@ -1,7 +1,8 @@
 //! Correlate successful edits and terminal validation results by tool call ID.
 //! A check has to rerun the same command in the same working directory.
-use crate::harness::lifecycle::{Observation, Status, ToolResult};
+use crate::harness::lifecycle::Status;
 use crate::tools::classify::{ToolOp, ToolSemantic};
+use crate::tools::ledger::{observe_tool_result, validation_command};
 use crate::{Block, Harness, JsonView, Message, Resolver};
 use anyhow::Result;
 use serde::Serialize;
@@ -75,23 +76,6 @@ impl Replacement {
     }
 }
 
-/// A plain test, check, lint, or build invocation (no shell composition).
-pub fn validation(command: &str) -> bool {
-    if command.len() > 4096 || command.contains(['\n', ';', '|', '&', '`', '>', '<', '$']) {
-        return false;
-    }
-    let mut words = command.split_whitespace();
-    let program = words.next().unwrap_or("").rsplit('/').next();
-    match (program, words.next()) {
-        (Some("pytest" | "ctest" | "jest" | "vitest" | "tsc"), _)
-        | (Some("cargo"), Some("test" | "check" | "clippy" | "build" | "nextest"))
-        | (Some("go"), Some("test" | "vet" | "build"))
-        | (Some("npm" | "pnpm" | "yarn" | "bun" | "make"), Some("test" | "check" | "lint" | "build")) => true,
-        (Some("python" | "python3"), Some("-m")) => matches!(words.next(), Some("pytest" | "unittest")),
-        _ => false,
-    }
-}
-
 type Check = (String, Option<String>);
 
 struct Failure {
@@ -154,7 +138,7 @@ impl Detector {
                 cmd: Some(cmd),
                 workdir,
                 background: false,
-            } if validation(cmd) => {
+            } if validation_command(cmd) => {
                 let preceding = self
                     .last_edit
                     .take()
@@ -209,16 +193,16 @@ impl Detector {
         } else {
             "".into()
         };
-        let result = ToolResult {
-            message: Some(m),
-            tool: &call.op.tool,
-            ops: std::slice::from_ref(&call.op),
-            body: &body,
-            status: status.as_deref(),
-            is_error: *is_error,
-            details: details.as_ref(),
-        };
-        let outcome = adapter.map_or_else(|| Observation::result(&result), |a| a.tool_result_lifecycle(&result));
+        let outcome = observe_tool_result(
+            harness,
+            Some(m),
+            &call.op.tool,
+            std::slice::from_ref(&call.op),
+            &body,
+            status.as_deref(),
+            *is_error,
+            details.as_ref(),
+        );
         if outcome.uncertain || !outcome.started_jobs.is_empty() {
             return Ok(());
         }

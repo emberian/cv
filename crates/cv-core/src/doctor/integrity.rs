@@ -11,7 +11,8 @@
 //! the evidence (a `tool_use_id`, a message index) for a reader to check; it is never a verdict.
 
 use crate::ir::{Block, Message, MessageKind, Origin, Role};
-use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
+use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolSemantic};
+use crate::tools::ledger::{gate_failed, GateLedger, VerificationState};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -346,22 +347,11 @@ pub struct DiaryLedgerDivergence {
     pub edited_paths: Vec<String>,
 }
 
-struct Validation {
-    index: usize,
-    tool_use_id: String,
-    command: String,
-    passed: bool,
-}
-
 /// The order of build/test results and file edits, and the last assistant report read against it.
 #[derive(Default)]
 pub(crate) struct Ledger {
     idx: usize,
-    /// Build/test calls whose result has not streamed past yet.
-    open: HashMap<String, String>,
-    last: Option<Validation>,
-    edits_after: usize,
-    edited_paths: Vec<String>,
+    gates: GateLedger,
     /// What the newest assistant report diverges by, judged against the record as it stood then.
     found: Option<DiaryLedgerDivergence>,
 }
@@ -376,6 +366,43 @@ impl Ledger {
         harness: Option<crate::Harness>,
         m: &Message,
         resolver: &crate::lazy::Resolver,
+    ) -> anyhow::Result<()> {
+        self.observe_inner(m, resolver, |id, name, input, gates| {
+            input.with_view(|view| {
+                let mut ops = Vec::new();
+                visit_tool_ops(
+                    harness,
+                    name,
+                    view,
+                    ClassifyOpts {
+                        command_limit: Some(4096),
+                        ..ClassifyOpts::EVENTS
+                    },
+                    |sem| ops.push(sem.into_owned()),
+                )?;
+                gates.observe_ops(id, &ops);
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn observe_with_ops(
+        &mut self,
+        m: &Message,
+        resolver: &crate::lazy::Resolver,
+        call_ops: &HashMap<String, Vec<ToolSemantic<'static>>>,
+    ) -> anyhow::Result<()> {
+        self.observe_inner(m, resolver, |id, _, _, gates| {
+            gates.observe_ops(id, call_ops.get(id).map_or(&[], Vec::as_slice));
+            Ok(())
+        })
+    }
+
+    fn observe_inner(
+        &mut self,
+        m: &Message,
+        resolver: &crate::lazy::Resolver,
+        mut on_call: impl FnMut(&str, &str, &crate::Json, &mut GateLedger) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let index = self.idx;
         self.idx += 1;
@@ -407,36 +434,7 @@ impl Ledger {
                     }
                 }
                 Block::ToolUse { id, name, input, .. } if m.role == Role::Assistant => {
-                    let (mut gate, mut edits) = (None, Vec::new());
-                    input.with_view(|view| {
-                        visit_tool_ops(
-                            harness,
-                            name,
-                            view,
-                            ClassifyOpts {
-                                command_limit: Some(4096),
-                                ..ClassifyOpts::EVENTS
-                            },
-                            |op| match op.op {
-                                ToolOp::Command { cmd: Some(cmd), .. } if crate::distill::is_gate_command(&cmd) => {
-                                    gate.get_or_insert_with(|| cmd.into_owned());
-                                }
-                                ToolOp::FileEdit { path, .. } if !crate::distill::is_prose_path(&path) => {
-                                    edits.push(path.into_owned());
-                                }
-                                _ => {}
-                            },
-                        )
-                    })?;
-                    if let Some(command) = gate {
-                        self.open.insert(id.clone(), command);
-                    }
-                    for path in edits {
-                        self.edits_after += 1;
-                        if self.edited_paths.len() < 5 && !self.edited_paths.contains(&path) {
-                            self.edited_paths.push(path);
-                        }
-                    }
+                    on_call(id, name, input, &mut self.gates)?;
                 }
                 Block::ToolResult {
                     tool_use_id,
@@ -445,19 +443,11 @@ impl Ledger {
                     status,
                     ..
                 } if status.as_deref() != Some("running") => {
-                    let Some(command) = self.open.remove(tool_use_id) else {
-                        continue;
-                    };
-                    let mut failed = *is_error;
-                    each_line(content, resolver, |line| failed |= crate::distill::gate_failed(line))?;
-                    self.last = Some(Validation {
-                        index,
-                        tool_use_id: tool_use_id.clone(),
-                        command: shown(&command),
-                        passed: !failed,
-                    });
-                    self.edits_after = 0;
-                    self.edited_paths.clear();
+                    if let Some(cmd) = self.gates.take_open(tool_use_id) {
+                        let mut failed = *is_error;
+                        each_line(content, resolver, |line| failed |= gate_failed(line))?;
+                        self.gates.finish_gate(index, tool_use_id, cmd, !failed);
+                    }
                 }
                 _ => {}
             }
@@ -466,13 +456,13 @@ impl Ledger {
     }
 
     fn judge(&self, claim_index: usize, claim: String) -> Option<DiaryLedgerDivergence> {
-        let last = self.last.as_ref()?;
-        let kind = match (last.passed, self.edits_after) {
-            (false, 0) => DivergenceKind::FailingValidation,
-            (false, _) => DivergenceKind::PostFailureEdit,
-            (true, 0) => return None,
-            (true, _) => DivergenceKind::UnverifiedEdit,
+        let kind = match self.gates.state() {
+            VerificationState::FailingValidation => DivergenceKind::FailingValidation,
+            VerificationState::PostFailureEdit => DivergenceKind::PostFailureEdit,
+            VerificationState::UnverifiedEdit => DivergenceKind::UnverifiedEdit,
+            VerificationState::Unvalidated | VerificationState::VerifiedClean => return None,
         };
+        let last = self.gates.last.as_ref()?;
         Some(DiaryLedgerDivergence {
             session: None,
             kind,
@@ -480,10 +470,10 @@ impl Ledger {
             claim,
             validation_index: last.index,
             validation_tool_use_id: last.tool_use_id.clone(),
-            validation_command: last.command.clone(),
+            validation_command: shown(&last.command),
             validation_passed: last.passed,
-            edits_after: self.edits_after,
-            edited_paths: self.edited_paths.clone(),
+            edits_after: self.gates.edits_after,
+            edited_paths: self.gates.edited_paths.clone(),
         })
     }
 

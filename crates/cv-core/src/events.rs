@@ -369,13 +369,37 @@ impl EventExtractor {
         Ok(false)
     }
 
-    fn complete(&mut self, id: &str) -> Result<()> {
+    pub(crate) fn complete(&mut self, id: &str) -> Result<()> {
         if self.inferred_edits.contains(&format!("c{id}"))? && self.completed.insert(format!("c{id}"))? {
             self.pending = self.pending.saturating_sub(1);
             if self.pending == 0 {
                 self.inferred_edits.clear();
                 self.completed.clear();
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_file_edits(&mut self, m: &Message, cwd: Option<&Path>) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Some(edit) = crate::harness::native_edit(m) {
+            if let Some(id) = edit.id {
+                let paths: std::collections::BTreeSet<_> =
+                    edit.paths.iter().map(|path| absolutize(path, cwd)).collect();
+                for path in paths {
+                    if !self.has_inferred_edit(id, &path)? {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn note_file_edit(&mut self, id: &str, tool_name: &str, target: &str) -> Result<()> {
+        self.note_target(id, target)?;
+        if tool_name == "exec" {
+            self.note_exec_target(target)?;
         }
         Ok(())
     }
@@ -420,23 +444,18 @@ fn extract_message(
     let mut staged = Vec::new();
     let ts = m.timestamp.map(|t| t.timestamp());
     // A file edit the harness record states outside its tool blocks, unless a call already did.
-    if let Some(edit) = crate::harness::native_edit(m) {
-        if let Some(id) = edit.id {
-            let paths: std::collections::BTreeSet<_> = edit.paths.iter().map(|path| absolutize(path, cwd)).collect();
-            for path in paths {
-                if !extractor.has_inferred_edit(id, &path)? {
-                    staged.push(Event {
-                        msg_idx,
-                        ts,
-                        kind: "file_edit",
-                        tool: Some(edit.tool.into()),
-                        target: Some(path),
-                        detail: None,
-                        call: false,
-                        hunk_hashes: Vec::new(),
-                    });
-                }
-            }
+    if let Some(edit_tool) = crate::harness::native_edit(m).map(|e| e.tool) {
+        for path in extractor.native_file_edits(m, cwd)? {
+            staged.push(Event {
+                msg_idx,
+                ts,
+                kind: "file_edit",
+                tool: Some(edit_tool.into()),
+                target: Some(path),
+                detail: None,
+                call: false,
+                hunk_hashes: Vec::new(),
+            });
         }
     }
     for b in &m.content {
@@ -446,10 +465,7 @@ fn extract_message(
                 extract_call_into(name, input, msg_idx, ts, cwd, details.is_some(), &mut staged)?;
                 for event in staged[before..].iter().filter(|event| event.kind == "file_edit") {
                     if let Some(target) = &event.target {
-                        extractor.note_target(id, target)?;
-                        if name == "exec" {
-                            extractor.note_exec_target(target)?;
-                        }
+                        extractor.note_file_edit(id, name, target)?;
                     }
                 }
             }

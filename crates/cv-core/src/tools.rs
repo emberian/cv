@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 pub mod classify;
 pub mod git;
+pub mod ledger;
 
 /// A per-tool tally with the kind breakdown the event classifier assigns.
 #[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]

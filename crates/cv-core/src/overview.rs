@@ -1,7 +1,8 @@
 //! Bounded orientation over the existing message stream, event classifier and worker forest.
 //! Excerpts are pointers into evidence, not a summary or a claim that reported work was integrated.
 mod episodes;
-pub use episodes::{validation as validation_command, Episode, RepairEpisodes};
+pub use crate::tools::ledger::validation_command;
+pub use episodes::{Episode, RepairEpisodes};
 
 use crate::events::EventExtractor;
 use crate::ir::{Block, Message, MessageKind, Origin, Role, Session, SessionRef};
@@ -240,7 +241,6 @@ struct Collector<'a> {
     episodes: episodes::Detector,
     seen: crate::spill::ExactStrings,
     extractor: EventExtractor,
-    scratch: Vec<crate::events::Event>,
     error: Option<anyhow::Error>,
 }
 impl<'a> Collector<'a> {
@@ -259,9 +259,22 @@ impl<'a> Collector<'a> {
             episodes: Default::default(),
             seen: Default::default(),
             extractor: EventExtractor::default(),
-            scratch: Vec::new(),
             error: None,
         }
+    }
+    fn push_file(&mut self, ts: Option<DateTime<Utc>>, kind: &'static str, path: String) {
+        self.totals.files += 1;
+        recent(
+            &mut self.files,
+            File {
+                msg_idx: self.index,
+                ts,
+                kind,
+                path,
+                present: None,
+            },
+            self.opts.file_limit,
+        );
     }
     fn observe(&mut self, m: &Message) -> Result<()> {
         if let Some(id) = &m.id {
@@ -304,65 +317,70 @@ impl<'a> Collector<'a> {
                 }
             }
         }
-        self.extractor
-            .extract(m, self.index, self.cwd.as_deref(), None, None, &mut self.scratch)?;
-        for event in self.scratch.drain(..) {
-            if matches!(event.kind, "file_read" | "file_edit") {
-                if let Some(path) = event.target {
-                    self.totals.files += 1;
-                    recent(
-                        &mut self.files,
-                        File {
-                            msg_idx: event.msg_idx,
-                            ts: event.ts.and_then(|t| DateTime::from_timestamp(t, 0)),
-                            kind: event.kind,
-                            path,
-                            present: None,
-                        },
-                        self.opts.file_limit,
-                    );
-                }
-            }
+        let file_ts = m.timestamp.and_then(|t| DateTime::from_timestamp(t.timestamp(), 0));
+        for path in self.extractor.native_file_edits(m, self.cwd.as_deref())? {
+            self.push_file(file_ts, "file_edit", path);
         }
-        crate::events::release_scratch(&mut self.scratch);
         for block in &m.content {
             if let Block::ToolUse { id, name, input, .. } = block {
                 input.with_view(|view| {
+                    use crate::tools::classify::{visit_tool_ops, ClassifyOpts, ToolOp};
                     let mut ops = Vec::new();
-                    crate::tools::classify::visit_tool_ops(
+                    let mut file_ops: Vec<(&'static str, String)> = Vec::new();
+                    visit_tool_ops(
                         Some(self.harness),
                         name,
                         view,
-                        crate::tools::classify::ClassifyOpts {
+                        ClassifyOpts {
                             commands: true,
                             command_limit: Some(self.opts.excerpt_bytes.saturating_add(4).max(4100)),
                             summaries: false,
                         },
                         |sem| {
-                            if let crate::tools::classify::ToolOp::Command { cmd, .. } = &sem.op {
-                                self.totals.commands += 1;
-                                let (command, truncated) =
-                                    optional_excerpt(cmd.as_deref().map(str::to_owned), self.opts.excerpt_bytes);
-                                recent(
-                                    &mut self.commands,
-                                    Command {
-                                        msg_idx: self.index,
-                                        ts: m.timestamp,
-                                        tool: sem.tool.to_string(),
-                                        command,
-                                        truncated,
-                                    },
-                                    self.opts.command_limit,
-                                );
+                            match &sem.op {
+                                ToolOp::Command { cmd, .. } => {
+                                    self.totals.commands += 1;
+                                    let (command, truncated) =
+                                        optional_excerpt(cmd.as_deref().map(str::to_owned), self.opts.excerpt_bytes);
+                                    recent(
+                                        &mut self.commands,
+                                        Command {
+                                            msg_idx: self.index,
+                                            ts: m.timestamp,
+                                            tool: sem.tool.to_string(),
+                                            command,
+                                            truncated,
+                                        },
+                                        self.opts.command_limit,
+                                    );
+                                }
+                                ToolOp::FileEdit { path, .. } => {
+                                    file_ops.push(("file_edit", crate::events::absolutize(path, self.cwd.as_deref())));
+                                }
+                                ToolOp::FileRead { path } | ToolOp::Search { path: Some(path), .. } => {
+                                    file_ops.push(("file_read", crate::events::absolutize(path, self.cwd.as_deref())));
+                                }
+                                _ => {}
                             }
                             ops.push(sem.into_owned());
                         },
                     )?;
+                    for (kind, path) in file_ops {
+                        if kind == "file_edit" {
+                            self.extractor.note_file_edit(id, name, &path)?;
+                        }
+                        self.push_file(file_ts, kind, path);
+                    }
                     self.episodes.call(id, self.index, view, ops)
                 })?;
             } else {
                 self.episodes
                     .result(m, block, self.index, self.harness, &self.resolver)?;
+            }
+        }
+        for block in &m.content {
+            if let Block::ToolResult { tool_use_id, .. } = block {
+                self.extractor.complete(tool_use_id)?;
             }
         }
         self.index += 1;
