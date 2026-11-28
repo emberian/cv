@@ -151,18 +151,7 @@ mod tests {
     use super::super::ByteSource;
     use super::*;
 
-    fn bytes(number: u32, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for mut value in [u64::from(number << 3 | 2), data.len() as u64] {
-            while value >= 128 {
-                out.push(value as u8 | 128);
-                value >>= 7;
-            }
-            out.push(value as u8);
-        }
-        out.extend_from_slice(data);
-        out
-    }
+    use crate::harness::antigravity::cold::proto::field as bytes;
     fn unread_step(kind: &str, member: u32, data: &[u8]) -> bool {
         let staged = ByteSource::arena().unwrap();
         staged.append(|out| Ok(out.write_all(data)?)).unwrap();

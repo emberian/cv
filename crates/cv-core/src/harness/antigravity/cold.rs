@@ -111,7 +111,7 @@ pub(crate) fn rewind_with_closure_budget(
         .context("expected an Antigravity conversation or brain transcript")?;
     let db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
     let mut reads = crate::source::ReadSet::default();
-    super::record_sqlite_readset(&db, &mut reads);
+    super::sqlite_files(&db).for_each(|file| reads.record(&file));
     reads.record(&reference.path);
     let adapter = crate::harness::rootless(Harness::Antigravity).context("Antigravity adapter unavailable")?;
     let (session, _, grown) = crate::emit::prepare_selected(adapter, reference, 0, None)?;

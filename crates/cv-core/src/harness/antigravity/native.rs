@@ -88,7 +88,7 @@ fn read_side_proto(
 
 fn read(path: &Path, complete: bool, limit: i64) -> Result<jsonl::Read> {
     let mut reads = ReadSet::default();
-    record_sqlite_readset(path, &mut reads);
+    sqlite_files(path).for_each(|file| reads.record(&file));
     let source = crate::json::JsonSource::capture_with_reads(path, &reads)?;
     let input = jsonl::Read::with(source)?;
     let output = Arc::new(ByteSource::arena()?);
@@ -1170,28 +1170,7 @@ fn value_json(file: &File, message: &Proto, out: &mut impl Write, depth: usize) 
 mod tests {
     use super::*;
 
-    fn varint(mut value: u64, out: &mut Vec<u8>) {
-        while value >= 128 {
-            out.push(value as u8 | 128);
-            value >>= 7;
-        }
-        out.push(value as u8);
-    }
-
-    fn bytes(number: u64, value: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        varint(number << 3 | 2, &mut out);
-        varint(value.len() as u64, &mut out);
-        out.extend_from_slice(value);
-        out
-    }
-
-    fn uint(number: u64, value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        varint(number << 3, &mut out);
-        varint(value, &mut out);
-        out
-    }
+    use crate::harness::antigravity::cold::proto::{field as bytes, int as uint};
 
     fn projection(data: &[u8], complete: bool) -> serde_json::Value {
         // An earlier row in the same staging file: ranges, not the file, bound a cell.

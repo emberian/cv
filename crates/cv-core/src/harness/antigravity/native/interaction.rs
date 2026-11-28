@@ -274,34 +274,7 @@ mod tests {
     use super::super::ByteSource;
     use super::*;
 
-    fn bytes(number: u32, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for mut value in [u64::from(number << 3 | 2), data.len() as u64] {
-            while value >= 128 {
-                out.push(value as u8 | 128);
-                value >>= 7;
-            }
-            out.push(value as u8);
-        }
-        out.extend_from_slice(data);
-        out
-    }
-
-    fn uint(number: u32, mut value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut tag = u64::from(number << 3);
-        while tag >= 128 {
-            out.push(tag as u8 | 128);
-            tag >>= 7;
-        }
-        out.push(tag as u8);
-        while value >= 128 {
-            out.push(value as u8 | 128);
-            value >>= 7;
-        }
-        out.push(value as u8);
-        out
-    }
+    use crate::harness::antigravity::cold::proto::{field as bytes, int as uint};
 
     fn projection(data: &[u8]) -> (bool, serde_json::Value) {
         let staged = ByteSource::arena().unwrap();

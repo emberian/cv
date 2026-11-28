@@ -176,10 +176,7 @@ fn agent_refs(file: &File, info: &Proto, out: &mut impl Write, first: &mut bool,
 mod tests {
     use super::*;
 
-    fn bytes(number: u8, data: &[u8]) -> Vec<u8> {
-        assert!(number < 16 && data.len() < 128);
-        [vec![number << 3 | 2, data.len() as u8], data.to_vec()].concat()
-    }
+    use crate::harness::antigravity::cold::proto::field as bytes;
 
     fn project(data: &[u8]) -> (bool, serde_json::Value) {
         let stage = Stage::new().unwrap();

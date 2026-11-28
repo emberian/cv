@@ -225,23 +225,7 @@ pub(super) fn base64(mut input: impl Read, out: &mut impl Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn bytes(field: u64, value: &[u8]) -> Vec<u8> {
-        fn varint(mut value: u64, out: &mut Vec<u8>) {
-            loop {
-                let b = (value & 127) as u8;
-                value >>= 7;
-                out.push(b | if value == 0 { 0 } else { 128 });
-                if value == 0 {
-                    return;
-                }
-            }
-        }
-        let mut out = Vec::new();
-        varint((field << 3) | 2, &mut out);
-        varint(value.len() as u64, &mut out);
-        out.extend_from_slice(value);
-        out
-    }
+    use crate::harness::antigravity::cold::proto::field as bytes;
     fn projected(item: &[u8]) -> Result<serde_json::Value> {
         let bytes = bytes(9, item);
         let source = crate::harness::store::bytes::ByteSource::arena()?;

@@ -488,20 +488,7 @@ mod tests {
     use super::super::ByteSource;
     use super::*;
 
-    fn bytes(number: u32, data: &[u8]) -> Vec<u8> {
-        fn varint(mut value: u64, out: &mut Vec<u8>) {
-            while value >= 128 {
-                out.push(value as u8 | 128);
-                value >>= 7;
-            }
-            out.push(value as u8);
-        }
-        let mut out = Vec::new();
-        varint((number << 3 | 2) as u64, &mut out);
-        varint(data.len() as u64, &mut out);
-        out.extend_from_slice(data);
-        out
-    }
+    use crate::harness::antigravity::cold::proto::field as bytes;
 
     fn projection(data: &[u8], is_task: bool) -> serde_json::Value {
         let staged = ByteSource::arena().unwrap();

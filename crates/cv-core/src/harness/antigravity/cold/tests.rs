@@ -10,16 +10,7 @@ const CHILDREN: [&str; 4] = [
     "51111111-1111-4111-8111-111111111111",
     "61111111-1111-4111-8111-111111111111",
 ];
-fn field(number: u32, v: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    proto::bytes(&mut out, number, v);
-    out
-}
-fn int(number: u32, v: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    proto::scalar(&mut out, number, v);
-    out
-}
+use proto::{field, int};
 fn metadata(i: u64) -> Vec<u8> {
     let mut r = field(1, TID.as_bytes());
     if i != 0 {

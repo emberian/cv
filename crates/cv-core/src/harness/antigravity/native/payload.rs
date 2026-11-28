@@ -307,26 +307,7 @@ mod tests {
     use super::super::ByteSource;
     use super::*;
 
-    fn varint(mut value: u64, out: &mut Vec<u8>) {
-        while value >= 128 {
-            out.push(value as u8 | 128);
-            value >>= 7;
-        }
-        out.push(value as u8);
-    }
-    fn bytes(number: u64, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        varint(number << 3 | 2, &mut out);
-        varint(data.len() as u64, &mut out);
-        out.extend_from_slice(data);
-        out
-    }
-    fn number(number: u64, value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        varint(number << 3, &mut out);
-        varint(value, &mut out);
-        out
-    }
+    use crate::harness::antigravity::cold::proto::{field as bytes, int as number};
     fn projection(url: &str, value: &[u8]) -> (bool, serde_json::Value) {
         let data = [bytes(1, url.as_bytes()), bytes(2, value)].concat();
         let staged = ByteSource::arena().unwrap();
@@ -517,7 +498,7 @@ mod tests {
         }
 
         for &(step_num, step_name) in STEPS {
-            let (known, payload) = projection("type.googleapis.com/gemini_coder.Step", &bytes(step_num as u64, b""));
+            let (known, payload) = projection("type.googleapis.com/gemini_coder.Step", &bytes(step_num, b""));
             assert!(known, "{step_name}");
             assert_eq!(payload["step"], step_name);
         }

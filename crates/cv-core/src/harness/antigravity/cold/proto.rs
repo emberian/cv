@@ -62,6 +62,18 @@ pub(in super::super) fn bytes(buf: &mut Vec<u8>, n: u32, v: &[u8]) {
     varint(buf, v.len() as u64);
     buf.extend(v);
 }
+/// One varint field, encoded on its own.
+pub(in super::super) fn int(n: u32, v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    scalar(&mut out, n, v);
+    out
+}
+/// One length-delimited field, encoded on its own.
+pub(in super::super) fn field(n: u32, v: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    bytes(&mut out, n, v);
+    out
+}
 
 pub(super) fn unique(data: &[u8], number: u32, wire: u8) -> Result<Option<Vec<u8>>> {
     let mut value = None;
@@ -277,28 +289,27 @@ pub(super) fn planner_tool_ids(body: &[u8]) -> Result<Vec<String>> {
 
 /// Extract the tool-call ID (`metadata.4.1`) carried by a tool-result step.
 pub(super) fn step_tool_id(md: &[u8], body: &[u8]) -> Result<Option<String>> {
-    let carrier = unique(body, 5, 2)?;
-    let meta = carrier.as_deref().unwrap_or(md);
-    let Some(call) = unique(meta, 4, 2)? else {
+    let Some(call) = tool_call(md, body)? else {
         return Ok(None);
     };
     Ok(last_string(&call, 1)?.filter(|s| !s.is_empty()))
 }
 
-fn tool_call_meta(md: &[u8], body: &[u8], generic: &[u8]) -> Result<(Option<String>, String, Value)> {
+/// The tool call (`metadata.4`) of a step, read from the metadata its body carries (`5`) when
+/// it carries one.
+fn tool_call(md: &[u8], body: &[u8]) -> Result<Option<Vec<u8>>> {
     let carrier = unique(body, 5, 2)?;
-    let meta = carrier.as_deref().unwrap_or(md);
-    if let Some(call) = unique(meta, 4, 2)? {
+    unique(carrier.as_deref().unwrap_or(md), 4, 2)
+}
+
+fn tool_call_meta(md: &[u8], body: &[u8], generic: &[u8]) -> Result<(Option<String>, String, Value)> {
+    if let Some(call) = tool_call(md, body)? {
         let id = last_string(&call, 1)?.filter(|s| !s.is_empty());
         let name = last_string(&call, 2)?.unwrap_or_default();
         let args = last_string(&call, 3)?
             .or(last_string(&call, 4)?)
             .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        if let Some(args) = args {
-            return Ok((id, name, args));
-        }
-        let fallback = generic_map_json(generic)?;
-        return Ok((id, name, fallback));
+        return Ok((id, name, args.map_or_else(|| generic_map_json(generic), Ok)?));
     }
     Ok((None, String::new(), generic_map_json(generic)?))
 }
@@ -330,7 +341,6 @@ pub(super) fn checkpoint_prune(
 ) -> Result<(Vec<u8>, u64, usize)> {
     let mut out = Vec::new();
     let mut sections_stripped = 0usize;
-    let mut wrote_summary = false;
     if let Some(summary) = replace_summary {
         walk(checkpoint, |f| {
             match f.number {
@@ -346,12 +356,7 @@ pub(super) fn checkpoint_prune(
             }
             Ok(())
         })?;
-        let mut framed = Vec::new();
-        scalar(&mut framed, 1, 1);
-        bytes(&mut framed, 5, summary.as_bytes());
-        scalar(&mut framed, 12, 0);
-        scalar(&mut framed, 24, 1);
-        scalar(&mut framed, 27, 0);
+        let mut framed = checkpoint_frame(summary);
         framed.extend(out);
         let saved = checkpoint.len().saturating_sub(framed.len()) as u64;
         return Ok((framed, saved, sections_stripped));
@@ -360,17 +365,32 @@ pub(super) fn checkpoint_prune(
     walk(checkpoint, |f| {
         if f.number == 26 && f.raw.len() > sludge_min_bytes {
             sections_stripped += 1;
-            return Ok(());
+        } else {
+            out.extend(f.raw);
         }
-        if f.number == 5 {
-            wrote_summary = true;
-        }
-        out.extend(f.raw);
         Ok(())
     })?;
-    let _ = wrote_summary;
     let saved = checkpoint.len().saturating_sub(out.len()) as u64;
     Ok((out, saved, sections_stripped))
+}
+
+/// The fields a fresh checkpoint opens with: its summary (`5`) among reset bounds and counts.
+fn checkpoint_frame(summary: &str) -> Vec<u8> {
+    let mut cp = int(1, 1);
+    bytes(&mut cp, 5, summary.as_bytes());
+    scalar(&mut cp, 12, 0);
+    scalar(&mut cp, 24, 1);
+    scalar(&mut cp, 27, 0);
+    cp
+}
+
+/// The fields a `CHECKPOINT` step body opens with: type 23, its metadata (`5`) and checkpoint (`30`).
+fn checkpoint_head(md: &[u8], checkpoint: &[u8]) -> Vec<u8> {
+    let mut body = int(1, 23);
+    scalar(&mut body, 4, 3);
+    bytes(&mut body, 5, md);
+    bytes(&mut body, 30, checkpoint);
+    body
 }
 
 /// Materialize step `0` as a clean `step_type = 23` (`CHECKPOINT`) carrying `summary`, seeded from
@@ -386,37 +406,19 @@ pub(super) fn checkpoint_step(
             let md = metadata(tpl_md, after)?;
             let rewritten = payload(tpl_body, after, old_cascade)?;
             let (clean_cp, saved, stripped) = checkpoint_prune(&cp_raw, Some(summary), 0)?;
-            let mut body: Vec<u8> = Vec::new();
+            let mut body = checkpoint_head(&md, &clean_cp);
             walk(&rewritten, |f| {
-                match f.number {
-                    1 | 4 | 5 | 30 | 148 => {}
-                    _ => body.extend(f.raw),
+                if !matches!(f.number, 1 | 4 | 5 | 30 | 148) {
+                    body.extend(f.raw);
                 }
                 Ok(())
             })?;
-            let mut header = Vec::new();
-            scalar(&mut header, 1, 23);
-            scalar(&mut header, 4, 3);
-            bytes(&mut header, 5, &md);
-            bytes(&mut header, 30, &clean_cp);
-            header.extend(body);
-            return Ok((md, header, saved, stripped));
+            return Ok((md, body, saved, stripped));
         }
     }
-    let mut md = Vec::new();
-    scalar(&mut md, 3, 5);
+    let mut md = int(3, 5);
     bytes(&mut md, 20, &after.encode(&[])?);
-    let mut cp = Vec::new();
-    scalar(&mut cp, 1, 1);
-    bytes(&mut cp, 5, summary.as_bytes());
-    scalar(&mut cp, 12, 0);
-    scalar(&mut cp, 24, 1);
-    scalar(&mut cp, 27, 0);
-    let mut body = Vec::new();
-    scalar(&mut body, 1, 23);
-    scalar(&mut body, 4, 3);
-    bytes(&mut body, 5, &md);
-    bytes(&mut body, 30, &cp);
+    let body = checkpoint_head(&md, &checkpoint_frame(summary));
     Ok((md, body, 0, 0))
 }
 
@@ -457,7 +459,8 @@ pub(super) fn drop_planner_thinking(body: &[u8]) -> Result<(Vec<u8>, u64)> {
         })?;
         Ok(Some(inner))
     })?;
-    Ok((rewritten.clone(), before.saturating_sub(rewritten.len()) as u64))
+    let saved = before.saturating_sub(rewritten.len()) as u64;
+    Ok((rewritten, saved))
 }
 
 /// Snip oversized `140.2.1` tool outputs (plus `140.2.3` embedded `render_info` and `140.2.6`
@@ -494,6 +497,13 @@ pub(super) fn snip_generic_step(
     })?;
 
     let keep_invoke_any = matches!(tool_name.as_str(), "invoke_subagent" | "swarm");
+    // The step body with its result (`140.2`) replaced, and how many bytes that saved.
+    let with_result = |result: Vec<u8>| -> Result<(Vec<u8>, u64)> {
+        let generic = transform(&generic, |f| Ok((f.number == 2).then(|| result.clone())))?;
+        let new_body = transform(body, |f| Ok((f.number == 140).then(|| generic.clone())))?;
+        let saved = body.len().saturating_sub(new_body.len()) as u64;
+        Ok((new_body, saved))
+    };
     if let Some(out_slice) = output_bytes {
         if out_slice.len() > min_size && !out_slice.starts_with(crate::prune::MARKER_PREFIX.as_bytes()) {
             let original = String::from_utf8_lossy(out_slice).into_owned();
@@ -525,21 +535,7 @@ pub(super) fn snip_generic_step(
                 }
                 Ok(())
             })?;
-            let new_generic = transform(&generic, |gf| {
-                if gf.number == 2 {
-                    Ok(Some(new_res.clone()))
-                } else {
-                    Ok(None)
-                }
-            })?;
-            let new_body = transform(body, |bf| {
-                if bf.number == 140 {
-                    Ok(Some(new_generic.clone()))
-                } else {
-                    Ok(None)
-                }
-            })?;
-            let saved = body.len().saturating_sub(new_body.len()) as u64;
+            let (new_body, saved) = with_result(new_res)?;
             return Ok((
                 new_body,
                 Some(SnippedGeneric {
@@ -567,21 +563,7 @@ pub(super) fn snip_generic_step(
                 new_res.extend(rf.raw);
                 Ok(())
             })?;
-            let new_generic = transform(&generic, |gf| {
-                if gf.number == 2 {
-                    Ok(Some(new_res.clone()))
-                } else {
-                    Ok(None)
-                }
-            })?;
-            let new_body = transform(body, |bf| {
-                if bf.number == 140 {
-                    Ok(Some(new_generic.clone()))
-                } else {
-                    Ok(None)
-                }
-            })?;
-            let saved = body.len().saturating_sub(new_body.len()) as u64;
+            let (new_body, saved) = with_result(new_res)?;
             return Ok((new_body, None, saved, strip_render));
         }
     }

@@ -109,23 +109,7 @@ fn text(file: &File, message: &Proto, number: u32, name: &str, out: &mut impl Wr
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn varint(mut value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let b = (value & 127) as u8;
-            value >>= 7;
-            out.push(b | if value == 0 { 0 } else { 128 });
-            if value == 0 {
-                return out;
-            }
-        }
-    }
-    fn bytes(field: u64, value: &[u8]) -> Vec<u8> {
-        [varint((field << 3) | 2), varint(value.len() as u64), value.to_vec()].concat()
-    }
-    fn number(field: u64, value: u64) -> Vec<u8> {
-        [varint(field << 3), varint(value)].concat()
-    }
+    use crate::harness::antigravity::cold::proto::{field as bytes, int as number};
     fn projection(bytes: &[u8]) -> serde_json::Value {
         let source = crate::harness::store::bytes::ByteSource::arena().unwrap();
         source

@@ -438,17 +438,8 @@ impl Adapter for Antigravity {
             }
             #[cfg(feature = "sqlite")]
             {
-                let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
-                record_sqlite_deps(&conv_db, &mut deps.files);
-                record_sqlite_deps(&loc.app_data_dir.join("conversation_summaries.db"), &mut deps.files);
-                for root in &self.roots {
-                    if root != &loc.app_data_dir {
-                        record_sqlite_deps(
-                            &root.join("conversations").join(format!("{}.db", loc.id)),
-                            &mut deps.files,
-                        );
-                    }
-                }
+                deps.files
+                    .extend(self.conversation_files(&loc.app_data_dir, &loc.id, true));
             }
         }
         Some(())
@@ -1198,13 +1189,8 @@ impl Adapter for Antigravity {
                         .join("subagents"),
                 );
                 #[cfg(feature = "sqlite")]
-                {
-                    record_sqlite_readset(&app_dir.join("conversations").join(format!("{id}.db")), &mut reads);
-                    for root in &self.roots {
-                        if root != app_dir {
-                            record_sqlite_readset(&root.join("conversations").join(format!("{id}.db")), &mut reads);
-                        }
-                    }
+                for file in self.conversation_files(app_dir, &id, false) {
+                    reads.record(&file);
                 }
             }
             let res = crate::discover_cache::cached_scan_with_reads(&cand.transcript, reads, || {
@@ -1327,15 +1313,8 @@ impl Adapter for Antigravity {
                 sink.dependency(&loc.brain_dir.join(".system_generated/swarm/members.json"));
                 sink.dependency(&loc.brain_dir.join(".system_generated/swarm/board.jsonl"));
                 #[cfg(feature = "sqlite")]
-                {
-                    let conv_db = loc.app_data_dir.join("conversations").join(format!("{}.db", loc.id));
-                    record_sink_sqlite_deps(&conv_db, sink);
-                    record_sink_sqlite_deps(&loc.app_data_dir.join("conversation_summaries.db"), sink);
-                    for root in &self.roots {
-                        if root != &loc.app_data_dir {
-                            record_sink_sqlite_deps(&root.join("conversations").join(format!("{}.db", loc.id)), sink);
-                        }
-                    }
+                for file in self.conversation_files(&loc.app_data_dir, &loc.id, true) {
+                    sink.dependency(&file);
                 }
             }
             // Header enrichment is owned from its read snapshot. Its dependencies still
@@ -4683,23 +4662,29 @@ pub(crate) fn parse_pbtxt_title(text: &str) -> Option<String> {
 // SQLite & Protobuf sidecar readers (`#[cfg(feature = "sqlite")]`)
 // ---------------------------------------------------------------------------
 
+/// A database and the WAL and journal SQLite may keep beside it.
 #[cfg(feature = "sqlite")]
-fn record_sqlite_deps(db: &Path, out: &mut Vec<PathBuf>) {
-    out.push(db.to_path_buf());
-    for suffix in ["-wal", "-journal"] {
-        let mut os = db.as_os_str().to_os_string();
-        os.push(suffix);
-        out.push(PathBuf::from(os));
-    }
+fn sqlite_files(db: &Path) -> impl Iterator<Item = PathBuf> {
+    std::iter::once(db.to_path_buf()).chain(crate::source::sqlite_sidecars(db))
 }
 
 #[cfg(feature = "sqlite")]
-fn record_sink_sqlite_deps(db: &Path, sink: &mut dyn MessageSink) {
-    sink.dependency(db);
-    for suffix in ["-wal", "-journal"] {
-        let mut os = db.as_os_str().to_os_string();
-        os.push(suffix);
-        sink.dependency(Path::new(&os));
+impl Antigravity {
+    /// Every file one conversation's SQLite state is read from: its database under `app_dir`,
+    /// the summaries there when `summaries`, then the same conversation under each other root.
+    fn conversation_files(&self, app_dir: &Path, id: &str, summaries: bool) -> Vec<PathBuf> {
+        let db = |root: &Path| root.join("conversations").join(format!("{id}.db"));
+        let mut dbs = vec![db(app_dir)];
+        if summaries {
+            dbs.push(app_dir.join("conversation_summaries.db"));
+        }
+        dbs.extend(
+            self.roots
+                .iter()
+                .filter(|root| root.as_path() != app_dir)
+                .map(|root| db(root)),
+        );
+        dbs.iter().flat_map(|db| sqlite_files(db)).collect()
     }
 }
 
@@ -4805,16 +4790,6 @@ fn summary_rows(store: &Path) -> Option<HashMap<String, crate::source::Rows>> {
             .ok()?;
     }
     Some(certificates.0)
-}
-
-#[cfg(feature = "sqlite")]
-fn record_sqlite_readset(db: &Path, reads: &mut ReadSet) {
-    reads.record(db);
-    for suffix in ["-wal", "-journal"] {
-        let mut os = db.as_os_str().to_os_string();
-        os.push(suffix);
-        reads.record(&PathBuf::from(os));
-    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -5697,27 +5672,11 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn enriches_model_cwd_git_and_lineage_from_readonly_sqlite_sidecars() {
-        fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
-            loop {
-                let mut b = (v & 0x7f) as u8;
-                v >>= 7;
-                if v != 0 {
-                    b |= 0x80;
-                }
-                out.push(b);
-                if v == 0 {
-                    break;
-                }
-            }
+        fn pb_bytes(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+            cold::proto::bytes(out, field, payload);
         }
-        fn pb_bytes(field: u64, payload: &[u8], out: &mut Vec<u8>) {
-            pb_varint((field << 3) | 2, out);
-            pb_varint(payload.len() as u64, out);
-            out.extend_from_slice(payload);
-        }
-        fn pb_u64(field: u64, val: u64, out: &mut Vec<u8>) {
-            pb_varint(field << 3, out);
-            pb_varint(val, out);
+        fn pb_u64(field: u32, val: u64, out: &mut Vec<u8>) {
+            cold::proto::scalar(out, field, val);
         }
 
         let world = crate::test_world("antigravity-sqlite");
@@ -5808,8 +5767,7 @@ mod tests {
             conn.execute("INSERT INTO steps VALUES (1, ?1)", [&metadata]).unwrap();
             let mut sub_model = Vec::new();
             pb_bytes(19, b"gemini-4-argon", &mut sub_model);
-            let mut packed_steps = Vec::new();
-            pb_varint(1, &mut packed_steps);
+            let packed_steps = vec![1];
             let mut gen_blob = Vec::new();
             pb_bytes(1, &sub_model, &mut gen_blob);
             pb_bytes(2, &packed_steps, &mut gen_blob);

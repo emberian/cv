@@ -124,18 +124,6 @@ fn build_seed_text(projected: &Session) -> Result<(String, bool)> {
     Ok((text, false))
 }
 
-fn encode_field(number: u32, v: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    proto::bytes(&mut out, number, v);
-    out
-}
-
-fn encode_int(number: u32, v: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    proto::scalar(&mut out, number, v);
-    out
-}
-
 fn encode_trajectory_blob(
     new_id: &str,
     cwd: Option<&Path>,
@@ -144,16 +132,16 @@ fn encode_trajectory_blob(
     let mut blob = Vec::new();
     if let Some(dir) = cwd {
         let uri = super::path_to_file_uri(dir);
-        let ws = encode_field(1, uri.as_bytes());
+        let ws = proto::field(1, uri.as_bytes());
         proto::bytes(&mut blob, 1, &ws);
     }
     if let Some(ts) = created_at {
         if let Ok(secs) = u64::try_from(ts.timestamp()) {
             if secs > 0 {
-                let mut ts_msg = encode_int(1, secs);
+                let mut ts_msg = proto::int(1, secs);
                 let nanos = ts.timestamp_subsec_nanos();
                 if nanos > 0 {
-                    ts_msg.extend(encode_int(2, u64::from(nanos)));
+                    ts_msg.extend(proto::int(2, u64::from(nanos)));
                 }
                 proto::bytes(&mut blob, 2, &ts_msg);
             }
@@ -242,21 +230,21 @@ pub(crate) fn emit_staged(
         tx.execute("INSERT INTO trajectory_metadata_blob VALUES('main', ?)", params![blob])?;
 
         let ref_inner = [
-            encode_field(1, trajectory_id.as_bytes()),
-            encode_field(4, new_id.as_bytes()),
+            proto::field(1, trajectory_id.as_bytes()),
+            proto::field(4, new_id.as_bytes()),
         ]
         .concat();
-        let md = encode_field(20, &ref_inner);
+        let md = proto::field(20, &ref_inner);
         let user_input = [
-            encode_field(2, seed_text.as_bytes()),
-            encode_field(3, &encode_field(1, seed_text.as_bytes())),
+            proto::field(2, seed_text.as_bytes()),
+            proto::field(3, &proto::field(1, seed_text.as_bytes())),
         ]
         .concat();
         let step_payload = [
-            encode_int(1, 14),
-            encode_int(4, 3),
-            encode_field(5, &md),
-            encode_field(19, &user_input),
+            proto::int(1, 14),
+            proto::int(4, 3),
+            proto::field(5, &md),
+            proto::field(19, &user_input),
         ]
         .concat();
         tx.execute(
