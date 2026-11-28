@@ -274,6 +274,9 @@ jobs:
         run: cargo clippy -p clustervision-core --no-default-features --target wasm32-unknown-unknown -- -D warnings
       - name: Build cv-web to wasm
         run: wasm-pack build --target web --out-dir /tmp/pkg crates/cv-web -- --no-default-features
+      - name: Run the built module
+        # wasm32 compiles std's clock and filesystem and panics on use: only a call finds that.
+        run: node tools/wasm-smoke.mjs /tmp/pkg
 
   desktop:
     name: desktop app (app/src-tauri)

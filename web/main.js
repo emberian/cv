@@ -5,11 +5,13 @@
 //   import init, { ingest_zip } from "./pkg/cv_web.js";
 //   await init();                          // async initializer
 //   const json = ingest_zip(uint8array);   // returns a JSON string: Session[]
+//   const md = to_markdown(openSessionJson); // cv_core's Markdown export of one document
 //
 // We don't statically `import` the pkg module (it may not exist on the static
 // fallback deploy), so we use a dynamic import wrapped in try/catch.
 
 import "./components/cv-app.js";
+import { useCoreMarkdown } from "./components/util.js";
 
 /** @type {null | ((bytes: Uint8Array) => string)} */
 let wasmIngest = null;
@@ -28,6 +30,7 @@ async function loadWasm() {
       throw new Error("cv_web.js loaded but ingest_zip export is missing");
     }
     wasmIngest = mod.ingest_zip;
+    useCoreMarkdown(mod.to_markdown);
     if (typeof mod.WasmStore === "function") {
       wasmStore = new mod.WasmStore();
     }

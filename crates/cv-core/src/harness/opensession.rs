@@ -465,9 +465,11 @@ fn read(
     sink.meta(&session);
     for view in messages.array()?.unwrap() {
         let message = ir_message(view?, opts.spans)?;
-        let started = std::time::Instant::now();
+        // Timed only against a file that can change underneath: an in-memory document has
+        // none, and wasm32 has no clock to read.
+        let started = file.map(|_| std::time::Instant::now());
         let flow = sink.try_message(message)?;
-        if let Some((_, source)) = file {
+        if let Some(((_, source), started)) = file.zip(started) {
             source.check_after(started)?;
         }
         if flow == Flow::Stop {

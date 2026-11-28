@@ -623,8 +623,29 @@ function sanitizeMarkdownBody(raw) {
   return out.join("\n");
 }
 
-/** Render a session as readable Markdown with adaptive CommonMark fences and forged-header safety. */
+/** cv-web's `to_markdown` (`cv_core::render::to_markdown`), once the WASM module has loaded. */
+let coreMarkdown = null;
+
+/** Install (or with `null`, remove) the WASM Markdown renderer `toMarkdown` prefers. */
+export function useCoreMarkdown(render) {
+  coreMarkdown = typeof render === "function" ? render : null;
+}
+
+/** Render a session as Markdown: by cv-core when its WASM build is loaded, so a browser export is
+ *  the one `cv export` writes; otherwise by the JS renderer below. Both lengthen fences past any
+ *  backtick run in the body and neutralize forged speaker and section headers. */
 export function toMarkdown(session) {
+  if (coreMarkdown) {
+    try {
+      return coreMarkdown(JSON.stringify(toOpenSession(session)));
+    } catch (err) {
+      console.warn("[clustervision] wasm Markdown export failed, using the JS renderer:", err?.message ?? err);
+    }
+  }
+  return jsMarkdown(session);
+}
+
+function jsMarkdown(session) {
   const lines = [];
   lines.push(`# ${cleanOneLine(session.title || sessionLabel(session)) || "Session"}`);
   lines.push("");
