@@ -548,8 +548,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tantivy",
- "tantivy-columnar",
- "tantivy-fst",
  "uuid",
  "zstd",
 ]

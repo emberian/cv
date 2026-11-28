@@ -1,6 +1,6 @@
 //! # cv-search
 //!
-//! Pure-Rust search and derived columnar storage over clustervision sessions:
+//! Pure-Rust search over clustervision sessions:
 //!
 //! 1. **Full-text** via [`tantivy`] (a Lucene-like inverted index) — `index_all` builds a
 //!    persistent index, [`Searcher`] queries it and returns highlighted snippets. Real

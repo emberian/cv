@@ -1057,23 +1057,6 @@ mod db {
         record_spooled_in(&mut conn, r, from, events, source, prov)
     }
 
-    /// Publish an ordered iterator of [`Event`] rows from `from` with the same atomic replacement
-    /// and source-baseline semantics as [`record_spooled_with_source`]. Allows callers such as
-    /// `cv-search` to tee streamed rows into derived columnar segments without re-parsing.
-    pub fn record_events_with_source(
-        r: &SessionRef,
-        from: usize,
-        events: impl IntoIterator<Item = Result<Event>>,
-        source: &crate::source::Baseline,
-        prov: &Provenance,
-    ) -> Result<()> {
-        if crate::env::frozen() {
-            return Ok(());
-        }
-        let mut conn = open().ok_or_else(|| anyhow::anyhow!("event catalog unavailable"))?;
-        record_from_in(&mut conn, r, from, events, prov, source)
-    }
-
     pub(crate) fn record_spooled_in(
         conn: &mut Connection,
         r: &SessionRef,
@@ -1857,8 +1840,8 @@ mod db {
 #[cfg(feature = "sqlite")]
 pub use db::{
     catalog_has_events, edit_hunks_for, edits_touching_file, edits_with_hunks_touching_file, events_for, ingest_all,
-    ingest_ref, ingest_subagent, needs_ingest, record_events_with_source, record_spooled_with_source, sessions_editing,
-    sessions_touching, SyncTable,
+    ingest_ref, ingest_subagent, needs_ingest, record_spooled_with_source, sessions_editing, sessions_touching,
+    SyncTable,
 };
 
 /// No-op fallbacks without sqlite: extraction still works (the sink is pure), persistence and
@@ -1902,18 +1885,6 @@ mod db_stub {
     ) -> Result<()> {
         Ok(())
     }
-    pub fn record_events_with_source(
-        _r: &SessionRef,
-        _from: usize,
-        events: impl IntoIterator<Item = Result<Event>>,
-        _source: &crate::source::Baseline,
-        _prov: &Provenance,
-    ) -> Result<()> {
-        for e in events {
-            let _ = e?;
-        }
-        Ok(())
-    }
     pub fn ingest_ref(_r: &SessionRef) -> Result<usize> {
         Ok(0)
     }
@@ -1948,8 +1919,8 @@ mod db_stub {
 #[cfg(not(feature = "sqlite"))]
 pub use db_stub::{
     catalog_has_events, edit_hunks_for, edits_touching_file, edits_with_hunks_touching_file, events_for, ingest_all,
-    ingest_ref, ingest_subagent, needs_ingest, record_events_with_source, record_spooled_with_source, sessions_editing,
-    sessions_touching, SyncTable,
+    ingest_ref, ingest_subagent, needs_ingest, record_spooled_with_source, sessions_editing, sessions_touching,
+    SyncTable,
 };
 
 #[cfg(test)]
@@ -2127,7 +2098,8 @@ mod tests {
             (
                 "Edit",
                 r#"{"file_path":"","path":"masked","command":["",false,"echo","",null]}"#,
-                vec![("command", Some(" echo ".to_string()))],
+                // A command target is stored trimmed.
+                vec![("command", Some("echo".to_string()))],
             ),
             (
                 "apply_patch",
@@ -2143,7 +2115,8 @@ mod tests {
                 vec![
                     (
                         "command",
-                        Some("apply_patch *** Begin Patch\n*** Add File: late\n*** End Patch".to_string()),
+                        // A multi-line command keeps its first line and the size of the rest.
+                        Some("apply_patch *** Begin Patch … [+33 bytes]".to_string()),
                     ),
                     ("file_edit", Some("/w/late".to_string())),
                 ],
