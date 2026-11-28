@@ -405,7 +405,9 @@ pub fn prune_ir(mut session: crate::ir::Session, opts: &PruneOptions, new_id: &s
             }
         }
     }
-    session.lineage.forked_from = Some(session.id.clone());
+    let source_id = crate::lineage::bare_session_id(&session.id).to_owned();
+    session.lineage.forked_from = Some(source_id.clone());
+    crate::lineage::stamp_derived(&mut session, &source_id, "prune");
     Ok(IrPruned {
         session,
         stashed,

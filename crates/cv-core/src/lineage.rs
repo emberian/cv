@@ -23,17 +23,91 @@ const OPENING_TEXT_BYTES: usize = 2048;
 /// Maximum JSONL lines scanned in the head probe before giving up.
 const MAX_HEAD_LINES: usize = 24;
 
-/// Return the parent session ID that `session` continues or was derived/forked from, if recorded.
-pub fn derived_from_session(session: &Session) -> Option<&str> {
-    fn non_self<'a>(s: &'a str, own: &str) -> Option<&'a str> {
-        (!s.is_empty() && s != own).then_some(s)
+/// Strip any `@<64-hex>` custody selector suffix (`<native_id>@<64-hex>`) down to the bare
+/// session ID used in transcripts and `state.db:lineage_edges`.
+pub fn bare_session_id(id: &str) -> &str {
+    crate::SessionKey::split_selector(id).map_or(id, |(bare, _)| bare)
+}
+
+/// Stamp canonical `extra["cv"]["derived_from"]` (and optional `derived_kind`) onto `session`
+/// before emission so native emitters, OpenSession documents, custody packs, and hub replicas
+/// carry derivation lineage natively without mutating `Session::lineage`.
+pub fn stamp_derived(session: &mut Session, source_id: &str, derived_kind: &str) {
+    let src = bare_session_id(source_id.trim());
+    if src.is_empty() {
+        return;
     }
-    let own = session.id.as_str();
+    let cv = session.cv_extra_mut();
+    cv.insert("derived_from".into(), Value::String(src.to_owned()));
+    let kind = derived_kind.trim();
+    if !kind.is_empty() {
+        cv.insert("derived_kind".into(), Value::String(kind.to_owned()));
+    }
+}
+
+/// Raw `(derived_from, derived_kind)` recorded in `session.extra["cv"]` before `session.id` has
+/// been replaced by an emitter's `new_id`. Emitters MUST filter `derived_from != new_id`.
+pub(crate) fn raw_cv_derived_info(session: &Session) -> Option<(&str, Option<&str>)> {
+    let cv = session.cv_extra()?;
+    let df = cv.get("derived_from")?.as_str()?.trim();
+    if df.is_empty() {
+        return None;
+    }
+    let dk = cv
+        .get("derived_kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some((df, dk))
+}
+
+/// Whether `kind` is a transcript derivation/continuation edge in `state.db:lineage_edges`
+/// (as opposed to subagent spawn `parent_subagent`, `adopted_into`, or `retired_for`).
+pub fn is_derivation_edge_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "continues"
+            | "fork"
+            | "forked_from"
+            | "rewind"
+            | "rewound_from"
+            | "prune"
+            | "pruned_from"
+            | "splice"
+            | "spliced_from"
+            | "distill"
+            | "distilled_from"
+            | "port"
+            | "ported_from"
+    )
+}
+
+/// Return `(parent_session_id, edge_kind)` that `session` continues or was derived/forked from.
+pub fn derived_info_session(session: &Session) -> Option<(&str, &str)> {
+    fn non_self<'a>(s: &'a str, own: &str) -> Option<&'a str> {
+        let b = bare_session_id(s);
+        (!b.is_empty() && b != own).then_some(b)
+    }
+    let own = bare_session_id(session.id.as_str());
+    if let Some(cv) = session.cv_extra() {
+        if let Some(df) = cv
+            .get("derived_from")
+            .and_then(Value::as_str)
+            .and_then(|s| non_self(s, own))
+        {
+            let dk = cv
+                .get("derived_kind")
+                .and_then(Value::as_str)
+                .filter(|k| !k.is_empty())
+                .unwrap_or("continues");
+            return Some((df, dk));
+        }
+    }
     if let Some(c) = session.lineage.continues.as_deref().and_then(|s| non_self(s, own)) {
-        return Some(c);
+        return Some((c, "continues"));
     }
     if let Some(f) = session.lineage.forked_from.as_deref().and_then(|s| non_self(s, own)) {
-        return Some(f);
+        return Some((f, "forked_from"));
     }
     if let Some(cv) = session.cv_extra() {
         if let Some(c) = cv
@@ -41,7 +115,7 @@ pub fn derived_from_session(session: &Session) -> Option<&str> {
             .and_then(Value::as_str)
             .and_then(|s| non_self(s, own))
         {
-            return Some(c);
+            return Some((c, "continues"));
         }
         if let Some(src) = cv
             .get("distill")
@@ -49,7 +123,7 @@ pub fn derived_from_session(session: &Session) -> Option<&str> {
             .and_then(Value::as_str)
             .and_then(|s| non_self(s, own))
         {
-            return Some(src);
+            return Some((src, "distilled_from"));
         }
         if let Some(seed) = cv.get("seed").and_then(Value::as_object) {
             if seed.get("kind").and_then(Value::as_str) != Some("pack") {
@@ -58,7 +132,7 @@ pub fn derived_from_session(session: &Session) -> Option<&str> {
                     .and_then(Value::as_str)
                     .and_then(|s| non_self(s, own))
                 {
-                    return Some(src);
+                    return Some((src, "distilled_from"));
                 }
             }
         }
@@ -70,10 +144,15 @@ pub fn derived_from_session(session: &Session) -> Option<&str> {
             .and_then(Value::as_str)
             .and_then(|s| non_self(s, own))
         {
-            return Some(src);
+            return Some((src, "spliced_from"));
         }
     }
     None
+}
+
+/// Return the parent session ID that `session` continues or was derived/forked from, if recorded.
+pub fn derived_from_session(session: &Session) -> Option<&str> {
+    derived_info_session(session).map(|(id, _)| id)
 }
 
 /// Detect explicit continuation/fold/distill/splice parent provenance on an opening message
@@ -255,25 +334,186 @@ fn is_uuid_bytes(b: &[u8]) -> bool {
     true
 }
 
-/// Probe `SessionRef` for explicit fold/splice/distill/rewind/continuation parent session ID.
-/// Reads at most a small head slice of the backing transcript (or sibling `.rewind.json`), falling
-/// back to recorded `lineage_edges` in `state.db` (`continues` / `fork` / `rewind` / `splice` / `distill`).
-pub fn derived_from_ref(r: &SessionRef) -> Option<String> {
-    if let Some(found) = derived_from_path(&r.path, Some(r.id.as_str())) {
-        return Some(found);
+/// Query frozen-safe `state.db:lineage_edges` for the immediate derivation parent `(src_id, edge_kind)`
+/// of `session_id` (matching any [`is_derivation_edge_kind`]).
+pub fn state_derived_info(session_id: &str) -> Option<(String, String)> {
+    #[cfg(feature = "sqlite")]
+    {
+        let bare = bare_session_id(session_id.trim());
+        if bare.is_empty() {
+            return None;
+        }
+        let store = crate::state::StateStore::default_store().ok()?;
+        store
+            .read_compatible_in(|conn| {
+                if !conn.table_exists(None, "lineage_edges")? {
+                    return Ok(None);
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT src_session_id, edge_kind
+                     FROM lineage_edges
+                     WHERE dst_session_id = ?1
+                     ORDER BY created_at DESC, src_session_id ASC",
+                )?;
+                let rows = stmt.query_map([bare], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                for item in rows {
+                    let (src, kind) = item?;
+                    let src_bare = bare_session_id(&src);
+                    if !src_bare.is_empty() && src_bare != bare && is_derivation_edge_kind(&kind) {
+                        return Ok(Some((src_bare.to_owned(), kind)));
+                    }
+                }
+                Ok(None)
+            })
+            .ok()
+            .flatten()
+            .flatten()
     }
-    crate::lanes::session_lineage(&r.id)
-        .ancestors
-        .into_iter()
-        .find(|link| {
-            link.dst_session_id == r.id
-                && link.src_session_id != r.id
-                && matches!(
-                    link.edge_kind.as_str(),
-                    "continues" | "fork" | "rewind" | "splice" | "distill"
-                )
-        })
-        .map(|link| link.src_session_id)
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = session_id;
+        None
+    }
+}
+
+/// Immediate derivation parent ID of `session_id` from frozen-safe `state.db:lineage_edges`.
+pub fn state_derived_from(session_id: &str) -> Option<String> {
+    state_derived_info(session_id).map(|(src, _)| src)
+}
+
+/// Resolve bare derivation parent `(src_id, edge_kind)` from custody/hub metadata, `.rewind.json`
+/// sidecars, bounded transcript heads, or SQLite harness session metadata — without consulting
+/// `state.db:lineage_edges`.
+pub(crate) fn derived_info_ref_without_state(r: &SessionRef) -> Option<(String, String)> {
+    let bare = bare_session_id(r.id.as_str());
+    #[cfg(feature = "sqlite")]
+    if crate::custody::is_pack_ref(r) {
+        if let Some((src, kind)) = derived_info_for_pack_ref(r) {
+            if !src.is_empty() && src != bare {
+                return Some((src, kind));
+            }
+        }
+        return None;
+    }
+    if let Some(src_id) = derived_from_rewind_sidecar(&r.path, Some(bare)) {
+        return Some((src_id, "rewound_from".into()));
+    }
+    if let Some(found) = derived_from_path_no_sidecar(&r.path, Some(bare)) {
+        return Some((found, "continues".into()));
+    }
+    #[cfg(feature = "sqlite")]
+    if is_sqlite_file(&r.path) {
+        if let Some(adapter) = crate::harness::for_harness(r.harness) {
+            let mut stop_first = |_: crate::Message| crate::stream::Flow::Stop;
+            if let Ok(session) = adapter.stream(r, &crate::Demand::FACTS, &mut stop_first) {
+                if let Some((src, kind)) = derived_info_session(&session) {
+                    return Some((src.to_owned(), kind.to_owned()));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "sqlite")]
+fn derived_info_for_pack_ref(r: &SessionRef) -> Option<(String, String)> {
+    let own = bare_session_id(&r.id);
+    if let Some(home) = crate::env::Env::current().cv_home() {
+        if r.path.starts_with(home.join("hub").join("packs")) {
+            let hub = crate::state::hub::HubStore::at_home(&home);
+            if let Ok(Some(entry)) = hub.session_head_for(&r.id, None) {
+                if let Some(df) = entry
+                    .metadata
+                    .get("derived_from")
+                    .and_then(Value::as_str)
+                    .map(bare_session_id)
+                    .filter(|s| !s.is_empty() && *s != own)
+                {
+                    let dk = entry
+                        .metadata
+                        .get("derived_kind")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("continues");
+                    return Some((df.to_owned(), dk.to_owned()));
+                }
+            }
+        } else {
+            let store = crate::state::StateStore::at_dir(&home);
+            if let Ok(Some(Some(val))) = store.custody_head_point(&r.id) {
+                if let Some(df) = val
+                    .get("derived_from")
+                    .and_then(Value::as_str)
+                    .map(bare_session_id)
+                    .filter(|s| !s.is_empty() && *s != own)
+                {
+                    let dk = val
+                        .get("derived_kind")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("continues");
+                    return Some((df.to_owned(), dk.to_owned()));
+                }
+            }
+        }
+    }
+    let adapter = crate::custody::backing_for(r).ok()??;
+    let mut turns = 0usize;
+    let mut opening = Vec::with_capacity(2);
+    let mut sink = |m: crate::Message| {
+        if opening.len() < 2 && matches!(m.role, crate::ir::Role::User | crate::ir::Role::Assistant) {
+            opening.push(m);
+        }
+        turns += 1;
+        if turns >= 4 {
+            crate::stream::Flow::Stop
+        } else {
+            crate::stream::Flow::Continue
+        }
+    };
+    let session = adapter.stream(r, &crate::Demand::FACTS, &mut sink).ok()?;
+    if let Some((p, k)) = derived_info_session(&session) {
+        return Some((p.to_owned(), k.to_owned()));
+    }
+    let resolver = session.resolver();
+    for msg in &opening {
+        if let Some(found) = detect_opening_message(msg, &resolver, Some(own)) {
+            return Some((bare_session_id(&found).to_owned(), "continues".into()));
+        }
+    }
+    None
+}
+
+fn qualify_for_ref(r: &SessionRef, src: String) -> String {
+    if let Some((_, suffix)) = crate::SessionKey::split_selector(&r.id) {
+        if crate::SessionKey::split_selector(&src).is_none() {
+            return format!("{src}@{suffix}");
+        }
+    }
+    src
+}
+
+/// Probe `SessionRef` for explicit fold/splice/distill/rewind/port/continuation `(parent_id, edge_kind)`
+/// across custody/hub packs, `.rewind.json`, transcript/SQLite metadata, and `state.db:lineage_edges`.
+pub fn derived_info_ref(r: &SessionRef) -> Option<(String, String)> {
+    if let Some((src, kind)) = derived_info_ref_without_state(r) {
+        return Some((qualify_for_ref(r, src), kind));
+    }
+    state_derived_info(&r.id).map(|(src, kind)| (qualify_for_ref(r, src), kind))
+}
+
+/// Probe `SessionRef` for explicit fold/splice/distill/rewind/port/continuation parent session ID.
+pub fn derived_from_ref(r: &SessionRef) -> Option<String> {
+    derived_info_ref(r).map(|(src, _)| src)
+}
+
+#[cfg(feature = "sqlite")]
+fn is_sqlite_file(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 16];
+    file.take(16).read_exact(&mut magic).is_ok() && magic.starts_with(b"SQLite format 3")
 }
 
 /// Check sibling `<stem>.rewind.json` provenance sidecar written by `cv rewind`.
@@ -347,8 +587,11 @@ pub fn derived_from_path(path: &Path, own_id: Option<&str>) -> Option<String> {
     if let Some(src_id) = derived_from_rewind_sidecar(path, own_id) {
         return Some(src_id);
     }
+    derived_from_path_no_sidecar(path, own_id)
+}
 
-    // 2. Read bounded head of the primary file.
+fn derived_from_path_no_sidecar(path: &Path, own_id: Option<&str>) -> Option<String> {
+    // Read bounded head of the primary file.
     let file = std::fs::File::open(path).ok()?;
     let mut buf = Vec::with_capacity(4096);
     file.take(HEAD_PROBE_BYTES as u64).read_to_end(&mut buf).ok()?;
@@ -474,8 +717,17 @@ fn derived_from_json_object(val: &Value, own_id: Option<&str>) -> Option<String>
             }
         }
     }
-    // `extra.cv` provenance bag.
-    if let Some(cv) = obj.get("extra").and_then(|e| e.get("cv")).and_then(Value::as_object) {
+    // `extra.cv` (or direct `cv`) provenance bag.
+    for cv in [
+        obj.get("extra").and_then(|e| e.get("cv")).and_then(Value::as_object),
+        obj.get("cv").and_then(Value::as_object),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(id) = cv.get("derived_from").and_then(Value::as_str).and_then(accept) {
+            return Some(id);
+        }
         if let Some(id) = cv.get("continues").and_then(Value::as_str).and_then(accept) {
             return Some(id);
         }
@@ -970,5 +1222,124 @@ mod tests {
         assert_eq!(kept[0].id, "c2");
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].dropped_id, "c1");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn unified_lineage_bridges_native_emitters_sqlite_and_state_edges_under_frozen() {
+        let _world = crate::test_world("unified-lineage");
+        let root = std::env::temp_dir().join(format!("cv-unified-lineage-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut base = Session::new("orig-root", Harness::Claude);
+        base.cwd = Some(root.clone());
+        base.created_at = Some(ts);
+        base.updated_at = Some(ts);
+        let mut u = Message::new(crate::ir::Role::User);
+        u.timestamp = Some(ts);
+        u.content.push(Block::from_text("ship unified lineage".into()));
+        let mut a = Message::new(crate::ir::Role::Assistant);
+        a.timestamp = Some(ts);
+        a.content.push(Block::from_text("done".into()));
+        base.messages.push(u);
+        base.messages.push(a);
+        stamp_derived(&mut base, "orig-root", "port");
+
+        // 1. Claude, Codex, and Devin native emitters persist and round-trip `extra.cv.derived_from`
+        //    under fresh IDs with zero lineage divergence warnings.
+        let claude_dir = root.join("claude");
+        let (claude_res, claude_warn) = crate::emit::emit_verified(
+            &base,
+            Harness::Claude,
+            &claude_dir,
+            &crate::EmitOptions {
+                new_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(claude_warn.is_empty(), "{claude_warn:?}");
+        let claude_ref = SessionRef::new(claude_res.new_id.clone(), Harness::Claude, claude_res.path.clone());
+        assert_eq!(derived_from_ref(&claude_ref).as_deref(), Some("orig-root"));
+
+        let codex_dir = root.join("codex");
+        let (codex_res, codex_warn) = crate::emit::emit_verified(
+            &base,
+            Harness::Codex,
+            &codex_dir,
+            &crate::EmitOptions {
+                new_id: Some("22222222-2222-7222-8222-222222222222".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!codex_warn.iter().any(|w| w.contains("lineage")), "{codex_warn:?}");
+        let codex_ref = SessionRef::new(codex_res.new_id.clone(), Harness::Codex, codex_res.path.clone());
+        assert_eq!(derived_from_ref(&codex_ref).as_deref(), Some("orig-root"));
+
+        let devin_dir = root.join("devin");
+        let (devin_res, devin_warn) = crate::emit::emit_verified(
+            &base,
+            Harness::Devin,
+            &devin_dir,
+            &crate::EmitOptions {
+                new_id: Some("33333333-3333-4333-8333-333333333333".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!devin_warn.iter().any(|w| w.contains("lineage")), "{devin_warn:?}");
+        let devin_ref = SessionRef::new(devin_res.new_id.clone(), Harness::Devin, devin_res.path.clone());
+        assert_eq!(
+            derived_from_ref(&devin_ref).as_deref(),
+            Some("orig-root"),
+            "SQLite harness session must resolve embedded extra.cv.derived_from"
+        );
+
+        // 2. `state.db:lineage_edges` edge kinds (`ported_from`, `pruned_from`, `rewound_from`,
+        //    `spliced_from`, `distilled_from`) resolve through `state_derived_from` AND bridge
+        //    multi-hop `session_lineage_for_ref` under `--frozen`.
+        crate::lanes::record_lineage_edge_best_effort(
+            "seed-zero",
+            "orig-root",
+            "rewound_from",
+            Some("claude"),
+            None,
+            serde_json::json!({}),
+        );
+        crate::lanes::record_lineage_edge_best_effort(
+            "orig-root",
+            "state-only-child",
+            "ported_from",
+            Some("codex"),
+            None,
+            serde_json::json!({}),
+        );
+
+        {
+            let _frozen = (*crate::env::Env::current()).clone().with_frozen().enter();
+            assert_eq!(state_derived_from("orig-root").as_deref(), Some("seed-zero"));
+            assert_eq!(state_derived_from("state-only-child").as_deref(), Some("orig-root"));
+
+            // `devin_ref` has embedded `derived_from = orig-root` (NOT in `state.db`), while
+            // `orig-root` has `rewound_from = seed-zero` in `state.db`: `session_lineage_for_ref`
+            // bridges both into one unified 2-hop ancestor chain!
+            let unified = crate::lanes::session_lineage_for_ref(&devin_ref, true);
+            let pairs: Vec<(&str, &str)> = unified
+                .ancestors
+                .iter()
+                .map(|l| (l.src_session_id.as_str(), l.dst_session_id.as_str()))
+                .collect();
+            assert_eq!(
+                pairs,
+                vec![("orig-root", devin_ref.id.as_str()), ("seed-zero", "orig-root")]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

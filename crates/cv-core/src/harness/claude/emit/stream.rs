@@ -783,23 +783,30 @@ pub(crate) fn emit_staged(
     let has_fork_ref_carrier = session.messages.iter().any(|m| {
         carrier_record_of(m).is_some_and(|r| r.get("type").and_then(Value::as_str) == Some("fork-context-ref"))
     });
-    if let Some(continues) = session
+    let continues = session
         .lineage
         .continues
         .as_deref()
-        .filter(|id| !id.is_empty() && *id != c.session_id)
-    {
-        if !has_fork_ref_carrier && c.agent.is_none() {
-            lines.push_with(|writer| {
-                let mut o = ObjectWriter::new(writer)?;
-                o.field("type", "fork-context-ref")?;
+        .filter(|id| !id.is_empty() && *id != c.session_id);
+    let cv_derived = crate::lineage::raw_cv_derived_info(session).filter(|(id, _)| *id != c.session_id);
+    if !has_fork_ref_carrier && c.agent.is_none() && (continues.is_some() || cv_derived.is_some()) {
+        lines.push_with(|writer| {
+            let mut o = ObjectWriter::new(writer)?;
+            o.field("type", "fork-context-ref")?;
+            if let Some(continues) = continues {
                 o.field("parentSessionId", continues)?;
                 o.field("continues", true)?;
-                o.field("sessionId", &c.session_id)?;
-                o.field("timestamp", &c.ts)?;
-                o.finish()
-            })?;
-        }
+            }
+            if let Some((df, dk)) = cv_derived {
+                o.field("derivedFrom", df)?;
+                if let Some(kind) = dk {
+                    o.field("derivedKind", kind)?;
+                }
+            }
+            o.field("sessionId", &c.session_id)?;
+            o.field("timestamp", &c.ts)?;
+            o.finish()
+        })?;
     }
     if session.harness != Harness::Claude {
         if let Some(prompt) = session.system_prompt.as_deref().filter(|p| !p.trim().is_empty()) {

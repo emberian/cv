@@ -748,6 +748,14 @@ pub(super) fn record(
                     session.lineage.forked_from = Some(id);
                 }
             }
+            if let Some(df) = r
+                .top
+                .string("derivedFrom")?
+                .filter(|d| !d.is_empty() && d != &session.id)
+            {
+                let dk = r.top.string("derivedKind")?;
+                crate::lineage::stamp_derived(session, &df, dk.as_deref().unwrap_or("continues"));
+            }
             let mut cut = Map::new();
             if let Some(uuid) = r.top.string("parentLastUuid")? {
                 cut.insert("parent_last_uuid".into(), Value::String(uuid));

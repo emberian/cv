@@ -1852,7 +1852,7 @@ impl StateStore {
 
 /// Whether `custody_heads` exists and folds exactly the manifests `pack_manifests` holds now (its
 /// watermark's count and newest position). False on a store without the tables.
-pub(super) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
+pub(crate) fn custody_heads_fresh(conn: &rusqlite::Connection) -> Result<bool, StateError> {
     let exists: bool = conn.query_row(
         "SELECT COUNT(*) = 2 FROM sqlite_schema
          WHERE type = 'table' AND name IN ('custody_heads', 'custody_heads_through')",

@@ -378,10 +378,24 @@ fn write_database_with_verify(
         .and_then(|b| b.get("cogs_json"))
         .filter(|v| !v.is_null())
         .map(Value::to_string);
-    let session_meta = sbag
-        .and_then(|b| b.get("metadata"))
-        .filter(|v| !v.is_null())
-        .map(Value::to_string);
+    let mut session_meta_val = sbag.and_then(|b| b.get("metadata")).filter(|v| !v.is_null()).cloned();
+    if let Some((df, dk)) = crate::lineage::raw_cv_derived_info(session).filter(|(id, _)| *id != new_id) {
+        let mut cv_obj = Map::new();
+        cv_obj.insert("derived_from".into(), json!(df));
+        if let Some(kind) = dk {
+            cv_obj.insert("derived_kind".into(), json!(kind));
+        }
+        match &mut session_meta_val {
+            Some(Value::Object(map)) => {
+                map.insert("cv".into(), Value::Object(cv_obj));
+            }
+            None => {
+                session_meta_val = Some(json!({ "cv": cv_obj }));
+            }
+            _ => {}
+        }
+    }
+    let session_meta = session_meta_val.map(|v| v.to_string());
 
     let cwd_str = cwd.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let model_str = session.model.as_deref().unwrap_or("");

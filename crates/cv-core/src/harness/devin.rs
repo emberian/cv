@@ -1181,12 +1181,38 @@ fn stream_session_with_guard(
         if fell_back && !chain.is_empty() {
             bag.insert("main_chain_fallback".into(), Value::Bool(true));
         }
+        let mut cv_derived_pair: Option<(String, Option<String>)> = None;
         for (k, raw) in [("cogs_json", cogs), ("metadata", smeta)] {
-            if let Some(v) = raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+            if let Some(mut v) = raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+                if k == "metadata" && agent.is_none() {
+                    if let Some(obj) = v.as_object_mut() {
+                        if let Some(cv) = obj.remove("cv") {
+                            if let Some(df) = cv
+                                .get("derived_from")
+                                .and_then(Value::as_str)
+                                .filter(|d| !d.is_empty() && *d != session_id)
+                            {
+                                let dk = cv.get("derived_kind").and_then(Value::as_str).map(str::to_owned);
+                                cv_derived_pair = Some((df.to_owned(), dk));
+                            }
+                        }
+                        if obj.is_empty() {
+                            v = Value::Null;
+                        }
+                    }
+                }
                 if !v.is_null() {
                     bag.insert(k.into(), v);
                 }
             }
+        }
+        if let Some((df, dk)) = cv_derived_pair {
+            let mut cv_map = serde_json::Map::new();
+            cv_map.insert("derived_from".into(), json!(df));
+            if let Some(kind) = dk {
+                cv_map.insert("derived_kind".into(), json!(kind));
+            }
+            extra.insert(crate::ir::CV_NAMESPACE.into(), Value::Object(cv_map));
         }
         match agent {
             // Parent: list its live sub-agent heads and count the dangling ones (a head whose

@@ -253,33 +253,26 @@ impl SessionLineage {
 }
 
 /// Query multi-generation `ancestors` and `descendants` for `session_id` from `$CLUSTERVISION_HOME/state.db`.
-/// Read-only and best-effort: returns an empty [`SessionLineage`] when `state.db` is absent or `sqlite` is disabled.
+/// Read-only and `--frozen` safe: returns an empty [`SessionLineage`] when `state.db` is absent or `sqlite` is disabled.
 pub fn session_lineage(session_id: &str) -> SessionLineage {
     #[cfg(feature = "sqlite")]
     {
-        if session_id.trim().is_empty() {
+        let bare = crate::lineage::bare_session_id(session_id.trim());
+        if bare.is_empty() {
             return SessionLineage::default();
         }
         let Ok(store) = crate::state::StateStore::default_store() else {
             return SessionLineage::default();
         };
-        let db_path = store.path();
-        if !std::fs::metadata(db_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
-            return SessionLineage::default();
-        }
-        let Ok(reader) = crate::harness::store::sqlite::open_ro(db_path) else {
-            return SessionLineage::default();
-        };
-        reader
-            .read_snapshot(|conn, _reads| {
-                let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-                if ver == 0 {
+        store
+            .read_compatible_in(|conn| {
+                if !conn.table_exists(None, "lineage_edges")? {
                     return Ok(SessionLineage::default());
                 }
                 let walk = |sql: &str, step_col: usize| -> rusqlite::Result<Vec<LineageLink>> {
                     let mut stmt = conn.prepare(sql)?;
-                    let mut visited = HashSet::from([session_id.to_string()]);
-                    let mut queue = std::collections::VecDeque::from([session_id.to_string()]);
+                    let mut visited = HashSet::from([bare.to_string()]);
+                    let mut queue = std::collections::VecDeque::from([bare.to_string()]);
                     let mut out = Vec::new();
                     while let Some(cur) = queue.pop_front() {
                         let rows = stmt.query_map([&cur], |r| {
@@ -331,6 +324,8 @@ pub fn session_lineage(session_id: &str) -> SessionLineage {
                 .unwrap_or_default();
                 Ok(SessionLineage { ancestors, descendants })
             })
+            .ok()
+            .flatten()
             .unwrap_or_default()
     }
     #[cfg(not(feature = "sqlite"))]
@@ -338,6 +333,53 @@ pub fn session_lineage(session_id: &str) -> SessionLineage {
         let _ = session_id;
         SessionLineage::default()
     }
+}
+
+/// Unified [`SessionLineage`] for a resolved [`SessionRef`], combining `state.db:lineage_edges`
+/// (when `include_state == true`) with embedded session metadata (`extra.cv.derived_from`),
+/// `.rewind.json` sidecars, SQLite session metadata, and custody/hub pack metadata.
+pub fn session_lineage_for_ref(r: &SessionRef, include_state: bool) -> SessionLineage {
+    let bare = crate::lineage::bare_session_id(r.id.as_str());
+    let mut out = if include_state {
+        session_lineage(bare)
+    } else {
+        SessionLineage::default()
+    };
+    if let Some((parent_id, edge_kind)) = crate::lineage::derived_info_ref_without_state(r) {
+        let already = out
+            .ancestors
+            .iter()
+            .any(|l| l.src_session_id == parent_id && l.dst_session_id == bare);
+        if !already && !parent_id.is_empty() && parent_id != bare {
+            let mut merged = vec![LineageLink {
+                src_session_id: parent_id.clone(),
+                dst_session_id: bare.to_owned(),
+                edge_kind,
+                harness: Some(r.harness.as_str().to_owned()),
+                tool_use_id: None,
+                metadata: serde_json::json!({"source": "transcript"}),
+                created_at: r.created_at.map(|t| t.timestamp_millis()).unwrap_or(0),
+            }];
+            merged.append(&mut out.ancestors);
+            if include_state {
+                let mut seen: HashSet<(String, String, String)> = merged
+                    .iter()
+                    .map(|l| (l.src_session_id.clone(), l.dst_session_id.clone(), l.edge_kind.clone()))
+                    .collect();
+                for upstream in session_lineage(&parent_id).ancestors {
+                    if seen.insert((
+                        upstream.src_session_id.clone(),
+                        upstream.dst_session_id.clone(),
+                        upstream.edge_kind.clone(),
+                    )) {
+                        merged.push(upstream);
+                    }
+                }
+            }
+            out.ancestors = merged;
+        }
+    }
+    out
 }
 
 /// Best-effort non-fatal recording of a directed cross-session `LineageEdge` (`src -> dst`) into
@@ -2227,7 +2269,7 @@ fn lane_of(
         (None, None)
     };
 
-    let mut lineage = session_lineage(&sub.session.id);
+    let mut lineage = session_lineage_for_ref(&sub.session, true);
     if lineage.is_empty() && sub.session.id != agent_id {
         lineage = session_lineage(&agent_id);
     }

@@ -45,7 +45,9 @@ pub(crate) fn cmd_port(
             skills_policy.as_str()
         ));
     }
-    let (session, grown) = prepare_for_emit(adapter.as_ref(), &r, to_h)?;
+    let (mut session, grown) = prepare_for_emit(adapter.as_ref(), &r, to_h)?;
+    let source_id = cv_core::lineage::bare_session_id(&r.id).to_owned();
+    cv_core::lineage::stamp_derived(&mut session, &source_id, "port");
     let thinking = thinking.unwrap_or_else(|| {
         cv_core::emit::ThinkingMode::replay_default(
             session
@@ -77,6 +79,16 @@ pub(crate) fn cmd_port(
         json,
         Some(&artifacts),
     )?;
+    cv_core::lanes::record_lineage_edge_best_effort(
+        &source_id,
+        &res.new_id,
+        "ported_from",
+        Some(to_h.as_str()),
+        None,
+        serde_json::json!({
+            "source_harness": r.harness.as_str(),
+        }),
+    );
     if let Some(grown) = grown {
         if json {
             eprintln!("  ↳ read {grown}");

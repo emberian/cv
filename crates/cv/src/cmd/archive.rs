@@ -130,6 +130,7 @@ impl Archive {
             source_len: Option<u64>,
             source_mtime_ns: Option<i128>,
             baseline: Option<cv_core::source::Baseline>,
+            derived_info: Option<(String, String)>,
             content: Content,
         }
 
@@ -288,6 +289,9 @@ impl Archive {
                     _ => unreachable!("a projection read renders its payload; a native one has its delta"),
                 };
 
+                let derived_info = cv_core::lineage::derived_info_session(&session_meta)
+                    .map(|(p, k)| (p.to_owned(), k.to_owned()))
+                    .or_else(|| cv_core::lineage::derived_info_ref(r));
                 staged.push(StagedSession {
                     key,
                     harness: harness_str,
@@ -303,6 +307,7 @@ impl Archive {
                     source_len,
                     source_mtime_ns,
                     baseline,
+                    derived_info,
                     content,
                 });
             }
@@ -506,7 +511,7 @@ impl Archive {
                 addr,
                 custody,
             });
-            written.push((item.key, is_native_delta_append));
+            written.push((item.key, is_native_delta_append, item.derived_info));
         }
         if entries.is_empty() {
             return Ok(summary);
@@ -525,7 +530,7 @@ impl Archive {
         //    Appended native extents emit `"kind": "session_delta"` carrying ONLY the newly added
         //    `delta_extents: [entry.addr]` (`O(1)` per commit, avoiding `O(R^2)` extent rewrites!).
         let mut committed = Vec::with_capacity(entries.len());
-        for ((key, is_delta_append), entry) in written.iter().zip(entries.iter()) {
+        for ((key, is_delta_append, derived_info), entry) in written.iter().zip(entries.iter()) {
             let op_id = format!("archive:{pack_id}:{}", key.selector());
             let mut envelope = json!({
                 "archive_version": 2,
@@ -544,6 +549,12 @@ impl Archive {
                 "decoded_offset": entry.addr.decoded_offset,
                 "length": entry.addr.length,
             });
+            if let Some((df, dk)) = derived_info {
+                envelope["metadata"] = json!({
+                    "derived_from": df,
+                    "derived_kind": dk,
+                });
+            }
             if *is_delta_append {
                 if let cv_core::custody::CustodyKind::NativeExtents {
                     total_bytes,
@@ -831,6 +842,15 @@ fn publish_contiguous_archive_runs(
         let mut run_entries = Vec::with_capacity(run.len());
         let mut run_commits = Vec::with_capacity(run.len());
         for c in run {
+            let mut entry_val = serde_json::to_value(&c.entry)?;
+            if let (Some(obj), Some(meta)) = (entry_val.as_object_mut(), c.envelope.get("metadata")) {
+                if let Some(df) = meta.get("derived_from").and_then(serde_json::Value::as_str) {
+                    obj.insert("derived_from".into(), json!(df));
+                }
+                if let Some(dk) = meta.get("derived_kind").and_then(serde_json::Value::as_str) {
+                    obj.insert("derived_kind".into(), json!(dk));
+                }
+            }
             run_commits.push(json!({
                 "local_commit_pos": c.local_commit_pos,
                 "producer_id": c.entry.producer_id,
@@ -840,7 +860,7 @@ fn publish_contiguous_archive_runs(
                 "envelope": c.envelope,
                 "payload_addr": c.entry.addr,
             }));
-            run_entries.push(c.entry);
+            run_entries.push(entry_val);
         }
         let manifest_pack_id = if run_idx == 0 {
             pack_id.to_string()

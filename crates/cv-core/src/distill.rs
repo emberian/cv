@@ -4962,6 +4962,7 @@ fn session_with_tail(session: &Session, d: &Distilled, keep_last: usize, mut tai
     output
         .cv_extra_mut()
         .insert("distill".into(), Value::Object(distill_meta));
+    crate::lineage::stamp_derived(&mut output, &session.id, "distill");
     // The selected tail was already materialized; earlier inputs were never demanded.
     output
 }

@@ -412,6 +412,10 @@ impl Reader<'_> {
             s.lineage.parent = str_at(Some(p), "parent_thread_id")?;
             s.lineage.forked_from = str_at(Some(p), "forked_from_id")?;
             s.lineage.agent_path = str_at(Some(p), "agent_path")?;
+            if let Some(df) = str_at(Some(p), "derived_from")?.filter(|d| !d.is_empty() && d != &s.id) {
+                let dk = str_at(Some(p), "derived_kind")?;
+                crate::lineage::stamp_derived(s, &df, dk.as_deref().unwrap_or("continues"));
+            }
             // `base_instructions {text, provenance?}` (0.147+): the system prompt this thread runs on.
             s.system_prompt = str_at(p.get("base_instructions")?, "text")?.filter(|t| !t.trim().is_empty());
             self.ctx.inherit_before = u64_at(Some(p), "subagent_history_start_ordinal")?;

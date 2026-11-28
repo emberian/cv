@@ -284,21 +284,6 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
     render(found, work, query, json, stats, auth_envelope.as_ref())
 }
 
-fn state_lineage_parent(id: &str) -> Option<String> {
-    cv_core::lanes::session_lineage(id)
-        .ancestors
-        .into_iter()
-        .find(|link| {
-            link.dst_session_id == id
-                && link.src_session_id != id
-                && matches!(
-                    link.edge_kind.as_str(),
-                    "continues" | "fork" | "rewind" | "splice" | "distill"
-                )
-        })
-        .map(|link| link.src_session_id)
-}
-
 fn collapse_search_hits(found: &mut Found, limit: usize, live_allowed: bool) {
     if found.hits.len() <= 1 {
         found.hits.truncate(limit);
@@ -329,14 +314,11 @@ fn collapse_search_hits(found: &mut Found, limit: usize, live_allowed: bool) {
             if h.agent_id.is_some() {
                 return None;
             }
-            if live_allowed {
-                refs[idx]
-                    .as_ref()
-                    .and_then(|s| s.derived_from())
-                    .or_else(|| state_lineage_parent(&h.id))
-            } else {
-                state_lineage_parent(&h.id)
-            }
+            refs[idx]
+                .as_ref()
+                .filter(|s| live_allowed || cv_core::custody::is_pack_ref(s))
+                .and_then(|s| s.derived_from())
+                .or_else(|| cv_core::lineage::state_derived_from(&h.id))
         })
         .collect();
     if derived.iter().all(Option::is_none) {
@@ -384,15 +366,13 @@ fn collapse_search_hits(found: &mut Found, limit: usize, live_allowed: bool) {
             size_bytes: sizes[*idx],
         },
         |harness, pid| {
-            if live_allowed {
-                cv_core::find(pid, cv_core::Harness::parse(harness))
-                    .ok()
-                    .flatten()
-                    .and_then(|(r, _)| r.derived_from())
-                    .or_else(|| state_lineage_parent(pid))
-            } else {
-                state_lineage_parent(pid)
-            }
+            cv_core::find(pid, cv_core::Harness::parse(harness))
+                .ok()
+                .flatten()
+                .map(|(r, _)| r)
+                .filter(|r| live_allowed || cv_core::custody::is_pack_ref(r))
+                .and_then(|r| r.derived_from())
+                .or_else(|| cv_core::lineage::state_derived_from(pid))
         },
     );
     found.total = found.total.saturating_sub(collapsed.len());

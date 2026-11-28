@@ -76,7 +76,7 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
 
     let mut rep = Report::default();
     let mut label = String::new();
-    let mut single_session_id: Option<String> = None;
+    let mut single_session_ref: Option<(cv_core::SessionRef, bool)> = None;
     for (r, found) in targets {
         let (rr, adapter) = match found {
             Some(adapter) => (r, adapter),
@@ -101,16 +101,15 @@ pub(crate) fn cmd_doctor(id: Option<String>, harness: Option<String>, recent: us
         if label.is_empty() {
             label = crate::util::short_id(&rr.id);
         }
-        // The lineage lookup is ID-only; it must not attach another root's same-ID family.
-        if n_targets == 1 && !exact_source {
-            single_session_id = Some(rr.id.clone());
+        if n_targets == 1 {
+            single_session_ref = Some((rr, !exact_source));
         }
     }
 
     let store_health = cv_core::doctor::collect_store_health();
-    let lineage = single_session_id
-        .as_deref()
-        .map(cv_core::lanes::session_lineage)
+    let lineage = single_session_ref
+        .as_ref()
+        .map(|(rr, include_state)| cv_core::lanes::session_lineage_for_ref(rr, *include_state))
         .filter(|l| !l.is_empty());
 
     if json {

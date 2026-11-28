@@ -627,6 +627,19 @@ fn prune_cold_antigravity(r: &cv_core::ir::SessionRef, args: ColdAntigravityPrun
         dry_run: args.dry_run,
     };
     let res = prune(r, &opts)?;
+    if !args.dry_run {
+        cv_core::lanes::record_lineage_edge_best_effort(
+            &res.source_id,
+            &res.new_id,
+            "pruned_from",
+            Some(r.harness.as_str()),
+            None,
+            serde_json::json!({
+                "route": "native_sqlite",
+                "pruned_count": res.pruned_count,
+            }),
+        );
+    }
     let pct = if res.before_bytes > 0 {
         100.0 * res.bytes_saved() as f64 / res.before_bytes as f64
     } else {
@@ -778,6 +791,17 @@ fn prune_ir(r: &cv_core::ir::SessionRef, args: IrPruneArgs) -> Result<()> {
     });
     if !dry_run {
         let (path, sidecar, lost) = emit_ir(&pruned.session, &r.path, r.harness, out, &new_id, &pruned.stashed)?;
+        cv_core::lanes::record_lineage_edge_best_effort(
+            cv_core::lineage::bare_session_id(&r.id),
+            &new_id,
+            "pruned_from",
+            Some(r.harness.as_str()),
+            None,
+            serde_json::json!({
+                "route": "ir",
+                "pruned_count": pruned.pruned_count,
+            }),
+        );
         let _ = writeln!(h, "  new session: {}", path.display());
         if let Some(sc) = &sidecar {
             let _ = writeln!(
@@ -827,7 +851,9 @@ fn rewind_ir(
     let (end, evidence) =
         cv_core::rewind::ir_cut_end(r, total, cut).map_err(|e| crate::util::UsageError(format!("{e:#}")))?;
     session.messages.truncate(end);
-    session.lineage.forked_from = Some(r.id.clone());
+    let source_id = cv_core::lineage::bare_session_id(&r.id).to_owned();
+    session.lineage.forked_from = Some(source_id.clone());
+    cv_core::lineage::stamp_derived(&mut session, &source_id, "rewind");
     let pinned = to.is_some();
     let new_id = to.unwrap_or_else(|| cv_core::emit::fresh_session_id(r.harness));
     if let Err(e) = cv_core::harness::validate_session_id(&new_id) {
@@ -864,6 +890,17 @@ fn rewind_ir(
     });
     if !dry_run {
         let (path, _, lost) = emit_ir(&session, &r.path, r.harness, out, &new_id, &[])?;
+        cv_core::lanes::record_lineage_edge_best_effort(
+            &source_id,
+            &new_id,
+            "rewound_from",
+            Some(r.harness.as_str()),
+            None,
+            serde_json::json!({
+                "route": "ir",
+                "cut_msg_idx": end.saturating_sub(1),
+            }),
+        );
         let _ = writeln!(h, "  new session: {}", path.display());
         for line in &lost {
             let _ = writeln!(h, "  ⚠ lost {line}");
@@ -1008,6 +1045,19 @@ pub(crate) fn cmd_rewind(args: RewindArgs<'_>) -> Result<()> {
         }
         let result =
             cv_core::harness::antigravity::cold::rewind(&r, &opts, recovery.uncompact, recovery.pre_compaction)?;
+        if !dry_run {
+            cv_core::lanes::record_lineage_edge_best_effort(
+                &result.source_id,
+                &result.new_id,
+                "rewound_from",
+                Some(r.harness.as_str()),
+                None,
+                serde_json::json!({
+                    "route": "native_sqlite",
+                    "selected_steps": result.selected_steps.len(),
+                }),
+            );
+        }
         let mut h = format!(
             "  {} native steps · {} generations retained · {} omitted · {} executor snapshots retained ({} omitted)\n",
             result.selected_steps.len(),

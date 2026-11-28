@@ -104,6 +104,12 @@ pub(crate) fn emit_staged(
     if let Some(g) = &session.git {
         meta.insert("git".into(), codex_git(g));
     }
+    if let Some((df, dk)) = crate::lineage::raw_cv_derived_info(session).filter(|(id, _)| *id != new_id) {
+        meta.insert("derived_from".into(), json!(df));
+        if let Some(kind) = dk {
+            meta.insert("derived_kind".into(), json!(kind));
+        }
+    }
     writer::value(&mut lines, &ts_str, "session_meta", &Value::Object(meta))?;
 
     // The model rides in a `turn_context` record (per-turn config: model/cwd/approval/sandbox) —

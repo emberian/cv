@@ -124,6 +124,8 @@ impl Composition {
         cv_bag.insert("loom".into(), serde_json::Value::Array(self.provenance));
         if let Some(parent) = &continues {
             cv_bag.insert("continues".into(), serde_json::Value::String(parent.clone()));
+            cv_bag.insert("derived_from".into(), serde_json::Value::String(parent.clone()));
+            cv_bag.insert("derived_kind".into(), serde_json::Value::String("splice".into()));
         }
         let mut extra = serde_json::Map::new();
         extra.insert(crate::ir::CV_NAMESPACE.into(), serde_json::Value::Object(cv_bag));
