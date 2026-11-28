@@ -1486,6 +1486,16 @@ impl<'a> Record<'a, '_> {
             })?;
         }
         let mut extra = Map::new();
+        // cv's own seed attestation, written into an imported carrier's `origin` by the emitter.
+        if origin == Origin::Import {
+            if let Some(seed) = bag
+                .get("origin")
+                .and_then(|o| o.get(super::CV_SEED_KEY))
+                .filter(|seed| seed.is_object())
+            {
+                extra.insert(crate::ir::CV_NAMESPACE.into(), serde_json::json!({ "seed": seed }));
+            }
+        }
         if !bag.is_empty() {
             extra.insert(Harness::Claude.as_str().into(), Value::Object(bag));
         }

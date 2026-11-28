@@ -1963,6 +1963,10 @@ fn tag_inner<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
     Some(&s[start..end])
 }
 
+/// The key inside an imported carrier's `origin` object holding cv's seed attestation
+/// ([`crate::distill::SEED_WIRE_FIELDS`]).
+pub(crate) const CV_SEED_KEY: &str = "cvSeed";
+
 const CLAUDE_EXTRA_TOP: &[&str] = &[
     "logicalParentUuid",
     "isSidechain",

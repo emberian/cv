@@ -195,7 +195,8 @@ work, and it has two consequences:
 
 ## What `cv distill` keeps and drops
 
-Deterministic, rule-based, no model calls, over the IR (any harness parses; emission is Claude).
+Deterministic, rule-based, no model calls, over the IR (any harness parses; `--session=<harness>`
+emits to any harness cv writes).
 
 Kept **verbatim**:
 
@@ -222,6 +223,15 @@ label is the Bash `description` when there is one; consecutive repeats collapse 
 format, so `cv cat <new> <tool_use_id>` returns it. Harness reminders, hook records and thinking are
 dropped. Token estimates use cv's shared estimator; the pack itself is priced at the tool-input rate
 (2.1 bytes per token), since resumed distilled packs measured 2.2–2.4.
+
+**Distilling a distilled session.** The pack is one opening turn whose origin is `import`, never
+a person's, and it carries a seed record: the source, how many human instructions the pack holds,
+a digest of them, and the pack's length. A later distill reads the brief and the human prompts
+back out of the pack only as far as that record vouches for them. Claude transcripts keep the
+record beside the turn (`origin.cvSeed`); where it does not check out, because a `· user` entry
+was written into the stored pack or an instruction was edited, every entry keeps its words and is
+carried as a message to the agent instead of a human prompt. A format with no room for the record
+falls back to the pack's own headings, which non-human text cannot forge.
 
 ### Who the pack is for: `--handoff`, `--state-header`, `--bricks`
 

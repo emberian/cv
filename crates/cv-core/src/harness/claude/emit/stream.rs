@@ -573,7 +573,24 @@ fn record<'a>(
             }),
         );
         if message.role == Role::User && message.origin == crate::ir::Origin::Import {
-            base.insert("origin".into(), json!({"kind": "import"}));
+            let mut origin = Map::new();
+            origin.insert("kind".into(), json!("import"));
+            // A distilled seed's attestation rides with the carrier, so a later distill of this
+            // file checks the pack's human instructions instead of trusting its headings.
+            if let Some(seed) = message
+                .cv_extra()
+                .and_then(|cv| cv.get("seed"))
+                .and_then(Value::as_object)
+            {
+                let wire: Map<String, Value> = crate::distill::SEED_WIRE_FIELDS
+                    .iter()
+                    .filter_map(|&field| Some((field.to_owned(), seed.get(field)?.clone())))
+                    .collect();
+                if !wire.is_empty() {
+                    origin.insert(crate::harness::claude::CV_SEED_KEY.into(), Value::Object(wire));
+                }
+            }
+            base.insert("origin".into(), Value::Object(origin));
         }
         let mut inner = Map::new();
         inner.insert(
@@ -898,9 +915,9 @@ pub(crate) fn emit_staged(
                 skills: skills.clone(),
             };
             verify_fn(crate::emit::stage::StagedSource::Files {
-            result: &staged_result,
-            destination: &file_path,
-        })?;
+                result: &staged_result,
+                destination: &file_path,
+            })?;
         }
     }
     crate::emit::stage::publish_source(&source, &file_path, opts.claim())?;
