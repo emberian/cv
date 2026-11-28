@@ -81,6 +81,8 @@ routes! {
 
         GET ["api", "session", harness, id, "files"] => files(harness, id, query),
 
+        GET ["api", "session", harness, id, "prompts"] => prompts(harness, id, query),
+
         GET ["api", "touched"] => touched(query),
 
         GET ["api", "session", harness, id, "subagents"] => subagents(harness, id, query),
@@ -1032,6 +1034,39 @@ fn context(harness: &str, id: &str, query: &str) -> (u16, Value) {
     }
 }
 
+/// Human prompts and question-tool answers ([`kind_rows`] selection, optional `kind=prompt,answer`).
+/// Returns the same `prompt_row` array as `show --kind prompt,answer --json`.
+fn prompts(harness: &str, id: &str, query: &str) -> (u16, Value) {
+    let params = Query::parse(query);
+    let (want_prompts, want_answers) = match params.raw("kind") {
+        None => (true, true),
+        Some(raw) => {
+            let (mut p, mut a) = (false, false);
+            for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match part {
+                    "prompt" | "prompts" => p = true,
+                    "answer" | "answers" => a = true,
+                    other => return err(400, &format!("unknown prompt kind {other:?}: prompt or answer")),
+                }
+            }
+            if !p && !a {
+                return err(400, "empty kind parameter: expected prompt or answer");
+            }
+            (p, a)
+        }
+    };
+    match kind_rows(
+        harness,
+        id,
+        query,
+        |adapter, r| crate::prompts::read_filtered(adapter, r, None, want_prompts, want_answers),
+        |row| row.index,
+    ) {
+        Ok(rows) => ok(json!(rows)),
+        Err(error) => error,
+    }
+}
+
 /// The file-touch timeline ([`kind_rows`] selection): the same array as `show --kind files --json`,
 /// supporting `?place=&as_of=&max_staleness=&authority=1`.
 fn files(harness: &str, id: &str, query: &str) -> (u16, Value) {
@@ -1700,6 +1735,102 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("ambiguous session id"));
+    }
+
+    #[test]
+    fn prompts_route_projects_human_prompts_and_question_answers_and_windows_rows() {
+        let world = crate::test_world("api-prompts-route");
+        world.write_session(
+            "p1",
+            &[
+                json!({
+                    "type": "user",
+                    "sessionId": "p1",
+                    "uuid": "u0",
+                    "timestamp": "2026-10-01T12:00:00Z",
+                    "message": {"role": "user", "content": "first human prompt"}
+                }),
+                json!({
+                    "type": "assistant",
+                    "sessionId": "p1",
+                    "uuid": "a1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "q1", "name": "AskUserQuestion", "input": {"questions": []}},
+                            {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "pwd"}}
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "user",
+                    "sessionId": "p1",
+                    "uuid": "u2",
+                    "timestamp": "2026-10-01T12:01:00Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "q1", "content": "Selected option B"},
+                            {"type": "tool_result", "tool_use_id": "b1", "content": "/tmp"}
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "user",
+                    "sessionId": "p1",
+                    "uuid": "u3",
+                    "timestamp": "2026-10-01T12:02:00Z",
+                    "message": {"role": "user", "content": "second human prompt"}
+                }),
+            ],
+        );
+        let parts = ["api", "session", "claude", "p1", "prompts"];
+        let (st, body) = route_json(&parts, "");
+        assert_eq!(st, 200, "{body}");
+        let rows = body.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{body}");
+        assert_eq!(
+            (
+                rows[0]["index"].as_u64(),
+                rows[0]["kind"].as_str(),
+                rows[0]["text"].as_str()
+            ),
+            (Some(0), Some("prompt"), Some("first human prompt"))
+        );
+        assert_eq!(
+            (
+                rows[1]["index"].as_u64(),
+                rows[1]["kind"].as_str(),
+                rows[1]["text"].as_str()
+            ),
+            (Some(2), Some("answer"), Some("Selected option B"))
+        );
+        assert_eq!(
+            (
+                rows[2]["index"].as_u64(),
+                rows[2]["kind"].as_str(),
+                rows[2]["text"].as_str()
+            ),
+            (Some(3), Some("prompt"), Some("second human prompt"))
+        );
+
+        let (st_ans, ans) = route_json(&parts, "kind=answer");
+        assert_eq!(st_ans, 200);
+        assert_eq!(ans.as_array().unwrap().len(), 1);
+        assert_eq!(ans[0]["kind"], "answer");
+
+        let (st_win, win) = route_json(&parts, "kind=prompt&start=1");
+        assert_eq!(st_win, 200);
+        assert_eq!(win.as_array().unwrap().len(), 1);
+        assert_eq!(win[0]["index"], 3);
+
+        let (st_around, around) = route_json(&parts, "around=2&context=0");
+        assert_eq!(st_around, 200);
+        assert_eq!(around.as_array().unwrap().len(), 1);
+        assert_eq!(around[0]["kind"], "answer");
+
+        assert_eq!(route_json(&parts, "kind=bogus").0, 400);
+        assert_eq!(route_json(&parts, "kind=").0, 400);
     }
 
     #[test]

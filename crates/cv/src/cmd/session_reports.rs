@@ -4,133 +4,14 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use cv_core::ir::{truncate, Block, Message, MessageKind, Origin, SessionRef};
+use cv_core::ir::{truncate, SessionRef};
 use cv_core::lanes::Lane;
+use cv_core::prompts::{read_filtered as collect_prompts, PromptRow};
 use cv_core::sanitize::sanitize_line;
-use cv_core::stream::{Demand, Flow};
-use serde::Serialize;
 
 use crate::util::{continue_hint, fmt_local, home_rel, parse_harness, resolve, short_id};
 
 // ===================== cv show --kind prompt,answer =====================
-
-#[derive(Debug, Clone, Serialize)]
-struct PromptRow {
-    /// Message index in the session (what `cv show --around N` takes).
-    index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamp: Option<DateTime<Utc>>,
-    /// `prompt` (typed by the person) or `answer` (a question-tool result).
-    kind: &'static str,
-    text: String,
-}
-
-fn is_question_tool(h: cv_core::Harness, name: &str, input: &cv_core::Json) -> Result<bool> {
-    if matches!(
-        cv_core::affordance::classify_tool_json(h, name, input)?,
-        Some((cv_core::affordance::Kind::Question, _))
-    ) {
-        return Ok(true);
-    }
-    let bare = name.rsplit(':').next().unwrap_or(name);
-    Ok(bare == "request_user_input")
-}
-
-/// Stream `r` once and keep only what the person said: `prompt`/`human` messages and results of
-/// [`cv_core::affordance::Kind::Question`] tool calls paired by `tool_use_id`, in order, with
-/// their raw session message indices. `span` bounds the raw message indices (`[start, end)`,
-/// `None` end = through the last) when `--pre-compaction` narrows the session before projection.
-fn collect_prompts(
-    r: &SessionRef,
-    adapter: &dyn cv_core::harness::Adapter,
-    span: Option<(usize, Option<usize>)>,
-    prompts: bool,
-    answers: bool,
-) -> Result<Vec<PromptRow>> {
-    let mut rows = Vec::new();
-    let mut question_ids = std::collections::HashSet::new();
-    let mut idx = 0usize;
-    let resolver = cv_core::Resolver::new(Some(r.path.clone()));
-    let mut error = None;
-    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut |m: Message| {
-        let i = idx;
-        idx += 1;
-        if let Some((_, Some(e))) = span {
-            if i >= e {
-                return Flow::Stop;
-            }
-        }
-        let selected = (|| -> Result<()> {
-            if answers {
-                for block in &m.content {
-                    if let Block::ToolUse { id, name, input, .. } = block {
-                        if !id.is_empty() && is_question_tool(r.harness, name, input)? {
-                            question_ids.insert(id.clone());
-                        }
-                    }
-                }
-            }
-            if span.is_some_and(|(s, _)| i < s) {
-                return Ok(());
-            }
-            if prompts && m.kind == MessageKind::Prompt && m.origin == Origin::Human {
-                let mut text = String::new();
-                for block in &m.content {
-                    if let Block::Text { text: body, .. } = block {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        body.try_for_each_chunk(&resolver, 64 * 1024, |part| {
-                            text.push_str(part);
-                            Ok(())
-                        })?;
-                    }
-                }
-                if !text.trim().is_empty() {
-                    rows.push(PromptRow {
-                        index: i,
-                        timestamp: m.timestamp,
-                        kind: "prompt",
-                        text,
-                    });
-                }
-            }
-            if answers {
-                for block in &m.content {
-                    if let Block::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                        ..
-                    } = block
-                    {
-                        if !*is_error && question_ids.contains(tool_use_id) {
-                            let text = content.try_resolve(&resolver)?.into_owned();
-                            if !text.trim().is_empty() {
-                                rows.push(PromptRow {
-                                    index: i,
-                                    timestamp: m.timestamp,
-                                    kind: "answer",
-                                    text,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(failure) = selected {
-            error = Some(failure);
-            return Flow::Stop;
-        }
-        Flow::Continue
-    })?;
-    if let Some(error) = error {
-        return Err(error);
-    }
-    Ok(rows)
-}
 
 fn format_prompt_row(p: &PromptRow) -> String {
     let ts = p
@@ -159,7 +40,7 @@ pub(crate) fn print_prompts(
     answers: bool,
     json: bool,
 ) -> Result<()> {
-    let rows = collect_prompts(r, adapter, win.pre_compaction, prompts, answers)?;
+    let rows = collect_prompts(adapter, r, win.pre_compaction, prompts, answers)?;
     let overhead = if json { 5 } else { 100 };
     let (rows, next) = super::view::slice_and_budget(
         rows,
@@ -930,7 +811,8 @@ pub(crate) fn cmd_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cv_core::ir::Role;
+    use cv_core::ir::{Block, Message, Role};
+    use cv_core::stream::{Demand, Flow};
 
     struct Fixture(cv_core::Harness, Vec<Message>);
     impl cv_core::Adapter for Fixture {
@@ -1020,16 +902,16 @@ mod tests {
         });
         let fixture = Fixture(cv_core::Harness::Claude, vec![assistant, user, tool]);
         let r = SessionRef::new("selection", cv_core::Harness::Claude, world.base.join("source"));
-        let both = collect_prompts(&r, &fixture, None, true, true)?;
+        let both = collect_prompts(&fixture, &r, None, true, true)?;
         assert_eq!(both.len(), 2);
         assert_eq!((both[0].index, both[0].text.as_str()), (1, prompt.as_str()));
         assert_eq!((both[1].index, both[1].text.as_str()), (2, answer.as_str()));
-        let window = collect_prompts(&r, &fixture, Some((2, Some(3))), true, true)?;
+        let window = collect_prompts(&fixture, &r, Some((2, Some(3))), true, true)?;
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].index, 2);
         std::fs::remove_file(&answer_path)?;
-        assert_eq!(collect_prompts(&r, &fixture, None, true, false)?[0].text, prompt);
-        assert!(collect_prompts(&r, &fixture, None, false, true).is_err());
+        assert_eq!(collect_prompts(&fixture, &r, None, true, false)?[0].text, prompt);
+        assert!(collect_prompts(&fixture, &r, None, false, true).is_err());
         Ok(())
     }
 
@@ -1094,7 +976,7 @@ mod tests {
             ];
             let fixture = Fixture(harness, vec![ask, res]);
             let r = SessionRef::new("qpair", harness, std::path::PathBuf::from("source"));
-            let rows = collect_prompts(&r, &fixture, None, true, true)?;
+            let rows = collect_prompts(&fixture, &r, None, true, true)?;
             assert_eq!(rows.len(), 1, "{harness:?} / {tool_name}");
             assert_eq!(rows[0].kind, "answer");
             assert_eq!(rows[0].index, 1);

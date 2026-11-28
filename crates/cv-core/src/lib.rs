@@ -62,6 +62,7 @@ pub(crate) mod lockfile;
 pub mod offsets;
 pub mod overview;
 pub mod packs;
+pub mod prompts;
 pub mod prune;
 pub mod publish;
 pub mod query;

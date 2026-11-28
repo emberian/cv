@@ -110,7 +110,7 @@ pub(crate) fn data_schema_json() -> Value {
             "read_coverage": "optional existing ReadCoverage for the parent read; absence means unassessed",
         },
         "prompt_row": {
-            "description": "one row of `show --kind prompt,answer --json`: what the person typed, or an AskUserQuestion answer",
+            "description": "one row of `show --kind prompt,answer --json` or GET /api/session/{harness}/{id}/prompts: what the person typed, or an AskUserQuestion answer",
             "keys": ["index", "timestamp", "kind", "text"],
             "kind": ["prompt", "answer"],
         },
@@ -614,6 +614,16 @@ mod tests {
         );
 
         let at: chrono::DateTime<chrono::Utc> = at.parse().unwrap();
+        let prompt_row = cv_core::prompts::PromptRow {
+            index: 0,
+            timestamp: Some(at),
+            kind: "prompt",
+            text: "t".into(),
+        };
+        assert_eq!(
+            keys(serde_json::to_value(&prompt_row).unwrap()),
+            published(&schema["prompt_row"]["keys"])
+        );
         let some = |s: &str| Some(s.to_string());
         let lane = cv_core::lanes::Lane {
             baggage: None,
@@ -684,6 +694,7 @@ mod tests {
         for route in [
             "GET /api/sessions",
             "GET /api/session/{}/{}/messages",
+            "GET /api/session/{}/{}/prompts",
             "GET /api/session/{}/{}/export",
             "GET /api/search",
             "POST /api/task/{}/{}",
