@@ -281,6 +281,14 @@ impl Adapter for Hermes {
         Harness::Hermes
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut crate::source::ReadSet) {
+        guard.record_sqlite(&r.path);
+    }
+
     /// The delegate runs of the conversation's compression chain ([`subagent_refs`]).
     fn forest(
         &self,

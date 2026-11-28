@@ -37,8 +37,7 @@ use std::path::{Path, PathBuf};
 pub use writer::Writer;
 
 fn codec_version(h: Harness) -> u32 {
-    // These adapters changed which rows certify a session in a shared database.
-    crate::source::VERSION + u32::from(matches!(h, Harness::Hermes | Harness::Devin))
+    crate::harness::codec_version(h)
 }
 
 pub(crate) type PrimaryReads = std::collections::HashMap<std::path::PathBuf, crate::source::ReadSet>;
@@ -296,7 +295,7 @@ mod imp {
     /// Physical DDL stamp for `catalog.db` (`PRAGMA user_version`), decoupled from
     /// [`crate::source::VERSION`]: codec and event version bumps invalidate only affected
     /// harness/consumer rows via `harness_versions` instead of dropping the whole catalog.
-    const SCHEMA: i64 = 12;
+    const SCHEMA: i64 = 13;
 
     #[cfg(test)]
     type ScopedVersionOverride = (std::collections::HashMap<Harness, u32>, Option<u32>);
@@ -999,7 +998,7 @@ mod imp {
     }
 
     pub(super) struct PreparedSubagents {
-        scanned: Vec<(String, String, String, Vec<String>)>,
+        scanned: Vec<(String, String, crate::source::ReadSet, Vec<String>)>,
     }
 
     fn current_now_ns() -> Option<u64> {
@@ -1009,127 +1008,12 @@ mod imp {
             .map(|d| d.as_nanos() as u64)
     }
 
-    fn settled_file_id(id: FileId, now_ns: Option<u64>) -> Option<FileId> {
-        let fudge = WATCH_FUDGE.as_nanos() as u64;
-        now_ns
-            .and_then(|now| now.checked_sub(id.mtime_ns))
-            .is_some_and(|age| age >= fudge)
-            .then_some(id)
-    }
-
-    fn escape_guard_path(path: &Path) -> Option<String> {
-        let s = path.to_str()?;
-        if !s.contains(['\\', '\n']) {
-            return Some(s.to_owned());
-        }
-        let mut out = String::with_capacity(s.len() + 4);
-        for ch in s.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                _ => out.push(ch),
-            }
-        }
-        Some(out)
-    }
-
-    fn unescape_guard_path(raw: &str) -> std::borrow::Cow<'_, str> {
-        if !raw.contains('\\') {
-            return std::borrow::Cow::Borrowed(raw);
-        }
-        let mut out = String::with_capacity(raw.len());
-        let mut chars = raw.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '\\' {
-                match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('\\') => out.push('\\'),
-                    Some(other) => {
-                        out.push('\\');
-                        out.push(other);
-                    }
-                    None => out.push('\\'),
-                }
-            } else {
-                out.push(ch);
-            }
-        }
-        std::borrow::Cow::Owned(out)
-    }
-
-    fn encode_guard(entries: &[(&Path, Watched)]) -> String {
-        if entries.is_empty() {
-            return "?".into();
-        }
-        let mut out = String::new();
-        for (i, &(path, watched)) in entries.iter().enumerate() {
-            let Some(escaped) = escape_guard_path(path) else {
-                return "?".into();
-            };
-            if i > 0 {
-                out.push('\n');
-            }
-            match watched {
-                Watched::Unknown => return "?".into(),
-                Watched::Absent => {
-                    out.push_str("A ");
-                    out.push_str(&escaped);
-                }
-                Watched::Is(id) => {
-                    use std::fmt::Write as _;
-                    let _ = write!(
-                        out,
-                        "I {}:{}:{}:{}:{} {}",
-                        id.len, id.mtime_ns, id.dev, id.ino, id.ctime_ns, escaped
-                    );
-                }
-            }
-        }
-        out
-    }
-
-    fn parse_guard_file_id(nums: &str) -> Option<FileId> {
-        let mut parts = nums.split(':');
-        let len = parts.next()?.parse::<u64>().ok()?;
-        let mtime_ns = parts.next()?.parse::<u64>().ok()?;
-        let dev = parts.next()?.parse::<u64>().ok()?;
-        let ino = parts.next()?.parse::<u64>().ok()?;
-        let ctime_ns = parts.next()?.parse::<i64>().ok()?;
-        parts.next().is_none().then_some(FileId {
-            len,
-            mtime_ns,
-            dev,
-            ino,
-            ctime_ns,
-        })
+    fn decode_guard(raw: &str) -> Option<crate::source::ReadSet> {
+        serde_json::from_str(raw).ok()
     }
 
     fn guard_is_fresh(guard: &str, probe: &mut crate::source::Probe) -> bool {
-        if guard.is_empty() || guard == "?" {
-            return false;
-        }
-        for line in guard.lines() {
-            if let Some(raw_path) = line.strip_prefix("A ") {
-                let path = unescape_guard_path(raw_path);
-                if probe.file_id(Path::new(path.as_ref())) != Some(None) {
-                    return false;
-                }
-            } else if let Some(rest) = line.strip_prefix("I ") {
-                let Some((nums, raw_path)) = rest.split_once(' ') else {
-                    return false;
-                };
-                let Some(expected) = parse_guard_file_id(nums) else {
-                    return false;
-                };
-                let path = unescape_guard_path(raw_path);
-                if probe.file_id(Path::new(path.as_ref())) != Some(Some(expected)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        true
+        decode_guard(guard).is_some_and(|g| g.fresh(probe))
     }
 
     fn collect_stems_in_dir(dir: &Path, stems: &mut BTreeSet<String>) -> bool {
@@ -1158,60 +1042,52 @@ mod imp {
     }
 
     /// Scan a workflow-capable parent session's sub-agent sidecar directories and return its
-    /// compact directory-stat guard plus discovered `agent-*` stems:
+    /// [`crate::source::ReadSet`] directory-stat guard plus discovered `agent-*` stems:
     /// - `<proj>/<sid>` absent -> guard `<proj>`'s `FileId` (shared across siblings via `probe`).
     /// - `<sid>` present without `subagents/` -> guard `<sid>`'s `FileId`.
-    /// - `<sid>/subagents` present -> guard `subagents/` `FileId`, `Watched` of
-    ///   `subagents/workflows`, and `FileId` of each `<run>` dir (`WATCH_FUDGE` = 2s).
+    /// - `<sid>/subagents` present -> guard `subagents/`, `subagents/workflows` (including absence),
+    ///   and each `<run>` dir (`WATCH_FUDGE` = 2s).
     fn scan_subagent_parent(
         store: &dyn crate::harness::Workflows,
         parent_path: &Path,
         probe: &mut crate::source::Probe,
         now_ns: Option<u64>,
-    ) -> (String, Vec<String>) {
-        let Some(proj) = parent_path.parent() else {
-            return ("?".into(), Vec::new());
-        };
-        let Some(sid_dir) = store.session_sidecar_dir(parent_path) else {
-            return ("?".into(), Vec::new());
+    ) -> (crate::source::ReadSet, Vec<String>) {
+        let fudge_ns = WATCH_FUDGE.as_nanos() as u64;
+        let (Some(proj), Some(sid_dir)) = (parent_path.parent(), store.session_sidecar_dir(parent_path)) else {
+            return (crate::source::ReadSet::unrecorded(), Vec::new());
         };
         match probe.file_id(&sid_dir) {
             Some(None) => {
-                let guard = match probe.file_id(proj).flatten().and_then(|id| settled_file_id(id, now_ns)) {
-                    Some(proj_id) => encode_guard(&[(proj, Watched::Is(proj_id))]),
-                    None => "?".into(),
-                };
+                let mut guard = crate::source::ReadSet::default();
+                if probe.file_id(proj).flatten().is_some() {
+                    guard.record_settled(proj, probe, now_ns, fudge_ns);
+                } else {
+                    guard = crate::source::ReadSet::unrecorded();
+                }
                 (guard, Vec::new())
             }
-            None => ("?".into(), Vec::new()),
-            Some(Some(sid_id)) => {
+            None => (crate::source::ReadSet::unrecorded(), Vec::new()),
+            Some(Some(_)) => {
                 let sub_dir = sid_dir.join("subagents");
                 match probe.file_id(&sub_dir) {
                     Some(None) => {
-                        let guard = match settled_file_id(sid_id, now_ns) {
-                            Some(settled) => encode_guard(&[(&sid_dir, Watched::Is(settled))]),
-                            None => "?".into(),
-                        };
+                        let mut guard = crate::source::ReadSet::default();
+                        guard.record_settled(&sid_dir, probe, now_ns, fudge_ns);
                         (guard, Vec::new())
                     }
-                    None => ("?".into(), Vec::new()),
-                    Some(Some(sub_id)) => {
+                    None => (crate::source::ReadSet::unrecorded(), Vec::new()),
+                    Some(Some(_)) => {
                         let mut stems = BTreeSet::new();
+                        let mut guard = crate::source::ReadSet::default();
                         let mut ok = collect_stems_in_dir(&sub_dir, &mut stems);
-                        let mut entries: Vec<(PathBuf, Watched)> = Vec::new();
-                        match settled_file_id(sub_id, now_ns) {
-                            Some(settled) => entries.push((sub_dir.clone(), Watched::Is(settled))),
-                            None => ok = false,
-                        }
+                        guard.record_settled(&sub_dir, probe, now_ns, fudge_ns);
                         let wf_runs_dir = sub_dir.join("workflows");
                         match probe.file_id(&wf_runs_dir) {
-                            Some(None) => entries.push((wf_runs_dir, Watched::Absent)),
+                            Some(None) => guard.record_settled(&wf_runs_dir, probe, now_ns, fudge_ns),
                             None => ok = false,
-                            Some(Some(wf_id)) => {
-                                match settled_file_id(wf_id, now_ns) {
-                                    Some(settled) => entries.push((wf_runs_dir.clone(), Watched::Is(settled))),
-                                    None => ok = false,
-                                }
+                            Some(Some(_)) => {
+                                guard.record_settled(&wf_runs_dir, probe, now_ns, fudge_ns);
                                 #[cfg(test)]
                                 crate::note_subagent_read_dir();
                                 match std::fs::read_dir(&wf_runs_dir) {
@@ -1232,10 +1108,7 @@ mod imp {
                                             if !md.is_dir() {
                                                 continue;
                                             }
-                                            match FileId::of(&md).and_then(|id| settled_file_id(id, now_ns)) {
-                                                Some(settled) => entries.push((run_dir.clone(), Watched::Is(settled))),
-                                                None => ok = false,
-                                            }
+                                            guard.record_settled(&run_dir, probe, now_ns, fudge_ns);
                                             ok &= collect_stems_in_dir(&run_dir, &mut stems);
                                         }
                                     }
@@ -1243,13 +1116,9 @@ mod imp {
                                 }
                             }
                         }
-                        let guard = if ok {
-                            let borrowed: Vec<(&Path, Watched)> =
-                                entries.iter().map(|(p, w)| (p.as_path(), *w)).collect();
-                            encode_guard(&borrowed)
-                        } else {
-                            "?".into()
-                        };
+                        if !ok {
+                            guard = crate::source::ReadSet::unrecorded();
+                        }
                         (guard, stems.into_iter().collect())
                     }
                 }
@@ -1304,7 +1173,8 @@ mod imp {
             "INSERT OR IGNORE INTO subagents(harness,stem,parent_id,parent_path) VALUES(?1,?2,?3,?4)",
         )?;
         for (pid, ppath, guard, stems) in &prep.scanned {
-            upsert_parent.execute(params![h.as_str(), pid, ppath, guard])?;
+            let guard_json = serde_json::to_string(guard).unwrap_or_default();
+            upsert_parent.execute(params![h.as_str(), pid, ppath, guard_json])?;
             clear_stems.execute(params![h.as_str(), pid, ppath])?;
             for stem in stems {
                 insert_stem.execute(params![h.as_str(), stem, pid, ppath])?;
@@ -1318,7 +1188,7 @@ mod imp {
         store: &dyn crate::harness::Workflows,
         want: &str,
         matched_stem: &str,
-        guard: Option<&str>,
+        guard: Option<&crate::source::ReadSet>,
         probe: &mut crate::source::Probe,
     ) -> bool {
         if probe.exists(&parent.path) != Some(true) {
@@ -1329,21 +1199,16 @@ mod imp {
                 if probe.exists(&sub_dir.join(format!("{matched_stem}.jsonl"))) == Some(true) {
                     return true;
                 }
-                if let Some(guard) = guard.filter(|g| !g.is_empty() && *g != "?") {
+                if let Some(guard) = guard {
+                    let sub_dir = std::path::absolute(&sub_dir).unwrap_or(sub_dir);
                     let wf_root = sub_dir.join("workflows");
-                    for line in guard.lines() {
-                        if let Some(rest) = line.strip_prefix("I ") {
-                            if let Some((_, raw_path)) = rest.split_once(' ') {
-                                let dir_str = unescape_guard_path(raw_path);
-                                let dir = Path::new(dir_str.as_ref());
-                                if dir != sub_dir
-                                    && dir != wf_root
-                                    && dir.starts_with(&wf_root)
-                                    && probe.exists(&dir.join(format!("{matched_stem}.jsonl"))) == Some(true)
-                                {
-                                    return true;
-                                }
-                            }
+                    for dir in guard.paths() {
+                        if dir != sub_dir
+                            && dir != wf_root
+                            && dir.starts_with(&wf_root)
+                            && probe.exists(&dir.join(format!("{matched_stem}.jsonl"))) == Some(true)
+                        {
+                            return true;
                         }
                     }
                 }
@@ -1495,8 +1360,8 @@ mod imp {
                             continue;
                         }
                         if let Some(&r) = guarded_refs.get(&key) {
-                            let guard = stored_guards.get(&key).map(String::as_str);
-                            if verify_subagent_candidate(r, store, want, &stem, guard, &mut probe) {
+                            let guard = stored_guards.get(&key).and_then(|g| decode_guard(g));
+                            if verify_subagent_candidate(r, store, want, &stem, guard.as_ref(), &mut probe) {
                                 matched_keys.insert(key);
                             }
                         }
@@ -1559,8 +1424,10 @@ mod imp {
                 }
             }
 
-            let mut in_memory_scans: std::collections::HashMap<(String, String), (String, Vec<String>)> =
-                std::collections::HashMap::new();
+            let mut in_memory_scans: std::collections::HashMap<
+                (String, String),
+                (crate::source::ReadSet, Vec<String>),
+            > = std::collections::HashMap::new();
             if !to_scan.is_empty() {
                 let mut scanned = Vec::with_capacity(to_scan.len());
                 for (pid, ppath) in to_scan {
@@ -1615,7 +1482,8 @@ mod imp {
                     if in_memory_scans.contains_key(&key) || accepted_keys.contains(&key) || !stem.starts_with(want) {
                         continue;
                     }
-                    if verify_subagent_candidate(&r, store, want, &stem, guard.as_deref(), &mut probe) {
+                    let decoded = guard.as_deref().and_then(decode_guard);
+                    if verify_subagent_candidate(&r, store, want, &stem, decoded.as_ref(), &mut probe) {
                         accepted_keys.insert(key);
                         results.push(r);
                     }
@@ -1970,138 +1838,16 @@ mod imp {
 
     use crate::source::Payload as _;
 
-    /// Whether `h` never records a sub-agent forest (`Adapter::forest` is always empty).
-    fn has_zero_subagent_forest(h: Harness) -> bool {
-        match h {
-            Harness::Claude
-            | Harness::Codex
-            | Harness::Hermes
-            | Harness::Devin
-            | Harness::Antigravity
-            | Harness::Kimi
-            | Harness::KimiCode => false,
-            Harness::Grok
-            | Harness::OpenCode
-            | Harness::Gemini
-            | Harness::OpenClaw
-            | Harness::Pi
-            | Harness::Cursor
-            | Harness::Qwen
-            | Harness::LmStudio
-            | Harness::Cline
-            | Harness::Roo
-            | Harness::Continue
-            | Harness::Goose
-            | Harness::Zed
-            | Harness::ChatGptExport
-            | Harness::ClaudeExport
-            | Harness::OpenSession => true,
-        }
-    }
-
     /// Capture sub-agent count and an exact filesystem guard for `r` on demand (when a query
     /// touches `agents` or `has:subagents`), without holding a SQLite writer lock.
     pub(crate) fn populate_subagent_facts(r: &SessionRef, facts: &mut SessionQueryFacts) {
         let mut guard = crate::source::ReadSet::default();
-        if has_zero_subagent_forest(r.harness) {
+        let Some(adapter) = crate::harness::rootless(r.harness).filter(|a| a.has_subagent_forest()) else {
             facts.subagent_count = Some(0);
             facts.subagent_guard = guard;
             return;
-        }
-        match r.harness {
-            Harness::Claude => {
-                let stem = r.path.with_extension("");
-                let subagents = stem.join("subagents");
-                let wf_subagents = subagents.join("workflows");
-                let workflows = stem.join("workflows");
-                for p in [&stem, &subagents, &wf_subagents, &workflows] {
-                    guard.record(p);
-                }
-                if let Ok(entries) = std::fs::read_dir(&wf_subagents) {
-                    for entry in entries.flatten() {
-                        guard.record(&entry.path());
-                    }
-                }
-            }
-            Harness::Codex => {
-                let ledger_path = crate::lanes::ledger_path();
-                guard.record(&ledger_path);
-                let home = crate::env::Env::current()
-                    .cv_home()
-                    .unwrap_or_else(|| PathBuf::from("."));
-                let state_db = home.join("state.db");
-                guard.record(&state_db);
-                for sidecar in crate::source::sqlite_sidecars(&state_db) {
-                    guard.record(&sidecar);
-                }
-                let ledger = crate::lanes::ledger_index();
-                let mut visited = HashSet::from([r.id.clone()]);
-                let mut queue = std::collections::VecDeque::from([r.id.clone()]);
-                while let Some(sid) = queue.pop_front() {
-                    for &at in ledger.rows_of(&sid) {
-                        let row = &ledger.rows[at];
-                        if let Some(child_path) = row.agent_transcript_path.as_deref() {
-                            guard.record(child_path);
-                        }
-                        if !row.agent_id.is_empty() && visited.insert(row.agent_id.clone()) {
-                            queue.push_back(row.agent_id.clone());
-                        }
-                    }
-                }
-            }
-            Harness::Hermes | Harness::Devin => {
-                guard.record(&r.path);
-                for sidecar in crate::source::sqlite_sidecars(&r.path) {
-                    guard.record(&sidecar);
-                }
-            }
-            Harness::Antigravity => crate::harness::antigravity::forest_dependencies(r, &mut guard),
-            Harness::Kimi => {
-                guard.record(&r.path);
-                let sub_dir = r.path.join("subagents");
-                guard.record(&sub_dir);
-                if let Ok(entries) = std::fs::read_dir(&sub_dir) {
-                    for entry in entries.flatten() {
-                        guard.record(&entry.path());
-                    }
-                }
-            }
-            Harness::KimiCode => {
-                let sdir = r
-                    .path
-                    .ancestors()
-                    .find(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("session_"))
-                    })
-                    .unwrap_or(&r.path);
-                guard.record(&sdir.join("state.json"));
-                let agents_dir = sdir.join("agents");
-                guard.record(&agents_dir);
-                if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-                    for entry in entries.flatten() {
-                        guard.record(&entry.path());
-                    }
-                }
-            }
-            Harness::Grok
-            | Harness::OpenCode
-            | Harness::Gemini
-            | Harness::OpenClaw
-            | Harness::Pi
-            | Harness::Cursor
-            | Harness::Qwen
-            | Harness::LmStudio
-            | Harness::Cline
-            | Harness::Roo
-            | Harness::Continue
-            | Harness::Goose
-            | Harness::Zed
-            | Harness::ChatGptExport
-            | Harness::ClaudeExport
-            | Harness::OpenSession => unreachable!("handled above"),
-        }
+        };
+        adapter.record_forest_dependencies(r, &mut guard);
         match crate::subagent_tree_filtered_of(r, crate::SubagentDemand::Sessions, None, |_, _| true) {
             Ok(agents) => {
                 for agent in &agents {
@@ -2186,7 +1932,7 @@ mod imp {
         let old_decoded = stored.as_deref().and_then(crate::source::Record::<Counted>::decode);
         if let Some(ref mut new_f) = facts {
             if new_f.subagent_count.is_none() {
-                if has_zero_subagent_forest(r.harness) {
+                if crate::harness::rootless(r.harness).is_none_or(|a| !a.has_subagent_forest()) {
                     new_f.subagent_count = Some(0);
                     new_f.subagent_guard = crate::source::ReadSet::default();
                 } else if let Some(old_f) = old_decoded.as_ref().and_then(|old| old.payload.facts.as_ref()) {
@@ -2480,24 +2226,7 @@ mod imp {
         }
     }
 
-    /// UTF-8 lexicographic successor of a literal prefix for SQLite's binary text index.
-    /// A suffix of maximal scalars carries into the preceding scalar; empty/all-maximal
-    /// prefixes need no upper bound. Skip the surrogate gap, which Rust strings cannot contain.
-    fn prefix_end(prefix: &str) -> Option<String> {
-        for (offset, ch) in prefix.char_indices().rev() {
-            if ch != char::MAX {
-                let next = if ch == '\u{d7ff}' {
-                    '\u{e000}'
-                } else {
-                    char::from_u32(ch as u32 + 1)?
-                };
-                let mut end = prefix[..offset].to_owned();
-                end.push(next);
-                return Some(end);
-            }
-        }
-        None
-    }
+    use crate::utf8::prefix_end;
 
     pub(super) fn exact_session_in(
         conn: &Connection,

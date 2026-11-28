@@ -455,6 +455,25 @@ impl Adapter for Claude {
         r.path.extension().is_some_and(|e| e == "jsonl")
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut crate::source::ReadSet) {
+        let stem = r.path.with_extension("");
+        let subagents = stem.join("subagents");
+        let wf_subagents = subagents.join("workflows");
+        let workflows = stem.join("workflows");
+        for p in [&stem, &subagents, &wf_subagents, &workflows] {
+            guard.record(p);
+        }
+        if let Ok(entries) = std::fs::read_dir(&wf_subagents) {
+            for entry in entries.flatten() {
+                guard.record(&entry.path());
+            }
+        }
+    }
+
     /// The `subagents/` sidecar: directly spawned agents and, a tier deeper, workflow agents.
     fn forest(
         &self,

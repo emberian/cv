@@ -452,6 +452,37 @@ impl ReadSet {
         self.record_as(path, false);
     }
 
+    /// Record `db` along with its `-wal` and `-journal` SQLite sidecars.
+    pub fn record_sqlite(&mut self, db: &Path) {
+        self.record(db);
+        for sidecar in sqlite_sidecars(db) {
+            self.record(&sidecar);
+        }
+    }
+
+    /// Record `path` through `probe`, marking this set unrecorded if `path` exists and its
+    /// `mtime_ns` is younger than `min_age_ns` relative to `now_ns` (or if `probe` could not stat it).
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn record_settled(&mut self, path: &Path, probe: &mut Probe, now_ns: Option<u64>, min_age_ns: u64) {
+        let Some(path) = absolute(path) else {
+            self.known = false;
+            return;
+        };
+        match probe.entry(&path) {
+            Some(entry) => {
+                if entry.state.is_some_and(|id| {
+                    now_ns
+                        .and_then(|now| now.checked_sub(id.mtime_ns))
+                        .is_none_or(|age| age < min_age_ns)
+                }) {
+                    self.known = false;
+                }
+                self.entries.entry(path).or_insert(entry);
+            }
+            None => self.known = false,
+        }
+    }
+
     /// [`Self::record`]; for an `appendable` primary its first record also keeps its [`Prefix`],
     /// so [`Self::fresh_or_grown`] can admit its growth by content.
     pub(crate) fn record_as(&mut self, path: &Path, appendable: bool) {

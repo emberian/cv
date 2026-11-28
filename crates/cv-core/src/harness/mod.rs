@@ -553,6 +553,56 @@ pub fn resume_in(cwd: Option<&Path>, command: String) -> String {
     }
 }
 
+/// Per-harness codec version stamped onto cached catalog and checkpoint records.
+pub(crate) fn codec_version(h: Harness) -> u32 {
+    // Hermes and Devin changed which rows certify a session in a shared database.
+    crate::source::VERSION + u32::from(matches!(h, Harness::Hermes | Harness::Devin))
+}
+
+/// Best-known resume target per harness: either the CLI program + unquoted args (`cwd` is handled
+/// separately, since most harnesses resume relative to the launch directory) or a GUI-only hint
+/// when the harness has no CLI resume command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeTarget {
+    Cli { program: &'static str, args: Vec<String> },
+    GuiOnly { hint: String },
+}
+
+pub fn resume_target(h: Harness, id: &str) -> ResumeTarget {
+    let cli = |program: &'static str, args: &[&str]| ResumeTarget::Cli {
+        program,
+        args: args.iter().map(|&s| s.to_owned()).collect(),
+    };
+    match h {
+        Harness::Claude => cli("claude", &["--resume", id]),
+        Harness::Codex => cli("codex", &["resume", id]),
+        Harness::Grok => cli("grok", &["--resume", id]),
+        Harness::OpenCode => cli("opencode", &["--session", id]),
+        Harness::Gemini => cli("gemini", &["--resume", id]),
+        Harness::Antigravity => cli("agy", &["--conversation", id]),
+        Harness::Hermes => cli("hermes", &["resume", id]),
+        Harness::OpenClaw => cli("openclaw", &["--resume", id]),
+        Harness::Cursor => cli("cursor-agent", &["--resume", id]),
+        Harness::Kimi => cli("kimi", &["--resume", id]),
+        // Kimi Code (`kimi --session <id>`): native ids are `session_<uuid>`; cv keys by bare uuid.
+        Harness::KimiCode => cli("kimi", &["--session", &format!("session_{id}")]),
+        Harness::Qwen => cli("qwen", &["--resume", id]),
+        Harness::Cline => cli("cline", &["--resume", id]),
+        Harness::Continue => cli("cn", &["--resume"]),
+        Harness::Goose => cli("goose", &["session", "--resume", "--session-id", id]),
+        Harness::Devin => cli("devin", &["-r", id]),
+        Harness::Pi => cli("pi", &["--session", id]),
+        Harness::LmStudio
+        | Harness::Roo
+        | Harness::Zed
+        | Harness::ChatGptExport
+        | Harness::ClaudeExport
+        | Harness::OpenSession => ResumeTarget::GuiOnly {
+            hint: format!("no CLI resume for {h}; open the app and find session {id}"),
+        },
+    }
+}
+
 /// Result of emitting an IR session into a harness's native on-disk format.
 #[derive(Debug, Clone, Default)]
 pub struct EmitResult {
@@ -1025,6 +1075,11 @@ pub trait Adapter: Send + Sync {
         None
     }
 
+    /// Best-known CLI or GUI resume invocation for session `id` in this harness.
+    fn resume_target(&self, id: &str) -> ResumeTarget {
+        resume_target(self.harness(), id)
+    }
+
     /// Whether `r`'s path alone names one session. Default: unless it is a store many sessions
     /// share ([`Self::rows_store`]).
     fn path_selects_session(&self, r: &SessionRef) -> bool {
@@ -1087,6 +1142,15 @@ pub trait Adapter: Send + Sync {
     fn native_thinking(&self, _model: &str) -> bool {
         false
     }
+
+    /// Whether [`Self::forest`] can ever return sub-agents for this harness. Default: false.
+    fn has_subagent_forest(&self) -> bool {
+        false
+    }
+
+    /// Record the filesystem dependencies whose identity guards a cached [`Self::forest`] count for
+    /// `r`. Called only when [`Self::has_subagent_forest`] is true.
+    fn record_forest_dependencies(&self, _r: &SessionRef, _guard: &mut crate::source::ReadSet) {}
 
     /// The sub-agent forest `r` spawned, newest first, keeping the members `select(id, workflow)`
     /// admits (and only `workflow`'s, when given) before their bodies or optional metadata are

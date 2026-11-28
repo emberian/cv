@@ -956,26 +956,6 @@ impl Backing {
 
 pub use crate::resolve::split_harness_id;
 
-/// Next lexicographic UTF-8 string strictly greater than every string starting with `prefix`.
-fn prefix_upper_bound(prefix: &str) -> Option<String> {
-    let mut chars: Vec<char> = prefix.chars().collect();
-    while let Some(last) = chars.pop() {
-        let code = last as u32;
-        let next = if code == 0xD7FF {
-            char::from_u32(0xE000)
-        } else if code < 0x10FFFF {
-            char::from_u32(code + 1)
-        } else {
-            None
-        };
-        if let Some(c) = next {
-            chars.push(c);
-            return Some(chars.into_iter().collect());
-        }
-    }
-    None
-}
-
 fn map_hub_head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::state::hub::SessionRevisionEntry> {
     let payload_str: Option<String> = r.get(12)?;
     let custody_str: Option<String> = r.get(13)?;
@@ -1119,7 +1099,7 @@ impl crate::state::hub::HubStore {
                         &[&prod, g],
                     )?,
                 }
-            } else if let Some(hi) = prefix_upper_bound(id) {
+            } else if let Some(hi) = crate::utf8::prefix_end(id) {
                 let primary = match g_i64 {
                     None => query_rows("selector >= ?1 AND selector < ?2 AND +gen_to IS NULL", &[&id, &hi])?,
                     Some(ref g) => query_rows(
@@ -1356,7 +1336,7 @@ pub fn matching_backings(id: &str, harness: Option<Harness>) -> Result<Vec<Backi
                 let mut stmt = conn.prepare("SELECT entry_json FROM custody_heads WHERE selector = ?1")?;
                 let r = stmt.query_map([id], |row| row.get(0))?;
                 r.collect::<rusqlite::Result<_>>()?
-            } else if let Some(hi) = prefix_upper_bound(id) {
+            } else if let Some(hi) = crate::utf8::prefix_end(id) {
                 let mut stmt =
                     conn.prepare("SELECT entry_json FROM custody_heads WHERE selector >= ?1 AND selector < ?2")?;
                 let r = stmt.query_map([id, hi.as_str()], |row| row.get(0))?;
@@ -1989,7 +1969,7 @@ mod tests {
                      WHERE selector >= ?1 AND selector < ?2 AND +gen_to IS NULL",
                 )
                 .unwrap();
-            let hi = prefix_upper_bound("shared").unwrap();
+            let hi = crate::utf8::prefix_end("shared").unwrap();
             let plan: Vec<String> = eqp
                 .query_map(["shared", hi.as_str()], |r| r.get::<_, String>(3))
                 .unwrap()

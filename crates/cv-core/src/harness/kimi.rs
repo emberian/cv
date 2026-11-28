@@ -137,6 +137,21 @@ impl Adapter for Kimi {
         Harness::Kimi
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut crate::source::ReadSet) {
+        guard.record(&r.path);
+        let sub_dir = r.path.join("subagents");
+        guard.record(&sub_dir);
+        if let Ok(entries) = fs::read_dir(&sub_dir) {
+            for entry in entries.flatten() {
+                guard.record(&entry.path());
+            }
+        }
+    }
+
     /// The `subagents/<agent_id>/` transcripts beside the session ([`subagent_refs`]).
     fn forest(
         &self,

@@ -272,11 +272,7 @@ fn emit_session_result(
 
 // ---------- resume ----------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ResumeTarget {
-    Cli { program: &'static str, args: Vec<String> },
-    GuiOnly { hint: String },
-}
+pub(crate) use cv_core::harness::{resume_target, ResumeTarget};
 
 pub(crate) fn cmd_resume(id: &str, harness: Option<String>, launch: bool, json: bool) -> Result<()> {
     let want = parse_harness(&harness)?;
@@ -434,92 +430,6 @@ pub(crate) fn resume_lines(h: Harness, id: &str, cwd: Option<&Path>) -> Vec<Stri
             out
         }
         ResumeTarget::GuiOnly { hint } => vec![format!("# {hint}")],
-    }
-}
-
-/// Best-known resume target per harness: either the CLI program + args (cwd is handled separately,
-/// since most harnesses resume relative to the directory they're launched in) or a GUI-only hint
-/// that `cv resume --launch` refuses with exit 2 instead of `execvp`-ing a comment string.
-pub(crate) fn resume_target(h: Harness, id: &str) -> ResumeTarget {
-    match h {
-        Harness::Claude => ResumeTarget::Cli {
-            program: "claude",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::Codex => ResumeTarget::Cli {
-            program: "codex",
-            args: vec!["resume".into(), id.into()],
-        },
-        Harness::Grok => ResumeTarget::Cli {
-            program: "grok",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::OpenCode => ResumeTarget::Cli {
-            program: "opencode",
-            args: vec!["--session".into(), id.into()],
-        },
-        Harness::Gemini => ResumeTarget::Cli {
-            program: "gemini",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::Antigravity => ResumeTarget::Cli {
-            program: "agy",
-            args: vec!["--conversation".into(), id.into()],
-        },
-        Harness::Hermes => ResumeTarget::Cli {
-            program: "hermes",
-            args: vec!["resume".into(), id.into()],
-        },
-        Harness::OpenClaw => ResumeTarget::Cli {
-            program: "openclaw",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::Cursor => ResumeTarget::Cli {
-            program: "cursor-agent",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::Kimi => ResumeTarget::Cli {
-            program: "kimi",
-            args: vec!["--resume".into(), id.into()],
-        },
-        // Kimi Code (`kimi --session <id>` / `-S`): the native id is `session_<uuid>`; cv keys the
-        // session by the bare uuid so prefixes work like every other harness.
-        Harness::KimiCode => ResumeTarget::Cli {
-            program: "kimi",
-            args: vec!["--session".into(), format!("session_{id}")],
-        },
-        Harness::Qwen => ResumeTarget::Cli {
-            program: "qwen",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::Cline => ResumeTarget::Cli {
-            program: "cline",
-            args: vec!["--resume".into(), id.into()],
-        },
-        Harness::Continue => ResumeTarget::Cli {
-            program: "cn",
-            args: vec!["--resume".into()],
-        },
-        Harness::Goose => ResumeTarget::Cli {
-            program: "goose",
-            args: vec!["session".into(), "--resume".into(), "--session-id".into(), id.into()],
-        },
-        Harness::Devin => ResumeTarget::Cli {
-            program: "devin",
-            args: vec!["-r".into(), id.into()],
-        },
-        Harness::Pi => ResumeTarget::Cli {
-            program: "pi",
-            args: vec!["--session".into(), id.into()],
-        },
-        Harness::LmStudio
-        | Harness::Roo
-        | Harness::Zed
-        | Harness::ChatGptExport
-        | Harness::ClaudeExport
-        | Harness::OpenSession => ResumeTarget::GuiOnly {
-            hint: format!("no CLI resume for {h}; open the app and find session {id}"),
-        },
     }
 }
 

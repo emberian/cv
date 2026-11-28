@@ -102,6 +102,26 @@ impl Chunks {
     }
 }
 
+/// UTF-8 lexicographic successor of a literal prefix for SQLite's binary text index.
+/// A suffix of maximal scalars carries into the preceding scalar; empty/all-maximal
+/// prefixes need no upper bound. Skip the surrogate gap, which Rust strings cannot contain.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+pub(crate) fn prefix_end(prefix: &str) -> Option<String> {
+    for (offset, ch) in prefix.char_indices().rev() {
+        if ch != char::MAX {
+            let next = if ch == '\u{d7ff}' {
+                '\u{e000}'
+            } else {
+                char::from_u32(ch as u32 + 1)?
+            };
+            let mut end = prefix[..offset].to_owned();
+            end.push(next);
+            return Some(end);
+        }
+    }
+    None
+}
+
 /// A whole reader through [`Chunks`] in 64 KiB windows; `Ok(false)` is a rejection.
 pub(crate) fn read<E: From<io::Error>>(
     mut input: impl Read,
@@ -127,6 +147,15 @@ pub(crate) fn read<E: From<io::Error>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_end_skips_surrogates_and_carries_maximal_scalars() {
+        assert_eq!(prefix_end(""), None);
+        assert_eq!(prefix_end("\u{10ffff}\u{10ffff}"), None);
+        assert_eq!(prefix_end("abc"), Some("abd".into()));
+        assert_eq!(prefix_end("a\u{10ffff}"), Some("b".into()));
+        assert_eq!(prefix_end("x\u{d7ff}"), Some("x\u{e000}".into()));
+    }
 
     /// Every split of every sample decodes as `from_utf8_lossy` (Replace) and is accepted exactly
     /// when the bytes are UTF-8 (Reject).

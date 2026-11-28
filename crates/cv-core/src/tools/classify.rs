@@ -154,11 +154,15 @@ pub(crate) fn is_codex_exec_call(harness: Harness, name: &str) -> bool {
 }
 
 fn is_codex_exec(harness: Option<Harness>, bare: &str) -> bool {
+    codex_exec_harness(harness, bare).is_some()
+}
+
+fn codex_exec_harness(harness: Option<Harness>, bare: &str) -> Option<Harness> {
     if bare != "exec" {
-        return false;
+        return None;
     }
     match harness {
-        None | Some(Harness::Codex) => true,
+        None | Some(Harness::Codex) => Some(Harness::Codex),
         Some(
             Harness::Claude
             | Harness::Grok
@@ -182,7 +186,7 @@ fn is_codex_exec(harness: Option<Harness>, bare: &str) -> bool {
             | Harness::ChatGptExport
             | Harness::ClaudeExport
             | Harness::OpenSession,
-        ) => false,
+        ) => None,
     }
 }
 
@@ -331,7 +335,7 @@ fn visit_tool_ops_internal<'a>(
     let bare = bare_tool_name(name);
 
     // 1. Codex Code Mode `exec` (`custom_tool_call` raw JS string or `{"raw": "..."}`).
-    if is_codex_exec(harness, bare) {
+    if let Some(exec_harness) = codex_exec_harness(harness, bare) {
         let script = if input.is_string()? {
             input::string(input)?
         } else if input.get("command")?.is_none() && input.get("cmd")?.is_none() {
@@ -343,7 +347,7 @@ fn visit_tool_ops_internal<'a>(
             None
         };
         if let Some(script) = script {
-            scan_codex_exec(&script, opts, extract_hunks, &mut |sem, hunks| {
+            scan_codex_exec(exec_harness, &script, opts, extract_hunks, &mut |sem, hunks| {
                 emit(sem.into_owned(), hunks)
             });
             return Ok(());
@@ -2137,6 +2141,7 @@ pub fn tool_string_arg(view: JsonView<'_>, keys: &[&str]) -> Result<Option<Strin
 }
 
 fn scan_codex_exec(
+    exec_harness: Harness,
     script: &str,
     opts: ClassifyOpts,
     extract_hunks: bool,
@@ -2192,7 +2197,7 @@ fn scan_codex_exec(
         }
         let plan_items = call.plan_items;
         let _ = visit_tool_ops_internal(
-            Some(Harness::Codex),
+            Some(exec_harness),
             &call.tool,
             view,
             opts,

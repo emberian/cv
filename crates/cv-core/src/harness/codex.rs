@@ -343,6 +343,32 @@ impl Adapter for Codex {
         r.path.extension().is_some_and(|e| e == "jsonl")
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut crate::source::ReadSet) {
+        guard.record(&crate::lanes::ledger_path());
+        let home = crate::env::Env::current()
+            .cv_home()
+            .unwrap_or_else(|| PathBuf::from("."));
+        guard.record_sqlite(&home.join("state.db"));
+        let ledger = crate::lanes::ledger_index();
+        let mut visited = std::collections::HashSet::from([r.id.clone()]);
+        let mut queue = std::collections::VecDeque::from([r.id.clone()]);
+        while let Some(sid) = queue.pop_front() {
+            for &at in ledger.rows_of(&sid) {
+                let row = &ledger.rows[at];
+                if let Some(child_path) = row.agent_transcript_path.as_deref() {
+                    guard.record(child_path);
+                }
+                if !row.agent_id.is_empty() && visited.insert(row.agent_id.clone()) {
+                    queue.push_back(row.agent_id.clone());
+                }
+            }
+        }
+    }
+
     /// Membership comes from installed hooks, each child verified against its own header.
     fn forest(
         &self,

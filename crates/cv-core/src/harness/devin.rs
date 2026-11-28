@@ -206,6 +206,14 @@ impl Adapter for Devin {
         Harness::Devin
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut crate::source::ReadSet) {
+        guard.record_sqlite(&r.path);
+    }
+
     /// The chains the session's `subagent_heads` table names.
     fn forest(
         &self,

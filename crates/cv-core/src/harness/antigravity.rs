@@ -562,6 +562,14 @@ impl Adapter for Antigravity {
         })
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut ReadSet) {
+        forest_dependencies(r, guard);
+    }
+
     fn forest(
         &self,
         r: &SessionRef,
@@ -2197,8 +2205,7 @@ fn read_subagent_descriptors(brain_dir: &Path) -> Result<Vec<SubagentDescriptor>
 
 /// The catalog uses the adapter's topology, including not-yet-created child logs,
 /// rather than a second unbounded JSON parser with a divergent list of sidecars.
-#[cfg(feature = "sqlite")]
-pub(crate) fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
+fn forest_dependencies(r: &SessionRef, guard: &mut ReadSet) {
     let Some(loc) = BrainLoc::from_transcript(&r.path) else {
         return;
     };

@@ -194,6 +194,30 @@ impl Adapter for KimiCode {
         Harness::KimiCode
     }
 
+    fn has_subagent_forest(&self) -> bool {
+        true
+    }
+
+    fn record_forest_dependencies(&self, r: &SessionRef, guard: &mut crate::source::ReadSet) {
+        let sdir = r
+            .path
+            .ancestors()
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("session_"))
+            })
+            .unwrap_or(&r.path);
+        guard.record(&sdir.join("state.json"));
+        let agents_dir = sdir.join("agents");
+        guard.record(&agents_dir);
+        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            for entry in entries.flatten() {
+                guard.record(&entry.path());
+            }
+        }
+    }
+
     /// The `agents/agent-N/` transcripts beside the session ([`subagent_refs`]).
     fn forest(
         &self,
