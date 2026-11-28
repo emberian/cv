@@ -679,23 +679,22 @@ fn strip_where(settings: &mut Value, selected: impl Fn(HookName) -> bool) {
     }
 }
 
-/// `settings` with our standard entries present (one group per spec, appended under its event).
-fn with_ours(harness: Harness, settings: Value, exe: &str) -> Value {
-    with_ours_opts(harness, settings, exe, true)
-}
-
-fn with_ours_opts(harness: Harness, mut settings: Value, exe: &str, include_hint: bool) -> Value {
-    // Opt-in entries are not part of the standard set; a reinstall keeps them.
-    strip_where(&mut settings, |n| {
-        !matches!(n, HookName::Retired | HookName::Receipt | HookName::Nudge)
-    });
+/// Replace our handlers matching `strip` with one group per spec in `add` under its event.
+fn with_specs<'a>(
+    harness: Harness,
+    mut settings: Value,
+    exe: &str,
+    strip: impl Fn(HookName) -> bool,
+    add: impl IntoIterator<Item = &'a Spec>,
+) -> Value {
+    strip_where(&mut settings, strip);
     let obj = settings.as_object_mut().expect("settings is an object");
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
     if !hooks.is_object() {
         *hooks = json!({});
     }
     let hooks = hooks.as_object_mut().expect("object");
-    for spec in specs(harness).filter(|s| include_hint || s.name != HookName::Hint) {
+    for spec in add {
         let mut group = Map::new();
         if let Some(m) = spec.matcher {
             group.insert("matcher".into(), json!(m));
@@ -710,81 +709,34 @@ fn with_ours_opts(harness: Harness, mut settings: Value, exe: &str, include_hint
     settings
 }
 
+/// `settings` with our standard entries present (one group per spec, appended under its event).
+fn with_ours(harness: Harness, settings: Value, exe: &str) -> Value {
+    with_ours_opts(harness, settings, exe, true)
+}
+
+fn with_ours_opts(harness: Harness, settings: Value, exe: &str, include_hint: bool) -> Value {
+    // Opt-in entries are not part of the standard set; a reinstall keeps them.
+    with_specs(
+        harness,
+        settings,
+        exe,
+        |n| !matches!(n, HookName::Retired | HookName::Receipt | HookName::Nudge),
+        specs(harness).filter(|s| include_hint || s.name != HookName::Hint),
+    )
+}
+
 /// `settings` with the retired-agent guard present once, and nothing else of ours touched.
-fn with_retired(harness: Harness, mut settings: Value, exe: &str) -> Value {
-    strip_where(&mut settings, |n| n == HookName::Retired);
-    let obj = settings.as_object_mut().expect("settings is an object");
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let groups = hooks
-        .as_object_mut()
-        .expect("object")
-        .entry(RETIRED.event)
-        .or_insert_with(|| json!([]));
-    if !groups.is_array() {
-        *groups = json!([]);
-    }
-    groups
-        .as_array_mut()
-        .expect("array")
-        .push(json!({"hooks": [handler_for(harness, exe, &RETIRED)]}));
-    settings
+fn with_retired(harness: Harness, settings: Value, exe: &str) -> Value {
+    with_specs(harness, settings, exe, |n| n == HookName::Retired, [&RETIRED])
 }
 
 /// `settings` with the receipt log's two entries present once, and nothing else of ours touched.
-fn with_receipts(harness: Harness, mut settings: Value, exe: &str) -> Value {
-    strip_where(&mut settings, |n| n == HookName::Receipt);
-    let obj = settings.as_object_mut().expect("settings is an object");
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let hooks = hooks.as_object_mut().expect("object");
-    for spec in &RECEIPTS {
-        let groups = hooks.entry(spec.event).or_insert_with(|| json!([]));
-        if !groups.is_array() {
-            *groups = json!([]);
-        }
-        groups
-            .as_array_mut()
-            .expect("array")
-            .push(json!({"hooks": [handler_for(harness, exe, spec)]}));
-    }
-    settings
+fn with_receipts(harness: Harness, settings: Value, exe: &str) -> Value {
+    with_specs(harness, settings, exe, |n| n == HookName::Receipt, &RECEIPTS)
 }
 
-fn with_single_spec(harness: Harness, mut settings: Value, exe: &str, spec: &Spec) -> Value {
-    strip_where(&mut settings, |n| n == spec.name);
-    let obj = settings.as_object_mut().expect("settings is an object");
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        *hooks = json!({});
-    }
-    let groups = hooks
-        .as_object_mut()
-        .expect("object")
-        .entry(spec.event)
-        .or_insert_with(|| json!([]));
-    if !groups.is_array() {
-        *groups = json!([]);
-    }
-    let mut group = Map::new();
-    if let Some(m) = spec.matcher {
-        group.insert("matcher".into(), json!(m));
-    }
-    group.insert("hooks".into(), json!([handler_for(harness, exe, spec)]));
-    groups.as_array_mut().expect("array").push(Value::Object(group));
-    settings
-}
-
-fn with_hint(harness: Harness, settings: Value, exe: &str) -> Value {
-    with_single_spec(harness, settings, exe, &HINT)
-}
-
-fn with_nudge(harness: Harness, settings: Value, exe: &str) -> Value {
-    with_single_spec(harness, settings, exe, nudge_spec(harness))
+fn with_single_spec(harness: Harness, settings: Value, exe: &str, spec: &Spec) -> Value {
+    with_specs(harness, settings, exe, |n| n == spec.name, [spec])
 }
 
 fn opt_in_specs(harness: Harness) -> Vec<(&'static Spec, &'static str)> {
@@ -863,6 +815,62 @@ fn this_exe() -> Result<String> {
     Ok(exe.to_string_lossy().into_owned())
 }
 
+fn install_settings_only(
+    harness: Harness,
+    scope: Scope,
+    mutate: impl FnOnce(Value, &str) -> Value,
+    unchanged_msg: &str,
+    installed_msg: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    let (settings_path, _) = paths(harness, scope)?;
+    let before = read_settings(&settings_path)?;
+    let after = mutate(before.clone(), &this_exe()?);
+    if after == before {
+        println!(
+            "cv hooks: {unchanged_msg} in {}; nothing written",
+            home_rel(&settings_path)
+        );
+    } else {
+        write_settings(&settings_path, &after)?;
+        println!("cv hooks: installed {installed_msg} → {}", home_rel(&settings_path));
+        if let Some(note) = note {
+            println!("  {note}");
+        }
+    }
+    if needs_trust(harness) {
+        println!(
+            "  Codex trust: {}",
+            trust_summary(&codex_trust(&settings_path, &after), scope)
+        );
+    }
+    Ok(())
+}
+
+fn remove_selected(
+    harness: &str,
+    scope: Scope,
+    strip: impl Fn(HookName) -> bool,
+    absent_what: &str,
+    removed_what: &str,
+) -> Result<()> {
+    let harness = hook_harness(harness)?;
+    let (settings_path, _) = paths(harness, scope)?;
+    let before = read_settings(&settings_path)?;
+    let mut after = before.clone();
+    strip_where(&mut after, strip);
+    if after == before {
+        println!(
+            "cv hooks: no {absent_what} in {}; nothing written",
+            home_rel(&settings_path)
+        );
+    } else {
+        write_settings(&settings_path, &after)?;
+        println!("cv hooks: removed the {removed_what} from {}", home_rel(&settings_path));
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
     match cmd {
         HooksCmd::Install {
@@ -875,51 +883,27 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             if !host(harness).is_some_and(|h| h.receipts) {
                 bail!("the receipt log reads Claude Code's `tool_use_id`; {harness} is not wired");
             }
-            let (settings_path, _) = paths(harness, scope)?;
-            let before = read_settings(&settings_path)?;
-            let after = with_receipts(harness, before.clone(), &this_exe()?);
-            if after == before {
-                println!(
-                    "cv hooks: the receipt log is already in {}; nothing written",
-                    home_rel(&settings_path)
-                );
-            } else {
-                write_settings(&settings_path, &after)?;
-                println!(
-                    "cv hooks: installed the receipt log (PreToolUse + PostToolUse, every tool) → {}",
-                    home_rel(&settings_path)
-                );
-                println!(
-                    "  (chained receipts land in <cv home>/state.db; `cv hooks remove --receipts` deletes the entries)"
-                );
-            }
-            Ok(())
+            install_settings_only(
+                harness,
+                scope,
+                |s, exe| with_receipts(harness, s, exe),
+                "the receipt log is already",
+                "the receipt log (PreToolUse + PostToolUse, every tool)",
+                Some("(chained receipts land in <cv home>/state.db; `cv hooks remove --receipts` deletes the entries)"),
+            )
         }
         HooksCmd::Remove {
             harness,
             scope,
             receipts: true,
             ..
-        } => {
-            let harness = hook_harness(&harness)?;
-            let (settings_path, _) = paths(harness, scope)?;
-            let before = read_settings(&settings_path)?;
-            let mut after = before.clone();
-            strip_where(&mut after, |n| n == HookName::Receipt);
-            if after == before {
-                println!(
-                    "cv hooks: no receipt log entries in {}; nothing written",
-                    home_rel(&settings_path)
-                );
-            } else {
-                write_settings(&settings_path, &after)?;
-                println!(
-                    "cv hooks: removed the receipt log entries from {}",
-                    home_rel(&settings_path)
-                );
-            }
-            Ok(())
-        }
+        } => remove_selected(
+            &harness,
+            scope,
+            |n| n == HookName::Receipt,
+            "receipt log entries",
+            "receipt log entries",
+        ),
         HooksCmd::Install {
             harness,
             scope,
@@ -930,49 +914,27 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             if !host(harness).is_some_and(|h| h.retired_guard) {
                 bail!("the retired-agent guard reads Claude Code's sub-agent `agent_id`; {harness} has no such field");
             }
-            let (settings_path, _) = paths(harness, scope)?;
-            let before = read_settings(&settings_path)?;
-            let after = with_retired(harness, before.clone(), &this_exe()?);
-            if after == before {
-                println!(
-                    "cv hooks: the retired-agent guard is already in {}; nothing written",
-                    home_rel(&settings_path)
-                );
-            } else {
-                write_settings(&settings_path, &after)?;
-                println!(
-                    "cv hooks: installed the retired-agent guard (PreToolUse, every tool) → {}",
-                    home_rel(&settings_path)
-                );
-                println!("  (`cv retire --list` shows who it refuses; `cv hooks remove --retired` deletes it)");
-            }
-            Ok(())
+            install_settings_only(
+                harness,
+                scope,
+                |s, exe| with_retired(harness, s, exe),
+                "the retired-agent guard is already",
+                "the retired-agent guard (PreToolUse, every tool)",
+                Some("(`cv retire --list` shows who it refuses; `cv hooks remove --retired` deletes it)"),
+            )
         }
         HooksCmd::Remove {
             harness,
             scope,
             retired: true,
             ..
-        } => {
-            let harness = hook_harness(&harness)?;
-            let (settings_path, _) = paths(harness, scope)?;
-            let before = read_settings(&settings_path)?;
-            let mut after = before.clone();
-            strip_where(&mut after, |n| n == HookName::Retired);
-            if after == before {
-                println!(
-                    "cv hooks: no retired-agent guard in {}; nothing written",
-                    home_rel(&settings_path)
-                );
-            } else {
-                write_settings(&settings_path, &after)?;
-                println!(
-                    "cv hooks: removed the retired-agent guard from {}",
-                    home_rel(&settings_path)
-                );
-            }
-            Ok(())
-        }
+        } => remove_selected(
+            &harness,
+            scope,
+            |n| n == HookName::Retired,
+            "retired-agent guard",
+            "retired-agent guard",
+        ),
         HooksCmd::Install {
             harness,
             scope,
@@ -982,44 +944,33 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             no_hint,
             nudge,
         } => {
+            let harness = hook_harness(&harness)?;
             if hint || nudge {
-                let harness = hook_harness(&harness)?;
-                let (settings_path, _) = paths(harness, scope)?;
-                let exe = this_exe()?;
-                let before = read_settings(&settings_path)?;
-                let mut after = before.clone();
                 let mut labels = Vec::new();
                 if hint {
-                    after = with_hint(harness, after, &exe);
                     labels.push("the verb-map hint (SessionStart)");
                 }
                 if nudge {
-                    after = with_nudge(harness, after, &exe);
                     labels.push("the transcript-grep nudge (PreToolUse)");
                 }
-                if after == before {
-                    println!(
-                        "cv hooks: {} already in {}; nothing written",
-                        labels.join(" and "),
-                        home_rel(&settings_path)
-                    );
-                } else {
-                    write_settings(&settings_path, &after)?;
-                    println!(
-                        "cv hooks: installed {} → {}",
-                        labels.join(" and "),
-                        home_rel(&settings_path)
-                    );
-                }
-                if needs_trust(harness) {
-                    println!(
-                        "  Codex trust: {}",
-                        trust_summary(&codex_trust(&settings_path, &after), scope)
-                    );
-                }
-                return Ok(());
+                let joined = labels.join(" and ");
+                return install_settings_only(
+                    harness,
+                    scope,
+                    |mut s, exe| {
+                        if hint {
+                            s = with_single_spec(harness, s, exe, &HINT);
+                        }
+                        if nudge {
+                            s = with_single_spec(harness, s, exe, nudge_spec(harness));
+                        }
+                        s
+                    },
+                    &format!("{joined} already"),
+                    &joined,
+                    None,
+                );
             }
-            let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
             let exe = this_exe()?;
             let before = read_settings(&settings_path)?;
@@ -1063,13 +1014,6 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
             nudge,
         } => {
             if hint || nudge {
-                let harness = hook_harness(&harness)?;
-                let (settings_path, _) = paths(harness, scope)?;
-                let before = read_settings(&settings_path)?;
-                let mut after = before.clone();
-                strip_where(&mut after, |n| {
-                    (hint && n == HookName::Hint) || (nudge && n == HookName::Nudge)
-                });
                 let mut labels = Vec::new();
                 if hint {
                     labels.push("verb-map hint");
@@ -1077,21 +1021,13 @@ pub(crate) fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
                 if nudge {
                     labels.push("transcript-grep nudge");
                 }
-                if after == before {
-                    println!(
-                        "cv hooks: no {} in {}; nothing written",
-                        labels.join(" or "),
-                        home_rel(&settings_path)
-                    );
-                } else {
-                    write_settings(&settings_path, &after)?;
-                    println!(
-                        "cv hooks: removed the {} from {}",
-                        labels.join(" and "),
-                        home_rel(&settings_path)
-                    );
-                }
-                return Ok(());
+                return remove_selected(
+                    &harness,
+                    scope,
+                    |n| (hint && n == HookName::Hint) || (nudge && n == HookName::Nudge),
+                    &labels.join(" or "),
+                    &labels.join(" and "),
+                );
             }
             let harness = hook_harness(&harness)?;
             let (settings_path, skill_path) = paths(harness, scope)?;
