@@ -2667,12 +2667,16 @@ mod tests {
         fs::create_dir_all(&mdir).unwrap();
         fs::create_dir_all(&pdir).unwrap();
 
-        let with_bom_and_nuls = |v: serde_json::Value| -> Vec<u8> {
-            let mut out = vec![0xEF, 0xBB, 0xBF];
+        // Each damage alone and both together: a BOM, trailing NUL padding.
+        let damaged = |bom: bool, nuls: bool, v: serde_json::Value| -> Vec<u8> {
+            let mut out = if bom { vec![0xEF, 0xBB, 0xBF] } else { Vec::new() };
             out.extend_from_slice(v.to_string().as_bytes());
-            out.extend_from_slice(&[0u8; 16]);
+            if nuls {
+                out.extend_from_slice(&[0u8; 16]);
+            }
             out
         };
+        let with_bom_and_nuls = |v| damaged(true, true, v);
 
         fs::write(
             sdir.join("ses_bom01.json"),
@@ -2686,23 +2690,31 @@ mod tests {
         .unwrap();
         fs::write(
             mdir.join("msg_01.json"),
-            with_bom_and_nuls(serde_json::json!({
-                "id": "msg_01",
-                "sessionID": "ses_bom01",
-                "role": "user",
-                "time": {"created": 1_760_000_001_000i64}
-            })),
+            damaged(
+                false,
+                true,
+                serde_json::json!({
+                    "id": "msg_01",
+                    "sessionID": "ses_bom01",
+                    "role": "user",
+                    "time": {"created": 1_760_000_001_000i64}
+                }),
+            ),
         )
         .unwrap();
         fs::write(
             pdir.join("prt_01.json"),
-            with_bom_and_nuls(serde_json::json!({
-                "id": "prt_01",
-                "sessionID": "ses_bom01",
-                "messageID": "msg_01",
-                "type": "text",
-                "text": "hello from windows"
-            })),
+            damaged(
+                true,
+                false,
+                serde_json::json!({
+                    "id": "prt_01",
+                    "sessionID": "ses_bom01",
+                    "messageID": "msg_01",
+                    "type": "text",
+                    "text": "hello from windows"
+                }),
+            ),
         )
         .unwrap();
 
