@@ -190,12 +190,15 @@ class CvFleet extends HTMLElement {
     this._inflight = false;
   }
 
+  _endpoint(path) {
+    const base = (this._base || DEFAULT_BASE).trim().replace(/\/+$/, "");
+    return new URL(base + path, document.baseURI);
+  }
+
   _targetOrigin() {
     try {
-      const base = (this._base || DEFAULT_BASE).trim();
-      const locOrigin = typeof location !== "undefined" ? location.origin : "";
-      const resolved = locOrigin && locOrigin !== "null" ? new URL(base, locOrigin) : new URL(base);
-      return resolved.origin && resolved.origin !== "null" ? resolved.origin : "";
+      const url = this._endpoint("/api/health");
+      return ["http:", "https:"].includes(url.protocol) ? url.origin : "";
     } catch {
       return "";
     }
@@ -232,7 +235,7 @@ class CvFleet extends HTMLElement {
   }
 
   async _fetchJson(path, signal) {
-    const url = this._base.replace(/\/+$/, "") + path;
+    const url = this._endpoint(path).href;
     const resp = await fetch(url, { signal, headers: this._headersForBase({ Accept: "application/json" }) });
     if (resp.status === 401) throw new Error(`${path} → HTTP 401 (enter bearer token in toolbar)`);
     if (!resp.ok) throw new Error(`${path} → HTTP ${resp.status}`);
@@ -284,7 +287,7 @@ class CvFleet extends HTMLElement {
 
   _streamUrl() {
     const target = this._laneTarget();
-    return this._base.replace(/\/+$/, "") + "/api/stream?follow=1"
+    return this._endpoint("/api/stream?follow=1").href
       + (target ? `&lanes=${encodeURIComponent(target)}` : "");
   }
 
@@ -296,9 +299,9 @@ class CvFleet extends HTMLElement {
     if (!hdrs.Authorization) { this._attachStream(); return; }
     // EventSource sends no headers, and the server refuses a query-string bearer: exchange the
     // bearer for the HttpOnly reader cookie first. Until then (or if refused) lanes are polled.
+    if (!this._isSameOrigin()) return;
     const opening = this._opening = {};
-    const credentials = this._isSameOrigin() ? "include" : "same-origin";
-    fetch(this._base.replace(/\/+$/, "") + "/api/auth", { headers: hdrs, credentials })
+    fetch(this._endpoint("/api/auth").href, { headers: hdrs, credentials: "same-origin" })
       .then((resp) => { if (resp.ok && this._opening === opening && !this._es) this._attachStream(); })
       .catch(() => {});
   }
