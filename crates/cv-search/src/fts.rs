@@ -2467,13 +2467,7 @@ fn git_facets_of(branch: Option<&str>, commit: Option<&str>, out: &mut String) {
 /// The branch and commit of `git commit`'s summary line (`[main 1a2b3c4] subject`, also
 /// `[main (root-commit) 1a2b3c4]` and `[detached HEAD 1a2b3c4]`) in the head of its output.
 fn commit_summary(output: &str) -> Option<(Option<&str>, &str)> {
-    output.lines().take(8).find_map(|line| {
-        let inner = line.trim_start().strip_prefix('[')?.split_once(']')?.0;
-        let words: Vec<&str> = inner.split_whitespace().collect();
-        let (&sha, rest) = words.split_last()?;
-        (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()) && !rest.is_empty())
-            .then(|| (Some(rest[0]).filter(|b| *b != "detached"), sha))
-    })
+    cv_core::tools::git::first_commit_summary(output, 8).map(|s| (s.branch, s.sha))
 }
 
 /// The branch names a git command creates or switches to (`checkout -b X`, `switch -c X`,

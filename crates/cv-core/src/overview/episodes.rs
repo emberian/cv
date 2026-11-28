@@ -132,7 +132,7 @@ impl Detector {
         self.calls.remove(id);
         let commit = ops.iter().any(|op| match &op.op {
             ToolOp::Command { cmd: Some(cmd), .. } => {
-                crate::rewind::git_evidence_kind(cmd) == Some(crate::rewind::EvidenceKind::Created)
+                crate::tools::git::git_evidence_kind(cmd) == Some(crate::tools::git::EvidenceKind::Created)
             }
             _ => false,
         });

@@ -35,7 +35,11 @@ use std::sync::OnceLock;
 
 mod lifecycle;
 use crate::harness::lifecycle::{Observation, Status, ToolResult as LifecycleResult};
-use crate::render::close_unclosed_fence;
+use crate::sanitize::{
+    close_unclosed_fence, is_distill_section_heading, lines_with_endings, neutralize_forged_headers,
+};
+#[cfg(test)]
+use crate::tools::git::quiet_commits;
 
 /// A distilled pack is dense with shas, paths, hosts and code: measured on three real lanes
 /// (resumed with Claude Code, harness overhead subtracted) it ran 2.2–2.4 bytes per token, so it is
@@ -358,17 +362,14 @@ impl Distilled {
     pub fn append_findings(&mut self, findings: &str) {
         let format_block = |src: &str, demote_h2: bool, neutralize_all: bool| -> String {
             let src = if neutralize_all {
-                crate::render::neutralize_forged_headers(src)
+                neutralize_forged_headers(src)
             } else {
                 std::borrow::Cow::Borrowed(src)
             };
             let mut out = String::with_capacity(src.len());
-            for (i, line) in src.split('\n').enumerate() {
-                if i > 0 {
-                    out.push('\n');
-                }
+            for (line, ending) in lines_with_endings(&src) {
                 let trimmed = line.trim_start_matches([' ', '\t', '>']);
-                if crate::render::is_distill_section_heading(trimmed) {
+                if is_distill_section_heading(trimmed) {
                     let prefix_len = line.len() - trimmed.len();
                     out.push_str(&line[..prefix_len]);
                     out.push('\\');
@@ -379,10 +380,13 @@ impl Distilled {
                 } else {
                     out.push_str(line);
                 }
+                out.push_str(if ending == "\r" { "\n" } else { ending });
             }
             let closed = close_unclosed_fence(&out);
             let mut res = closed.into_owned();
-            res.push('\n');
+            if !res.ends_with('\n') {
+                res.push('\n');
+            }
             res
         };
 
@@ -682,7 +686,6 @@ fn bump(counts: &mut Counts, key: &str) {
 /// The distiller's patterns, each compiled on first use.
 #[derive(Clone, Copy)]
 enum Re {
-    Commit,
     OnBranch,
     NewBranch,
     Push,
@@ -692,12 +695,8 @@ enum Re {
     Verdict,
     ErrorLine,
     Tip,
-    GitLog,
     Cd,
-    Oneline,
     HeredocTarget,
-    GitCommit,
-    CommitFile,
     PidFile,
     OpenItem,
     Decision,
@@ -707,160 +706,76 @@ enum Re {
     Definition,
 }
 
-static RES: [OnceLock<Regex>; 23] = [const { OnceLock::new() }; 23];
+static RES: [OnceLock<Regex>; 18] = [const { OnceLock::new() }; 18];
 
 fn re(which: Re) -> &'static Regex {
     let (cell, pat) = match which {
-        Re::Commit => (&RES[0], r"(?m)^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$"),
-        Re::OnBranch => (&RES[1], r"(?m)^On branch (\S+)"),
+        Re::OnBranch => (&RES[0], r"(?m)^On branch (\S+)"),
         Re::NewBranch => (
-            &RES[2],
+            &RES[1],
             r"git\s+(?:-C\s+\S+\s+)?(?:checkout\s+-[bB]|switch\s+-[cC]|worktree\s+add\s+(?:\S+\s+)*?-b)\s+([\w./-]+)",
         ),
         Re::Push => (
-            &RES[3],
+            &RES[2],
             r"git\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*[\w./:@-]+\s+\+?([\w./-]+(?::[\w./-]+)?)",
         ),
-        Re::Path => (&RES[4], r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)"),
-        Re::RemoteTarget => (&RES[5], r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]"),
+        Re::Path => (&RES[3], r"(?:^|[\s'`=(:,\x22])(~?/[\w.@+-]+(?:/[\w.@+-]+)+/?)"),
+        Re::RemoteTarget => (&RES[4], r"(?:^|\s)((?:[\w.-]+@)?[\w.-]+):[/~]"),
         Re::GateCmd => (
-            &RES[6],
+            &RES[5],
             r"\blake\s+(?:build|env\s+lean|test)\b|\bcargo\s+(?:build|test|nextest|check|clippy)\b|swarm-build|\bmake\b|\bpytest\b|\bnpm\s+(?:run\s+)?test\b|\bvitest\b|\bjest\b|\btsc\b|\bgo\s+test\b|clean-build|local-gates|\bctest\b|\bninja\b|\brc=",
         ),
         Re::Verdict => (
-            &RES[7],
+            &RES[6],
             r"(?i)\berror\b|\bfail|\bpassed\b|\bsuccess|\bcompleted\b|\brc=\d|exit code|✔|✖|\bbuilt\b|test result|declaration uses 'sorry'",
         ),
         Re::ErrorLine => (
-            &RES[8],
+            &RES[7],
             r"(?i)\berror\b|\bfatal\b|denied|no such file|not found|cannot|can't|failed|refused|timed out|unknown|invalid|conflict|panicked|traceback",
         ),
-        Re::Tip => (&RES[9], r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$"),
-        Re::GitLog => (
-            &RES[10],
-            r"git\s+(?:-C\s+(\S+)\s+)?log\b((?:\s+-[^\s|;&)]*)*)(?:\s+([^\s|;&)'-][^\s|;&)']*))?",
-        ),
-        Re::Cd => (&RES[11], r"\bcd\s+([^\s;&|)']+)"),
-        Re::Oneline => (&RES[12], r"^([0-9a-f]{7,40})\s+(\S.*)$"),
+        Re::Tip => (&RES[8], r"(?m)^([0-9a-f]{40})\s+refs/heads/(\S+)$"),
+        Re::Cd => (&RES[9], r"\bcd\s+([^\s;&|)']+)"),
         Re::HeredocTarget => (
-            &RES[13],
+            &RES[10],
             r#"(?:cat|tee(?:\s+-a)?)\s*>{0,2}\s*['"]?([^\s'"<>|;&]+)['"]?\s*<<-?\s*['"]?\w+"#,
         ),
-        // `git commit`, through any `-c key=value` / `-C dir` options; group 1 is a `-C` dir.
-        Re::GitCommit => (&RES[14], r"\bgit(?:\s+-c\s+\S+|\s+-C\s+(\S+))*\s+commit\b"),
         // A PID file path: `/abs/…/name.pid`, `~/…`, or `$VAR/…` (how lanes name their own).
-        Re::PidFile => (&RES[16], r"((?:~|\$\{?\w+\}?)?/[\w.@/${}-]*\.pid)\b"),
+        Re::PidFile => (&RES[11], r"((?:~|\$\{?\w+\}?)?/[\w.@/${}-]*\.pid)\b"),
         // A line naming something still open, in the words lanes use for it.
         Re::OpenItem => (
-            &RES[17],
+            &RES[12],
             r"(?i)\bowed\b|\bbatch for\b|\bstill red\b|\bnot done\b|\bwaiting on\b",
         ),
         // A command that rewrites a file in place.
-        Re::InPlace => (&RES[19], r"\bsed\s+-i|\bperl\s+-[a-z]*i|write_text\(|\.write\("),
+        Re::InPlace => (&RES[13], r"\bsed\s+-i|\bperl\s+-[a-z]*i|write_text\(|\.write\("),
         // A line recording an explicit decision or modal constraint (excluding noisy `\bdefault\b`).
         Re::Decision => (
-            &RES[18],
+            &RES[14],
             r"(?i)\bdecided\b|\bruling\b|\bdecision:\s|\bmust\s+not\b|\bshall\s+not\b|\bdo\s+not\s+(?:edit|touch|modify|commit|push|delete|write)\b",
         ),
         // A build/test run that reported failure in output its tool did not flag as an error.
         Re::GateFailed => (
-            &RES[20],
+            &RES[15],
             r"(?m)test result: FAILED|^error(?:\[E\d+\])?:|^FAILED\b|\b[1-9]\d* failed\b|^FAIL\b|Exit code [1-9]",
         ),
         // A markdown heading, behind an optional `cat -n`-style line number.
-        Re::Heading => (&RES[21], r"(?m)^\s*(?:\d+(?:→|\t))?\s*#{1,6}[ \t]+(\S[^\n]*?)[ \t#]*$"),
+        Re::Heading => (&RES[16], r"(?m)^\s*(?:\d+(?:→|\t))?\s*#{1,6}[ \t]+(\S[^\n]*?)[ \t#]*$"),
         // A definition's name at the start of a code line (behind an optional `cat -n` line number
         // and declaration modifiers).
         Re::Definition => (
-            &RES[22],
+            &RES[17],
             r#"(?m)^\s*(?:\d+\s*(?:→|\t|:|\|)\s*)?(?:(?:pub(?:\s*\([^)\n]*\))?|priv|private|protected|public|internal|crate|export|default|async|unsafe|const|static|abstract|final|virtual|override|inline|extern(?:\s+"[^"\n]*")?)\s+)*(?:fn|struct|enum|trait|union|impl|class|def|interface|func|function|type|mod|module|macro_rules!)(?:<[^>\n]*>)?\s+([A-Za-z_][A-Za-z0-9_]{2,})"#,
-        ),
-        // The message file of `git commit … -F <file>` (also `-qF`, `--file=`).
-        Re::CommitFile => (
-            &RES[15],
-            r#"\bcommit\b[^|;&\n]*?\s(?:-[a-zA-Z]*F\s*|--file[=\s])['"]?([^\s'";&|]+)"#,
         ),
     };
     cell.get_or_init(|| Regex::new(pat).expect("static regex"))
 }
 
 /// The repository a single `git log` in `cmd` reads, and the HEAD line it printed: `(key, line)`.
-/// The key is `host:dir`, plus `[ref]` when the log names a ref instead of HEAD. Commands with
-/// several `git log`s (loops over many repos) are skipped — their output can't be attributed.
+/// Delegates to [`crate::tools::git::git_log_head`] with the command's SSH target host, if any.
 fn git_log_head(cmd: &str, out: &str) -> Option<(String, String)> {
-    let mut logs = re(Re::GitLog).captures_iter(cmd);
-    let c = logs.next()?;
-    if logs.next().is_some() {
-        return None;
-    }
-    let at = c.get(0)?.start();
-    let dir = c
-        .get(1)
-        .map(|m| m.as_str().to_string())
-        .or_else(|| re(Re::Cd).captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
-        .unwrap_or_else(|| ".".into());
     let host = hosts_in(cmd).into_iter().next();
-    let mut key = match host {
-        Some(h) => format!("{h}:{dir}"),
-        None => dir,
-    };
-    if let Some(r) = c.get(3) {
-        key = format!("{key} [{}]", r.as_str());
-    }
-    // A compound command prints other output first (a build's last line, a test verdict): the
-    // head is the first `git log --oneline`-shaped line, wherever it sits.
-    let (sha, subject) = oneline_lines(out).next()?;
+    let (key, sha, subject) = crate::tools::git::git_log_head(cmd, out, host.as_deref())?;
     Some((key, format!("{sha} {}", truncate(subject, 90))))
-}
-
-/// The `<sha> <subject>` lines of `out`, in order. A line that is not the output's first must
-/// carry a hex letter in its sha, so a count (`wc -l`'s `1234567 total`) is not read as a commit.
-fn oneline_lines(out: &str) -> impl Iterator<Item = (&str, &str)> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .enumerate()
-        .filter_map(|(n, line)| {
-            let m = re(Re::Oneline).captures(line)?;
-            let (sha, subject) = (m.get(1)?.as_str(), m.get(2)?.as_str().trim());
-            (n == 0 || sha.bytes().any(|b| b.is_ascii_alphabetic())).then_some((sha, subject))
-        })
-}
-
-/// Commits made quietly: `git commit -q` prints no `[branch sha] subject` line, so a lane that
-/// commits that way (as minidregg's lanes must) and then prints `git log --oneline -1` shows its
-/// commits only as oneline output. When a command runs k `git commit`s followed by a `git log`,
-/// the first k oneline lines it printed are those commits: `(repo, sha, subject)`, the repo being
-/// the commit's `-C` dir or the last `cd` before it.
-fn quiet_commits<'a>(cmd: &str, out: &'a str) -> Vec<(String, &'a str, &'a str)> {
-    let commits: Vec<_> = re(Re::GitCommit)
-        .captures_iter(cmd)
-        .filter(|c| {
-            !cmd[c.get(0).map_or(0, |m| m.end())..]
-                .trim_start()
-                .starts_with("--dry-run")
-        })
-        .collect();
-    let Some(last) = commits.last().and_then(|c| c.get(0)) else {
-        return Vec::new();
-    };
-    if !re(Re::GitLog).is_match(&cmd[last.end()..]) {
-        return Vec::new();
-    }
-    let repos: Vec<String> = commits
-        .iter()
-        .map(|c| {
-            let at = c.get(0).map_or(0, |m| m.start());
-            c.get(1)
-                .map(|d| d.as_str().to_string())
-                .or_else(|| re(Re::Cd).captures_iter(&cmd[..at]).last().map(|d| d[1].to_string()))
-                .unwrap_or_else(|| ".".into())
-        })
-        .collect();
-    oneline_lines(out)
-        .zip(repos)
-        .map(|((sha, subject), repo)| (repo, sha, subject))
-        .collect()
 }
 
 /// Canonical dotless or build/lock filenames recognized even without a path slash or code extension.
@@ -1692,8 +1607,8 @@ fn analyze_with_policy(
                 if name != "Write" {
                     let summary = ToolInput::new(session.harness, name, input, false, false)?;
                     for cmd in summary.commands() {
-                        for c in re(Re::CommitFile).captures_iter(cmd) {
-                            commit_files.insert(basename(&c[1]).to_string());
+                        for file in crate::tools::git::commit_message_files(cmd) {
+                            commit_files.insert(basename(file).to_string());
                         }
                     }
                 }
@@ -3811,20 +3726,24 @@ fn scan_result_facts(
         ));
     }
     let mut commit_outcome: Option<String> = None;
-    for c in re(Re::Commit).captures_iter(out) {
-        let (b, sha, subj) = (c[1].to_string(), c[2].to_string(), c[3].trim().to_string());
+    for c in crate::tools::git::parse_commit_summaries(out) {
+        let label = c.header_label.to_string();
+        let sha = c.sha.to_string();
+        let subj = c.subject.to_string();
         // `git log --oneline`-style listings never use the bracketed form; a bracketed line is a
         // commit (or cherry-pick/amend) the agent made.
         if f.commit_shas.insert(sha.clone()) {
-            bump(&mut f.branches, &b);
-            commit_outcome.get_or_insert_with(|| format!("⊕ [{b} {sha}] {}", truncate(subj.trim(), 90)));
-            f.tips.push((i, b.clone(), sha.clone()));
-            f.commits.push((i, b, sha, subj));
+            if let Some(branch) = c.branch {
+                bump(&mut f.branches, branch);
+                f.tips.push((i, branch.to_string(), sha.clone()));
+            }
+            commit_outcome.get_or_insert_with(|| format!("⊕ [{label} {sha}] {}", truncate(subj.trim(), 90)));
+            f.commits.push((i, label, sha, subj));
         }
     }
     if commit_outcome.is_none() && !is_error {
         for &cmd in &cmds {
-            for (repo, sha, subject) in quiet_commits(cmd, out) {
+            for (repo, sha, subject) in crate::tools::git::quiet_commits(cmd, out) {
                 if f.commit_shas.insert(sha.to_string()) {
                     commit_outcome.get_or_insert_with(|| format!("⊕ [{repo} {sha}] {}", truncate(subject, 90)));
                     f.commits.push((i, repo, sha.to_string(), subject.to_string()));

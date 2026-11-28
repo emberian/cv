@@ -1290,10 +1290,7 @@ fn trim_excerpt(s: &str, limit: usize, cut: bool) -> (String, bool) {
         // Nothing visible within the limit (a whitespace-padded blob): no excerpt line at all.
         return (out, true);
     }
-    if let Some((ch, len)) = cv_core::render::unclosed_fence(&out) {
-        out.push('\n');
-        out.extend(std::iter::repeat_n(ch, len));
-    }
+    out = cv_core::sanitize::close_unclosed_fence(&out).into_owned();
     out.push_str("\n…");
     (out, true)
 }
@@ -1456,8 +1453,8 @@ fn files_line(s: &PackSource) -> Option<String> {
 
 /// The `md` format: a CLAUDE.md-style bundle you can paste into project memory.
 fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)], bounds: &Bounds) -> String {
-    use cv_core::render::{fenced_block, inline_code_span, neutralize_forged_headers, role_origin_label};
-    use cv_core::sanitize::sanitize_line;
+    use cv_core::render::role_origin_label;
+    use cv_core::sanitize::{fenced_block, inline_code_span, neutralize_non_human, sanitize_line};
 
     let mut out = String::new();
     let _ = writeln!(out, "# Context pack: {}\n", sanitize_line(task));
@@ -1498,11 +1495,7 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
             let _ = writeln!(out, "Key excerpt:\n");
             for (role, origin, text, _) in &s.excerpt {
                 let speaker = role_origin_label(*role, *origin);
-                let safe = if *origin == cv_core::ir::Origin::Human {
-                    std::borrow::Cow::Borrowed(text.as_str())
-                } else {
-                    neutralize_forged_headers(text)
-                };
+                let safe = neutralize_non_human(*origin, text);
                 let _ = writeln!(out, "**{speaker}:**");
                 let _ = writeln!(out, "{}\n", fenced_block(&safe, ""));
             }
@@ -1549,8 +1542,8 @@ fn md_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, 
 
 /// The `prompt` format: the same content shaped as a system prompt (second person).
 fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i64, i64)], bounds: &Bounds) -> String {
-    use cv_core::render::{backtick_fence, inline_code_span, neutralize_forged_headers, role_origin_label};
-    use cv_core::sanitize::sanitize_line;
+    use cv_core::render::role_origin_label;
+    use cv_core::sanitize::{fenced_block_indented, inline_code_span, neutralize_non_human, sanitize_line};
 
     let mut out = String::new();
     let _ = writeln!(out, "You are picking up work on: {}\n", sanitize_line(task));
@@ -1588,18 +1581,9 @@ fn prompt_bundle(task: &str, sources: &[PackSource], rollup: &[(String, usize, i
         }
         for (role, origin, text, _) in &s.excerpt {
             let speaker = role_origin_label(*role, *origin);
-            let safe = if *origin == cv_core::ir::Origin::Human {
-                std::borrow::Cow::Borrowed(text.as_str())
-            } else {
-                neutralize_forged_headers(text)
-            };
-            let fence = backtick_fence(&safe);
+            let safe = neutralize_non_human(*origin, text);
             let _ = writeln!(out, "   {speaker} said:");
-            let _ = writeln!(out, "   {fence}");
-            for line in safe.lines() {
-                let _ = writeln!(out, "   {line}");
-            }
-            let _ = writeln!(out, "   {fence}");
+            let _ = writeln!(out, "{}", fenced_block_indented(&safe, "", "   "));
         }
         if let Some(files) = files_line(s) {
             let _ = writeln!(out, "   You touched: {files}");

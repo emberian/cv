@@ -17,6 +17,7 @@ use crate::stream::{Demand, Flow, MessageSink};
 use std::collections::BTreeMap;
 
 pub mod classify;
+pub mod git;
 
 /// A per-tool tally with the kind breakdown the event classifier assigns.
 #[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]

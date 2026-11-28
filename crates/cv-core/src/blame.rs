@@ -18,8 +18,8 @@ mod carve;
 
 use crate::events::{self, EditEvent, EditHunkEvent};
 use crate::ir::Harness;
-use crate::rewind::{CommitEvidence, CommitEvidenceSink, EvidenceKind};
 use crate::tools::classify::{extract_diff_hunk_hashes, hash_normalized_hunk, hash_normalized_line, normalize_path};
+use crate::tools::git::{commit_evidence_many, CommitEvidence, CommitEvidenceSink, EvidenceKind};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -738,7 +738,7 @@ fn exact_sha_matches(
         .collect();
     let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
     let mut out = Vec::new();
-    for (r, found) in crate::rewind::commit_evidence_many(refs, &shas)? {
+    for (r, found) in commit_evidence_many(refs, &shas)? {
         for sha in &shas {
             if let Some(ev) = CommitEvidenceSink::best(&found, &sha.to_ascii_lowercase()) {
                 let cwd = cwds
