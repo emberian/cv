@@ -44,9 +44,15 @@ struct Offer {
 }
 #[derive(Serialize, Deserialize)]
 enum Pointer {
-    Inbox { count: u32, source: crate::source::FileId },
+    Inbox {
+        count: u32,
+        source: crate::source::FileId,
+    },
     Compact(u32),
-    Adopt { count: u32, from: String },
+    Adopt {
+        count: u32,
+        from: String,
+    },
     /// Directives in the newest compaction summary that repeat a tool result and no human prompt.
     Laundering(u32),
 }

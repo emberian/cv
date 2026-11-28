@@ -276,7 +276,10 @@ impl Laundering {
             *shared.entry(*at).or_default() += 1;
         }
         // The earliest best match, so the report is the same on every run.
-        let Some((at, count)) = shared.into_iter().max_by_key(|&(at, count)| (count, std::cmp::Reverse(at))) else {
+        let Some((at, count)) = shared
+            .into_iter()
+            .max_by_key(|&(at, count)| (count, std::cmp::Reverse(at)))
+        else {
             return false;
         };
         let tool_overlap = f64::from(count) / total;
@@ -526,7 +529,11 @@ mod tests {
         calls(id, "Bash", json!({"command": command}))
     }
     fn edit(id: &str, path: &str) -> Message {
-        calls(id, "Edit", json!({"file_path": path, "old_string": "a", "new_string": "b"}))
+        calls(
+            id,
+            "Edit",
+            json!({"file_path": path, "old_string": "a", "new_string": "b"}),
+        )
     }
     fn result(id: &str, body: &str, is_error: bool) -> Message {
         let result = Block::ToolResult {
@@ -647,11 +654,7 @@ mod tests {
         verified.extend(run("t2", passed));
         verified.push(done.clone());
         assert_eq!(kind(verified), None);
-        let errored = vec![
-            bash("t1", "npm test"),
-            result("t1", "exit 1", true),
-            done.clone(),
-        ];
+        let errored = vec![bash("t1", "npm test"), result("t1", "exit 1", true), done.clone()];
         assert_eq!(kind(errored), Some(DivergenceKind::FailingValidation));
 
         // Notes written after a passing run are not unchecked source, a hedged line is not a
@@ -660,7 +663,9 @@ mod tests {
         notes.extend([edit("e1", "/repo/CHANGELOG.md"), done.clone()]);
         assert_eq!(kind(notes), None);
         let mut hedged = run("t1", failed);
-        hedged.push(says("The tests should pass once the fixture is regenerated; 1 still fails."));
+        hedged.push(says(
+            "The tests should pass once the fixture is regenerated; 1 still fails.",
+        ));
         assert_eq!(kind(hedged), None);
         let mut after = run("t1", passed);
         after.extend([done.clone(), edit("e1", "/repo/src/parser.rs")]);

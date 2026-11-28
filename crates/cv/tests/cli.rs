@@ -4150,7 +4150,12 @@ fn prune_by_bare_agent_id_drops_thinking_and_keeps_the_sidecar_readable() {
     let w = World::new("prune-agent-id");
     let parent = w.write_session(
         "lane-parent",
-        &[user_line("lane-parent", "p0", "2026-01-01T00:00:00Z", "spawn the worker")],
+        &[user_line(
+            "lane-parent",
+            "p0",
+            "2026-01-01T00:00:00Z",
+            "spawn the worker",
+        )],
     );
     let output = format!("WORKER-OUTPUT-HEAD\n{}", "worker output line\n".repeat(400));
     let signature = "S".repeat(6000);
@@ -4159,7 +4164,12 @@ fn prune_by_bare_agent_id_drops_thinking_and_keeps_the_sidecar_readable() {
             "uuid": uuid, "parentUuid": parent_uuid, "timestamp": "2026-01-01T00:00:01Z", "cwd": "/work/proj", "message": message})
     };
     let rows = [
-        row("user", "w0", None, serde_json::json!({"role": "user", "content": "audit the worker queue"})),
+        row(
+            "user",
+            "w0",
+            None,
+            serde_json::json!({"role": "user", "content": "audit the worker queue"}),
+        ),
         row(
             "assistant",
             "w1",
@@ -4205,12 +4215,22 @@ fn prune_by_bare_agent_id_drops_thinking_and_keeps_the_sidecar_readable() {
     let new_id = report["new_id"].as_str().unwrap();
     let new_path = PathBuf::from(report["new_path"].as_str().unwrap());
     let sidecar = PathBuf::from(report["sidecar_path"].as_str().unwrap());
-    assert_eq!(new_path.parent(), parent.parent(), "a standalone session beside the parent");
+    assert_eq!(
+        new_path.parent(),
+        parent.parent(),
+        "a standalone session beside the parent"
+    );
     assert_eq!(sidecar, new_path.with_file_name(format!("{new_id}.flat.jsonl")));
 
     let pruned = fs::read_to_string(&new_path).unwrap();
-    assert!(!pruned.contains(&signature) && !pruned.contains("WORKER-REASONING"), "thinking stayed");
-    assert!(!pruned.contains("worker output line\\nworker output line"), "the output stayed");
+    assert!(
+        !pruned.contains(&signature) && !pruned.contains("WORKER-REASONING"),
+        "thinking stayed"
+    );
+    assert!(
+        !pruned.contains("worker output line\\nworker output line"),
+        "the output stayed"
+    );
     assert!(pruned.contains("The queue is drained."));
     for line in pruned.lines() {
         let record: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -4222,7 +4242,10 @@ fn prune_by_bare_agent_id_drops_thinking_and_keeps_the_sidecar_readable() {
     let (cat, _) = w.cv_ok(&["cat", new_id, "toolu_worker"]);
     assert_eq!(cat.trim_end(), output.trim_end());
     let stashed = fs::read_to_string(&sidecar).unwrap();
-    assert!(stashed.contains("WORKER-REASONING about the queue"), "the reasoning is in the sidecar");
+    assert!(
+        stashed.contains("WORKER-REASONING about the queue"),
+        "the reasoning is in the sidecar"
+    );
     let (shown, _) = w.cv_ok(&["show", &format!("claude:{new_id}")]);
     assert!(shown.contains("audit the worker queue") && !shown.contains("spawn the worker"));
 

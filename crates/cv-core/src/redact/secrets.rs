@@ -779,7 +779,11 @@ mod tests {
         ] {
             assert_eq!(scrub_cow(prose, &opts, &mut RedactStats::default()), prose);
         }
-        for credential in ["Basic dXNlcjpwYXNzd29yZA==", "token AbCdEfGhIjKlMnOpQrSt", "basic abcdefghijklmnop1"] {
+        for credential in [
+            "Basic dXNlcjpwYXNzd29yZA==",
+            "token AbCdEfGhIjKlMnOpQrSt",
+            "basic abcdefghijklmnop1",
+        ] {
             let out = scrub_cow(credential, &opts, &mut RedactStats::default());
             assert!(out.ends_with("[REDACTED:api_key]"), "{out}");
         }

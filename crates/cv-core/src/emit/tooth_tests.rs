@@ -1060,7 +1060,11 @@ fn tooth_forced_sidecar_failure_keeps_previous_session_and_sidecar() -> Result<(
             );
             let err = failed.expect_err("an injected sidecar failure fails the emit");
             assert!(format!("{err:#}").contains("injected sidecar claim failure"), "{err:#}");
-            assert_eq!(fs::read(&seeded_sc)?, first_sidecar, "{target}: previous sidecar intact");
+            assert_eq!(
+                fs::read(&seeded_sc)?,
+                first_sidecar,
+                "{target}: previous sidecar intact"
+            );
             assert_eq!(read_back("session")?, first_read, "{target}: previous session intact");
             if !is_database {
                 assert_eq!(snapshot_tree(&out)?, first_tree, "{target}: previous files intact");

@@ -2048,13 +2048,20 @@ fn concurrent_large_hook_observations_arrive_whole_over_the_datagram_socket() {
     loop {
         match rx.read_one() {
             Ok(()) => folded += 1,
-            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => {
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
                 break
             }
             Err(_) => refused += 1,
         }
     }
-    assert_eq!((folded, refused), (LANES, 1), "every observation whole, the stray datagram alone refused");
+    assert_eq!(
+        (folded, refused),
+        (LANES, 1),
+        "every observation whole, the stray datagram alone refused"
+    );
     let runs = store.list_lane_runs_for_session("dgramsess").unwrap();
     assert_eq!(runs.len(), LANES);
     for lane in 0..LANES {
