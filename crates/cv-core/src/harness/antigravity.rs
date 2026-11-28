@@ -4816,20 +4816,23 @@ struct SummaryRow {
 }
 
 #[cfg(feature = "sqlite")]
-fn apply_summary_fallback(sref: &mut SessionRef, sum: &SummaryRow, has_pbtxt_title: bool) {
-    if !has_pbtxt_title {
-        if let Some(sum_title) = sum.title.as_ref().filter(|s| !s.trim().is_empty()) {
-            sref.title = Some(sum_title.clone());
-        } else if sref.title.is_none() {
-            sref.title = sum.preview.clone().filter(|s| !s.trim().is_empty());
-        }
-    } else if sref.title.is_none() {
-        sref.title = sum
-            .title
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| sum.preview.clone().filter(|s| !s.trim().is_empty()));
+impl SummaryRow {
+    /// The row's title replaces `title` unless the annotations file already named the session,
+    /// which then keeps the name it has. The row's preview only fills a title still missing.
+    fn retitle(&self, title: &mut Option<String>, has_pbtxt_title: bool) {
+        let nonblank = |s: &Option<String>| s.clone().filter(|s| !s.trim().is_empty());
+        let own = nonblank(&self.title);
+        let chosen = match has_pbtxt_title {
+            true => title.take().or(own),
+            false => own.or(title.take()),
+        };
+        *title = chosen.or_else(|| nonblank(&self.preview));
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn apply_summary_fallback(sref: &mut SessionRef, sum: &SummaryRow, has_pbtxt_title: bool) {
+    sum.retitle(&mut sref.title, has_pbtxt_title);
     if sref.cwd.is_none() {
         sref.cwd.clone_from(&sum.cwd);
     }
@@ -4852,19 +4855,7 @@ fn apply_summary_fallback(sref: &mut SessionRef, sum: &SummaryRow, has_pbtxt_tit
 
 #[cfg(feature = "sqlite")]
 fn apply_summary_to_session(s: &mut Session, sum: &SummaryRow, has_pbtxt_title: bool, want_extra: bool) {
-    if !has_pbtxt_title {
-        if let Some(sum_title) = sum.title.as_ref().filter(|t| !t.trim().is_empty()) {
-            s.title = Some(sum_title.clone());
-        } else if s.title.is_none() {
-            s.title = sum.preview.clone().filter(|t| !t.trim().is_empty());
-        }
-    } else if s.title.is_none() {
-        s.title = sum
-            .title
-            .clone()
-            .filter(|t| !t.trim().is_empty())
-            .or_else(|| sum.preview.clone().filter(|t| !t.trim().is_empty()));
-    }
+    sum.retitle(&mut s.title, has_pbtxt_title);
     if s.cwd.is_none() {
         s.cwd.clone_from(&sum.cwd);
     }
