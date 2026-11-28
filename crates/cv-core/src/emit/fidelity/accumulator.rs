@@ -719,11 +719,20 @@ fn hash_tool_input(target: Harness, name: &str, input: &crate::Json) -> Result<(
     })
 }
 
-/// Canonical projection of a `Block::Image` onto `(hash, preview)` or degraded text on `target`.
-enum ImageProjection {
+/// Canonical projection of a `Block::Image` or `Block::File` onto `(hash, preview)` or degraded text on `target`.
+enum MediaProjection {
     Media { hash: [u8; 32], preview: String },
     DegradedText(String),
     Dropped,
+}
+
+fn media_pair(mime: &str, uri: &str) -> MediaProjection {
+    let mut preview = String::new();
+    append_preview(&mut preview, uri);
+    MediaProjection::Media {
+        hash: hash_pair(mime, uri),
+        preview,
+    }
 }
 
 fn finish_image_media(
@@ -731,7 +740,7 @@ fn finish_image_media(
     data_ref: Option<&str>,
     trunc_80: bool,
     mime_from_uri_only: bool,
-) -> ImageProjection {
+) -> MediaProjection {
     let norm_ref: std::borrow::Cow<'_, str> = match data_ref {
         Some(r) if trunc_80 && r.chars().count() > 80 => std::borrow::Cow::Owned(r.chars().take(80).collect()),
         Some(r) => std::borrow::Cow::Borrowed(r),
@@ -751,7 +760,7 @@ fn finish_image_media(
     };
     let mut prev = String::new();
     append_preview(&mut prev, if !norm_ref.is_empty() { &norm_ref } else { norm_mime });
-    ImageProjection::Media {
+    MediaProjection::Media {
         hash: hash_pair(norm_mime, &norm_ref),
         preview: prev,
     }
@@ -763,24 +772,24 @@ fn project_image(
     is_source: bool,
     media_type: Option<&str>,
     data_ref: Option<&str>,
-) -> ImageProjection {
+) -> MediaProjection {
     match target {
         Harness::LmStudio => {
             if media_type.is_some() || data_ref.is_some() {
                 let r = data_ref.unwrap_or("");
                 let mut prev = String::new();
                 append_preview(&mut prev, if r.is_empty() { "image" } else { r });
-                ImageProjection::Media {
+                MediaProjection::Media {
                     hash: hash_pair("", r),
                     preview: prev,
                 }
             } else {
-                ImageProjection::Dropped
+                MediaProjection::Dropped
             }
         }
         Harness::Codex => {
             if role == UnitRole::Assistant {
-                ImageProjection::Dropped
+                MediaProjection::Dropped
             } else {
                 finish_image_media(media_type, data_ref, false, true)
             }
@@ -788,7 +797,7 @@ fn project_image(
         Harness::Hermes => finish_image_media(media_type, data_ref, false, true),
         Harness::Continue => {
             if data_ref.is_none() {
-                ImageProjection::Dropped
+                MediaProjection::Dropped
             } else {
                 finish_image_media(media_type, data_ref, false, true)
             }
@@ -796,7 +805,7 @@ fn project_image(
         Harness::OpenCode => {
             if is_source && role != UnitRole::Assistant {
                 if let Some(unavail) = opencode_attachment_unavailable("Image", media_type, data_ref) {
-                    return ImageProjection::DegradedText(unavail);
+                    return MediaProjection::DegradedText(unavail);
                 }
             }
             finish_image_media(media_type, data_ref, false, false)
@@ -814,12 +823,7 @@ fn project_image(
                         .unwrap_or("application/octet-stream")
                 };
                 let canonical_uri = format!("data:{eff_mime};base64,{b64}");
-                let mut prev = String::new();
-                append_preview(&mut prev, &canonical_uri);
-                return ImageProjection::Media {
-                    hash: hash_pair(eff_mime, &canonical_uri),
-                    preview: prev,
-                };
+                return media_pair(eff_mime, &canonical_uri);
             }
             if is_source {
                 let label = data_ref
@@ -829,7 +833,7 @@ fn project_image(
                     Some(l) => format!("[image: {l}]"),
                     None => "[image]".to_owned(),
                 };
-                return ImageProjection::DegradedText(text);
+                return MediaProjection::DegradedText(text);
             }
             finish_image_media(media_type, data_ref, false, false)
         }
@@ -850,17 +854,10 @@ fn project_image(
             if target_holds(target, Field::Image) {
                 finish_image_media(media_type, data_ref, false, false)
             } else {
-                ImageProjection::Dropped
+                MediaProjection::Dropped
             }
         }
     }
-}
-
-/// Canonical projection of a `Block::File` onto `(hash, preview)` or degraded text on `target`.
-enum FileProjection {
-    Media { hash: [u8; 32], preview: String },
-    DegradedText(String),
-    Dropped,
 }
 
 fn project_file(
@@ -870,14 +867,15 @@ fn project_file(
     mime: Option<&str>,
     path: Option<&str>,
     source: Option<&str>,
-) -> FileProjection {
+) -> MediaProjection {
     let label_fallback = || path.or(source).unwrap_or("?");
     match target {
-        Harness::Codex => {
+        Harness::Codex | Harness::OpenClaw => {
             if is_source {
-                return FileProjection::DegradedText(format!("[file: {}]", label_fallback()));
+                MediaProjection::DegradedText(format!("[file: {}]", label_fallback()))
+            } else {
+                MediaProjection::Dropped
             }
-            FileProjection::Dropped
         }
         Harness::Claude | Harness::Cline | Harness::Roo => {
             if role == UnitRole::User {
@@ -891,70 +889,32 @@ fn project_file(
                 }
                 let mut prev = String::new();
                 append_preview(&mut prev, if !p.is_empty() { p } else { s });
-                FileProjection::Media {
+                MediaProjection::Media {
                     hash: *h.finalize().as_bytes(),
                     preview: prev,
                 }
             } else if is_source {
-                FileProjection::DegradedText(format!("[file: {}]", label_fallback()))
+                MediaProjection::DegradedText(format!("[file: {}]", label_fallback()))
             } else {
-                FileProjection::Dropped
-            }
-        }
-        Harness::OpenClaw => {
-            if is_source {
-                FileProjection::DegradedText(format!("[file: {}]", label_fallback()))
-            } else {
-                FileProjection::Dropped
+                MediaProjection::Dropped
             }
         }
         Harness::OpenCode => {
             let uri = source.or(path);
             if is_source && role != UnitRole::Assistant {
                 if let Some(unavail) = opencode_attachment_unavailable("File", mime, uri) {
-                    return FileProjection::DegradedText(unavail);
+                    return MediaProjection::DegradedText(unavail);
                 }
             }
-            let u = uri.unwrap_or("");
-            let m = mime.unwrap_or("");
-            let mut prev = String::new();
-            append_preview(&mut prev, u);
-            FileProjection::Media {
-                hash: hash_pair(m, u),
-                preview: prev,
-            }
+            media_pair(mime.unwrap_or(""), uri.unwrap_or(""))
         }
-        Harness::Gemini | Harness::Qwen => {
-            let u = source.or(path).unwrap_or("");
-            let m = mime.unwrap_or("");
-            let mut prev = String::new();
-            append_preview(&mut prev, u);
-            FileProjection::Media {
-                hash: hash_pair(m, u),
-                preview: prev,
-            }
-        }
-        Harness::Continue => {
-            let u = path.or(source).unwrap_or("");
-            let m = mime.unwrap_or("");
-            let mut prev = String::new();
-            append_preview(&mut prev, u);
-            FileProjection::Media {
-                hash: hash_pair(m, u),
-                preview: prev,
-            }
-        }
+        Harness::Gemini | Harness::Qwen => media_pair(mime.unwrap_or(""), source.or(path).unwrap_or("")),
+        Harness::Continue => media_pair(mime.unwrap_or(""), path.or(source).unwrap_or("")),
         Harness::LmStudio => {
             if path.is_some() || source.is_some() {
-                let u = source.or(path).unwrap_or("");
-                let mut prev = String::new();
-                append_preview(&mut prev, u);
-                FileProjection::Media {
-                    hash: hash_pair("", u),
-                    preview: prev,
-                }
+                media_pair("", source.or(path).unwrap_or(""))
             } else {
-                FileProjection::Dropped
+                MediaProjection::Dropped
             }
         }
         Harness::Hermes
@@ -971,16 +931,9 @@ fn project_file(
         | Harness::ClaudeExport
         | Harness::OpenSession => {
             if target_holds(target, Field::File) {
-                let u = source.or(path).unwrap_or("");
-                let m = mime.unwrap_or("");
-                let mut prev = String::new();
-                append_preview(&mut prev, u);
-                FileProjection::Media {
-                    hash: hash_pair(m, u),
-                    preview: prev,
-                }
+                media_pair(mime.unwrap_or(""), source.or(path).unwrap_or(""))
             } else {
-                FileProjection::Dropped
+                MediaProjection::Dropped
             }
         }
     }
@@ -2014,62 +1967,30 @@ fn build_canonical_units(
                     else {
                         continue;
                     };
-                    if is_source && folds {
-                        if called.contains(tool_use_id.as_str()) {
-                            continue;
+                    if is_source && folds && called.contains(tool_use_id.as_str()) {
+                        continue;
+                    }
+                    if is_source && !called.contains(tool_use_id.as_str()) {
+                        if let Some((name, input_hash, input_preview)) =
+                            orphan_shell_spec(prof.orphan_result_shell, tool_name.as_deref(), empty_obj)?
+                        {
+                            let call_rho = rho.intern(tool_use_id);
+                            out.push(Unit {
+                                loc: *loc,
+                                kind: UnitKind::Turn {
+                                    role: UnitRole::Assistant,
+                                },
+                            });
+                            out.push(Unit {
+                                loc: *loc,
+                                kind: UnitKind::ToolUse {
+                                    call_rho,
+                                    name,
+                                    input_hash,
+                                    input_preview,
+                                },
+                            });
                         }
-                        // Orphan result: OpenCode & Gemini synthesize an Assistant call shell for it.
-                        let shell_name = if prof.orphan_result_shell == OrphanShell::Gemini {
-                            tool_name.as_deref().unwrap_or("tool").to_owned()
-                        } else {
-                            tool_name.clone().unwrap_or_default()
-                        };
-                        let call_rho = rho.intern(tool_use_id);
-                        out.push(Unit {
-                            loc: *loc,
-                            kind: UnitKind::Turn {
-                                role: UnitRole::Assistant,
-                            },
-                        });
-                        out.push(Unit {
-                            loc: *loc,
-                            kind: UnitKind::ToolUse {
-                                call_rho,
-                                name: shell_name,
-                                input_hash: empty_obj,
-                                input_preview: "{}".into(),
-                            },
-                        });
-                    } else if is_source
-                        && prof.orphan_result_shell == OrphanShell::Codex
-                        && !called.contains(tool_use_id.as_str())
-                    {
-                        // Codex synthesizes a `function_call` / `custom_tool_call` shell before an orphan output.
-                        let shell_name = tool_name.clone().unwrap_or_else(|| "unknown".into());
-                        let call_rho = rho.intern(tool_use_id);
-                        let (shell_hash, shell_prev) = if matches!(tool_name.as_deref(), Some("exec" | "apply_patch")) {
-                            let val = serde_json::json!({"raw": ""});
-                            let mut h = blake3::Hasher::new();
-                            hash_canonical_json_view(JsonView::from(&val), &mut h)?;
-                            (*h.finalize().as_bytes(), val.to_string())
-                        } else {
-                            (empty_obj, "{}".into())
-                        };
-                        out.push(Unit {
-                            loc: *loc,
-                            kind: UnitKind::Turn {
-                                role: UnitRole::Assistant,
-                            },
-                        });
-                        out.push(Unit {
-                            loc: *loc,
-                            kind: UnitKind::ToolUse {
-                                call_rho,
-                                name: shell_name,
-                                input_hash: shell_hash,
-                                input_preview: shell_prev,
-                            },
-                        });
                     }
                     push_tool_result_unit(target, b, &mut rho, &mut out);
                 }
@@ -2077,6 +1998,30 @@ fn build_canonical_units(
         }
     }
     Ok(out)
+}
+
+fn orphan_shell_spec(
+    shell: OrphanShell,
+    tool_name: Option<&str>,
+    empty_obj: [u8; 32],
+) -> Result<Option<(String, [u8; 32], String)>> {
+    Ok(match shell {
+        OrphanShell::None => None,
+        OrphanShell::OpenCode => Some((tool_name.unwrap_or_default().to_owned(), empty_obj, "{}".into())),
+        OrphanShell::Gemini => Some((tool_name.unwrap_or("tool").to_owned(), empty_obj, "{}".into())),
+        OrphanShell::Codex => {
+            let name = tool_name.unwrap_or("unknown").to_owned();
+            let (hash, prev) = if matches!(tool_name, Some("exec" | "apply_patch")) {
+                let val = serde_json::json!({"raw": ""});
+                let mut h = blake3::Hasher::new();
+                hash_canonical_json_view(JsonView::from(&val), &mut h)?;
+                (*h.finalize().as_bytes(), val.to_string())
+            } else {
+                (empty_obj, "{}".into())
+            };
+            Some((name, hash, prev))
+        }
+    })
 }
 
 fn push_tool_result_unit(target: Harness, b: &ScannedBlock, rho: &mut RhoMap, out: &mut Vec<Unit>) {
@@ -2155,57 +2100,83 @@ fn project_turn_units(
     // Qwen skips blank text on ordinary parts and `Notice` records (`Error` keeps empty `""`, which is 0B anyway).
     let skip_blank_text = prof.skip_blank_text;
 
-    enum PendingItem {
-        Text {
-            loc: UnitLoc,
-            hash: [u8; 32],
-            byte_len: u64,
-            preview: String,
-        },
-        Thinking {
-            loc: UnitLoc,
-            text_hash: Option<[u8; 32]>,
-            sig_hash: Option<[u8; 32]>,
-            enc_hash: Option<[u8; 32]>,
-            preview: String,
-        },
+    struct PendingItem {
+        loc: UnitLoc,
+        kind: PendingKind,
+    }
+
+    enum PendingKind {
+        Ready(UnitKind),
         ToolUse {
-            loc: UnitLoc,
             id: String,
             name: String,
             input_hash: [u8; 32],
             input_preview: String,
         },
-        Image {
-            loc: UnitLoc,
-            hash: [u8; 32],
-            preview: String,
-        },
-        File {
-            loc: UnitLoc,
-            hash: [u8; 32],
-            preview: String,
-        },
-        Opaque {
-            loc: UnitLoc,
-            block_type: String,
-            hash: [u8; 32],
-        },
     }
+
+    impl PendingItem {
+        fn to_unit(&self, rho: &mut RhoMap) -> Unit {
+            let kind = match &self.kind {
+                PendingKind::Ready(k) => k.clone(),
+                PendingKind::ToolUse {
+                    id,
+                    name,
+                    input_hash,
+                    input_preview,
+                } => UnitKind::ToolUse {
+                    call_rho: rho.intern(id),
+                    name: name.clone(),
+                    input_hash: *input_hash,
+                    input_preview: input_preview.clone(),
+                },
+            };
+            Unit { loc: self.loc, kind }
+        }
+    }
+
+    let push_scanned_text = |items: &mut Vec<PendingItem>, loc: UnitLoc, s: &ScannedText| {
+        items.push(PendingItem {
+            loc,
+            kind: PendingKind::Ready(UnitKind::Text {
+                hash: s.hash,
+                byte_len: s.byte_len,
+                preview: s.preview.clone(),
+            }),
+        });
+    };
+    let push_raw_text = |items: &mut Vec<PendingItem>, loc: UnitLoc, text: &str| {
+        let mut preview = String::new();
+        append_preview(&mut preview, text);
+        items.push(PendingItem {
+            loc,
+            kind: PendingKind::Ready(UnitKind::Text {
+                hash: hash_bytes(text.as_bytes()),
+                byte_len: text.len() as u64,
+                preview,
+            }),
+        });
+    };
+    let push_media = |items: &mut Vec<PendingItem>, loc: UnitLoc, proj: MediaProjection, is_file: bool| match proj {
+        MediaProjection::Media { hash, preview } => items.push(PendingItem {
+            loc,
+            kind: PendingKind::Ready(if is_file {
+                UnitKind::File { hash, preview }
+            } else {
+                UnitKind::Image { hash, preview }
+            }),
+        }),
+        MediaProjection::DegradedText(text) => push_raw_text(items, loc, &text),
+        MediaProjection::Dropped => {}
+    };
 
     let mut items: Vec<PendingItem> = Vec::new();
     for b in msg.blocks.iter().filter(|b| !is_orphan_call(b)) {
         match b {
             ScannedBlock::Text { loc, scanned } => {
-                if scanned.byte_len == 0 || (skip_blank_text && !scanned.non_blank) {
-                    continue;
+                if scanned.byte_len > 0 && (!skip_blank_text || scanned.non_blank) {
+                    push_scanned_text(&mut items, *loc, scanned);
                 }
-                items.push(PendingItem::Text {
-                    loc: *loc,
-                    hash: scanned.hash,
-                    byte_len: scanned.byte_len,
-                    preview: scanned.preview.clone(),
-                });
             }
             ScannedBlock::Thinking {
                 loc,
@@ -2217,26 +2188,15 @@ fn project_turn_units(
             } => {
                 if is_source && prof.native_thinking_as_text && thinking == ThinkingMode::Native {
                     if text.non_blank {
-                        items.push(PendingItem::Text {
-                            loc: *loc,
-                            hash: text.hash,
-                            byte_len: text.byte_len,
-                            preview: text.preview.clone(),
-                        });
+                        push_scanned_text(&mut items, *loc, text);
                     }
                     continue;
                 }
-                let fate = scanned_thinking_fate(target, thinking, b);
-                match fate {
+                match scanned_thinking_fate(target, thinking, b) {
                     ThinkingFate::Drop => {}
                     ThinkingFate::AsText => {
                         if text.byte_len > 0 && (!skip_blank_text || text.non_blank) {
-                            items.push(PendingItem::Text {
-                                loc: *loc,
-                                hash: text.hash,
-                                byte_len: text.byte_len,
-                                preview: text.preview.clone(),
-                            });
+                            push_scanned_text(&mut items, *loc, text);
                         }
                     }
                     ThinkingFate::Placeholder => {
@@ -2245,14 +2205,7 @@ fn project_turn_units(
                             encrypted.as_ref().map(|(_, len)| "x".repeat(*len)).as_deref(),
                             *redacted,
                         );
-                        let mut prev = String::new();
-                        append_preview(&mut prev, &ph);
-                        items.push(PendingItem::Text {
-                            loc: *loc,
-                            hash: hash_bytes(ph.as_bytes()),
-                            byte_len: ph.len() as u64,
-                            preview: prev,
-                        });
+                        push_raw_text(&mut items, *loc, &ph);
                     }
                     ThinkingFate::Keep => {
                         if skip_blank_text && !text.non_blank {
@@ -2274,12 +2227,14 @@ fn project_turn_units(
                             })
                             .flatten();
                         if text_hash.is_some() || sig_hash.is_some() || enc_hash.is_some() {
-                            items.push(PendingItem::Thinking {
+                            items.push(PendingItem {
                                 loc: *loc,
-                                text_hash,
-                                sig_hash,
-                                enc_hash,
-                                preview: eff_text.preview.clone(),
+                                kind: PendingKind::Ready(UnitKind::Thinking {
+                                    text_hash,
+                                    sig_hash,
+                                    enc_hash,
+                                    preview: eff_text.preview.clone(),
+                                }),
                             });
                         }
                     }
@@ -2298,22 +2253,26 @@ fn project_turn_units(
                 }
                 if prof.renders_tools_as_text {
                     if let Some((h, len, prev)) = lmstudio_text {
-                        items.push(PendingItem::Text {
+                        items.push(PendingItem {
                             loc: *loc,
-                            hash: *h,
-                            byte_len: *len,
-                            preview: prev.clone(),
+                            kind: PendingKind::Ready(UnitKind::Text {
+                                hash: *h,
+                                byte_len: *len,
+                                preview: prev.clone(),
+                            }),
                         });
                     }
                     continue;
                 }
                 if target_holds(target, Field::ToolUse) {
-                    items.push(PendingItem::ToolUse {
+                    items.push(PendingItem {
                         loc: *loc,
-                        id: id.clone(),
-                        name: name.clone(),
-                        input_hash: *input_hash,
-                        input_preview: input_preview.clone(),
+                        kind: PendingKind::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input_hash: *input_hash,
+                            input_preview: input_preview.clone(),
+                        },
                     });
                 }
             }
@@ -2321,60 +2280,38 @@ fn project_turn_units(
                 loc,
                 media_type,
                 data_ref,
-            } => match project_image(target, role, is_source, media_type.as_deref(), data_ref.as_deref()) {
-                ImageProjection::Media { hash, preview } => items.push(PendingItem::Image {
-                    loc: *loc,
-                    hash,
-                    preview,
-                }),
-                ImageProjection::DegradedText(text) => {
-                    let mut prev = String::new();
-                    append_preview(&mut prev, &text);
-                    items.push(PendingItem::Text {
-                        loc: *loc,
-                        hash: hash_bytes(text.as_bytes()),
-                        byte_len: text.len() as u64,
-                        preview: prev,
-                    });
-                }
-                ImageProjection::Dropped => {}
-            },
+            } => push_media(
+                &mut items,
+                *loc,
+                project_image(target, role, is_source, media_type.as_deref(), data_ref.as_deref()),
+                false,
+            ),
             ScannedBlock::File {
                 loc,
                 mime,
                 path,
                 source,
-            } => match project_file(
-                target,
-                role,
-                is_source,
-                mime.as_deref(),
-                path.as_deref(),
-                source.as_deref(),
-            ) {
-                FileProjection::Media { hash, preview } => items.push(PendingItem::File {
-                    loc: *loc,
-                    hash,
-                    preview,
-                }),
-                FileProjection::DegradedText(text) => {
-                    let mut prev = String::new();
-                    append_preview(&mut prev, &text);
-                    items.push(PendingItem::Text {
-                        loc: *loc,
-                        hash: hash_bytes(text.as_bytes()),
-                        byte_len: text.len() as u64,
-                        preview: prev,
-                    });
-                }
-                FileProjection::Dropped => {}
-            },
+            } => push_media(
+                &mut items,
+                *loc,
+                project_file(
+                    target,
+                    role,
+                    is_source,
+                    mime.as_deref(),
+                    path.as_deref(),
+                    source.as_deref(),
+                ),
+                true,
+            ),
             ScannedBlock::Opaque { loc, block_type, hash } => {
                 if target_holds(target, Field::Opaque) {
-                    items.push(PendingItem::Opaque {
+                    items.push(PendingItem {
                         loc: *loc,
-                        block_type: block_type.clone(),
-                        hash: *hash,
+                        kind: PendingKind::Ready(UnitKind::Opaque {
+                            block_type: block_type.clone(),
+                            hash: *hash,
+                        }),
                     });
                 }
             }
@@ -2421,80 +2358,11 @@ fn project_turn_units(
             return;
         }
         for item in &items {
-            let (loc, kind) = match item {
-                PendingItem::Text {
-                    loc,
-                    hash,
-                    byte_len,
-                    preview,
-                } => (
-                    *loc,
-                    UnitKind::Text {
-                        hash: *hash,
-                        byte_len: *byte_len,
-                        preview: preview.clone(),
-                    },
-                ),
-                PendingItem::Thinking {
-                    loc,
-                    text_hash,
-                    sig_hash,
-                    enc_hash,
-                    preview,
-                } => (
-                    *loc,
-                    UnitKind::Thinking {
-                        text_hash: *text_hash,
-                        sig_hash: *sig_hash,
-                        enc_hash: *enc_hash,
-                        preview: preview.clone(),
-                    },
-                ),
-                PendingItem::ToolUse {
-                    loc,
-                    id,
-                    name,
-                    input_hash,
-                    input_preview,
-                } => {
-                    let call_rho = rho.intern(id);
-                    (
-                        *loc,
-                        UnitKind::ToolUse {
-                            call_rho,
-                            name: name.clone(),
-                            input_hash: *input_hash,
-                            input_preview: input_preview.clone(),
-                        },
-                    )
-                }
-                PendingItem::Image { loc, hash, preview } => (
-                    *loc,
-                    UnitKind::Image {
-                        hash: *hash,
-                        preview: preview.clone(),
-                    },
-                ),
-                PendingItem::File { loc, hash, preview } => (
-                    *loc,
-                    UnitKind::File {
-                        hash: *hash,
-                        preview: preview.clone(),
-                    },
-                ),
-                PendingItem::Opaque { loc, block_type, hash } => (
-                    *loc,
-                    UnitKind::Opaque {
-                        block_type: block_type.clone(),
-                        hash: *hash,
-                    },
-                ),
-            };
             out.push(Unit {
-                loc,
+                loc: item.loc,
                 kind: UnitKind::Turn { role },
             });
-            out.push(Unit { loc, kind });
+            out.push(item.to_unit(rho));
         }
         return;
     }
@@ -2504,7 +2372,9 @@ fn project_turn_units(
         kind: UnitKind::Turn { role },
     });
 
-    let emit_thinking = |items: &[PendingItem], out: &mut Vec<Unit>| {
+    if separated_assistant || join_texts || prof.files_after_tool_calls {
+        // 1. Thinking units (merged into one unit when `join_thinking` holds).
+        let mut emitted_joined_thinking = false;
         if join_thinking {
             if let Some((th, eh, prev)) = &msg.hermes_verbatim_reasoning {
                 out.push(Unit {
@@ -2516,86 +2386,67 @@ fn project_turn_units(
                         preview: prev.clone(),
                     },
                 });
-                return;
-            }
-            let thoughts: Vec<_> = items
-                .iter()
-                .filter_map(|i| match i {
-                    PendingItem::Thinking {
+                emitted_joined_thinking = true;
+            } else {
+                let thoughts: Vec<_> = items
+                    .iter()
+                    .filter_map(|i| match &i.kind {
+                        PendingKind::Ready(UnitKind::Thinking {
+                            text_hash,
+                            sig_hash,
+                            enc_hash,
+                            preview,
+                        }) => Some((i.loc, *text_hash, *sig_hash, *enc_hash, preview)),
+                        _ => None,
+                    })
+                    .collect();
+                if thoughts.len() == 1 {
+                    let (loc, text_hash, sig_hash, enc_hash, preview) = thoughts[0];
+                    out.push(Unit {
                         loc,
-                        text_hash,
-                        sig_hash,
-                        enc_hash,
-                        preview,
-                    } => Some((*loc, *text_hash, *sig_hash, *enc_hash, preview)),
-                    _ => None,
-                })
-                .collect();
-            if thoughts.len() == 1 {
-                let (loc, text_hash, sig_hash, enc_hash, preview) = thoughts[0];
-                out.push(Unit {
-                    loc,
-                    kind: UnitKind::Thinking {
-                        text_hash,
-                        sig_hash,
-                        enc_hash,
-                        preview: preview.clone(),
-                    },
-                });
-                return;
-            }
-            if thoughts.len() > 1 {
-                let first_enc = thoughts.iter().find_map(|(_, _, _, e, _)| *e);
-                let first_sig = thoughts.iter().find_map(|(_, _, s, _, _)| *s);
-                let loc = thoughts[0].0;
-                let (text_hash, preview) = match &msg.joined_thinking {
-                    Some((th, prev)) if holds(target, thinking, Field::ThinkingText) => (Some(*th), prev.clone()),
-                    _ => (thoughts[0].1, thoughts[0].4.clone()),
-                };
-                out.push(Unit {
-                    loc,
-                    kind: UnitKind::Thinking {
-                        text_hash,
-                        sig_hash: first_sig,
-                        enc_hash: first_enc,
-                        preview,
-                    },
-                });
-                return;
+                        kind: UnitKind::Thinking {
+                            text_hash,
+                            sig_hash,
+                            enc_hash,
+                            preview: preview.clone(),
+                        },
+                    });
+                    emitted_joined_thinking = true;
+                } else if thoughts.len() > 1 {
+                    let first_enc = thoughts.iter().find_map(|(_, _, _, e, _)| *e);
+                    let first_sig = thoughts.iter().find_map(|(_, _, s, _, _)| *s);
+                    let (text_hash, preview) = match &msg.joined_thinking {
+                        Some((th, prev)) if holds(target, thinking, Field::ThinkingText) => (Some(*th), prev.clone()),
+                        _ => (thoughts[0].1, thoughts[0].4.clone()),
+                    };
+                    out.push(Unit {
+                        loc: thoughts[0].0,
+                        kind: UnitKind::Thinking {
+                            text_hash,
+                            sig_hash: first_sig,
+                            enc_hash: first_enc,
+                            preview,
+                        },
+                    });
+                    emitted_joined_thinking = true;
+                }
             }
         }
-        for item in items {
-            if let PendingItem::Thinking {
-                loc,
-                text_hash,
-                sig_hash,
-                enc_hash,
-                preview,
-            } = item
-            {
-                out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::Thinking {
-                        text_hash: *text_hash,
-                        sig_hash: *sig_hash,
-                        enc_hash: *enc_hash,
-                        preview: preview.clone(),
-                    },
-                });
+        if !emitted_joined_thinking {
+            for item in &items {
+                if matches!(item.kind, PendingKind::Ready(UnitKind::Thinking { .. })) {
+                    out.push(item.to_unit(rho));
+                }
             }
         }
-    };
 
-    let emit_content_and_media = |items: &[PendingItem], out: &mut Vec<Unit>| {
+        // 2. Content & media units (joined text first when `join_texts` holds; Continue defers `File`s).
         if join_texts {
             if let Some((hash, byte_len, non_blank, preview)) = &msg.joined_text {
                 if *byte_len > 0 && (!skip_blank_text || *non_blank) {
                     let loc = items
                         .iter()
-                        .find_map(|i| match i {
-                            PendingItem::Text { loc, .. } => Some(*loc),
-                            _ => None,
-                        })
+                        .find_map(|i| matches!(i.kind, PendingKind::Ready(UnitKind::Text { .. })).then_some(i.loc))
                         .unwrap_or(turn_loc);
                     out.push(Unit {
                         loc,
@@ -2607,192 +2458,35 @@ fn project_turn_units(
                     });
                 }
             }
-            for item in items {
-                match item {
-                    PendingItem::Image { loc, hash, preview } => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::Image {
-                            hash: *hash,
-                            preview: preview.clone(),
-                        },
-                    }),
-                    // Continue writes `contextItems` (`File`) after `toolCalls`; handled below.
-                    PendingItem::File { loc, hash, preview } if !prof.files_after_tool_calls => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::File {
-                            hash: *hash,
-                            preview: preview.clone(),
-                        },
-                    }),
-                    PendingItem::Opaque { loc, block_type, hash } => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::Opaque {
-                            block_type: block_type.clone(),
-                            hash: *hash,
-                        },
-                    }),
-                    _ => {}
-                }
-            }
-        } else {
-            for item in items {
-                match item {
-                    PendingItem::Text {
-                        loc,
-                        hash,
-                        byte_len,
-                        preview,
-                    } => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::Text {
-                            hash: *hash,
-                            byte_len: *byte_len,
-                            preview: preview.clone(),
-                        },
-                    }),
-                    PendingItem::Image { loc, hash, preview } => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::Image {
-                            hash: *hash,
-                            preview: preview.clone(),
-                        },
-                    }),
-                    PendingItem::File { loc, hash, preview } if !prof.files_after_tool_calls => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::File {
-                            hash: *hash,
-                            preview: preview.clone(),
-                        },
-                    }),
-                    PendingItem::Opaque { loc, block_type, hash } => out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::Opaque {
-                            block_type: block_type.clone(),
-                            hash: *hash,
-                        },
-                    }),
-                    _ => {}
-                }
+        }
+        for item in &items {
+            let keep = match &item.kind {
+                PendingKind::Ready(UnitKind::Text { .. }) => !join_texts,
+                PendingKind::Ready(UnitKind::Image { .. } | UnitKind::Opaque { .. }) => true,
+                PendingKind::Ready(UnitKind::File { .. }) => !prof.files_after_tool_calls,
+                _ => false,
+            };
+            if keep {
+                out.push(item.to_unit(rho));
             }
         }
-    };
 
-    let emit_tool_uses = |items: &[PendingItem], rho: &mut RhoMap, out: &mut Vec<Unit>| {
-        for item in items {
-            if let PendingItem::ToolUse {
-                loc,
-                id,
-                name,
-                input_hash,
-                input_preview,
-            } = item
-            {
-                let call_rho = rho.intern(id);
-                out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::ToolUse {
-                        call_rho,
-                        name: name.clone(),
-                        input_hash: *input_hash,
-                        input_preview: input_preview.clone(),
-                    },
-                });
+        // 3. Tool calls, followed by Continue `contextItems` (`File`) when applicable.
+        for item in &items {
+            if matches!(item.kind, PendingKind::ToolUse { .. }) {
+                out.push(item.to_unit(rho));
             }
         }
-    };
-
-    let emit_continue_files = |items: &[PendingItem], out: &mut Vec<Unit>| {
         if prof.files_after_tool_calls {
-            for item in items {
-                if let PendingItem::File { loc, hash, preview } = item {
-                    out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::File {
-                            hash: *hash,
-                            preview: preview.clone(),
-                        },
-                    });
+            for item in &items {
+                if matches!(item.kind, PendingKind::Ready(UnitKind::File { .. })) {
+                    out.push(item.to_unit(rho));
                 }
             }
         }
-    };
-
-    if separated_assistant || join_texts || prof.files_after_tool_calls {
-        emit_thinking(&items, out);
-        emit_content_and_media(&items, out);
-        emit_tool_uses(&items, rho, out);
-        emit_continue_files(&items, out);
     } else {
         for item in &items {
-            match item {
-                PendingItem::Text {
-                    loc,
-                    hash,
-                    byte_len,
-                    preview,
-                } => out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::Text {
-                        hash: *hash,
-                        byte_len: *byte_len,
-                        preview: preview.clone(),
-                    },
-                }),
-                PendingItem::Thinking {
-                    loc,
-                    text_hash,
-                    sig_hash,
-                    enc_hash,
-                    preview,
-                } => out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::Thinking {
-                        text_hash: *text_hash,
-                        sig_hash: *sig_hash,
-                        enc_hash: *enc_hash,
-                        preview: preview.clone(),
-                    },
-                }),
-                PendingItem::ToolUse {
-                    loc,
-                    id,
-                    name,
-                    input_hash,
-                    input_preview,
-                } => {
-                    let call_rho = rho.intern(id);
-                    out.push(Unit {
-                        loc: *loc,
-                        kind: UnitKind::ToolUse {
-                            call_rho,
-                            name: name.clone(),
-                            input_hash: *input_hash,
-                            input_preview: input_preview.clone(),
-                        },
-                    });
-                }
-                PendingItem::Image { loc, hash, preview } => out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::Image {
-                        hash: *hash,
-                        preview: preview.clone(),
-                    },
-                }),
-                PendingItem::File { loc, hash, preview } => out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::File {
-                        hash: *hash,
-                        preview: preview.clone(),
-                    },
-                }),
-                PendingItem::Opaque { loc, block_type, hash } => out.push(Unit {
-                    loc: *loc,
-                    kind: UnitKind::Opaque {
-                        block_type: block_type.clone(),
-                        hash: *hash,
-                    },
-                }),
-            }
+            out.push(item.to_unit(rho));
         }
     }
 }
