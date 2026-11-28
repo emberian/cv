@@ -25,10 +25,9 @@
 use anyhow::{bail, Result};
 use chrono::Utc;
 use cv_core::api::Query;
+use cv_core::task::ops::{self as task_ops, EventFilter, Since};
 use cv_core::task::{self, TaskEventKind, TaskStore};
 use serde_json::{json, Value};
-
-use super::task_ops::{self, EventFilter, Since};
 
 /// The inbox page: one inline HTML file, no external JS/CSS, no build step.
 pub(crate) const PAGE: &str = include_str!("serve_tasks_page.html");
@@ -173,11 +172,12 @@ fn api_events(q: &Query) -> Result<String> {
     };
     let f = EventFilter {
         scope: q.get("scope").map(Into::into),
-        since: Since::parse(q.get("since").as_deref(), now)?,
+        since: Since::parse(q.get("since").as_deref(), now).map_err(anyhow::Error::msg)?,
         kinds: q
             .get("kind")
             .map(|k| task_ops::kind_tags(&k))
-            .transpose()?
+            .transpose()
+            .map_err(anyhow::Error::msg)?
             .unwrap_or_default(),
         by: q.get("by"),
         not_by: q.get("not_by"),

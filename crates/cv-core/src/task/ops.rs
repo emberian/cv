@@ -1,23 +1,32 @@
-//! The composite task operations and read views the CLI verbs and `cv serve`'s inbox share, so the
-//! page and the shell are one store: posing a decision (`opened` + `posed`, one unit), resolving
-//! one, the event feed (`cv task events` ≡ `GET /api/events`), and the inbox page
-//! (`cv task inbox` ≡ `GET /api/inbox`).
+//! Composite task operations and shared read views across CLI (`cv task`), HTTP (`cv serve`),
+//! MCP, and library consumers: posing a decision (`opened` + `posed`, one unit), resolving one,
+//! building structured note claims, querying the event feed (`cv task events` ≡ `GET /api/events`),
+//! and rendering the inbox (`cv task inbox` ≡ `GET /api/inbox`).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
-use cv_core::ir::truncate;
-use cv_core::sanitize::sanitize_line;
-use cv_core::task::{self, InboxReason, ReplayOutcome, TaskEvent, TaskEventKind, TaskReadModel, TaskStore};
+use chrono::{DateTime, Local, Utc};
 
-use crate::util::fmt_local;
+use crate::ir::truncate;
+use crate::sanitize::sanitize_line;
+
+use super::{
+    append, append_events, claims, effective_display, new_event, parse_since, same_actor, uuid_v7_timestamp,
+    AppendOutcome, Claim, InboxItem, InboxPage, InboxReason, ReplayOutcome, TaskEvent, TaskEventKind, TaskReadModel,
+    TaskStore, LIVE_TAGS, RETIRED_TAGS,
+};
+
+fn fmt_local(d: DateTime<Utc>, fmt: &str) -> String {
+    d.with_timezone(&Local).format(fmt).to_string()
+}
 
 // ───────────────────────────── pose / resolve ─────────────────────────────
 
 /// Everything a decision is opened with.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DecisionSpec {
+pub struct DecisionSpec {
     pub title: String,
     pub body: String,
     pub for_who: String,
@@ -40,7 +49,7 @@ pub(crate) struct DecisionSpec {
 }
 
 /// The option list a spec poses: the default first, then the alternatives, deduplicated.
-pub(crate) fn option_list(default_choice: &str, options: &[String]) -> Vec<String> {
+pub fn option_list(default_choice: &str, options: &[String]) -> Vec<String> {
     let mut out = vec![default_choice.trim().to_string()];
     for o in options {
         let o = o.trim();
@@ -56,7 +65,7 @@ pub(crate) fn option_list(default_choice: &str, options: &[String]) -> Vec<Strin
 /// `tagged` only for the caller's own tags, one `blocked_by` per task it blocks, and the
 /// provisional `resolved` when `spec.provisional`. Built, not written: [`pose`] appends them as
 /// ONE unit.
-pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEvent>> {
+pub fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEvent>> {
     if spec.default_choice.trim().is_empty() {
         bail!("a decision needs a --default (the option that stands if nobody speaks)");
     }
@@ -65,7 +74,7 @@ pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEven
     }
     let options = option_list(&spec.default_choice, &spec.options);
     let default_choice = spec.default_choice.trim().to_string();
-    let opened = task::new_event(
+    let opened = new_event(
         None,
         from,
         TaskEventKind::Opened {
@@ -80,7 +89,7 @@ pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEven
     let id = opened.task_id.clone();
     let mut candidates = vec![
         opened,
-        task::new_event(
+        new_event(
             Some(&id),
             from,
             TaskEventKind::Posed {
@@ -98,10 +107,10 @@ pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEven
         }
     }
     if !tags.is_empty() {
-        candidates.push(task::new_event(Some(&id), from, TaskEventKind::Tagged { tags }));
+        candidates.push(new_event(Some(&id), from, TaskEventKind::Tagged { tags }));
     }
     for other in &spec.blocks {
-        candidates.push(task::new_event(
+        candidates.push(new_event(
             Some(other),
             from,
             TaskEventKind::BlockedBy {
@@ -112,7 +121,7 @@ pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEven
         ));
     }
     if spec.provisional {
-        candidates.push(task::new_event(
+        candidates.push(new_event(
             Some(&id),
             from,
             TaskEventKind::Resolved {
@@ -128,8 +137,8 @@ pub(crate) fn pose_events(from: &str, spec: DecisionSpec) -> Result<Vec<TaskEven
 /// Pose a decision with the whole candidate batch validated before writing; a rejected event
 /// leaves no half-posed decision. I/O failure may leave a completed prefix. Returns append-order
 /// events and advisory warnings.
-pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<(Vec<TaskEvent>, Vec<String>)> {
-    let out = task::append_events(store, pose_events(from, spec)?, Vec::new())?;
+pub fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<(Vec<TaskEvent>, Vec<String>)> {
+    let out = append_events(store, pose_events(from, spec)?, Vec::new())?;
     let mut warnings = out.replay_warnings;
     warnings.extend(out.warnings);
     Ok((out.events, warnings))
@@ -137,7 +146,7 @@ pub(crate) fn pose(store: &TaskStore, from: &str, spec: DecisionSpec) -> Result<
 
 /// What a resolution says: the literal choice, or the posed default.
 #[derive(Clone, Debug)]
-pub(crate) enum Answer {
+pub enum Answer {
     Choice(String),
     AcceptDefault,
     /// Confirm a provisional resolution: the decider answers with the choice made for them.
@@ -162,7 +171,7 @@ impl Answer {
 /// `provisional`: resolve it on its default on the decider's behalf, with a veto window. The
 /// rules — a posed decision, a known option, provisional only on the default — are the reducer's;
 /// this only turns `--accept-default` / `--confirm` into the literal choice they stand for.
-pub(crate) fn resolve(
+pub fn resolve(
     store: &TaskStore,
     model: &TaskReadModel,
     from: &str,
@@ -170,9 +179,9 @@ pub(crate) fn resolve(
     answer: Answer,
     note: Option<String>,
     provisional: bool,
-) -> Result<task::AppendOutcome> {
+) -> Result<AppendOutcome> {
     let t = model.tasks.get(id).with_context(|| format!("no task {id}"))?;
-    let short = super::task::prefix(id, 13);
+    let short = id.get(..13).unwrap_or(id);
     let decision = || {
         t.decision.as_ref().with_context(|| {
             format!("task {short} is not a decision (nothing was posed) — finish it with `cv task done`")
@@ -189,7 +198,7 @@ pub(crate) fn resolve(
         },
     };
     let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-    task::append(
+    append(
         store,
         Some(id),
         from,
@@ -202,10 +211,10 @@ pub(crate) fn resolve(
     )
 }
 
-/// Build a structured [`task::Claim`] from ergonomic CLI/HTTP inputs (`"fact"` / `"fail"` or JSON,
+/// Build a structured [`Claim`] from ergonomic CLI/HTTP inputs (`"fact"` / `"fail"` or JSON,
 /// optional `--scope` / `--resolves`) and automatically populate `FileAt` + provisional decision
 /// conditions when `any_of` was not manually provided.
-pub(crate) fn build_note_claim(
+pub fn build_note_claim(
     model: &TaskReadModel,
     task_id: &str,
     raw_claim: Option<&str>,
@@ -213,11 +222,11 @@ pub(crate) fn build_note_claim(
     resolves: &[String],
     session_ref: Option<&str>,
     from: &str,
-) -> Result<Option<task::Claim>> {
-    let Some((mut claim, explicit_any_of)) = task::Claim::parse_spec(raw_claim, scopes, resolves)? else {
+) -> Result<Option<Claim>> {
+    let Some((mut claim, explicit_any_of)) = Claim::parse_spec(raw_claim, scopes, resolves)? else {
         return Ok(None);
     };
-    task::claims::populate_auto_conditions(&mut claim, explicit_any_of, model, task_id, session_ref, Some(from))?;
+    claims::populate_auto_conditions(&mut claim, explicit_any_of, model, task_id, session_ref, Some(from))?;
     Ok(Some(claim))
 }
 
@@ -225,13 +234,13 @@ pub(crate) fn build_note_claim(
 
 /// A `--since` argument, resolved: an instant, or an event id (exclusive cursor).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Since {
+pub struct Since {
     pub ts: Option<DateTime<Utc>>,
     pub id: Option<String>,
 }
 
 impl Since {
-    pub fn parse(s: Option<&str>, now: DateTime<Utc>) -> Result<Since> {
+    pub fn parse(s: Option<&str>, now: DateTime<Utc>) -> std::result::Result<Since, String> {
         let Some(s) = s else {
             return Ok(Since::default());
         };
@@ -239,13 +248,13 @@ impl Since {
         // An event/task id (or a ≥13-hex prefix of one) is a cursor: everything after it.
         let hex_only: String = s.chars().filter(|c| *c != '-').collect();
         let looks_like_id = hex_only.len() >= 13 && hex_only.chars().all(|c| c.is_ascii_hexdigit());
-        if looks_like_id && task::uuid_v7_timestamp(s).is_some() {
+        if looks_like_id && uuid_v7_timestamp(s).is_some() {
             return Ok(Since {
                 ts: None,
                 id: Some(s.to_string()),
             });
         }
-        let ts = task::parse_since(s, now).map_err(crate::util::UsageError)?;
+        let ts = parse_since(s, now)?;
         Ok(Since { ts: Some(ts), id: None })
     }
 
@@ -287,10 +296,10 @@ impl Since {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct EventFilter {
-    pub scope: Option<std::path::PathBuf>,
+pub struct EventFilter {
+    pub scope: Option<PathBuf>,
     pub since: Since,
-    /// Wire tags (already canonicalized by [`kind_tag`]).
+    /// Wire tags (already canonicalized by [`kind_tags`]).
     pub kinds: Vec<String>,
     pub by: Option<String>,
     pub not_by: Option<String>,
@@ -299,34 +308,18 @@ pub(crate) struct EventFilter {
     pub task: Option<String>,
 }
 
-/// Every wire tag an event can carry: the kinds cv writes, then the retired ones a log may hold.
-const LIVE_KIND_TAGS: [&str; 12] = [
-    "opened",
-    "claimed",
-    "released",
-    "noted",
-    "done",
-    "abandoned",
-    "superseded",
-    "tagged",
-    "blocked_by",
-    "posed",
-    "resolved",
-    "status_set",
-];
-
-/// The wire tags of a comma-separated `--kind` list (`kind_tag` on each). An unknown spelling is a
-/// usage error naming the known tags, never an empty result.
-pub(crate) fn kind_tags(list: &str) -> Result<Vec<String>> {
+/// The wire tags of a comma-separated `--kind` list (`kind_tag` on each). An unknown spelling is
+/// an error naming the known tags, never an empty result.
+pub fn kind_tags(list: &str) -> std::result::Result<Vec<String>, String> {
     list.split(',')
         .map(|spelling| {
             let tag = kind_tag(spelling);
-            if LIVE_KIND_TAGS.contains(&tag.as_str()) || cv_core::task::RETIRED_TAGS.contains(&tag.as_str()) {
+            if LIVE_TAGS.contains(&tag.as_str()) || RETIRED_TAGS.contains(&tag.as_str()) {
                 Ok(tag)
             } else {
-                crate::util::usage(format!(
+                Err(format!(
                     "unknown event kind {spelling:?} (known: {}; `note`, `resolve`, `open`, `claim`, … also spell)",
-                    LIVE_KIND_TAGS.join(", ")
+                    LIVE_TAGS.join(", ")
                 ))
             }
         })
@@ -355,17 +348,28 @@ fn kind_tag(s: &str) -> String {
 }
 
 /// The events matching `f`, log order.
-pub(crate) fn select_events<'a>(outcome: &'a ReplayOutcome, f: &EventFilter) -> Result<Vec<&'a TaskEvent>> {
+pub fn select_events<'a>(outcome: &'a ReplayOutcome, f: &EventFilter) -> Result<Vec<&'a TaskEvent>> {
     let start = f.since.start(&outcome.events)?;
     Ok(outcome
         .events
         .iter()
         .skip(start)
         .filter(|ev| f.since.admits_time(ev))
-        .filter(|ev| f.scope.as_deref().is_none_or(|path|matches!(&ev.kind,TaskEventKind::Noted{claim:Some(c),..} if c.covers(path,outcome.model.tasks.get(&ev.task_id).and_then(|t|t.repo.as_deref())))))
+        .filter(|ev| {
+            f.scope.as_deref().is_none_or(|path| {
+                matches!(
+                    &ev.kind,
+                    TaskEventKind::Noted { claim: Some(c), .. }
+                        if c.covers(
+                            path,
+                            outcome.model.tasks.get(&ev.task_id).and_then(|t| t.repo.as_deref()),
+                        )
+                )
+            })
+        })
         .filter(|ev| f.kinds.is_empty() || f.kinds.iter().any(|k| k == ev.kind.tag()))
-        .filter(|ev| f.by.as_deref().is_none_or(|b| task::same_actor(&ev.by, b)))
-        .filter(|ev| !f.not_by.as_deref().is_some_and(|b| task::same_actor(&ev.by, b)))
+        .filter(|ev| f.by.as_deref().is_none_or(|b| same_actor(&ev.by, b)))
+        .filter(|ev| !f.not_by.as_deref().is_some_and(|b| same_actor(&ev.by, b)))
         .filter(|ev| f.task.as_deref().is_none_or(|t| ev.task_id == t))
         .filter(|ev| {
             f.assignee.as_deref().is_none_or(|a| {
@@ -373,7 +377,7 @@ pub(crate) fn select_events<'a>(outcome: &'a ReplayOutcome, f: &EventFilter) -> 
                     .model
                     .tasks
                     .get(&ev.task_id)
-                    .is_some_and(|t| t.assignee.as_deref().is_some_and(|have| task::same_actor(have, a)))
+                    .is_some_and(|t| t.assignee.as_deref().is_some_and(|have| same_actor(have, a)))
             })
         })
         .collect())
@@ -381,15 +385,12 @@ pub(crate) fn select_events<'a>(outcome: &'a ReplayOutcome, f: &EventFilter) -> 
 
 /// One event as a JSON line: the event's own wire fields, plus the task's `title` and current
 /// effective `task_state` so a poller can act without a second lookup.
-pub(crate) fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::Value {
+pub fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::Value {
     let mut v = serde_json::to_value(ev).expect("TaskEvent serializes");
     if let Some(obj) = v.as_object_mut() {
         if let Some(t) = model.tasks.get(&ev.task_id) {
             obj.insert("title".into(), serde_json::Value::String(t.title.clone()));
-            obj.insert(
-                "task_state".into(),
-                serde_json::Value::String(task::effective_display(t)),
-            );
+            obj.insert("task_state".into(), serde_json::Value::String(effective_display(t)));
             if let Some(a) = &t.assignee {
                 obj.insert("assignee".into(), serde_json::Value::String(a.clone()));
             }
@@ -403,7 +404,7 @@ pub(crate) fn event_json(ev: &TaskEvent, model: &TaskReadModel) -> serde_json::V
 
 /// The telling detail of one event, shaped like the one `event_text` prints after the kind but
 /// at this feed's own widths, sanitized.
-pub(crate) fn event_detail(ev: &TaskEvent) -> String {
+pub fn event_detail(ev: &TaskEvent) -> String {
     match &ev.kind {
         TaskEventKind::Noted { text, .. } => truncate(&sanitize_line(text), 160),
         TaskEventKind::Resolved {
@@ -435,7 +436,7 @@ pub(crate) fn event_detail(ev: &TaskEvent) -> String {
 }
 
 /// One event as a human line: time, kind, task, actor, and the telling detail.
-pub(crate) fn event_text(ev: &TaskEvent, model: &TaskReadModel, plen: usize) -> String {
+pub fn event_text(ev: &TaskEvent, model: &TaskReadModel, plen: usize) -> String {
     let title = model
         .tasks
         .get(&ev.task_id)
@@ -484,7 +485,7 @@ pub(crate) fn event_text(ev: &TaskEvent, model: &TaskReadModel, plen: usize) -> 
 
 /// The inbox's groups, in the order they are printed: a decision owed is the slowest blocker a
 /// fleet has, so it comes first; then the actions handed to you; then the work you hold.
-pub(crate) const INBOX_GROUPS: &[(InboxReason, &str)] = &[
+pub const INBOX_GROUPS: &[(InboxReason, &str)] = &[
     (InboxReason::DecisionOwed, "decisions owed"),
     (
         InboxReason::Discussing,
@@ -495,7 +496,6 @@ pub(crate) const INBOX_GROUPS: &[(InboxReason, &str)] = &[
     (InboxReason::ClaimedByYou, "claimed work"),
 ];
 
-/// The first non-empty line of a text, trimmed and capped.
 /// A title's words for comparison: lowercase alphanumeric runs, without a leading `TAG:`.
 fn title_words(title: &str) -> Vec<String> {
     let title = match title.split_once(':') {
@@ -512,7 +512,7 @@ fn title_words(title: &str) -> Vec<String> {
 /// Whether two task titles likely name the same work: the same words, one a word-prefix of the
 /// other, or at least three shared words making up 60% of all their distinct words. It only
 /// decides a warning at `cv task open`; nothing is refused on it.
-pub(crate) fn similar_titles(a: &str, b: &str) -> bool {
+pub fn similar_titles(a: &str, b: &str) -> bool {
     let (a, b) = (title_words(a), title_words(b));
     let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
     if short.is_empty() {
@@ -521,25 +521,25 @@ pub(crate) fn similar_titles(a: &str, b: &str) -> bool {
     if long.starts_with(short) && (short.len() >= 3 || short.len() == long.len()) {
         return true;
     }
-    let (a, b): (std::collections::BTreeSet<_>, std::collections::BTreeSet<_>) =
-        (a.iter().collect(), b.iter().collect());
+    let (a, b): (BTreeSet<_>, BTreeSet<_>) = (a.iter().collect(), b.iter().collect());
     let shared = a.intersection(&b).count();
     shared >= 3 && shared * 5 >= a.union(&b).count() * 3
 }
 
-pub(crate) fn first_line(text: &str, max: usize) -> String {
+/// The first non-empty line of a text, trimmed and capped.
+pub fn first_line(text: &str, max: usize) -> String {
     let l = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     truncate(&sanitize_line(l), max)
 }
 
 /// `cv task inbox <who>` as text.
-pub(crate) fn render_inbox_text(page: &task::InboxPage) -> String {
+pub fn render_inbox_text(page: &InboxPage) -> String {
     let mut out = String::new();
     if page.items.is_empty() {
         out.push_str(&format!("(inbox empty for {})\n", sanitize_line(&page.who)));
     }
     for (reason, label) in INBOX_GROUPS {
-        let group: Vec<&task::InboxItem> = page.items.iter().filter(|i| i.reason == Some(*reason)).collect();
+        let group: Vec<&InboxItem> = page.items.iter().filter(|i| i.reason == Some(*reason)).collect();
         if group.is_empty() {
             continue;
         }
@@ -620,7 +620,7 @@ pub(crate) fn render_inbox_text(page: &task::InboxPage) -> String {
 
 /// `cv task inbox <who> --md`: the whole inbox as one Markdown page — every item's body and the
 /// first line of every note, ready to paste anywhere.
-pub(crate) fn render_inbox_md(page: &task::InboxPage) -> String {
+pub fn render_inbox_md(page: &InboxPage) -> String {
     let mut out = String::new();
     let who = sanitize_line(&page.who);
     out.push_str(&format!(
@@ -644,7 +644,7 @@ pub(crate) fn render_inbox_md(page: &task::InboxPage) -> String {
     }
     let mut n = 0;
     for (reason, label) in INBOX_GROUPS {
-        let group: Vec<&task::InboxItem> = page.items.iter().filter(|i| i.reason == Some(*reason)).collect();
+        let group: Vec<&InboxItem> = page.items.iter().filter(|i| i.reason == Some(*reason)).collect();
         if group.is_empty() {
             continue;
         }
@@ -749,6 +749,7 @@ fn md_block(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::{deadline_phrase, inbox_page, inbox_page_brief, TaskReducer};
 
     #[test]
     fn similar_titles_flag_restatements_and_leave_distinct_work_alone() {
@@ -786,7 +787,7 @@ mod tests {
 
     #[test]
     fn event_text_sanitizes_record_identifiers_and_tags_while_json_keeps_wire_values() {
-        let mut event = task::new_event(
+        let mut event = new_event(
             Some("ta\nsk\x1b[31m"),
             "author",
             TaskEventKind::Tagged {
@@ -807,7 +808,7 @@ mod tests {
     fn inbox_brief_projection_preserves_full_text_without_cloning_rich_payloads() {
         let now: DateTime<Utc> = "2026-10-01T12:00:00Z".parse().unwrap();
         let body = "large payload 🌙".repeat(8192);
-        let opened = task::new_event(
+        let opened = new_event(
             None,
             "orchestrator",
             TaskEventKind::Opened {
@@ -820,7 +821,7 @@ mod tests {
             },
         );
         let action_id = opened.task_id.clone();
-        let decision = task::new_event(
+        let decision = new_event(
             None,
             "orchestrator",
             TaskEventKind::Opened {
@@ -835,7 +836,7 @@ mod tests {
         let decision_id = decision.task_id.clone();
         let events = vec![
             opened,
-            task::new_event(
+            new_event(
                 Some(&action_id),
                 "orchestrator",
                 TaskEventKind::Noted {
@@ -844,13 +845,13 @@ mod tests {
                     session_ref: None,
                 },
             ),
-            task::new_event(
+            new_event(
                 Some(&action_id),
                 "orchestrator",
                 TaskEventKind::StatusSet { text: body.clone() },
             ),
             decision,
-            task::new_event(
+            new_event(
                 Some(&decision_id),
                 "orchestrator",
                 TaskEventKind::Posed {
@@ -860,7 +861,7 @@ mod tests {
                     source: None,
                 },
             ),
-            task::new_event(
+            new_event(
                 Some(&decision_id),
                 "orchestrator",
                 TaskEventKind::Resolved {
@@ -871,14 +872,14 @@ mod tests {
             ),
         ];
         let outcome = ReplayOutcome {
-            model: task::TaskReducer::reduce(&events).unwrap(),
+            model: TaskReducer::reduce(&events).unwrap(),
             events,
             warnings: Vec::new(),
             quarantined: 0,
         };
         for unread in [false, true] {
-            let full = task::inbox_page(&outcome, "ember", None, None, unread, now);
-            let brief = task::inbox_page_brief(&outcome, "ember", None, None, unread, now);
+            let full = inbox_page(&outcome, "ember", None, None, unread, now);
+            let brief = inbox_page_brief(&outcome, "ember", None, None, unread, now);
             assert_eq!(render_inbox_text(&brief), render_inbox_text(&full));
             assert_eq!(
                 serde_json::to_value(&brief.counts).unwrap(),
@@ -904,7 +905,7 @@ mod tests {
 
     #[test]
     fn event_assignee_filters_share_web_actor_aliases() {
-        let opened = task::new_event(
+        let opened = new_event(
             None,
             "orchestrator",
             TaskEventKind::Opened {
@@ -917,7 +918,7 @@ mod tests {
             },
         );
         let outcome = ReplayOutcome {
-            model: task::TaskReducer::reduce(std::slice::from_ref(&opened)).unwrap(),
+            model: TaskReducer::reduce(std::slice::from_ref(&opened)).unwrap(),
             events: vec![opened],
             warnings: Vec::new(),
             quarantined: 0,
@@ -984,11 +985,7 @@ mod tests {
             ["noted", "resolved", "landed"]
         );
         let err = kind_tags("note,bogus").unwrap_err();
-        assert!(err.downcast_ref::<crate::util::UsageError>().is_some());
-        assert!(
-            err.to_string().contains("\"bogus\"") && err.to_string().contains("status_set"),
-            "{err}"
-        );
+        assert!(err.contains("\"bogus\"") && err.contains("status_set"), "{err}");
     }
 
     #[test]
@@ -1026,7 +1023,7 @@ mod tests {
             });
         }
         let mut outcome = ReplayOutcome {
-            model: task::TaskReducer::reduce(&events).unwrap(),
+            model: TaskReducer::reduce(&events).unwrap(),
             events,
             warnings: Vec::new(),
             quarantined: 0,
@@ -1104,7 +1101,7 @@ mod tests {
     /// then claimed work, then the two copy-paste lines; and the empty inbox names its owner.
     #[test]
     fn inbox_text_groups_decisions_first_and_names_the_resolve_lines() {
-        let ev = |n: u8, task: u8, ts: &str, by: &str, kind: serde_json::Value| -> task::TaskEvent {
+        let ev = |n: u8, task: u8, ts: &str, by: &str, kind: serde_json::Value| -> TaskEvent {
             let mut v = serde_json::json!({
                 "id": format!("01a0f000-0000-7000-8000-0000000000{n:02x}"),
                 "task_id": format!("01a0f000-0000-7000-8000-0000000000{task:02x}"),
@@ -1174,20 +1171,20 @@ mod tests {
                 serde_json::json!({"event": "claimed", "assignee": "ember"}),
             ),
         ];
-        let mut r = cv_core::task::TaskReducer::new();
+        let mut r = TaskReducer::new();
         for e in &events {
             r.apply(e).unwrap();
         }
-        let outcome = cv_core::task::ReplayOutcome {
+        let outcome = ReplayOutcome {
             model: r.model().clone(),
             events,
             warnings: Vec::new(),
             quarantined: 0,
         };
         let now: DateTime<Utc> = "2026-10-01T12:00:00Z".parse().unwrap();
-        let page = task::inbox_page(&outcome, "ember", None, None, false, now);
+        let page = inbox_page(&outcome, "ember", None, None, false, now);
         // The deadline renders in local time; the phrase's own unit test pins its shape.
-        let by = task::deadline_phrase("2026-10-04T12:00:00Z".parse().unwrap(), now);
+        let by = deadline_phrase("2026-10-04T12:00:00Z".parse().unwrap(), now);
         let pad = " ".repeat(39);
         let want = format!(
             "decisions owed (1):\n\
@@ -1205,7 +1202,7 @@ mod tests {
         );
         assert_eq!(render_inbox_text(&page), want);
 
-        let empty = task::inbox_page(&outcome, "nobody", None, None, false, now);
+        let empty = inbox_page(&outcome, "nobody", None, None, false, now);
         assert_eq!(render_inbox_text(&empty), "(inbox empty for nobody)\n");
     }
 

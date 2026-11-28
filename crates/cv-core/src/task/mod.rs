@@ -25,6 +25,7 @@ pub mod claims;
 pub use claims::{AllOf, Applicability, Claim, ClaimKind, Condition, EvidenceRef, FileDigests};
 pub mod inbox;
 pub mod model;
+pub mod ops;
 pub mod project;
 pub mod reduce;
 pub mod stall;
@@ -37,6 +38,7 @@ pub use inbox::{
     InboxPage, NoteView, ResolutionView,
 };
 pub use model::{RetiredEvent, TaskEvent, TaskEventKind, TaskState, LIVE_TAGS, RETIRED_TAGS};
+pub use ops::{Answer, DecisionSpec, EventFilter, Since};
 pub use project::{
     age_short, blocks, effective_display, in_scope, inbox, involves, is_blocked, list, parse_deadline, parse_duration,
     parse_since, resolve_id, same_actor, unique_prefix_len, uuid_v7_timestamp, InboxEntry, InboxReason, TaskFilter,

@@ -28,7 +28,6 @@ pub(crate) mod session_json;
 pub(crate) mod session_reports;
 pub(crate) mod share;
 pub(crate) mod task;
-pub(crate) mod task_ops;
 pub(crate) mod tools;
 pub(crate) mod view;
 pub(crate) mod workflow;

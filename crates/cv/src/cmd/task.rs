@@ -11,9 +11,9 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use cv_core::ir::truncate;
 use cv_core::sanitize::sanitize_line;
+use cv_core::task::ops::{self as task_ops, DecisionSpec, EventFilter, Since};
 use cv_core::task::{self, TaskEvent, TaskEventKind, TaskReadModel, TaskRow, TaskStore};
 
-use super::task_ops::{self, DecisionSpec, EventFilter, Since};
 use crate::util::fmt_local;
 
 /// A text argument that may come from a file: `--body-file`/`--file` (`-` reads stdin). Bodies
@@ -1317,11 +1317,12 @@ pub(crate) fn cmd_task(action: TaskCmd) -> Result<()> {
                 None => None,
             };
             let f = EventFilter {
-                since: Since::parse(since.as_deref(), now)?,
+                since: Since::parse(since.as_deref(), now).map_err(crate::util::UsageError)?,
                 kinds: kind
                     .as_deref()
                     .map(task_ops::kind_tags)
-                    .transpose()?
+                    .transpose()
+                    .map_err(crate::util::UsageError)?
                     .unwrap_or_default(),
                 by,
                 not_by,
@@ -1885,6 +1886,21 @@ mod tests {
         assert_eq!(from_or_cv(Some("agent:me".into())), "agent:me");
         // The unset-env cases are exercised end-to-end in tests/cli.rs (spawned process with a
         // controlled environment — no process-global set_var races here).
+    }
+
+    #[test]
+    fn bad_event_kind_and_since_flags_map_to_usage_error() {
+        let now: DateTime<Utc> = "2026-10-01T12:00:00Z".parse().unwrap();
+        let kind_err: anyhow::Error = task_ops::kind_tags("note,bogus")
+            .map_err(crate::util::UsageError)
+            .unwrap_err()
+            .into();
+        assert!(kind_err.downcast_ref::<crate::util::UsageError>().is_some());
+        let since_err: anyhow::Error = Since::parse(Some("yesterday-ish"), now)
+            .map_err(crate::util::UsageError)
+            .unwrap_err()
+            .into();
+        assert!(since_err.downcast_ref::<crate::util::UsageError>().is_some());
     }
 }
 
