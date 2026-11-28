@@ -350,13 +350,14 @@ fn visit_tool_ops_internal<'a>(
             first_string_prefix(
                 input,
                 &[
-                    "description",
                     "task_name",
+                    "description",
                     "Role",
                     "subagent_type",
                     "TypeName",
                     "agent_name",
                     "name",
+                    "agent_type",
                 ],
                 120,
             )?
@@ -423,6 +424,7 @@ fn visit_tool_ops_internal<'a>(
                     "TaskId",
                     "job_id",
                     "id",
+                    "target",
                 ],
                 80,
             )?
@@ -491,13 +493,15 @@ fn visit_tool_ops_internal<'a>(
             | "list_dir"
             | "search_web"
             | "web_search"
+            | "web__run"
+            | "web.run"
             | "read_url_content"
     ) {
         let path = file_key(input, SEARCH_PATH_KEYS)?.map(|p| Cow::Owned(resolve_workdir(&p, workdir.as_deref())));
         let query = if opts.summaries {
             first_string_prefix(
                 input,
-                &["pattern", "query", "Query", "Pattern", "url", "Url", "domain"],
+                &["pattern", "query", "q", "Query", "Pattern", "url", "Url", "domain"],
                 120,
             )?
             .map(Cow::Owned)
@@ -629,11 +633,36 @@ fn visit_tool_ops_internal<'a>(
         }
         return Ok(());
     }
+    if bare == "exec_command" {
+        let background = bool_flag(input, "run_in_background")?
+            || bool_flag(input, "is_background")?
+            || bool_flag(input, "background")?;
+        emit(
+            ToolSemantic {
+                tool: Cow::Borrowed(name),
+                op: ToolOp::Command {
+                    cmd: None,
+                    workdir: workdir.map(Cow::Owned),
+                    background,
+                },
+            },
+            Vec::new(),
+        );
+        return Ok(());
+    }
 
     // 7. Structured affordance tools when harness is known.
     if let Some(h) = harness {
         if let Some((kind, action)) = crate::affordance::classify_tool_view(h, name, input)? {
-            let summary = if opts.summaries {
+            let summary = if opts.summaries && (kind, action) == (Kind::Goal, "update") {
+                let mut parts = Vec::new();
+                for key in ["objective", "progress_summary", "status"] {
+                    if let Some(val) = first_string_prefix(input, &[key], 120)? {
+                        parts.push(val);
+                    }
+                }
+                truncate(&parts.join(" · "), 120)
+            } else if opts.summaries {
                 match first_string_prefix(
                     input,
                     &[
@@ -793,7 +822,11 @@ fn classify_bg_tool(harness: Option<Harness>, bare: &str, input: JsonView<'_>) -
         | "command_status"
         | "wait_agent"
         | "bg_output" => Some(BgAction::Poll),
-        "write_stdin" => Some(BgAction::Interact),
+        "write_stdin" => Some(if has_nonempty_string(input, &["chars"])? {
+            BgAction::Interact
+        } else {
+            BgAction::Poll
+        }),
         "send_command_input" => Some(if bool_flag(input, "Terminate")? || bool_flag(input, "terminate")? {
             BgAction::Stop
         } else {
@@ -981,11 +1014,15 @@ fn first_question_prefix(view: JsonView<'_>, cap: usize) -> Result<Option<String
 }
 
 fn fallback_summary(view: JsonView<'_>, cap: usize) -> Result<Option<String>> {
+    if view.is_string()? {
+        return Ok(crate::projection::Head::of_string(view, cap)?.filter(|s| !s.is_empty()));
+    }
     for key in [
         "command",
         "cmd",
         "CommandLine",
         "file_path",
+        "uri",
         "path",
         "Path",
         "pattern",
@@ -1935,21 +1972,6 @@ fn command_rows_bounded(
     Ok(Some((command, files)))
 }
 
-fn command_patch_files(cmd: &str, extract_hunks: bool) -> Vec<(String, Vec<u64>)> {
-    let mut trigger = Trigger::default();
-    trigger.push(cmd);
-    if !(trigger.marker || trigger.apply) {
-        return Vec::new();
-    }
-    let mut patch = Patch::new(extract_hunks);
-    patch.push(cmd);
-    patch
-        .finish()
-        .into_iter()
-        .filter(|(path, _)| trigger.apply || std::path::Path::new(path).is_absolute())
-        .collect()
-}
-
 pub(crate) fn patch_rows(view: JsonView<'_>, extract_hunks: bool) -> Result<Vec<(String, Vec<u64>)>> {
     let mut body = view.is_string()?.then_some(view);
     if body.is_none() {
@@ -2063,56 +2085,10 @@ pub(crate) fn file_key(view: JsonView<'_>, keys: &[&str]) -> Result<Option<Strin
 // ── Zero-AST Codex Code Mode (`exec`) JavaScript Scanner ──
 
 #[derive(Debug, Clone)]
-enum JsCall {
-    ExecCommand {
-        cmd: Option<String>,
-        workdir: Option<String>,
-    },
-    ApplyPatch {
-        direct_body: Option<String>,
-        workdir: Option<String>,
-    },
-    WriteStdin {
-        session_id: Option<String>,
-        has_chars: bool,
-    },
-    ViewImage {
-        path: Option<String>,
-        workdir: Option<String>,
-    },
-    UpdatePlan {
-        explanation: Option<String>,
-        items: Vec<Item>,
-    },
-    Goal {
-        tool: &'static str,
-        action: &'static str,
-        summary: String,
-    },
-    SpawnAgent {
-        target_hint: Option<String>,
-        has_prompt: bool,
-    },
-    AgentMessage {
-        tool: &'static str,
-        recipient: Option<String>,
-    },
-    BgControl {
-        tool: &'static str,
-        job_id: Option<String>,
-        action: BgAction,
-    },
-    Question {
-        tool: &'static str,
-        summary: String,
-    },
-    WebRun {
-        query: Option<String>,
-    },
-    Other {
-        tool: String,
-        summary: Option<String>,
-    },
+struct JsToolCall {
+    tool: String,
+    input: serde_json::Value,
+    plan_items: Vec<Item>,
 }
 
 fn scan_codex_exec(
@@ -2140,286 +2116,68 @@ fn scan_codex_exec(
     let mut fallback_patch_edits: Option<Vec<(String, Vec<u64>)>> = None;
 
     for call in scanner.calls {
-        match call {
-            JsCall::ExecCommand { cmd, workdir } => {
-                let patch_files = cmd
-                    .as_deref()
-                    .map(|c| command_patch_files(c, extract_hunks))
-                    .unwrap_or_default();
-                let clean_workdir = workdir.filter(|w| !w.is_empty() && !w.contains("${"));
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed("exec_command"),
-                        op: ToolOp::Command {
-                            cmd: if opts.commands {
-                                cmd.map(|mut cmd| {
-                                    if let Some(limit) = opts.command_limit {
-                                        let mut end = limit.min(cmd.len());
-                                        while !cmd.is_char_boundary(end) {
-                                            end -= 1;
-                                        }
-                                        cmd.truncate(end);
-                                    }
-                                    Cow::Owned(cmd)
-                                })
-                            } else {
-                                None
-                            },
-                            workdir: clean_workdir.clone().map(Cow::Owned),
-                            background: false,
-                        },
-                    },
-                    Vec::new(),
-                );
-                for (file, hunks) in patch_files {
-                    let path = resolve_workdir(&file, clean_workdir.as_deref());
+        let view = JsonView::from(&call.input);
+        if call.tool == "apply_patch" && patch_rows(view, false).unwrap_or_default().is_empty() {
+            let workdir = file_key(view, &["workdir", "cwd"]).ok().flatten();
+            let edits = fallback_patch_edits
+                .get_or_insert_with(|| {
+                    let mut patch = Patch::new(extract_hunks);
+                    for lit in &scanner.literals {
+                        patch.push(lit);
+                        patch.push("\n");
+                    }
+                    patch.finish()
+                })
+                .clone();
+            if !edits.is_empty() {
+                for (file, hunks) in edits {
                     emit(
                         ToolSemantic {
-                            tool: Cow::Borrowed("exec_command"),
+                            tool: Cow::Borrowed("apply_patch"),
                             op: ToolOp::FileEdit {
-                                path: Cow::Owned(path),
+                                path: Cow::Owned(resolve_workdir(&file, workdir.as_deref())),
                                 is_full_write: false,
                             },
                         },
                         hunks,
                     );
                 }
-            }
-            JsCall::ApplyPatch { direct_body, workdir } => {
-                let clean_workdir = workdir.filter(|w| !w.is_empty() && !w.contains("${"));
-                let direct_edits = direct_body
-                    .as_deref()
-                    .map(|body| {
-                        let mut p = Patch::new(extract_hunks);
-                        p.push(body);
-                        p.finish()
-                    })
-                    .unwrap_or_default();
-                let edits = if !direct_edits.is_empty() {
-                    direct_edits
-                } else {
-                    fallback_patch_edits
-                        .get_or_insert_with(|| {
-                            let mut patch = Patch::new(extract_hunks);
-                            for lit in &scanner.literals {
-                                patch.push(lit);
-                                patch.push("\n");
-                            }
-                            patch.finish()
-                        })
-                        .clone()
-                };
-                if edits.is_empty() {
-                    emit(
-                        ToolSemantic {
-                            tool: Cow::Borrowed("apply_patch"),
-                            op: ToolOp::Other {
-                                path: None,
-                                summary: None,
-                            },
-                        },
-                        Vec::new(),
-                    );
-                } else {
-                    for (file, hunks) in edits {
-                        let path = resolve_workdir(&file, clean_workdir.as_deref());
-                        emit(
-                            ToolSemantic {
-                                tool: Cow::Borrowed("apply_patch"),
-                                op: ToolOp::FileEdit {
-                                    path: Cow::Owned(path),
-                                    is_full_write: false,
-                                },
-                            },
-                            hunks,
-                        );
-                    }
-                }
-            }
-            JsCall::WriteStdin { session_id, has_chars } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed("write_stdin"),
-                        op: ToolOp::Background {
-                            job_id: if opts.summaries {
-                                session_id.map(Cow::Owned)
-                            } else {
-                                None
-                            },
-                            action: if has_chars { BgAction::Interact } else { BgAction::Poll },
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::ViewImage { path, workdir } => {
-                let clean_workdir = workdir.filter(|w| !w.is_empty() && !w.contains("${"));
-                if let Some(p) = path.filter(|p| !p.is_empty() && !p.contains("${")) {
-                    let resolved = resolve_workdir(&p, clean_workdir.as_deref());
-                    emit(
-                        ToolSemantic {
-                            tool: Cow::Borrowed("view_image"),
-                            op: ToolOp::FileRead {
-                                path: Cow::Owned(resolved),
-                            },
-                        },
-                        Vec::new(),
-                    );
-                } else {
-                    emit(
-                        ToolSemantic {
-                            tool: Cow::Borrowed("view_image"),
-                            op: ToolOp::Other {
-                                path: None,
-                                summary: None,
-                            },
-                        },
-                        Vec::new(),
-                    );
-                }
-            }
-            JsCall::UpdatePlan { explanation, items } => {
-                let summary = if opts.summaries {
-                    let mut parts = Vec::new();
-                    if let Some(exp) = explanation.filter(|s| !s.is_empty()) {
-                        parts.push(collapse_line(&exp, 120));
-                    }
-                    if !items.is_empty() {
-                        let first = collapse_line(&items[0].content, 80);
-                        if items.len() == 1 {
-                            parts.push(format!("1 item · {first}"));
-                        } else {
-                            parts.push(format!("{} items · {first}", items.len()));
-                        }
-                    }
-                    truncate(&parts.join(" · "), 120)
-                } else {
-                    String::new()
-                };
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed("update_plan"),
-                        op: ToolOp::Affordance {
-                            kind: Kind::Plan,
-                            action: "write",
-                            summary,
-                            items: if opts.summaries { items } else { Vec::new() },
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::Goal { tool, action, summary } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed(tool),
-                        op: ToolOp::Affordance {
-                            kind: Kind::Goal,
-                            action,
-                            summary: if opts.summaries {
-                                truncate(&summary, 120)
-                            } else {
-                                String::new()
-                            },
-                            items: Vec::new(),
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::SpawnAgent {
-                target_hint,
-                has_prompt,
-            } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed("spawn_agent"),
-                        op: ToolOp::SubagentSpawn {
-                            target_hint: if opts.summaries {
-                                target_hint.map(|h| Cow::Owned(truncate(&h, 120)))
-                            } else {
-                                None
-                            },
-                            has_prompt: opts.summaries && has_prompt,
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::AgentMessage { tool, recipient } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed(tool),
-                        op: ToolOp::AgentMessage {
-                            recipient: if opts.summaries {
-                                recipient.map(|r| Cow::Owned(truncate(&r, 120)))
-                            } else {
-                                None
-                            },
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::BgControl { tool, job_id, action } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed(tool),
-                        op: ToolOp::Background {
-                            job_id: if opts.summaries {
-                                job_id.map(|j| Cow::Owned(truncate(&j, 80)))
-                            } else {
-                                None
-                            },
-                            action,
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::Question { tool, summary } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed(tool),
-                        op: ToolOp::Affordance {
-                            kind: Kind::Question,
-                            action: "ask",
-                            summary: if opts.summaries {
-                                truncate(&summary, 120)
-                            } else {
-                                String::new()
-                            },
-                            items: Vec::new(),
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::WebRun { query } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Borrowed("web__run"),
-                        op: ToolOp::Search {
-                            path: None,
-                            query: if opts.summaries { query.map(Cow::Owned) } else { None },
-                        },
-                    },
-                    Vec::new(),
-                );
-            }
-            JsCall::Other { tool, summary } => {
-                emit(
-                    ToolSemantic {
-                        tool: Cow::Owned(tool),
-                        op: ToolOp::Other {
-                            path: None,
-                            summary: if opts.summaries { summary.map(Cow::Owned) } else { None },
-                        },
-                    },
-                    Vec::new(),
-                );
+                continue;
             }
         }
+        let plan_items = call.plan_items;
+        let _ = visit_tool_ops_internal(
+            Some(Harness::Codex),
+            &call.tool,
+            view,
+            opts,
+            extract_hunks,
+            |mut sem, hunks| {
+                if let ToolOp::Affordance {
+                    kind: Kind::Plan,
+                    summary,
+                    items,
+                    ..
+                } = &mut sem.op
+                {
+                    if opts.summaries && !plan_items.is_empty() {
+                        let first = collapse_line(&plan_items[0].content, 80);
+                        let item_label = if plan_items.len() == 1 {
+                            format!("1 item · {first}")
+                        } else {
+                            format!("{} items · {first}", plan_items.len())
+                        };
+                        *summary = if summary.is_empty() {
+                            truncate(&item_label, 120)
+                        } else {
+                            truncate(&format!("{} · {item_label}", collapse_line(summary, 120)), 120)
+                        };
+                        *items = plan_items.clone();
+                    }
+                }
+                emit(sem.into_owned(), hunks);
+            },
+        );
     }
 }
 
@@ -2431,7 +2189,7 @@ struct JsScanner<'s> {
     nesting: usize,
     bindings: HashMap<String, String>,
     literals: Vec<String>,
-    calls: Vec<JsCall>,
+    calls: Vec<JsToolCall>,
 }
 
 #[derive(Default)]
@@ -2458,11 +2216,23 @@ impl JsVal {
             _ => None,
         }
     }
-    fn resolve_scalar(&self, bindings: &HashMap<String, String>) -> Option<String> {
+    fn into_json(self, bindings: &HashMap<String, String>) -> Option<serde_json::Value> {
         match self {
-            JsVal::Str(s) | JsVal::Num(s) => Some(s.clone()),
-            JsVal::Bool(b) => Some(b.to_string()),
-            JsVal::Ident(name) => bindings.get(name).cloned(),
+            JsVal::Str(s) => Some(serde_json::Value::String(s)),
+            JsVal::Num(n) => Some(
+                n.parse::<i64>()
+                    .ok()
+                    .map(serde_json::Value::from)
+                    .or_else(|| {
+                        n.parse::<f64>()
+                            .ok()
+                            .and_then(serde_json::Number::from_f64)
+                            .map(serde_json::Value::Number)
+                    })
+                    .unwrap_or(serde_json::Value::String(n)),
+            ),
+            JsVal::Bool(b) => Some(serde_json::Value::Bool(b)),
+            JsVal::Ident(name) => bindings.get(&name).cloned().map(serde_json::Value::String),
             JsVal::Other => None,
         }
     }
@@ -3033,127 +2803,53 @@ impl<'s> JsScanner<'s> {
             self.pos += 1;
         }
 
-        let prop_str = |key: &str| obj.props.get(key).and_then(|v| v.resolve_str(&self.bindings));
-        let prop_scalar = |key: &str| obj.props.get(key).and_then(|v| v.resolve_scalar(&self.bindings));
-
-        let call = match tool_name {
-            "exec_command" => JsCall::ExecCommand {
-                cmd: prop_str("cmd").or_else(|| prop_str("command")).or(direct_str),
-                workdir: prop_str("workdir").or_else(|| prop_str("cwd")),
-            },
-            "apply_patch" => {
-                let direct_body = direct_str
-                    .or_else(|| prop_str("input"))
-                    .or_else(|| prop_str("patch"))
-                    .or_else(|| prop_str("cmd"));
-                JsCall::ApplyPatch {
-                    direct_body,
-                    workdir: prop_str("workdir").or_else(|| prop_str("cwd")),
+        let input = if obj.props.is_empty() && obj.search_query.is_none() {
+            match direct_str {
+                Some(s) if tool_name == "exec_command" => serde_json::json!({ "cmd": s }),
+                Some(s) if tool_name == "view_image" => {
+                    if s.contains("${") {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({ "path": s })
+                    }
+                }
+                Some(s) => serde_json::Value::String(s),
+                None => serde_json::json!({}),
+            }
+        } else {
+            let mut map = serde_json::Map::new();
+            for (k, v) in obj.props {
+                let Some(jv) = v.into_json(&self.bindings) else {
+                    continue;
+                };
+                if matches!(k.as_str(), "workdir" | "cwd")
+                    && jv.as_str().is_some_and(|s| s.is_empty() || s.contains("${"))
+                {
+                    continue;
+                }
+                if tool_name == "view_image"
+                    && k == "path"
+                    && jv.as_str().is_some_and(|s| s.is_empty() || s.contains("${"))
+                {
+                    continue;
+                }
+                map.insert(k, jv);
+            }
+            if tool_name == "apply_patch" && !map.contains_key("patch") && !map.contains_key("input") {
+                if let Some(cmd) = map.remove("cmd") {
+                    map.insert("patch".into(), cmd);
                 }
             }
-            "write_stdin" => {
-                let has_chars = prop_str("chars").is_some_and(|c| !c.is_empty());
-                JsCall::WriteStdin {
-                    session_id: prop_scalar("session_id"),
-                    has_chars,
-                }
+            if let Some(q) = obj.search_query {
+                map.entry("query").or_insert(serde_json::Value::String(q));
             }
-            "view_image" => JsCall::ViewImage {
-                path: prop_str("path").or(direct_str),
-                workdir: prop_str("workdir").or_else(|| prop_str("cwd")),
-            },
-            "update_plan" => JsCall::UpdatePlan {
-                explanation: prop_str("explanation"),
-                items: obj.plan_items,
-            },
-            "create_goal" => JsCall::Goal {
-                tool: "create_goal",
-                action: "create",
-                summary: prop_str("objective").unwrap_or_default(),
-            },
-            "update_goal" => {
-                let mut parts = Vec::new();
-                if let Some(obj_text) = prop_str("objective").filter(|s| !s.is_empty()) {
-                    parts.push(obj_text);
-                }
-                if let Some(prog) = prop_str("progress_summary").filter(|s| !s.is_empty()) {
-                    parts.push(prog);
-                }
-                if let Some(st) = prop_str("status").filter(|s| !s.is_empty()) {
-                    parts.push(st);
-                }
-                JsCall::Goal {
-                    tool: "update_goal",
-                    action: "update",
-                    summary: parts.join(" · "),
-                }
-            }
-            "get_goal" => JsCall::Goal {
-                tool: "get_goal",
-                action: "read",
-                summary: String::new(),
-            },
-            "spawn_agent" => JsCall::SpawnAgent {
-                target_hint: prop_str("task_name")
-                    .or_else(|| prop_str("description"))
-                    .or_else(|| prop_str("agent_type")),
-                has_prompt: prop_str("message")
-                    .or_else(|| prop_str("prompt"))
-                    .is_some_and(|s| !s.trim().is_empty()),
-            },
-            "send_message" => JsCall::AgentMessage {
-                tool: "send_message",
-                recipient: prop_str("target").or_else(|| prop_str("to")).or_else(|| prop_str("id")),
-            },
-            "send_input" => JsCall::AgentMessage {
-                tool: "send_input",
-                recipient: prop_str("target").or_else(|| prop_str("id")),
-            },
-            "wait" if prop_scalar("cell_id").is_some() => JsCall::BgControl {
-                tool: "wait",
-                job_id: prop_scalar("cell_id"),
-                action: BgAction::Poll,
-            },
-            "wait_agent" => JsCall::BgControl {
-                tool: "wait_agent",
-                job_id: prop_scalar("id").or_else(|| prop_scalar("target")),
-                action: BgAction::Poll,
-            },
-            "interrupt_agent" => JsCall::BgControl {
-                tool: "interrupt_agent",
-                job_id: prop_scalar("id").or_else(|| prop_scalar("target")),
-                action: BgAction::Stop,
-            },
-            "close_agent" => JsCall::BgControl {
-                tool: "close_agent",
-                job_id: prop_scalar("id").or_else(|| prop_scalar("target")),
-                action: BgAction::Stop,
-            },
-            "request_user_input" => JsCall::Question {
-                tool: "request_user_input",
-                summary: prop_str("question").or_else(|| prop_str("prompt")).unwrap_or_default(),
-            },
-            "request_user_input_async" => JsCall::Question {
-                tool: "request_user_input_async",
-                summary: prop_str("question").or_else(|| prop_str("prompt")).unwrap_or_default(),
-            },
-            "web__run" => JsCall::WebRun {
-                query: obj.search_query.or_else(|| prop_str("q")).or_else(|| prop_str("query")),
-            },
-            other => {
-                let summary = prop_str("uri")
-                    .or_else(|| prop_str("prompt"))
-                    .or_else(|| prop_str("query"))
-                    .or_else(|| prop_str("path"))
-                    .or_else(|| prop_str("url"))
-                    .or(direct_str);
-                JsCall::Other {
-                    tool: other.to_string(),
-                    summary,
-                }
-            }
+            serde_json::Value::Object(map)
         };
-        self.calls.push(call);
+        self.calls.push(JsToolCall {
+            tool: tool_name.to_string(),
+            input,
+            plan_items: obj.plan_items,
+        });
         self.nesting -= 1;
     }
 
@@ -3530,9 +3226,10 @@ mod tests {
                 assert_eq!(scanner.pos, script.len(), "{script}");
                 if !close.contains("/*") {
                     assert!(
-                        scanner.calls.iter().any(|call| matches!(call,
-                            JsCall::ExecCommand { cmd: Some(cmd), .. } if cmd == "recovered"
-                        )),
+                        scanner
+                            .calls
+                            .iter()
+                            .any(|call| call.tool == "exec_command" && call.input["cmd"] == "recovered"),
                         "{script}"
                     );
                 }
@@ -3560,9 +3257,10 @@ mod tests {
             scanner.scan_all();
             assert_eq!(scanner.pos, script.len());
             assert_eq!(scanner.nesting, 0);
-            assert!(scanner.calls.iter().any(|call| matches!(call,
-                JsCall::ExecCommand { cmd: Some(cmd), .. } if cmd == "after"
-            )));
+            assert!(scanner
+                .calls
+                .iter()
+                .any(|call| call.tool == "exec_command" && call.input["cmd"] == "after"));
         }
     }
 
@@ -3577,9 +3275,10 @@ mod tests {
                 scanner.scan_all();
                 assert_eq!(scanner.pos, script.len(), "{script}");
                 assert!(
-                    scanner.calls.iter().any(|call| matches!(call,
-                        JsCall::ExecCommand { cmd: Some(cmd), .. } if cmd == "after"
-                    )),
+                    scanner
+                        .calls
+                        .iter()
+                        .any(|call| call.tool == "exec_command" && call.input["cmd"] == "after"),
                     "{script}"
                 );
             }
