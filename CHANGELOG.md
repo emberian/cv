@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `GET /api/session/{harness}/{id}/prompts` serves windowed `PromptRow`s for `?kind=prompt,answer`, matching `cv prompts`.
+- `GET /api/search` collapses derived-session chains to the fullest hit unless `?all=1`, matching `cv search` and `cv pack`.
+- `/api/session/{harness}/{id}/subagent/{agent}` resolves a unique stem prefix; `/subagents?returns` adds each agent's last unsummarized text.
+- Browser Markdown export uses `cv-core` fence and header sanitization, labels Pi, and reads OpenSession on `wasm32` without a clock.
 - File URIs preserve Unix filenames containing non-UTF-8 bytes when reading workspace paths and emitting Antigravity sessions.
 - Archive watch catches native transcripts appended during its initial sync.
 - Codex command extraction preserves non-BMP characters written as UTF-16 surrogate pairs in scripts.
@@ -12,9 +16,9 @@
 - Place-scoped CLI and HTTP file/blame views resolve single sessions via B-tree indexes, deduplicate self-shipped echoes, preserve sub-agents, and whisper disconnected peers once.
 - Incremental hub indexing compacts Tantivy segments, commits deletes once, preserves watermarks across retention, and validates native extents and pack ownership on quarantine resolution.
 - `cv distill --session=<harness>` writes to every harness with a verified emitter (Codex, Gemini, Devin, …), sidecar and resume command included; `--delivery=live` stays Antigravity's.
-- A distilled seed attests its pack's human instructions (count, digest, length) and Claude transcripts keep that record, so a second distill demotes entries it cannot vouch for.
-- `cv doctor` reports `compaction_laundering` (a summary directive that repeats a tool result and no human prompt) and `diary_ledger_divergence` (a final "tests pass" against the recorded runs and edits); `cv lanes --json` carries the latter, and the post-compaction hook points at the former.
-- Hooks send observations as datagrams on a Unix socket (`hooks-v1.sock`) instead of a FIFO: whole up to 8 KiB each, where a pipe dropped anything over 512 bytes on macOS.
+- A distilled seed records human-instruction count, digest, and length; Claude keeps it, and a later distill demotes entries it cannot vouch for.
+- `cv doctor` reports `compaction_laundering` (tool-result echo, no human prompt) and `diary_ledger_divergence` ("tests pass" vs recorded edits); `cv lanes --json` has the latter, hook the former.
+- Hooks send observations as Unix-socket datagrams on `hooks-v1.sock`, each up to 8 KiB; the FIFO dropped anything over 512 bytes on macOS.
 - Blame, file views, tools, context packs and worker reports support place and generation selection. Edit hooks identify disconnected peers in the same checkout.
 - Hub ingest, spool import and SSH pull index changed sessions and their file events, with a durable generation watermark and retryable deletions.
 
