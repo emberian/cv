@@ -30,16 +30,18 @@ pub(crate) fn cmd_events(
     let (r, rows): (cv_core::SessionRef, Vec<events::EventRow>) = if let Some(ref view) = scoped_view {
         let src = match view.resolve(id, want) {
             Ok(s) => s,
-            Err(cv_core::custody::ScopedResolveError::NotFound(_)) => {
-                return match authority.as_of {
-                    Some(gen) => crate::util::usage(format!("session {id:?} not found at generation {gen}")),
-                    None => crate::util::usage("session not found in selected places"),
-                };
-            }
-            Err(cv_core::custody::ScopedResolveError::Ambiguous(_)) => {
-                return crate::util::usage(format!("ambiguous session id {id:?}"));
-            }
-            Err(cv_core::custody::ScopedResolveError::Other(e)) => return Err(e),
+            Err(e) => match cv_core::ResolveError::of(&e) {
+                Some(cv_core::ResolveError::NotFound(_)) => {
+                    return match authority.as_of {
+                        Some(gen) => crate::util::usage(format!("session {id:?} not found at generation {gen}")),
+                        None => crate::util::usage("session not found in selected places"),
+                    };
+                }
+                Some(cv_core::ResolveError::Ambiguous(_)) => {
+                    return crate::util::usage(format!("ambiguous session id {id:?}"));
+                }
+                None => return Err(e),
+            },
         };
         if view.pinned || src.entry.is_some() {
             if src.r.path.as_os_str().is_empty() {

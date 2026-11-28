@@ -1,6 +1,6 @@
 //! CLI report guard over [`cv_core::custody::ScopedView`].
 use anyhow::{Context, Result};
-use cv_core::custody::{ScopedResolveError, ScopedSource, ScopedView};
+use cv_core::custody::{ScopedSource, ScopedView};
 use cv_core::state::hub::HubStore;
 use cv_core::{Adapter, Harness, SessionRef};
 use std::{cell::RefCell, rc::Rc};
@@ -51,20 +51,18 @@ pub(crate) fn enter(args: &crate::AuthorityArgs, cwd: Option<&str>, query: Optio
     Ok(Guard(CURRENT.with(|c| c.replace(Some(view))), human))
 }
 
-fn map_resolve(
-    spec: &str,
-    kind: &str,
-    res: std::result::Result<ScopedSource, ScopedResolveError>,
-) -> Result<ScopedSource> {
+fn map_resolve(spec: &str, kind: &str, res: Result<ScopedSource>) -> Result<ScopedSource> {
     match res {
         Ok(src) => Ok(src),
-        Err(ScopedResolveError::NotFound(_)) => {
-            crate::util::usage(format!("no {kind} {spec:?} in the selected places"))
-        }
-        Err(ScopedResolveError::Ambiguous(_)) => {
-            crate::util::usage(format!("ambiguous {kind} {spec:?} in the selected places"))
-        }
-        Err(ScopedResolveError::Other(e)) => Err(e),
+        Err(e) => match cv_core::ResolveError::of(&e) {
+            Some(cv_core::ResolveError::NotFound(_)) => {
+                crate::util::usage(format!("no {kind} {spec:?} in the selected places"))
+            }
+            Some(cv_core::ResolveError::Ambiguous(_)) => {
+                crate::util::usage(format!("ambiguous {kind} {spec:?} in the selected places"))
+            }
+            None => Err(e),
+        },
     }
 }
 

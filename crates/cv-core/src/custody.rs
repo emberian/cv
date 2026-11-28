@@ -1379,14 +1379,6 @@ pub fn matching_backings(id: &str, harness: Option<Harness>) -> Result<Vec<Backi
     Ok(rows.into_values().collect())
 }
 
-/// Resolution errors inside a place/generation-scoped view (`ScopedView`).
-#[derive(Debug)]
-pub enum ScopedResolveError {
-    NotFound(String),
-    Ambiguous(String),
-    Other(anyhow::Error),
-}
-
 /// One local or hub-replicated session selected under an [`AuthorityEnvelope`].
 #[derive(Clone)]
 pub struct ScopedSource {
@@ -1492,11 +1484,7 @@ impl ScopedView {
         Ok(self.sources.get().expect("just initialized").as_slice())
     }
 
-    pub fn resolve(
-        &self,
-        spec: &str,
-        harness: Option<Harness>,
-    ) -> std::result::Result<ScopedSource, ScopedResolveError> {
+    pub fn resolve(&self, spec: &str, harness: Option<Harness>) -> Result<ScopedSource> {
         let (want, id) = split_harness_id(spec, harness);
         let native_of = |s: &ScopedSource| {
             s.entry
@@ -1505,7 +1493,7 @@ impl ScopedView {
                 .map(|k| k.native_id)
                 .unwrap_or_else(|| s.r.id.clone())
         };
-        let pick_from = |candidates: Vec<ScopedSource>| -> std::result::Result<ScopedSource, ScopedResolveError> {
+        let pick_from = |candidates: Vec<ScopedSource>| -> Result<ScopedSource> {
             let exact: Vec<_> = candidates
                 .iter()
                 .filter(|s| {
@@ -1523,8 +1511,8 @@ impl ScopedView {
             };
             match hits.as_slice() {
                 [s] => Ok(s.clone()),
-                [] => Err(ScopedResolveError::NotFound(spec.to_owned())),
-                _ => Err(ScopedResolveError::Ambiguous(spec.to_owned())),
+                [] => Err(crate::ResolveError::NotFound(spec.to_owned()).into()),
+                _ => Err(crate::ResolveError::Ambiguous(spec.to_owned()).into()),
             }
         };
 
@@ -1563,24 +1551,21 @@ impl ScopedView {
                 }
                 Ok(_) => {}
                 Err(e) if matches!(crate::ResolveError::of(&e), Some(crate::ResolveError::Ambiguous(_))) => {
-                    return Err(ScopedResolveError::Ambiguous(spec.to_owned()));
+                    return Err(crate::ResolveError::Ambiguous(spec.to_owned()).into());
                 }
-                Err(e) => return Err(ScopedResolveError::Other(e)),
+                Err(e) => return Err(e),
             }
         }
 
         if generation != 0 {
             let local_prods = if live_triple.is_some() {
-                self.hub
-                    .local_shipped_producers()
-                    .map_err(|e| ScopedResolveError::Other(e.into()))?
+                self.hub.local_shipped_producers()?
             } else {
                 Default::default()
             };
             let heads = self
                 .hub
-                .resolve_session_heads(id, want, Some(generation), Some(&self.envelope.borrow()))
-                .map_err(|e| ScopedResolveError::Other(e.into()))?;
+                .resolve_session_heads(id, want, Some(generation), Some(&self.envelope.borrow()))?;
             for entry in heads {
                 if !seen_selectors.insert(entry.selector_string()) {
                     continue;
@@ -1657,26 +1642,18 @@ impl ScopedView {
         Ok(out)
     }
 
-    pub fn child(&self, parent: &ScopedSource, id: &str) -> std::result::Result<ScopedSource, ScopedResolveError> {
-        let bare = id.strip_prefix("agent-").unwrap_or(id);
-        let children = self.children(parent).map_err(ScopedResolveError::Other)?;
-        let exact: Vec<_> = children
-            .iter()
-            .filter(|s| Self::agent_id(s) == bare || s.r.id == id)
-            .cloned()
-            .collect();
-        let hits = if exact.is_empty() {
-            children
-                .into_iter()
-                .filter(|s| Self::agent_id(s).starts_with(bare))
-                .collect()
-        } else {
-            exact
-        };
-        match hits.as_slice() {
-            [s] => Ok(s.clone()),
-            [] => Err(ScopedResolveError::NotFound(id.to_owned())),
-            _ => Err(ScopedResolveError::Ambiguous(id.to_owned())),
+    /// One collected child of `parent`. The selector is the same exact-then-stem rule as
+    /// [`crate::resolve::subagent`]: the whole id, its agent id, or a unique prefix of either,
+    /// with a leading `agent-` optional. Exact matches beat prefixes.
+    pub fn child(&self, parent: &ScopedSource, id: &str) -> Result<ScopedSource> {
+        let children = self.children(parent)?;
+        let mut hits = crate::resolve::exact_first(children, |source| {
+            crate::resolve::agent_match_any([Self::agent_id(source), source.r.id.as_str()], id)
+        });
+        match hits.len() {
+            1 => Ok(hits.remove(0)),
+            0 => Err(crate::ResolveError::NotFound(id.to_owned()).into()),
+            _ => Err(crate::ResolveError::Ambiguous(id.to_owned()).into()),
         }
     }
 

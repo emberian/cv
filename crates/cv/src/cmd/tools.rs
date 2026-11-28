@@ -73,17 +73,7 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
                 .is_none_or(|q| w.as_deref().is_some_and(|w| w.starts_with(q)))
         });
         if let Some(q) = &agent {
-            let bare = q.strip_prefix("agent-").unwrap_or(q);
-            let exact: Vec<_> = inputs
-                .iter()
-                .filter(|(aid, ..)| aid == q || aid == bare)
-                .cloned()
-                .collect();
-            if !exact.is_empty() {
-                inputs = exact;
-            } else {
-                inputs.retain(|(aid, ..)| aid.starts_with(bare) || aid.starts_with(q));
-            }
+            inputs = cv_core::resolve::exact_first(inputs, |row| cv_core::resolve::agent_match(&row.0, q));
             if inputs.is_empty() {
                 return crate::util::usage(format!("no collected agent {q:?} in the selected places"));
             }
@@ -141,15 +131,15 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
         // usage error (exit 2), like a session id.
         let agent = agent
             .map(|key| {
-                cv_core::tools::resolve_agent(&r, &key, workflow.as_deref()).map_err(|e| {
-                    match e.downcast_ref::<cv_core::tools::AgentSelectorError>() {
+                cv_core::tools::resolve_agent(&r, &key, workflow.as_deref()).map_err(
+                    |e| match cv_core::ResolveError::of(&e) {
                         Some(sel) => {
                             crate::util::UsageError(format!("{sel} (try `cv tools {} --across`)", short_id(&r.id)))
                                 .into()
                         }
                         None => e,
-                    }
-                })
+                    },
+                )
             })
             .transpose()?;
         if timeline {

@@ -508,36 +508,12 @@ fn matches_agent(agent: Option<&str>, id: &str) -> bool {
     agent.is_none_or(|key| id == key)
 }
 
-/// An `--agent` selector that names no agent, or more than one: the same two answers the session
-/// selector gives, and the CLI exits 2 on both.
-#[derive(Debug)]
-pub enum AgentSelectorError {
-    None { key: String },
-    Ambiguous { key: String, candidates: Vec<String> },
-}
-
-impl std::fmt::Display for AgentSelectorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None { key } => write!(f, "no agent matching {key:?}"),
-            Self::Ambiguous { key, candidates } => write!(
-                f,
-                "ambiguous agent id {key:?} matches {} agents: {} — pass a longer id",
-                candidates.len(),
-                candidates.join(", ")
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AgentSelectorError {}
-
 /// The one `--agent` grammar: an exact agent id (`<orchestrator>` included), else a unique prefix
 /// of an id (a leading `agent-` is optional), among the orchestrator and the forest (the named
-/// workflow's agents when `workflow` is set). Returns the full id; a selector that matches none
-/// or several is an [`AgentSelectorError`].
+/// workflow's agents when `workflow` is set). Ranking is [`crate::resolve::agent_match`], the same
+/// exact-then-stem rule as [`crate::resolve::subagent`]. Returns the full id. A selector that
+/// matches none or several is a [`crate::ResolveError`] (the CLI exits 2 on both).
 pub fn resolve_agent(r: &SessionRef, key: &str, workflow: Option<&str>) -> anyhow::Result<String> {
-    let bare = key.strip_prefix("agent-").unwrap_or(key);
     let mut ids: Vec<String> = Vec::new();
     if workflow.is_none() {
         ids.push(ORCHESTRATOR.to_string());
@@ -551,20 +527,15 @@ pub fn resolve_agent(r: &SessionRef, key: &str, workflow: Option<&str>) -> anyho
     );
     ids.sort();
     ids.dedup();
-    if ids.iter().any(|id| id == key) {
-        return Ok(key.to_string());
-    }
-    let mut hits: Vec<String> = ids
-        .into_iter()
-        .filter(|id| id.starts_with(bare) || id.starts_with(key))
-        .collect();
+    let mut hits = crate::resolve::exact_first(ids, |id| crate::resolve::agent_match(id, key));
     match hits.len() {
-        0 => Err(AgentSelectorError::None { key: key.to_string() }.into()),
+        0 => Err(crate::ResolveError::NotFound(format!("no agent matching {key:?}")).into()),
         1 => Ok(hits.remove(0)),
-        _ => Err(AgentSelectorError::Ambiguous {
-            key: key.to_string(),
-            candidates: hits,
-        }
+        _ => Err(crate::ResolveError::Ambiguous(format!(
+            "ambiguous agent id {key:?} matches {} agents: {} — pass a longer id",
+            hits.len(),
+            hits.join(", ")
+        ))
         .into()),
     }
 }

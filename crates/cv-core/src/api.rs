@@ -359,12 +359,14 @@ fn scoped_view_from_params(params: &Query) -> Result<Option<crate::custody::Scop
 }
 
 #[cfg(feature = "sqlite")]
-fn scoped_resolve_reply(error: crate::custody::ScopedResolveError) -> (u16, Value) {
-    match error {
-        crate::custody::ScopedResolveError::NotFound(_) => err(404, "session not found"),
-        crate::custody::ScopedResolveError::Ambiguous(spec) => err(400, &format!("ambiguous session id {spec:?}")),
-        crate::custody::ScopedResolveError::Other(e) => err(500, &e.to_string()),
-    }
+fn scoped_resolve_reply(error: anyhow::Error) -> (u16, Value) {
+    let status = crate::ResolveError::status(&error);
+    let message = match crate::ResolveError::of(&error) {
+        Some(crate::ResolveError::NotFound(_)) => "session not found".to_owned(),
+        Some(crate::ResolveError::Ambiguous(spec)) => format!("ambiguous session id {spec:?}"),
+        None => error.to_string(),
+    };
+    err(status, &message)
 }
 
 /// `GET /api/places?place=&as_of=&max_staleness=` — enrolled places, watermarks, and authority status.

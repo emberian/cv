@@ -78,15 +78,40 @@ pub fn short_id_len(id: &str, min_bare: usize) -> String {
 }
 
 /// How `want` names a forest member: `Some(true)` exactly, `Some(false)` as a prefix, `None` not
-/// at all. A member id is the agent's own (Claude's `agent-<stem>`) or `<parent>/<agent>` (Kimi,
-/// Kimi Code); a caller types the whole id, its agent part, or either without `agent-`.
+/// at all. A member id is the agent's own (Claude's `agent-<stem>`, or the bare stem a tool list
+/// already stores) or `<parent>/<agent>` (Kimi, Kimi Code). A caller types the whole id, its
+/// agent part, or either with or without a leading `agent-`.
 pub fn agent_match(member: &str, want: &str) -> Option<bool> {
     let agent = member.rsplit('/').next().unwrap_or(member);
-    let forms = [member, agent, agent.strip_prefix("agent-").unwrap_or(agent)];
+    let bare = agent.strip_prefix("agent-").unwrap_or(agent);
+    let forms = [member, agent, bare];
     if forms.contains(&want) {
         return Some(true);
     }
-    forms.iter().any(|form| form.starts_with(want)).then_some(false)
+    // Queries that do not spell `agent-` keep the original rule: a prefix of any form, nothing else.
+    let Some(want_bare) = want.strip_prefix("agent-").filter(|rest| !rest.is_empty()) else {
+        return forms.iter().any(|form| form.starts_with(want)).then_some(false);
+    };
+    // `agent-<stem>` and a stored bare `<stem>` are the same exact name.
+    if want_bare == bare {
+        return Some(true);
+    }
+    // Prefix the bare stem only. The full `agent-…` form starts with `a`, so a bare query of `a`
+    // must not count as a prefix of every prefixed id.
+    (forms.iter().any(|form| form.starts_with(want)) || bare.starts_with(want_bare)).then_some(false)
+}
+
+/// The strongest [`agent_match`] of `want` against every id of one candidate. Exact wins over prefix.
+pub fn agent_match_any<'a>(ids: impl IntoIterator<Item = &'a str>, want: &str) -> Option<bool> {
+    let mut prefix = false;
+    for id in ids {
+        match agent_match(id, want) {
+            Some(true) => return Some(true),
+            Some(false) => prefix = true,
+            None => {}
+        }
+    }
+    prefix.then_some(false)
 }
 
 /// Keep the exact matches when there are any, else the prefix matches: an exact id always beats
@@ -286,6 +311,17 @@ mod tests {
         assert_eq!(agent_match("sess-1/agent-2", "sess-1/agent"), Some(false));
         assert_eq!(agent_match("agent-ab12", "b12"), None);
         assert_eq!(agent_match("sess-1/agent-2", "sess-9"), None);
+        // A tool list stores the bare stem. `agent-` on the query is the same name, not a longer one.
+        assert_eq!(agent_match("first-agent", "agent-first-agent"), Some(true));
+        assert_eq!(agent_match("first-agent", "agent-first"), Some(false));
+        assert_eq!(agent_match("first-agent", "agent-"), None);
+        assert_eq!(agent_match("<orchestrator>", "agent-<orchestrator>"), Some(true));
+        assert_eq!(agent_match_any(["ab12cd", "11111111-2222"], "agent-ab12"), Some(false));
+        assert_eq!(
+            agent_match_any(["ab12cd", "11111111-2222"], "11111111-2222"),
+            Some(true)
+        );
+        assert_eq!(agent_match_any(["ab12cd", "11111111-2222"], "nope"), None);
     }
 
     #[test]
@@ -295,5 +331,15 @@ mod tests {
         assert_eq!(exact_first(ids, rank("ab")), ["agent-ab"]);
         assert_eq!(exact_first(ids, rank("agent-a")), ["agent-ab", "agent-abc"]);
         assert!(exact_first(ids, rank("q")).is_empty());
+        let bare = ["first-agent", "first-twin", "<orchestrator>"];
+        assert_eq!(exact_first(bare, rank("first")), ["first-agent", "first-twin"]);
+        assert_eq!(exact_first(bare, rank("first-a")), ["first-agent"]);
+        assert_eq!(exact_first(bare, rank("agent-first-agent")), ["first-agent"]);
+        assert_eq!(exact_first(bare, rank("<orchestrator>")), ["<orchestrator>"]);
+        assert!(exact_first(bare, rank("nobody")).is_empty());
+        // The exact stem wins over a longer id that only shares its prefix, for both spellings.
+        let twins = ["foo", "foo-extra", "agent-foo"];
+        assert_eq!(exact_first(twins, rank("foo")), ["foo", "agent-foo"]);
+        assert_eq!(exact_first(twins, rank("agent-foo")), ["foo", "agent-foo"]);
     }
 }
