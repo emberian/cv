@@ -1756,11 +1756,20 @@ fn stream_conn_with_reads(
 /// (`SessionDB._is_duplicate_replayed_user_message`): tracks only the trailing run of
 /// user single-texts since the last substantive assistant turn (the exact look-back window the
 /// whole-Vec scan uses), so the streaming path stays byte-identical without retaining the session.
-#[derive(Default)]
 struct ReplayDedup {
     /// Single-texts of consecutive trailing user messages (most recent last). Cleared when a
     /// substantive assistant turn passes (which ends the look-back window).
     recent_user_texts: crate::spill::ExactStrings,
+}
+
+impl Default for ReplayDedup {
+    fn default() -> Self {
+        // Captured message cells have their own arena. Keep at most one I/O chunk of
+        // duplicate prompt bytes beside it before moving exact comparisons to disk.
+        Self {
+            recent_user_texts: crate::spill::ExactStrings::with_memory_limit(super::store::IO_CHUNK),
+        }
+    }
 }
 
 impl ReplayDedup {
@@ -3275,6 +3284,18 @@ mod tests {
             .unwrap();
         assert!(input.resolve().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn replay_dedup_spills_a_large_prompt_without_changing_exact_membership() {
+        let mut dedup = ReplayDedup::default();
+        let mut message = Message::new(Role::User);
+        message
+            .content
+            .push(Block::from_text("λ".repeat(crate::harness::store::IO_CHUNK).into()));
+        assert!(dedup.admit(&message).unwrap());
+        assert!(dedup.recent_user_texts.is_spilled());
+        assert!(!dedup.admit(&message).unwrap());
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub mod sqlite;
 pub(crate) mod zst;
 
 /// The store's standard buffered-I/O chunk: stage chunks, read/write buffers, copy buffers.
-const IO_CHUNK: usize = 64 * 1024;
+pub(super) const IO_CHUNK: usize = 64 * 1024;
 /// The buffer for streaming one stored artifact into another — a copy, not a parse.
 const COPY_CHUNK: usize = 256 * 1024;
 
