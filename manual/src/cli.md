@@ -63,9 +63,15 @@ An **ambiguous** prefix lists the candidates (`harness:full-id`) and exits `2`.
 | `--thinking <mode>` | reasoning policy: `native`, `portable`, `text`, `drop`; rewind accepts native/portable |
 | `--strict` | `port`: fail on unexpected fidelity loss; `index`: fail on any unreadable session |
 | `--skills <p>` | restored skills in a new Claude session: `keep`, `drop`, `drop-stale` |
-| `--place <glob>` | restrict `ls`, `search`, `events`, and `touched` to matching producer places |
-| `--as-of <gen>` | pin `ls`, `search`, `events`, and `touched` to hub generation `<gen>` |
+| `--place <glob>` | select matching producer places for the reports below |
+| `--as-of <gen>` | read the selected places at published hub generation `<gen>` |
 | `--max-staleness <dur>` | fail closed (exit 2 / HTTP 503) if any unsealed place exceeds `<dur>` |
+
+Use these selectors with `ls`, `search`, `events`, `touched`, `blame`, `show --kind files`, `tools`, `pack` and `lanes`.
+For example, `cv show SESSION --kind files --place build-box --as-of 2 --json` returns the file touches in that revision under `files` and its coverage under `authority`.
+Historical blame uses transcript edit evidence. Line attribution needs a Git checkout at the selected revision. Remote worker reports mark missing process, task or auxiliary transcript evidence as partial. With place selection, `lanes --follow --json` prints a new scoped snapshot when worker evidence or coverage changes.
+
+Hub ingest, spool import and SSH pull update the text and event indexes from the changed session heads. The authority watermark advances after both indexes commit. Repeating collection, restarting the hub or running `cv index` retries pending work. Before an edit, the hook names disconnected peers associated with the checkout in a single advisory.
 
 Historical search scans scrubbed message text for a case-insensitive literal in the selected
 generation. Historical file activity comes from those same session revisions. An unmatched

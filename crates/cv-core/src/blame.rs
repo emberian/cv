@@ -902,6 +902,18 @@ fn absolutize_input(file: &str) -> Result<PathBuf> {
 
 /// Compute structured blame provenance for `file` and optional `lines` (`"a"` or `"a,b"`).
 pub fn blame(file: &str, lines: Option<&str>) -> Result<BlameReport> {
+    blame_from(file, lines, None, false)
+}
+
+type EditReader<'a> = dyn Fn(&str, &str) -> Result<Vec<EditHunkEvent>> + 'a;
+
+/// Git describes the local checkout. A historical hub cut has only the collected edit evidence.
+pub fn blame_from(
+    file: &str,
+    lines: Option<&str>,
+    read: Option<&EditReader<'_>>,
+    historical: bool,
+) -> Result<BlameReport> {
     let parsed_lines = match lines {
         Some(spec) => Some(parse_line_spec(spec)?),
         None => None,
@@ -909,10 +921,14 @@ pub fn blame(file: &str, lines: Option<&str>) -> Result<BlameReport> {
     let abs = absolutize_input(file)?;
     let abs_str = abs.to_string_lossy().into_owned();
 
-    let Some(root) = repo_toplevel(&abs)? else {
+    let root = if historical { None } else { repo_toplevel(&abs)? };
+    let Some(root) = root else {
         let rel = file.trim_start_matches("./");
-        let edits = events::edits_touching_file(&abs_str, rel)?;
-        let cold_catalog = edits.is_empty() && !events::catalog_has_events();
+        let edits = match read {
+            Some(f) => f(&abs_str, rel)?.into_iter().map(|e| e.edit).collect(),
+            None => events::edits_touching_file(&abs_str, rel)?,
+        };
+        let cold_catalog = edits.is_empty() && read.is_none() && !events::catalog_has_events();
         let mut latest: Vec<&EditEvent> = Vec::new();
         let mut positions: HashMap<(&str, &str), usize> = HashMap::new();
         for e in &edits {
@@ -981,12 +997,14 @@ pub fn blame(file: &str, lines: Option<&str>) -> Result<BlameReport> {
     for c in &commits_raw {
         let path = c.relocated_from.as_ref().map_or(rel.as_str(), |r| r.path.as_str());
         if let std::collections::hash_map::Entry::Vacant(entry) = sources.entry(path) {
-            let edits = events::edits_with_hunks_touching_file(&root.join(path).to_string_lossy(), path)?;
+            let read = read.unwrap_or(&events::edits_with_hunks_touching_file);
+            let edits = read(&root.join(path).to_string_lossy(), path)?;
             let exact = exact_sha_matches(&commits_raw, &edits, &root)?;
             entry.insert((edits, exact));
         }
     }
-    let cold_catalog = sources.values().all(|(edits, _)| edits.is_empty()) && !events::catalog_has_events();
+    let cold_catalog =
+        sources.values().all(|(edits, _)| edits.is_empty()) && read.is_none() && !events::catalog_has_events();
     let line_scoped = parsed_lines.is_some();
     let mut matched_commits = 0usize;
     let mut commits_out = Vec::with_capacity(commits_raw.len());

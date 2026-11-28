@@ -257,6 +257,8 @@ enum Cmd {
         /// With the compaction kinds: print each summary in full, not just its head.
         #[arg(long, requires = "kind")]
         summaries: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// Print one tool call's full output, wherever it lives: inline in the transcript, in a
     /// `prune` sidecar, or in a persisted-output file. `--input` prints the call's arguments instead.
@@ -407,6 +409,8 @@ enum Cmd {
         timeline: bool,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// A `Workflow`-tool run, first-class: its phase tree, the agents under each phase with their
     /// outcomes, run totals, and the driving script. Without `<run_id>`, lists the session's runs.
@@ -497,6 +501,8 @@ enum Cmd {
         /// Emit one JSON array, or changed lane rows as NDJSON with parent_id when following.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// Fleet analytics over all discovered sessions.
     Stats {
@@ -531,6 +537,8 @@ enum Cmd {
         /// Emit structured provenance attribution as JSON (`file`, `lines`, `commits`, `event_only_sessions`).
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
     /// Diagnose why a session's context window keeps filling and compacting: attribute context
     /// pressure by source (tool results split MCP/builtin, thinking, messages), size the fixed
@@ -1136,6 +1144,8 @@ enum Cmd {
         /// Skip the default credential-redaction pass (keep raw tokens/passwords in the pack).
         #[arg(long)]
         no_redact: bool,
+        #[command(flatten)]
+        authority: AuthorityArgs,
     },
 
     /// Fleet task substrate: dispatch, review, and git-observed landing.
@@ -1504,8 +1514,35 @@ fn run() -> Result<()> {
             | Cmd::Watch { .. }
             | Cmd::Workflow { follow: true, .. }
             | Cmd::Workflow { for_: Some(_), .. }
+            | Cmd::Lanes { follow: true, .. }
+            | Cmd::Lanes { for_: Some(_), .. }
     ))
     .then(cv_core::source::read_scope);
+    let _report_scope = match &cli.cmd {
+        Cmd::Show {
+            authority, kind, json, ..
+        } if authority.is_active() => {
+            if kind.as_deref() != Some("files") {
+                return util::usage("place selection on show requires --kind files");
+            }
+            Some(cmd::place::enter(authority, None, None, !json)?)
+        }
+        Cmd::Lanes {
+            authority, cwd, json, ..
+        } if authority.is_active() => Some(cmd::place::enter(
+            authority,
+            cwd.as_ref().and_then(|p| p.to_str()),
+            None,
+            !json,
+        )?),
+        Cmd::Pack {
+            authority, json, task, ..
+        } if authority.is_active() => Some(cmd::place::enter(authority, None, task.as_deref(), !json)?),
+        Cmd::Tools { authority, json, .. } | Cmd::Blame { authority, json, .. } if authority.is_active() => {
+            Some(cmd::place::enter(authority, None, None, !json)?)
+        }
+        _ => None,
+    };
     match cli.cmd {
         Cmd::Ls {
             harness,
@@ -1572,6 +1609,7 @@ fn run() -> Result<()> {
             tree,
             kind,
             summaries,
+            ..
         } => view::cmd_show(
             &id,
             harness,
@@ -1683,6 +1721,7 @@ fn run() -> Result<()> {
             lines,
             show,
             json,
+            ..
         } => blame::cmd_blame(&file, lines.as_deref(), show, json),
         Cmd::Share {
             id,
@@ -1705,6 +1744,7 @@ fn run() -> Result<()> {
             json,
             excerpt_bytes,
             no_redact,
+            ..
         } => pack::cmd_pack(pack::PackArgs {
             review,
             all,
@@ -1855,6 +1895,7 @@ fn run() -> Result<()> {
             across,
             timeline,
             json,
+            ..
         } => tools::cmd_tools(tools::ToolsArgs {
             id: &id,
             harness,
@@ -1879,6 +1920,7 @@ fn run() -> Result<()> {
             follow,
             for_,
             json,
+            ..
         } => {
             let filter = if running {
                 session_reports::LaneFilter::Running

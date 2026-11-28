@@ -1960,3 +1960,29 @@ fn hint_and_nudge_hooks_install_emit_verb_map_without_denying_and_remove_cleanly
     }
     assert!(!cold_home.exists());
 }
+
+/// #tooth A disconnected peer can have unpublished edits. Its advisory follows checkout path components.
+#[test]
+fn hook_edit_reports_only_stale_peers_of_the_same_checkout() {
+    let w = World::new("peer-edit-advisory");
+    let hub = cv_core::state::hub::HubStore::at_home(&w.cv_home);
+    for (id, cwd) in [
+        ("offline-peer", "/work/proj"),
+        ("unrelated-peer", "/work/project-other"),
+    ] {
+        hub.enroll_producer(id, id, &serde_json::json!({"cwd":cwd})).unwrap();
+    }
+    hub.enroll_producer("partitioned-peer","peer",&serde_json::json!({"cwd":"/work/proj/sub","lifecycle":{"state":"sealed","final_seq":2,"final_epoch":"e1","sealed_at_ms":0}})).unwrap();
+    let mut ev = common(&w, "active", "PreToolUse");
+    ev["tool_name"] = "Edit".into();
+    ev["tool_input"] = serde_json::json!({"file_path":"/work/proj/example.rs","old_string":"a","new_string":"b"});
+    let out = hook(&w, "edit", &ev, &[]);
+    assert!(
+        out.contains("offline-peer")
+            && out.contains("partitioned-peer")
+            && out.contains("stale")
+            && !out.contains("unrelated-peer"),
+        "{out}"
+    );
+    assert!(!out.contains("permissionDecision"), "{out}");
+}

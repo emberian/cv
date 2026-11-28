@@ -121,7 +121,11 @@ impl ToolHistogram {
     pub fn from_stream(adapter: &dyn crate::Adapter, r: &SessionRef) -> anyhow::Result<Self> {
         Self::from_stream_selected(adapter, r, None)
     }
-    fn from_stream_selected(adapter: &dyn crate::Adapter, r: &SessionRef, tool: Option<&str>) -> anyhow::Result<Self> {
+    pub fn from_stream_selected(
+        adapter: &dyn crate::Adapter,
+        r: &SessionRef,
+        tool: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let mut sink = HistogramSink {
             state: SinkState::new(r.cwd.clone()),
             msg_idx: 0,
@@ -446,6 +450,20 @@ pub fn forest_tools_selected(
     Ok(ForestTools { agents })
 }
 
+pub fn timeline_from_reader(
+    adapter: &dyn crate::Adapter,
+    r: &SessionRef,
+    agent: &str,
+    tool: Option<&str>,
+) -> anyhow::Result<Vec<ToolEvent>> {
+    let mut sink = CallSink::new(r.cwd.clone());
+    sink.tool = tool.map(str::to_owned);
+    adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
+    let mut out = Vec::new();
+    timeline_calls(agent, sink.rows, &mut out);
+    Ok(out)
+}
+
 /// A flat, time-ordered tool-call timeline across the orchestrator + forest — `cv tools --timeline`.
 /// Streams each agent, collects its tool rows tagged with the agent id, then sorts by `(ts,
 /// agent, msg_idx)` so calls interleave in wall-clock order (untimestamped rows sort last, stably).
@@ -462,10 +480,7 @@ pub fn forest_timeline_selected(
     let mut out: Vec<ToolEvent> = Vec::new();
 
     if workflow.is_none() && matches_agent(agent, ORCHESTRATOR) {
-        let mut sink = CallSink::new(r.cwd.clone());
-        sink.tool = tool.map(str::to_owned);
-        adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
-        timeline_calls(ORCHESTRATOR, sink.rows, &mut out);
+        out.extend(timeline_from_reader(adapter.as_ref(), r, ORCHESTRATOR, tool)?);
     }
 
     for s in selected_tool_agents(r, agent, workflow, crate::SubagentDemand::Sessions)? {

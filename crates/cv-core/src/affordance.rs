@@ -1666,6 +1666,15 @@ impl Counter {
 
 /// The transcript rows plus the adapter's side-store rows, for one session ref.
 pub fn read(adapter: &dyn crate::harness::Adapter, r: &crate::ir::SessionRef) -> anyhow::Result<Vec<Affordance>> {
+    read_evidence(adapter, r, true)
+}
+
+/// Read only transcript evidence when the selected revision has no pinned side stores.
+pub fn read_evidence(
+    adapter: &dyn crate::harness::Adapter,
+    r: &crate::ir::SessionRef,
+    with_stores: bool,
+) -> anyhow::Result<Vec<Affordance>> {
     let resolver = crate::lazy::Resolver::new(Some(r.path.clone()));
     let mut messages = Vec::new();
     let mut index = 0;
@@ -1687,7 +1696,10 @@ pub fn read(adapter: &dyn crate::harness::Adapter, r: &crate::ir::SessionRef) ->
             index += 1;
             Flow::Continue
         },
-        crate::stream::Pass::RECORD,
+        crate::stream::Pass {
+            record: with_stores,
+            ..crate::stream::Pass::RECORD
+        },
     )?
     .session;
     if let Some(error) = error {
@@ -1696,7 +1708,9 @@ pub fn read(adapter: &dyn crate::harness::Adapter, r: &crate::ir::SessionRef) ->
     // Session facts can arrive at EOF; they still precede message rows, exactly as of_session.
     let mut rows = session_rows(&s);
     rows.extend(messages);
-    rows.extend(adapter.store_affordances(r)?);
+    if with_stores {
+        rows.extend(adapter.store_affordances(r)?);
+    }
     Ok(rows)
 }
 

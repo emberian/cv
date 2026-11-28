@@ -3,6 +3,88 @@ use crate::source::FileId;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Peer places with incomplete contact and recorded activity in this checkout.
+#[cfg(feature = "sqlite")]
+pub fn stale_peer_places(directories: &std::collections::BTreeSet<&Path>) -> anyhow::Result<Vec<String>> {
+    use crate::state::{
+        hub::{AuthorityQueryContext, HubStore, PlaceState},
+        StateStore,
+    };
+    if directories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hub = HubStore::default_hub()?;
+    let authority = hub.compute_authority(&AuthorityQueryContext::default())?;
+    let stale: std::collections::BTreeSet<_> = authority
+        .places
+        .into_iter()
+        .filter(|p| matches!(p.state, PlaceState::Partitioned | PlaceState::Unknown))
+        .map(|p| p.place_id)
+        .collect();
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+    let roots: std::collections::BTreeSet<_> = directories
+        .iter()
+        .map(|p| {
+            p.ancestors()
+                .find(|ancestor| ancestor.join(".git").exists())
+                .unwrap_or(p)
+        })
+        .collect();
+    let store = StateStore::default_store()?;
+    let matches_checkout = |dir: &str| !dir.is_empty() && roots.iter().any(|root| Path::new(dir).starts_with(root));
+    let peers = store.read_in(|conn| {
+        use rusqlite::OptionalExtension;
+        let have_heads = conn.table_exists(None, "hub_session_heads")?;
+        let mut peers = Vec::new();
+        for place in stale {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT metadata_json FROM producers WHERE producer_id = ?1",
+                    [&place],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let metadata: serde_json::Value = serde_json::from_str(raw.as_deref().unwrap_or("null"))?;
+            let enrolled = ["cwd", "repo", "repo_root"]
+                .iter()
+                .any(|key| metadata[*key].as_str().is_some_and(matches_checkout));
+            let policy = &metadata["filter_policy"];
+            let in_policy = |cwd: &Path, key: &str| {
+                policy[key].as_array().is_some_and(|hashes| {
+                    cwd.ancestors().any(|path| {
+                        let hash = crate::state::hub::shipper::hash_cwd_filter_prefix(&place, &path.to_string_lossy());
+                        hashes.iter().any(|value| value.as_str() == Some(hash.as_str()))
+                    })
+                })
+            };
+            if enrolled
+                || directories
+                    .iter()
+                    .any(|dir| in_policy(dir, "allow_cwd_hashes") && !in_policy(dir, "deny_cwd_hashes"))
+            {
+                peers.push(place);
+                continue;
+            }
+            if have_heads {
+                let mut heads = conn.prepare_cached(
+                    "SELECT DISTINCT cwd FROM hub_session_heads
+                     WHERE producer_id = ?1 AND gen_to IS NULL AND cwd IS NOT NULL",
+                )?;
+                for dir in heads.query_map([&place], |row| row.get::<_, String>(0))? {
+                    if matches_checkout(&dir?) {
+                        peers.push(place);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(peers)
+    })?;
+    Ok(peers.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileVersion {
     pub path: String,

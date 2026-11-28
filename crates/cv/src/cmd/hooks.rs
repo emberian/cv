@@ -2216,19 +2216,20 @@ fn hook_edit(ev: &Event, payload: &Value) -> Result<Option<Value>> {
     };
     let mut conflicts = Vec::new();
     let mut advice = std::collections::BTreeSet::new();
+    let edits = ev.normalized_edits();
     let versions = std::cell::OnceCell::new();
-    for abs_str in ev.normalized_edits() {
-        let abs = PathBuf::from(&abs_str);
+    for abs_str in &edits {
+        let abs = PathBuf::from(abs_str);
         let mut live: Vec<(String, i64)> = Vec::new();
         // The guard answers in milliseconds and never blocks an edit on its own failure: an event
         // catalog that cannot answer degrades once, as an accelerator does.
-        let mut editing = cv_core::events::sessions_editing(&abs_str).unwrap_or_else(|e| {
+        let mut editing = cv_core::events::sessions_editing(abs_str).unwrap_or_else(|e| {
             cv_core::env::warn_once("the event catalog", format_args!("{e:#}"));
             Vec::new()
         });
         let agent = ev.agent.as_ref().map_or("", |a| a.id.as_str());
         let stale =
-            cv_core::events::workspace::stale_reads(ev.harness.as_str(), &ev.session.id, Some(agent), Some(&abs_str))
+            cv_core::events::workspace::stale_reads(ev.harness.as_str(), &ev.session.id, Some(agent), Some(abs_str))
                 .unwrap_or_default();
         if let Some(s) = stale.first().filter(|s| {
             versions
@@ -2238,12 +2239,12 @@ fn hook_edit(ev: &Event, payload: &Value) -> Result<Option<Value>> {
         }) {
             advice.insert(format!(
                 "cv: stale read of {}. Inspect the peer edit with `cv show {}:{}` before applying this change.",
-                sanitize_line(&abs_str),
+                sanitize_line(abs_str),
                 sanitize_line(&s.writer_harness),
                 sanitize_line(&s.writer)
             ));
         }
-        let pending = cv_core::events::workspace::pending_editors(&abs_str).unwrap_or_default();
+        let pending = cv_core::events::workspace::pending_editors(abs_str).unwrap_or_default();
         editing.extend(pending);
         let mut visited = std::collections::HashSet::new();
         for t in editing {
@@ -2261,7 +2262,7 @@ fn hook_edit(ev: &Event, payload: &Value) -> Result<Option<Value>> {
                         let overlap = versions
                             .get_or_init(|| version_samples(ev, payload))
                             .iter()
-                            .find(|v| v.path == abs_str)
+                            .find(|v| v.path == *abs_str)
                             .and_then(|v| {
                                 cv_core::events::workspace::overlaps(
                                     &t.harness,
@@ -2308,6 +2309,24 @@ fn hook_edit(ev: &Event, payload: &Value) -> Result<Option<Value>> {
         conflicts.push(format!(
             "cv: {shown} was edited by live session {first} ({mins} min ago){more}. `cv show {first} --last 10` shows its hand; proceed only if the edits do not collide."
         ));
+    }
+    let directories = ev
+        .cwd
+        .as_deref()
+        .into_iter()
+        .chain(edits.iter().filter_map(|p| Path::new(p).parent()))
+        .collect();
+    match cv_core::events::workspace::stale_peer_places(&directories) {
+        Ok(peers) if !peers.is_empty() => {
+            let places = peers.iter().map(|id| sanitize_line(id)).collect::<Vec<_>>().join(", ");
+            advice.insert(format!(
+                "cv: Peer edit history may be stale in this checkout ({places})."
+            ));
+        }
+        Err(error) => {
+            cv_core::env::warn_once("peer edit history", format_args!("{error:#}"));
+        }
+        _ => {}
     }
     if conflicts.is_empty() {
         return Ok(

@@ -239,11 +239,13 @@ fn emit_session_result(
         }
     }
     if json {
-        println!(
-            "{}",
-            serde_json::json!({"path": res.path, "id": res.new_id, "harness": to_h,
-            "resume_hint": res.resume_hint, "warnings": warnings})
-        );
+        let out = serde_json::json!({"path": res.path, "id": res.new_id, "harness": to_h,
+            "resume_hint": res.resume_hint, "warnings": warnings});
+        if super::place::current().is_some() {
+            super::place::print_json("pack", &out)?;
+        } else {
+            println!("{out}");
+        }
     } else {
         println!("✦ wrote {} ({})", res.path.display(), res.new_id);
         if let Some(hint) = &res.resume_hint {

@@ -336,6 +336,65 @@ fn fleet_hub_out_of_order_frontier_and_publish_before_reference() {
     assert_eq!(sess2_raw.header("X-Cv-Hub-Generation"), Some("2"));
     let sess2_rows: Vec<Value> = sess2_raw.json().unwrap();
     assert_eq!(sess2_rows.len(), 8);
+
+    // #tooth A published HTTP receipt becomes searchable in the indexes used by a separate process.
+    let args = [
+        "--frozen",
+        "search",
+        "question",
+        "--place",
+        "prod-alpha",
+        "--live-bytes",
+        "0",
+        "--json",
+    ];
+    let found: Value = serde_json::from_str(&hub_w.cv_ok(&args).0).unwrap();
+    assert_eq!(found["total"], 8, "{found}");
+    assert_eq!(found["authority"]["indexed_generation"], 2, "{found}");
+
+    let alternate = hub_w.base.join("second-cache");
+    let env = [("CLUSTERVISION_CACHE", alternate.to_str().unwrap())];
+    let ls = ["--frozen", "ls", "--place", "prod-alpha", "--json"];
+    let (ok, _, stdout, err) = hub_w.cv_env(&ls, &env);
+    assert!(ok, "{err}");
+    let blank: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(blank["authority"]["indexed_generation"], 0, "{blank}");
+    let (ok, _, _, err) = hub_w.cv_env(&["index"], &env);
+    assert!(ok, "{err}");
+    let (ok, _, stdout, err) = hub_w.cv_env(&args, &env);
+    assert!(ok, "{err}");
+    let indexed: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(indexed["total"], 8, "{indexed}");
+    assert_eq!(indexed["authority"]["indexed_generation"], 2, "{indexed}");
+
+    // A derived write failure must preserve the custody receipt and leave the cursor behind.
+    let lock = hub_w.cv_home.join(".hub-index.lock");
+    let held = hub_w.cv_home.join("original-index-lock");
+    fs::rename(&lock, &held).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let deletion = IngestBatchRequest {
+        events: vec![IngestEventRecord::new(
+            EventId::new("prod-alpha", "ep-1", 9),
+            "delete-first",
+            json!({"kind":"session_delete","session_id":"sess-1","updated_at":"2026-06-16T00:00:00Z"}),
+            None,
+        )
+        .unwrap()],
+    };
+    let receipt = shipper.send_ingest_batch(&deletion).unwrap().0;
+    assert_eq!(receipt.hub_generation, Some(3));
+    let behind: Value = serde_json::from_str(&hub_w.cv_ok(&ls).0).unwrap();
+    assert_eq!(behind["authority"]["indexed_generation"], 2, "{behind}");
+    fs::remove_dir(&lock).unwrap();
+    fs::rename(&held, &lock).unwrap();
+    assert_eq!(shipper.send_ingest_batch(&deletion).unwrap().0.replayed_count, 1);
+    let raw = hub_w
+        .cv_ok(&["--frozen", "search", "question", "--live-bytes", "0", "--json"])
+        .0;
+    let remaining: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(remaining["total"], 7, "{remaining}");
+    let caught_up: Value = serde_json::from_str(&hub_w.cv_ok(&ls).0).unwrap();
+    assert_eq!(caught_up["authority"]["indexed_generation"], 3, "{caught_up}");
 }
 
 /// 2. Duplicate batch & pack replay is 100% idempotent; conflicting pack digest for an existing

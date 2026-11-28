@@ -433,6 +433,11 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// The file-touch timeline of one session.
 pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouch>> {
+    read_with_checkout(adapter, r, true)
+}
+
+/// A replicated transcript can reconstruct edits but cannot certify the producer's checkout.
+pub fn read_with_checkout(adapter: &dyn crate::Adapter, r: &SessionRef, checkout: bool) -> Result<Vec<FileTouch>> {
     let mut pending: Vec<Pending> = Vec::new();
     let mut by_call: HashMap<String, Vec<usize>> = HashMap::new();
     let mut results: HashMap<String, bool> = HashMap::new();
@@ -505,7 +510,10 @@ pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouc
             index += 1;
             Flow::Continue
         },
-        crate::stream::Pass::RECORD,
+        crate::stream::Pass {
+            record: checkout,
+            ..crate::stream::Pass::RECORD
+        },
     )?
     .session;
     if let Some(e) = error {
@@ -519,12 +527,12 @@ pub fn read(adapter: &dyn crate::Adapter, r: &SessionRef) -> Result<Vec<FileTouc
         }
     }
     let cwd = session.cwd.clone().or_else(|| r.cwd.clone());
-    let mut repo = cwd.as_deref().and_then(git_root).map(|root| Repo {
+    let mut repo = cwd.as_deref().filter(|_| checkout).and_then(git_root).map(|root| Repo {
         root,
         paths: HashMap::new(),
         blobs: None,
     });
-    let frozen = crate::env::frozen();
+    let frozen = !checkout || crate::env::frozen();
     let mut state: HashMap<String, Option<String>> = HashMap::new();
     let mut out = Vec::with_capacity(pending.len());
     for p in pending {

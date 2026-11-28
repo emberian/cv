@@ -136,6 +136,12 @@ to copy a Claude session's `subagents/` spawn metadata and restamped transcripts
 session id (joining any transcript the destination already started); `adopt --join --from <old>
 --into <new>` runs the same join after an in-place `/resume`.
 
+**Place selection** uses the same `--place <GLOB>`, `--as-of <GEN>` and `--max-staleness <DUR>`
+on `ls`, `search`, `events`, `touched`, `blame`, `show --kind files`, `tools`, `pack` and `lanes`.
+Scoped JSON reports include an `authority` object alongside their payload. A historical read selects
+the published heads and frontier at that generation. Missing worker evidence is reported as partial.
+Current index coverage advances when text and event indexing have both committed.
+
 **Global:** `--frozen` (`CV_FROZEN=1`) leaves cv stores untouched; commands whose purpose is to
 write stores or sessions error with exit 2.
 

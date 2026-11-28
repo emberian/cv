@@ -93,14 +93,77 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     if review && sessions.is_empty() {
         selections.insert(std::env::current_dir()?, None);
     }
-    if !sessions.is_empty() {
+    let view = super::place::current();
+    if let Some(v) = &view {
+        if review && (v.pinned || (sessions.is_empty() && !v.envelope.borrow().includes("local"))) {
+            return crate::util::usage("checkout review needs the current local checkout");
+        }
+        let mut selected = Vec::new();
+        if sessions.is_empty() && !review {
+            let terms = query_tokens(query);
+            for src in &v.sources {
+                if let Some(e) = src.entry.as_ref().filter(|_| src.r.path.as_os_str().is_empty()) {
+                    v.omit(
+                        &e.producer_id,
+                        "missing_payload",
+                        "A session has no collected payload for recall.",
+                    );
+                    continue;
+                }
+                let mut sink = cv_core::scan::ScanSink::new(&src.r.path, cv_core::scan::Matcher::new(terms.clone(), 0));
+                v.adapter(src)?
+                    .try_stream(&src.r, &cv_core::Demand::LEAN.with_spans(), &mut sink)?;
+                sink.matcher.finish();
+                let matched = (0..terms.len()).filter(|i| sink.matcher.found(*i)).count();
+                if matched > 0 {
+                    selected.push((matched, src));
+                }
+            }
+            selected.sort_by(|(a, x), (b, y)| {
+                b.cmp(a)
+                    .then_with(|| y.r.updated_at.cmp(&x.r.updated_at))
+                    .then_with(|| x.r.id.cmp(&y.r.id))
+            });
+            selected.truncate(limit);
+        } else {
+            let mut seen = HashSet::new();
+            for spec in sessions {
+                let src = v.resolve(spec, None)?;
+                if seen.insert(src.r.session_selector()) {
+                    selected.push((0, src));
+                }
+            }
+        }
+        for (_, src) in selected {
+            if review && src.entry.is_some() {
+                return crate::util::usage("checkout review requires a local checkout");
+            }
+            if review {
+                continue;
+            }
+            let selector = Some(src.r.session_selector());
+            let adapter = v.adapter(src)?;
+            let source = if use_overview {
+                build_overview_source(src.r.clone(), excerpt_bytes, selector, redact)
+            } else {
+                build_source(src.r.clone(), adapter.as_ref(), query, excerpt_bytes, selector, redact)
+            };
+            sources.push(source?);
+        }
+    }
+    if (view.is_none() || review) && !sessions.is_empty() {
         // Explicit input is authoritative: never recall outside it or silently omit a bad source.
         // Resolve all selections before reading so a bad final selector cannot publish a partial pack.
         let selected = sessions
             .iter()
             .map(|spec| {
                 let (harness, id) = crate::util::split_harness_id(spec, None);
-                let (session, adapter) = crate::cmd::distill::resolve_source(id, harness)?;
+                let (session, adapter) = if let Some(v) = &view {
+                    let src = v.resolve(spec, None)?;
+                    (src.r.clone(), v.adapter(src)?)
+                } else {
+                    crate::cmd::distill::resolve_source(id, harness)?
+                };
                 let is_path = Path::new(id).is_file();
                 if is_path {
                     crate::util::require_session_file(&session, adapter.as_ref())?;
@@ -149,7 +212,7 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
             };
             sources.push(source.with_context(|| format!("reading selected session {}", path.display()))?);
         }
-    } else if !review {
+    } else if view.is_none() && !review {
         // Search still selects candidates for the original task-only form.
         let (hits, collapsed) = recall(query, limit, all)?;
         collapsed_copies = collapsed;
@@ -184,12 +247,17 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
     } else {
         let mut file_digests = cv_core::task::FileDigests::default();
         for s in &mut sources {
-            s.verified = cv_core::events::workspace::observed_edits(s.session.harness.as_str(), &s.session.id)?;
-            let blobs = cv_core::events::workspace::observed_file_blobs(s.session.harness.as_str(), &s.session.id)?;
-            for (path, blob) in &blobs {
-                if file_digests.check_path(s.session.cwd.as_deref(), path, blob) == cv_core::task::Applicability::Stale
-                {
-                    s.stale_files.insert(path.clone());
+            if view.as_ref().is_none_or(|v| {
+                !v.pinned && v.envelope.borrow().includes("local") && !cv_core::custody::is_pack_ref(&s.session)
+            }) {
+                s.verified = cv_core::events::workspace::observed_edits(s.session.harness.as_str(), &s.session.id)?;
+                let blobs = cv_core::events::workspace::observed_file_blobs(s.session.harness.as_str(), &s.session.id)?;
+                for (path, blob) in &blobs {
+                    if file_digests.check_path(s.session.cwd.as_deref(), path, blob)
+                        == cv_core::task::Applicability::Stale
+                    {
+                        s.stale_files.insert(path.clone());
+                    }
                 }
             }
             if !all && s.edits.keys().chain(&s.verified).any(|p| review::runner(p)) {
@@ -208,11 +276,35 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 redact_source(s);
             }
         }
-        let replay = cv_core::lanes::replay_tasks_readonly()?;
-        for warning in &replay.warnings {
+        if let Some(v) = &view {
+            let peers: Vec<_> = v
+                .envelope
+                .borrow()
+                .places
+                .iter()
+                .filter(|p| p.place_id != "local")
+                .map(|p| p.place_id.clone())
+                .collect();
+            for id in peers {
+                v.omit(
+                    &id,
+                    "task_history",
+                    "Task findings and live checkout observations are not part of the published session.",
+                );
+            }
+        }
+        let replay = if view
+            .as_ref()
+            .is_none_or(|v| !v.pinned && v.envelope.borrow().includes("local"))
+        {
+            Some(cv_core::lanes::replay_tasks_readonly()?)
+        } else {
+            None
+        };
+        for warning in replay.iter().flat_map(|r| &r.warnings) {
             eprintln!("cv pack: {}", cv_core::sanitize::sanitize_line(warning));
         }
-        let model = replay.model;
+        let model = replay.map(|r| r.model).unwrap_or_default();
         let cwd = std::env::current_dir()?;
         let relevant = |t: &cv_core::task::TaskProjection| {
             t.repo.as_deref().is_some_and(|r| {
@@ -273,10 +365,10 @@ pub(crate) fn cmd_pack(args: PackArgs<'_>) -> Result<()> {
                 task_display = cv_core::redact::redact_credentials(&task_display).0;
             }
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"task":task_display,"format":format,"sources":[],"content":null,"path":null})
-                );
+                super::place::print_json(
+                    "pack",
+                    &serde_json::json!({"task":task_display,"format":format,"sources":[],"content":null,"path":null}),
+                )?;
             } else {
                 println!("no relevant past sessions for {task_display:?} — nothing to pack");
             }
@@ -702,9 +794,15 @@ fn build_source(
 ) -> Result<PackSource> {
     // Carry the resolved source through the read, including path-selected duplicate IDs.
     let mut resolved = session.clone();
-    let (excerpt, excerpt_range) =
-        best_window_and_ingest_meta(adapter, &session, task, excerpt_bytes, Some(&mut resolved))?;
-    let rows = cv_core::events::read_ref(&session, None)?;
+    let (excerpt, excerpt_range, rows) = if let Some(v) = super::place::current() {
+        let (excerpt, range) =
+            best_window_observing(adapter, &session, task, excerpt_bytes, None, Some(&mut resolved))?;
+        (excerpt, range, v.event_rows(v.source_for(&session)?)?)
+    } else {
+        let (excerpt, range) =
+            best_window_and_ingest_meta(adapter, &session, task, excerpt_bytes, Some(&mut resolved))?;
+        (excerpt, range, cv_core::events::read_ref(&session, None)?)
+    };
     let EventFacts {
         edits,
         reads,
@@ -737,17 +835,23 @@ fn build_overview_source(
     selector: Option<String>,
     _redact: bool,
 ) -> Result<PackSource> {
-    let overview = cv_core::overview::read(
-        &session,
-        &cv_core::overview::OverviewOptions {
-            file_limit: MAX_FILES_PER_SOURCE,
-            excerpt_bytes,
-            ..Default::default()
-        },
-    )?;
-    // The overview's standard session row includes metadata from the same streaming read.
-    let session = serde_json::from_value(overview.session.clone())?;
-    let facts = event_facts(&cv_core::events::read_ref(&session, None)?);
+    let opts = cv_core::overview::OverviewOptions {
+        file_limit: MAX_FILES_PER_SOURCE,
+        excerpt_bytes,
+        ..Default::default()
+    };
+    let (overview, session, rows) = if let Some(v) = super::place::current() {
+        let src = v.source_for(&session)?;
+        let parsed = v.adapter(src)?.parse(&session)?;
+        let overview = cv_core::overview::from_session(&parsed, &opts)?;
+        (overview, session, v.event_rows(src)?)
+    } else {
+        let overview = cv_core::overview::read(&session, &opts)?;
+        let session = serde_json::from_value(overview.session.clone())?;
+        let rows = cv_core::events::read_ref(&session, None)?;
+        (overview, session, rows)
+    };
+    let facts = event_facts(&rows);
     Ok(PackSource {
         verified: Default::default(),
         stale_files: Default::default(),
@@ -1607,12 +1711,12 @@ fn write_text(text: &str, out: Option<PathBuf>, force: bool, what: &str, json: b
         Some(path) => {
             crate::util::write_user_file(&path, text.as_bytes(), force)?;
             if json {
-                println!("{}", serde_json::json!({"path": path, "content": null}));
+                super::place::print_json("pack", &serde_json::json!({"path": path, "content": null}))?;
             } else {
                 eprintln!("✦ wrote {what} → {}", path.display());
             }
         }
-        None if json => println!("{}", serde_json::json!({"path": null, "content": text})),
+        None if json => super::place::print_json("pack", &serde_json::json!({"path": null, "content": text}))?,
         None => print!("{text}"),
     }
     Ok(())

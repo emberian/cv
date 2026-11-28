@@ -487,6 +487,12 @@ fn run(
         }
     }
 
+    if hub && !cv_core::env::frozen() {
+        let store = cv_core::state::hub::HubStore::default_hub()?;
+        if store.latest_generation_fast()?.is_some() {
+            index_receipt_header(&store);
+        }
+    }
     let _recorder = super::start_recorder()?;
     let mut limits = crate::http::Limits::default();
     if hub {
@@ -1729,6 +1735,17 @@ fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Custody is durable before indexing. Preserve the receipt if the derived stores need a retry.
+fn index_receipt_header(hub: &cv_core::state::hub::HubStore) -> (&'static str, String) {
+    match cv_search::fts::index_changed_heads(hub) {
+        Ok(generation) => ("X-Cv-Indexed-Generation", generation.to_string()),
+        Err(e) => {
+            eprintln!("cv serve: hub index update pending: {e:#}");
+            ("X-Cv-Index-Status", "pending".into())
+        }
+    }
+}
+
 fn hub_error_reply(err: cv_core::state::hub::HubError) -> Reply {
     use cv_core::state::hub::HubError;
     match err {
@@ -1902,7 +1919,12 @@ fn handle_hub_write(
                 Ok(resolved) => {
                     ctx.stream.bump(&["hub", "sessions"]);
                     let out = serde_json::to_value(resolved).unwrap_or_else(|_| json!({"error": "serialize failed"}));
-                    json_response(200, &out, cors, &[("Cache-Control", "no-store".into())])
+                    json_response(
+                        200,
+                        &out,
+                        cors,
+                        &[("Cache-Control", "no-store".into()), index_receipt_header(&hub)],
+                    )
                 }
                 Err(e) => {
                     let (status, body, extra) = hub_error_reply(e);
@@ -2128,13 +2150,7 @@ fn handle_hub_write(
                 Ok(resp) => {
                     ctx.stream.bump(&["hub", "sessions"]);
                     let mut extra = vec![("Cache-Control", "no-store".to_string())];
-                    match cv_search::fts::index_changed_heads(&hub) {
-                        Ok(generation) => extra.push(("X-Cv-Indexed-Generation", generation.to_string())),
-                        Err(e) => {
-                            eprintln!("cv serve: hub ingest committed, index update pending: {e:#}");
-                            extra.push(("X-Cv-Index-Status", "pending".into()));
-                        }
-                    }
+                    extra.push(index_receipt_header(&hub));
                     if let Some(ref pub_id) = resp.publication_id {
                         extra.push(("X-Cv-Snapshot", header_safe(pub_id)));
                     }
@@ -2286,7 +2302,7 @@ fn no_content(cors: Cors<'_>) -> Response<'static> {
 /// response header from `fetch` unless it is named here, so `/api/search`'s "this answer is
 /// degraded" signal and hit count would be invisible to a dashboard on a dev server without it.
 const EXPOSED_HEADERS: &str =
-    "X-Cv-Search-Source, X-Cv-Search-Note, X-Cv-Search-Total, Content-Disposition, X-Cv-Snapshot, X-Cv-Hub-Generation";
+    "X-Cv-Search-Source, X-Cv-Search-Note, X-Cv-Search-Total, Content-Disposition, X-Cv-Snapshot, X-Cv-Hub-Generation, X-Cv-Indexed-Generation, X-Cv-Index-Status";
 
 /// CORS headers echoing the one allowed `origin` — an unlisted origin gets none (the browser then
 /// refuses to share the response with it). `Access-Control-Allow-Credentials` is emitted ONLY when

@@ -42,38 +42,100 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
         );
     }
     let want = crate::util::parse_harness(&harness)?;
-    let (r, _adapter) = crate::util::resolve(id, want)?;
-
-    let workflow = if let Some(run) = &workflow {
-        // Resolve a run-id *prefix* to the full id (the forest tags agents with the full run id),
-        // so `--workflow wf_08eb66fa` matches `wf_08eb66fa-4b1`.
-        let full =
-            cv_core::workflow_id_of(&r, run).with_context(|| format!("no workflow {run:?} in {}", short_id(&r.id)))?;
-        // The orchestrator isn't part of any one workflow; restrict to the named run's agents.
-        Some(full)
+    let view = super::place::current();
+    let source = view.as_ref().map(|v| v.resolve(id, want)).transpose()?;
+    let (forest, agent) = if let (Some(v), Some(src)) = (&view, source.filter(|s| s.entry.is_some())) {
+        let entry = src.entry.as_ref().unwrap();
+        v.omit(
+            &entry.producer_id,
+            "worker_inventory",
+            "Only collected worker transcripts carry tool evidence.",
+        );
+        let mut inputs = vec![(cv_core::tools::ORCHESTRATOR, "orchestrator", None, src)];
+        for s in v.children(src) {
+            let m = &s.entry.as_ref().unwrap().metadata;
+            inputs.push((
+                super::place::View::agent_id(s),
+                m["agent_type"].as_str().unwrap_or("agent"),
+                m["workflow"].as_str(),
+                s,
+            ));
+        }
+        inputs.retain(|(_, _, w, _)| workflow.as_deref().is_none_or(|q| w.is_some_and(|w| w.starts_with(q))));
+        if let Some(q) = &agent {
+            inputs.retain(|(id, _, _, _)| id.starts_with(q));
+            anyhow::ensure!(inputs.len() == 1, "missing or ambiguous collected agent {q:?}");
+        }
+        let selected = agent.as_ref().and_then(|_| inputs.first().map(|t| t.0.to_owned()));
+        let mut hist = Vec::new();
+        let mut events = Vec::new();
+        for (id, ty, w, s) in inputs {
+            let reader = v.adapter(s)?;
+            if timeline {
+                events.extend(cv_core::tools::timeline_from_reader(
+                    reader.as_ref(),
+                    &s.r,
+                    id,
+                    tool.as_deref(),
+                )?);
+            } else {
+                hist.push(cv_core::tools::AgentTools {
+                    agent: id.into(),
+                    agent_type: ty.into(),
+                    workflow: w.map(str::to_owned),
+                    histogram: cv_core::tools::ToolHistogram::from_stream_selected(
+                        reader.as_ref(),
+                        &s.r,
+                        tool.as_deref(),
+                    )?,
+                });
+            }
+        }
+        if timeline {
+            events.sort_by_key(|e| (e.ts.unwrap_or(i64::MAX), e.agent.clone(), e.msg_idx));
+            return render_timeline(events, selected.as_deref(), json);
+        }
+        (ForestTools { agents: hist }, selected)
     } else {
-        None
-    };
-    // One selector grammar for every view: an exact id or a unique prefix; none or several is a
-    // usage error (exit 2), like a session id.
-    let agent = agent
-        .map(|key| {
-            cv_core::tools::resolve_agent(&r, &key, workflow.as_deref()).map_err(|e| {
-                match e.downcast_ref::<cv_core::tools::AgentSelectorError>() {
-                    Some(sel) => {
-                        crate::util::UsageError(format!("{sel} (try `cv tools {} --across`)", short_id(&r.id))).into()
+        let r = match source {
+            Some(s) => s.r.clone(),
+            None => crate::util::resolve(id, want)?.0,
+        };
+
+        let workflow = if let Some(run) = &workflow {
+            // Resolve a run-id *prefix* to the full id (the forest tags agents with the full run id),
+            // so `--workflow wf_08eb66fa` matches `wf_08eb66fa-4b1`.
+            let full = cv_core::workflow_id_of(&r, run)
+                .with_context(|| format!("no workflow {run:?} in {}", short_id(&r.id)))?;
+            // The orchestrator isn't part of any one workflow; restrict to the named run's agents.
+            Some(full)
+        } else {
+            None
+        };
+        // One selector grammar for every view: an exact id or a unique prefix; none or several is a
+        // usage error (exit 2), like a session id.
+        let agent = agent
+            .map(|key| {
+                cv_core::tools::resolve_agent(&r, &key, workflow.as_deref()).map_err(|e| {
+                    match e.downcast_ref::<cv_core::tools::AgentSelectorError>() {
+                        Some(sel) => {
+                            crate::util::UsageError(format!("{sel} (try `cv tools {} --across`)", short_id(&r.id)))
+                                .into()
+                        }
+                        None => e,
                     }
-                    None => e,
-                }
+                })
             })
-        })
-        .transpose()?;
-    if timeline {
-        return tools_timeline(&r, agent.as_deref(), workflow.as_deref(), tool.as_deref(), json);
-    }
+            .transpose()?;
+        if timeline {
+            return tools_timeline(&r, agent.as_deref(), workflow.as_deref(), tool.as_deref(), json);
+        }
 
-    let forest = cv_core::tools::forest_tools_selected(&r, agent.as_deref(), workflow.as_deref(), tool.as_deref())?;
-
+        (
+            cv_core::tools::forest_tools_selected(&r, agent.as_deref(), workflow.as_deref(), tool.as_deref())?,
+            agent,
+        )
+    };
     // `--tool T`: which agents used it.
     if let Some(t) = &tool {
         return tools_which_agents(&forest, t, json);
@@ -83,12 +145,12 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
         let at = forest.agent(a).with_context(|| {
             format!(
                 "no agent matching {a:?} in {} (try `cv tools {} --across`)",
-                short_id(&r.id),
-                short_id(&r.id)
+                short_id(id),
+                short_id(id)
             )
         })?;
         if json {
-            println!("{}", serde_json::to_string_pretty(at)?);
+            super::place::print_json("tools", at)?;
             return Ok(());
         }
         println!("# tools used by {} ({})", at.agent, at.agent_type);
@@ -103,12 +165,12 @@ pub(crate) fn cmd_tools(args: ToolsArgs<'_>) -> Result<()> {
     // Default: the aggregate across the whole forest.
     let agg = forest.aggregate();
     if json {
-        println!("{}", serde_json::to_string_pretty(&agg)?);
+        super::place::print_json("tools", &agg)?;
         return Ok(());
     }
     println!(
         "# tool usage across {} ({} agent(s): orchestrator + forest)",
-        short_id(&r.id),
+        short_id(id),
         forest.agents.len()
     );
     print_histogram(&agg);
@@ -129,7 +191,7 @@ fn tools_which_agents(forest: &ForestTools, tool: &str, json: bool) -> Result<()
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        super::place::print_json("tools", &rows)?;
         return Ok(());
     }
     if users.is_empty() {
@@ -158,7 +220,7 @@ fn tools_which_agents(forest: &ForestTools, tool: &str, json: bool) -> Result<()
 /// Per-agent breakdown: one block per agent, its histogram beneath.
 fn tools_across(forest: &ForestTools, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(forest)?);
+        super::place::print_json("tools", forest)?;
         return Ok(());
     }
     // Skip agents that used no tools (a chat-only sub-agent) to keep the view dense.
@@ -200,8 +262,12 @@ fn tools_timeline(
     json: bool,
 ) -> Result<()> {
     let events = cv_core::tools::forest_timeline_selected(r, agent, workflow, tool)?;
+    render_timeline(events, agent, json)
+}
+
+fn render_timeline(events: Vec<cv_core::tools::ToolEvent>, agent: Option<&str>, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&events)?);
+        super::place::print_json("tools", &events)?;
         return Ok(());
     }
     if events.is_empty() {

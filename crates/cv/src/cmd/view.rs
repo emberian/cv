@@ -284,7 +284,8 @@ fn file_line(t: &cv_core::files::FileTouch) -> String {
 
 /// `show --kind files`: the session's file touches in message order, sliced like other kinds.
 fn print_files(r: &SessionRef, adapter: &dyn Adapter, win: KindWindow, json: bool) -> Result<()> {
-    let mut rows = cv_core::files::read(adapter, r)?;
+    let checkout = super::place::current().is_none_or(|v| !v.pinned && !cv_core::custody::is_pack_ref(r));
+    let mut rows = cv_core::files::read_with_checkout(adapter, r, checkout)?;
     if let Some((start, end)) = win.pre_compaction {
         rows.retain(|t| t.msg_idx >= start && end.is_none_or(|end| t.msg_idx < end));
     }
@@ -304,7 +305,7 @@ fn print_files(r: &SessionRef, adapter: &dyn Adapter, win: KindWindow, json: boo
         },
     )?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        super::place::print_json("files", &rows)?;
         if let Some(next) = next {
             eprintln!("{}", continue_hint(next));
         }
@@ -396,11 +397,30 @@ pub(crate) fn cmd_show(
     }
 
     if subagents {
+        if super::place::current().is_some() {
+            return usage("select either the files view or --subagents");
+        }
         let (r, _adapter) = resolve(id, parse_harness(&harness)?)?;
         return show_subagents(&r, json);
     }
 
-    let (r, adapter, sub) = resolve_show_target(id, parse_harness(&harness)?, agent.as_deref())?;
+    let (r, adapter, sub) = if let Some(scope) = super::place::current() {
+        let parent = scope.resolve(id, parse_harness(&harness)?)?;
+        if let Some(agent_id) = agent.as_deref().filter(|_| parent.entry.is_none()) {
+            let child = resolve_subagent(&parent.r, agent_id)?;
+            let adapter = cv_core::harness::for_harness(child.session.harness).context("agent reader unavailable")?;
+            (child.session.clone(), adapter, Some(child))
+        } else {
+            let target = if let Some(a) = &agent {
+                scope.child(parent, a)?
+            } else {
+                parent
+            };
+            (target.r.clone(), scope.adapter(target)?, None)
+        }
+    } else {
+        resolve_show_target(id, parse_harness(&harness)?, agent.as_deref())?
+    };
 
     if let Some(kind) = kind {
         return match kind {
@@ -414,7 +434,7 @@ pub(crate) fn cmd_show(
             }
             KindView::Said { prompts, answers } => {
                 let win = KindWindow {
-                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    pre_compaction: pre_compaction_span(&r, adapter.as_ref(), pre_compaction)?,
                     selector: window.kind_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
@@ -422,7 +442,7 @@ pub(crate) fn cmd_show(
             }
             KindView::Affordances(kinds) => {
                 let win = KindWindow {
-                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    pre_compaction: pre_compaction_span(&r, adapter.as_ref(), pre_compaction)?,
                     selector: window.kind_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
@@ -430,7 +450,7 @@ pub(crate) fn cmd_show(
             }
             KindView::Context => {
                 let win = KindWindow {
-                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    pre_compaction: pre_compaction_span(&r, adapter.as_ref(), pre_compaction)?,
                     selector: window.message_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
@@ -438,7 +458,7 @@ pub(crate) fn cmd_show(
             }
             KindView::Files => {
                 let win = KindWindow {
-                    pre_compaction: pre_compaction_span(&r, pre_compaction)?,
+                    pre_compaction: pre_compaction_span(&r, adapter.as_ref(), pre_compaction)?,
                     selector: window.message_selector_in(adapter.as_ref(), &r)?,
                     max_bytes: window.max_bytes,
                 };
@@ -469,14 +489,20 @@ pub(crate) fn cmd_show(
     render_text(adapter.as_ref(), &r, range, window.max_bytes)
 }
 
-fn pre_compaction_span(r: &SessionRef, pre_compaction: Option<usize>) -> Result<Option<(usize, Option<usize>)>> {
+fn pre_compaction_span(
+    r: &SessionRef,
+    adapter: &dyn Adapter,
+    pre_compaction: Option<usize>,
+) -> Result<Option<(usize, Option<usize>)>> {
     let Some(n) = pre_compaction else {
         return Ok(None);
     };
     if n == 0 {
         return usage("--pre-compaction is 1-based; use 1 for the first boundary");
     }
-    let comps = cv_core::compaction::detect(r, false)?;
+    let mut sink = cv_core::compaction::CompactionSink::new(false);
+    adapter.try_stream(r, &cv_core::Demand::FACTS.with_spans(), &mut sink)?;
+    let comps = sink.into_boundaries()?;
     if comps.is_empty() {
         bail!("{} never compacted — nothing pre-compaction to show", short_id(&r.id));
     }
@@ -507,7 +533,7 @@ fn show_range(
     window: &WindowArgs,
     pre_compaction: Option<usize>,
 ) -> Result<Option<Window>> {
-    if let Some((start, end)) = pre_compaction_span(r, pre_compaction)? {
+    if let Some((start, end)) = pre_compaction_span(r, adapter, pre_compaction)? {
         return Ok(Some(Window::Range(start, end)));
     }
     window.window_in(adapter, r)

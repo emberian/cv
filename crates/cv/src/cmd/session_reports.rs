@@ -291,6 +291,45 @@ pub(crate) fn follow_lanes(
 
     let wait = crate::util::Wait::resolve(true, for_)?;
     let since = lane_since(since)?;
+    if let Some(view) = super::place::current() {
+        if view.pinned {
+            return crate::util::usage("--follow requires a current generation");
+        }
+        if !matches!(scope, LaneScope::Session { .. }) {
+            return crate::util::usage("lanes --follow needs one session");
+        }
+        wait.announce("lanes", "workers in the selected places");
+        let mut last = None;
+        loop {
+            let _scope = super::place::enter(&view.args, None, None, false)?;
+            let current = super::place::current().expect("active report scope");
+            let rows = scoped_workers(&current, &scope, filter, since, with_tasks)?;
+            let snapshot = serde_json::json!({"lanes":rows,"authority":*current.envelope.borrow()});
+            let mut comparable = snapshot.clone();
+            if let Some(rows) = comparable["lanes"].as_array_mut() {
+                for row in rows {
+                    row.as_object_mut().expect("worker row").remove("duration_ms");
+                }
+            }
+            if let Some(places) = comparable["authority"]["places"].as_array_mut() {
+                for p in places.iter_mut().filter(|p| p["place_id"] == "local") {
+                    p.as_object_mut().expect("place row").remove("last_contact_ms");
+                }
+            }
+            if last.as_ref() != Some(&comparable) {
+                if json {
+                    println!("{}", serde_json::to_string(&snapshot)?);
+                } else {
+                    print_scoped_workers(&rows, false)?;
+                }
+                std::io::stdout().flush()?;
+                last = Some(comparable);
+            }
+            if !wait.pause(Duration::from_secs(1)) {
+                return Ok(());
+            }
+        }
+    }
     let LaneScope::Session { id, harness } = scope else {
         return crate::util::usage("lanes --follow needs one session, not --recent");
     };
@@ -419,6 +458,110 @@ fn print_lane_tasks(l: &Lane, tasks: &[cv_core::lanes::LaneTask]) {
     }
 }
 
+/// A published parent can attest a worker call or return. Live process, stop-journal and task
+/// evidence belong to the producer and cannot be inferred from silence in a collected transcript.
+fn scoped_workers(
+    view: &super::place::View,
+    scope: &LaneScope,
+    filter: LaneFilter,
+    since: Option<DateTime<Utc>>,
+    tasks: bool,
+) -> Result<Vec<serde_json::Value>> {
+    use cv_core::affordance::Kind;
+    let parents = match scope {
+        LaneScope::Session { id, harness } => vec![view.resolve(id, parse_harness(harness)?)?],
+        LaneScope::Recent { n, dir } => {
+            let mut parents: Vec<_> = view
+                .sources
+                .iter()
+                .filter(|s| {
+                    s.r.cwd
+                        .as_deref()
+                        .is_some_and(|p| if s.entry.is_some() { p == dir } else { same_dir(p, dir) })
+                        && cv_core::harness::rootless(s.r.harness)
+                            .is_some_and(|a| a.capabilities().lane_stops.is_some())
+                })
+                .collect();
+            parents.sort_by_key(|s| std::cmp::Reverse(s.r.updated_at.or(s.r.created_at)));
+            parents.truncate(*n);
+            parents
+        }
+    };
+    let mut rows = Vec::new();
+    for parent in parents {
+        if let Some(e) = &parent.entry {
+            view.omit(
+                &e.producer_id,
+                "worker_liveness",
+                "Worker process state, stop journals and task bindings are local to the producer.",
+            );
+            if parent.r.path.as_os_str().is_empty() {
+                continue;
+            }
+            let a = view.adapter(parent)?;
+            let mut calls = std::collections::BTreeMap::new();
+            for row in cv_core::affordance::read_evidence(a.as_ref(), &parent.r, false)? {
+                if !matches!(row.kind, Kind::SubagentSpawn | Kind::SubagentReturn) {
+                    continue;
+                }
+                let id = row
+                    .tool_use_id
+                    .clone()
+                    .unwrap_or_else(|| format!("message-{}", row.index.unwrap_or_default()));
+                calls.insert(id, row);
+            }
+            for (id, row) in calls {
+                let returned = row.kind == Kind::SubagentReturn;
+                if since.is_some_and(|t| row.timestamp.is_none_or(|ts| ts < t))
+                    || !match filter {
+                        LaneFilter::All => true,
+                        LaneFilter::Done => returned,
+                        _ => false,
+                    }
+                {
+                    continue;
+                }
+                rows.push(serde_json::json!({"parent_id":parent.r.id,"place":e.producer_id,"tool_use_id":id,
+                    "status":if returned {"returned"} else {"unknown"}, "timestamp":row.timestamp,"summary":row.summary}));
+            }
+        } else {
+            let mut workers = cv_core::lanes::lanes_of(&parent.r)?;
+            if tasks && !workers.is_empty() {
+                let replay = cv_core::lanes::replay_tasks_readonly()?;
+                cv_core::lanes::attach_tasks(&mut workers, &replay.model);
+            }
+            for w in workers
+                .iter()
+                .filter(|w| lane_passes(w, filter) && since.is_none_or(|t| w.active_since(t)))
+            {
+                let mut row = lane_follow_row(&parent.r, w)?;
+                row["place"] = "local".into();
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn print_scoped_workers(rows: &[serde_json::Value], json: bool) -> Result<()> {
+    if json {
+        return super::place::print_json("lanes", &rows);
+    }
+    if rows.is_empty() {
+        println!("no matching workers");
+    }
+    for r in rows {
+        println!(
+            "{}  {}  {}  {}",
+            sanitize_line(r["parent_id"].as_str().unwrap_or("")),
+            sanitize_line(r["agent_id"].as_str().or(r["tool_use_id"].as_str()).unwrap_or("")),
+            sanitize_line(r["status"].as_str().unwrap_or("unknown")),
+            sanitize_line(r["summary"].as_str().unwrap_or(""))
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_lanes(
     scope: LaneScope,
     filter: LaneFilter,
@@ -426,6 +569,12 @@ pub(crate) fn cmd_lanes(
     with_tasks: bool,
     json: bool,
 ) -> Result<()> {
+    if let Some(view) = super::place::current() {
+        return print_scoped_workers(
+            &scoped_workers(&view, &scope, filter, lane_since(since)?, with_tasks)?,
+            json,
+        );
+    }
     let multi = matches!(scope, LaneScope::Recent { .. });
     let (title, empty_note, sessions): (String, String, Vec<SessionRef>) = match scope {
         LaneScope::Session { id, harness } => {

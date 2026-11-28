@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Blame, file views, tools, context packs and worker reports support place and generation selection. Edit hooks identify disconnected peers in the same checkout.
 - Hub ingest, spool import and SSH pull index changed sessions and their file events, with a durable generation watermark and retryable deletions.
 
 - Antigravity `cv prune` splices across checkpoints, strips `30.26` sludge, accepts `--replace-summary` and `--title`, and stashes snipped tool outputs for `cv cat`.

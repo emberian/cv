@@ -830,7 +830,7 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
             "type": "assistant",
             "uuid": "ra-delta-1",
             "timestamp": "2026-06-10T10:05:00Z",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": format!("narwhal-delta-marker {}", "y".repeat(3500))}, {"type":"tool_use","id":"edit-on-second","name":"Edit","input":{"file_path":"revision-proof.rs","old_string":"a","new_string":"b"}}]}
+            "message": {"role": "assistant", "content": [{"type": "text", "text": format!("narwhal-delta-marker {}", "y".repeat(3500))}, {"type":"tool_use","id":"edit-on-second","name":"Edit","input":{"file_path":"revision-proof.rs","old_string":"a","new_string":"b"}}, {"type":"tool_use","id":"spawn-on-second","name":"Agent","input":{"subagent_type":"general-purpose","description":"Review archived evidence","prompt":"Review archived evidence"}}]}
         })
     );
     fs::OpenOptions::new()
@@ -941,6 +941,80 @@ fn archive_topologies_spool_seal_ssh_pull_delta_and_semiauthoritative_queries() 
         shown.contains("narwhal-delta-marker"),
         &shown[..shown.len().min(800)]
     );
+
+    // #tooth The same native ID exists at two places, with an extra file edit only in revision two.
+    for (gen, changed) in [("1", false), ("2", true)] {
+        let scoped = |args: &[&str]| {
+            let cmd = [args, &["--place", "remote-box", "--as-of", gen, "--json"]].concat();
+            let value = hub_json(&cmd);
+            assert_eq!(value["authority"]["generation"], gen.parse::<u64>().unwrap(), "{value}");
+            value
+        };
+        let files = scoped(&["show", "alphasess", "--kind", "files"]);
+        assert_eq!(
+            files["files"].to_string().contains("revision-proof.rs"),
+            changed,
+            "{files}"
+        );
+        let tools = scoped(&["tools", "alphasess", "--timeline"]);
+        assert_eq!(
+            tools["tools"].to_string().contains("revision-proof.rs"),
+            changed,
+            "{tools}"
+        );
+        let blame = scoped(&["blame", "revision-proof.rs"]);
+        assert_eq!(
+            blame["blame"]["event_only_sessions"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            changed,
+            "{blame}"
+        );
+        let pack = scoped(&[
+            "pack",
+            "narwhal-delta-marker",
+            "--session",
+            "alphasess",
+            "--excerpt-bytes",
+            "500",
+        ]);
+        assert_eq!(
+            pack["pack"]["content"].as_str().unwrap().contains("revision-proof.rs"),
+            changed,
+            "{pack}"
+        );
+        let workers = scoped(&["lanes", "alphasess"]);
+        assert_eq!(
+            workers["lanes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["tool_use_id"] == "spawn-on-second" && row["status"] == "unknown"),
+            changed,
+            "{workers}"
+        );
+        assert!(
+            workers["lanes"].is_array() && workers["authority"]["status"] == "partial",
+            "{workers}"
+        );
+    }
+    let unselected = hub_json(&["pack", "narwhal", "--place", "sbx-*", "--json"]);
+    assert!(unselected["pack"]["content"].is_null(), "{unselected}");
+    for cmd in [
+        vec!["show", "alphasess", "--kind", "files"],
+        vec!["tools", "alphasess"],
+        vec!["blame", "x.rs"],
+        vec!["pack", "query"],
+        vec!["lanes", "alphasess"],
+    ] {
+        let cmd = [
+            cmd.as_slice(),
+            &["--place", "absent", "--max-staleness", "1s", "--json"],
+        ]
+        .concat();
+        let (ok, code, _, err) = hub_w.cv(&cmd);
+        assert!(!ok && code == 2 && err.contains("absent"), "{cmd:?} {err}");
+    }
 
     // Sealed sandbox at final frontier is `Complete` forever even with `--max-staleness 0s`!
     let sealed_ls = hub_json(&["ls", "--place", "sbx-*", "--max-staleness", "0s", "--json"]);
