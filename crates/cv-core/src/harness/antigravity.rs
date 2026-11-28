@@ -4354,9 +4354,14 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
         .add(b'`')
         .add(b'{')
         .add(b'}');
-    let raw = path.to_string_lossy();
-    let encoded = percent_encoding::utf8_percent_encode(&raw, FILE_URI_SET);
-    if raw.starts_with('/') {
+    #[cfg(unix)]
+    let raw = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+    #[cfg(not(unix))]
+    let text = path.to_string_lossy();
+    #[cfg(not(unix))]
+    let raw = text.as_bytes();
+    let encoded = percent_encoding::percent_encode(raw, FILE_URI_SET);
+    if raw.starts_with(b"/") {
         format!("file://{encoded}")
     } else {
         format!("file:///{encoded}")
@@ -5041,6 +5046,25 @@ mod tests {
 
     const PARENT_ID: &str = "11111111-2222-4333-8444-555555555555";
     const CHILD_ID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    #[cfg(all(unix, feature = "sqlite"))]
+    #[test]
+    fn file_uri_round_trips_distinct_unix_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\xff b"));
+        let encoded = "file:///tmp/a%FF%20b";
+        assert_eq!(file_uri_to_path(encoded).as_deref(), Some(raw));
+        assert_eq!(path_to_file_uri(raw), encoded);
+        assert_ne!(
+            file_uri_to_path(encoded),
+            file_uri_to_path("file:///tmp/a%EF%BF%BD%20b")
+        );
+        assert_eq!(
+            file_uri_to_path("file://localhost/C%3A/x%20y"),
+            Some(PathBuf::from("C:/x y"))
+        );
+    }
 
     #[test]
     fn latest_steps_replay_in_index_order_with_interleaved_deliveries() {

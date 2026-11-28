@@ -81,21 +81,21 @@ pub(crate) fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
 
 /// Strip a leading `/` before a Windows drive prefix (`/C:/...` -> `C:/...`).
 pub(crate) fn normalize_windows_drive_slash(s: &str) -> &str {
-    let b = s.as_bytes();
-    if b.len() >= 3
-        && b[0] == b'/'
-        && b[1].is_ascii_alphabetic()
-        && b[2] == b':'
-        && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\')
-    {
-        &s[1..]
-    } else {
-        s
-    }
+    &s[drive_slash_len(s.as_bytes())..]
+}
+
+fn drive_slash_len(b: &[u8]) -> usize {
+    usize::from(
+        b.len() >= 3
+            && b[0] == b'/'
+            && b[1].is_ascii_alphabetic()
+            && b[2] == b':'
+            && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\'),
+    )
 }
 
 /// Convert a `file://` URI (`file:///path`, `file://localhost/path`, `file://host/path`,
-/// `file:///C:/path`, with `%XX` UTF-8 escapes) into a local [`PathBuf`].
+/// `file:///C:/path`, with percent-encoded path bytes) into a local [`PathBuf`].
 pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
@@ -107,8 +107,17 @@ pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
         Some(i) if !rest.as_bytes().get(1).is_some_and(|&b| b == b':') => &rest[i..],
         _ => rest,
     };
-    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
-    Some(PathBuf::from(normalize_windows_drive_slash(&decoded)))
+    let decoded: std::borrow::Cow<'_, [u8]> = percent_encoding::percent_decode_str(path).into();
+    let bytes = &decoded[drive_slash_len(&decoded)..];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(PathBuf::from(String::from_utf8_lossy(bytes).as_ref()))
+    }
 }
 
 /// Flexible timestamp from a JSON value: an RFC3339 string, or an epoch number as

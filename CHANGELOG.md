@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- File URIs preserve Unix filenames containing non-UTF-8 bytes when reading workspace paths and emitting Antigravity sessions.
 - Archive watch catches native transcripts appended during its initial sync.
 - Codex command extraction preserves non-BMP characters written as UTF-16 surrogate pairs in scripts.
 - Distillation attributes messages and written file contents to their own tool calls inside batched Codex scripts.
