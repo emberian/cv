@@ -244,22 +244,35 @@ fn is_spawn_tool(harness: Option<Harness>, bare: &str) -> bool {
 
 /// Whether `name` carries potentially multi-megabyte file bodies, diffs, or JS scripts that
 /// consumers like `distill` must inspect via [`JsonView`] rather than eagerly materializing.
+/// Whether `name` is a dedicated full-file overwrite tool (`Write`, `write_file`, `create_file`, …).
+pub fn is_full_write_tool(name: &str) -> bool {
+    let bare = bare_tool_name(name);
+    matches!(
+        bare,
+        "Write" | "write_file" | "save-file" | "create_file" | "write_to_file"
+    ) || bare.eq_ignore_ascii_case("write")
+}
+
+/// Whether `name` can emit [`ToolOp::AgentMessage`] (directly or inside Codex `exec`).
+pub fn may_carry_agent_message(harness: Option<Harness>, name: &str) -> bool {
+    let bare = bare_tool_name(name);
+    is_codex_exec(harness, bare)
+        || matches!(
+            bare,
+            "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message" | "post_message"
+        )
+}
+
 pub fn is_large_payload_tool(harness: Option<Harness>, name: &str) -> bool {
     let bare = bare_tool_name(name);
-    if is_codex_exec(harness, bare) {
+    if is_codex_exec(harness, bare) || is_full_write_tool(bare) {
         return true;
     }
     let lname = bare.to_ascii_lowercase();
     lname.contains("patch")
         || matches!(
             bare,
-            "Write"
-                | "write"
-                | "write_file"
-                | "save-file"
-                | "create_file"
-                | "write_to_file"
-                | "Edit"
+            "Edit"
                 | "edit"
                 | "MultiEdit"
                 | "NotebookEdit"
@@ -530,11 +543,7 @@ fn visit_tool_ops_internal<'a>(
                 .is_some();
         let (op, hunks) = if is_editor_view {
             (ToolOp::FileRead { path }, Vec::new())
-        } else if matches!(
-            bare,
-            "Write" | "write_file" | "save-file" | "create_file" | "write_to_file"
-        ) || lname == "write"
-        {
+        } else if is_full_write_tool(bare) {
             let is_full_write = !(bare == "write_file" && (bool_flag(input, "Append")? || bool_flag(input, "append")?));
             let hunks = if extract_hunks {
                 extract_file_edit_hunks(input, is_full_write)?
@@ -2089,6 +2098,42 @@ struct JsToolCall {
     tool: String,
     input: serde_json::Value,
     plan_items: Vec<Item>,
+}
+
+/// Extract the first string argument matching `keys` from a structured JSON view or from
+/// `tools.<method>({ ... })` calls inside a Codex Code Mode `exec` script (with variable
+/// bindings and JS string escapes resolved).
+pub fn tool_string_arg(view: JsonView<'_>, keys: &[&str]) -> Result<Option<String>> {
+    if !view.is_string()? {
+        for &key in keys {
+            if let Some(val) = view.get(key)? {
+                if val.is_string()? {
+                    return Ok(val.resolve()?.as_str().map(str::to_owned));
+                }
+            }
+        }
+    }
+    let script = if view.is_string()? {
+        input::string(view)?
+    } else {
+        match view.get("raw")? {
+            Some(raw) if raw.is_string()? => input::string(raw)?,
+            _ => None,
+        }
+    };
+    let Some(script) = script else {
+        return Ok(None);
+    };
+    let mut scanner = JsScanner::new(&script);
+    scanner.scan_all();
+    for call in &scanner.calls {
+        for &key in keys {
+            if let Some(s) = call.input.get(key).and_then(serde_json::Value::as_str) {
+                return Ok(Some(s.to_owned()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn scan_codex_exec(

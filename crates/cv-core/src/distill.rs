@@ -916,18 +916,14 @@ impl<'a> ToolInput<'a> {
                     }
                 }
             }
-            let full_write_path: Option<String> = if name == "Write" {
-                fields.get("file_path").and_then(Value::as_str).map(str::to_owned)
-            } else {
-                ops.iter().find_map(|sem| match &sem.op {
-                    ToolOp::FileEdit {
-                        path,
-                        is_full_write: true,
-                    } => Some(path.as_ref().to_owned()),
-                    _ => None,
-                })
-            };
-            let write_bytes = if name == "Write" || full_write_path.is_some() {
+            let full_write_path: Option<String> = ops.iter().find_map(|sem| match &sem.op {
+                ToolOp::FileEdit {
+                    path,
+                    is_full_write: true,
+                } => Some(path.as_ref().to_owned()),
+                _ => None,
+            });
+            let write_bytes = if crate::tools::classify::is_full_write_tool(name) || full_write_path.is_some() {
                 let note = notes && full_write_path.as_deref().is_some_and(is_note_path);
                 let mut bytes = 0;
                 let content_view = match view.get("content")? {
@@ -1018,18 +1014,16 @@ impl<'a> ToolInput<'a> {
 
     fn label(&self, harness: Harness, name: &str) -> String {
         if let Some(bytes) = self.write_bytes {
-            let path = if name == "Write" {
-                self.fields.get("file_path").and_then(Value::as_str).unwrap_or("")
-            } else {
-                self.ops
-                    .iter()
-                    .find_map(|sem| match &sem.op {
-                        crate::tools::classify::ToolOp::FileEdit { path, .. } => Some(path.as_ref()),
-                        _ => None,
-                    })
-                    .unwrap_or("")
-            };
-            return one_line(&truncate(format!("{name} {path} ({bytes} bytes)").trim(), 140)).into_owned();
+            let path = self
+                .ops
+                .iter()
+                .find_map(|sem| match &sem.op {
+                    crate::tools::classify::ToolOp::FileEdit { path, .. } => Some(path.as_ref()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let bare = name.rsplit(':').next().unwrap_or(name);
+            return one_line(&truncate(format!("{bare} {path} ({bytes} bytes)").trim(), 140)).into_owned();
         }
         one_line(&tool_label_with_ops(harness, name, &self.fields, &self.ops)).into_owned()
     }
@@ -1042,139 +1036,119 @@ fn tool_label_with_ops(
     input: &Value,
     ops: &[crate::tools::classify::ToolSemantic<'_>],
 ) -> String {
-    use crate::tools::classify::{is_codex_exec_call, ToolOp};
+    use crate::tools::classify::{
+        compact_label, is_codex_exec_call, is_full_write_tool, visit_tool_ops, ClassifyOpts, ToolOp, ToolSemantic,
+    };
+    let mut classified: Vec<ToolSemantic<'static>> = Vec::new();
+    let ops = if ops.is_empty() {
+        let _ = visit_tool_ops(
+            Some(harness),
+            name,
+            crate::json::JsonView::from(input),
+            ClassifyOpts::FULL,
+            |sem| classified.push(sem.into_owned()),
+        );
+        classified.as_slice()
+    } else {
+        ops
+    };
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
-    let op_file = || {
-        ops.iter()
-            .find_map(|sem| match &sem.op {
-                ToolOp::FileEdit { path, .. } | ToolOp::FileRead { path } => Some(path.as_ref()),
-                ToolOp::Search { path: Some(p), .. } => Some(p.as_ref()),
-                _ => None,
-            })
-            .unwrap_or("")
+    let bare = name.rsplit(':').next().unwrap_or(name);
+    let desc = if !s("description").is_empty() {
+        s("description")
+    } else {
+        s("toolSummary")
     };
-    let claude_path = || {
-        if input.get("file_path").is_some() {
-            s("file_path")
+    let edit_count = ops
+        .iter()
+        .filter(|sem| matches!(sem.op, ToolOp::FileEdit { .. }))
+        .count();
+
+    let l = if is_codex_exec_call(harness, name) && !ops.is_empty() {
+        let t = &ops[0].tool;
+        let head = match &ops[0].op {
+            ToolOp::Command { cmd: Some(cmd), .. } => truncate(first_line(cmd), 100),
+            ToolOp::FileEdit { path, .. } => format!("apply_patch {path}"),
+            ToolOp::FileRead { path } => format!("{t} {path}"),
+            ToolOp::SubagentSpawn { target_hint, .. } => {
+                format!("spawn_agent {}", target_hint.as_deref().unwrap_or(""))
+                    .trim()
+                    .to_string()
+            }
+            ToolOp::AgentMessage { recipient } => format!("{t} → {}", recipient.as_deref().unwrap_or(""))
+                .trim()
+                .to_string(),
+            ToolOp::Background { job_id, .. } => format!("{t} {}", job_id.as_deref().unwrap_or("")).trim().to_string(),
+            ToolOp::Affordance { summary, .. } => format!("{t} {summary}").trim().to_string(),
+            ToolOp::Search { query, .. } => format!("{t} {}", query.as_deref().unwrap_or("")).trim().to_string(),
+            _ => t.to_string(),
+        };
+        if ops.len() > 1 {
+            format!("exec: {head} (+{})", ops.len() - 1)
         } else {
-            op_file()
+            format!("exec: {head}")
         }
-    };
-    let l = match name {
-        "Bash" => {
-            let d = s("description");
-            if d.is_empty() {
-                truncate(first_line(s("command")), 120)
-            } else {
-                truncate(d.trim(), 120)
-            }
-        }
-        "Read" => format!("Read {}", claude_path()),
-        "Write" => format!("Write {} ({} bytes)", claude_path(), s("content").len()),
-        "Edit" | "MultiEdit" | "NotebookEdit" => format!("{name} {}", claude_path()),
-        "Grep" | "Glob" => format!("{name} {:?} {}", s("pattern"), claude_path()),
-        "SendMessage" => format!("SendMessage → {}", s("to")),
-        "Agent" | "Task" => format!("{name}: {}", s("description")),
-        _ => {
-            let bare = name.rsplit(':').next().unwrap_or(name);
-            let desc = if !s("description").is_empty() {
-                s("description")
-            } else {
-                s("toolSummary")
-            };
-            let edit_count = ops
-                .iter()
-                .filter(|sem| matches!(sem.op, ToolOp::FileEdit { .. }))
-                .count();
-            if is_codex_exec_call(harness, name) && !ops.is_empty() {
-                let head = match &ops[0].op {
-                    ToolOp::Command { cmd: Some(cmd), .. } => truncate(first_line(cmd), 100),
-                    ToolOp::FileEdit { path, .. } => format!("apply_patch {path}"),
-                    ToolOp::FileRead { path } => format!("{} {path}", ops[0].tool),
-                    ToolOp::SubagentSpawn { target_hint, .. } => {
-                        format!("spawn_agent {}", target_hint.as_deref().unwrap_or(""))
-                            .trim()
-                            .to_string()
-                    }
-                    ToolOp::AgentMessage { recipient } => {
-                        format!("{} → {}", ops[0].tool, recipient.as_deref().unwrap_or(""))
-                            .trim()
-                            .to_string()
-                    }
-                    ToolOp::Background { job_id, .. } => format!("{} {}", ops[0].tool, job_id.as_deref().unwrap_or(""))
-                        .trim()
-                        .to_string(),
-                    ToolOp::Affordance { summary, .. } => format!("{} {summary}", ops[0].tool).trim().to_string(),
-                    ToolOp::Search { query, .. } => format!("{} {}", ops[0].tool, query.as_deref().unwrap_or(""))
-                        .trim()
-                        .to_string(),
-                    _ => ops[0].tool.to_string(),
-                };
-                if ops.len() > 1 {
-                    format!("exec: {head} (+{})", ops.len() - 1)
+    } else if let Some(sem) = ops.first() {
+        let content_len = || {
+            input
+                .get("content")
+                .or_else(|| input.get("Content"))
+                .and_then(Value::as_str)
+                .map_or(0, str::len)
+        };
+        match &sem.op {
+            ToolOp::Command { cmd, .. } if !is_full_write_tool(bare) => {
+                if !desc.is_empty() {
+                    truncate(desc.trim(), 120)
+                } else if let Some(c) = cmd {
+                    truncate(first_line(c), 120)
                 } else {
-                    format!("exec: {head}")
+                    bare.to_string()
                 }
-            } else if let Some(sem) = ops.first() {
-                match &sem.op {
-                    ToolOp::Command { cmd, .. } => {
-                        if !desc.is_empty() {
-                            truncate(desc.trim(), 120)
-                        } else if let Some(c) = cmd {
-                            truncate(first_line(c), 120)
-                        } else {
-                            bare.to_string()
-                        }
-                    }
-                    ToolOp::FileEdit {
-                        path,
-                        is_full_write: true,
-                    } => {
-                        let content = input
-                            .get("content")
-                            .or_else(|| input.get("Content"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        format!("{bare} {path} ({} bytes)", content.len())
-                    }
-                    ToolOp::FileEdit {
-                        path,
-                        is_full_write: false,
-                    } => {
-                        if edit_count > 1 {
-                            format!("{bare} {path} (+{})", edit_count - 1)
-                        } else {
-                            format!("{bare} {path}")
-                        }
-                    }
-                    ToolOp::FileRead { path } => format!("{bare} {path}"),
-                    ToolOp::Search { query, path } => format!(
-                        "{bare} {:?} {}",
-                        query.as_deref().unwrap_or(""),
-                        path.as_deref().unwrap_or("")
-                    ),
-                    ToolOp::AgentMessage { recipient } => {
-                        format!("{bare} → {}", recipient.as_deref().unwrap_or(""))
-                    }
-                    ToolOp::SubagentSpawn { target_hint, .. } => {
-                        format!("{bare}: {}", target_hint.as_deref().unwrap_or(""))
-                    }
-                    ToolOp::Background { job_id, .. } => {
-                        format!("{bare} {}", job_id.as_deref().unwrap_or(""))
-                    }
-                    ToolOp::Affordance { action, summary, .. } => {
-                        if summary.is_empty() {
-                            format!("{bare} ({action})")
-                        } else {
-                            format!("{bare}: {summary}")
-                        }
-                    }
-                    ToolOp::Other { .. } => format!("{name} {}", truncate(&input.to_string(), 100)),
-                }
-            } else {
-                format!("{name} {}", truncate(&input.to_string(), 100))
             }
+            ToolOp::FileEdit {
+                path,
+                is_full_write: true,
+            } => format!("{bare} {path} ({} bytes)", content_len()),
+            ToolOp::FileEdit {
+                path,
+                is_full_write: false,
+            } => {
+                if edit_count > 1 {
+                    format!("{bare} {path} (+{})", edit_count - 1)
+                } else {
+                    format!("{bare} {path}")
+                }
+            }
+            ToolOp::FileRead { path } => format!("{bare} {path}"),
+            ToolOp::Search { query, path } => format!(
+                "{bare} {:?} {}",
+                query.as_deref().unwrap_or(""),
+                path.as_deref().unwrap_or("")
+            ),
+            ToolOp::AgentMessage { recipient } => format!("{bare} → {}", recipient.as_deref().unwrap_or("")),
+            ToolOp::SubagentSpawn { target_hint, .. } => format!("{bare}: {}", target_hint.as_deref().unwrap_or("")),
+            ToolOp::Background { job_id, .. } => format!("{bare} {}", job_id.as_deref().unwrap_or("")),
+            ToolOp::Affordance { action, summary, .. } => {
+                if summary.is_empty() {
+                    format!("{bare} ({action})")
+                } else {
+                    format!("{bare}: {summary}")
+                }
+            }
+            _ if is_full_write_tool(bare) => format!("{bare}  ({} bytes)", content_len()),
+            _ => compact_label(Some(harness), name, crate::json::JsonView::from(input), 120)
+                .unwrap_or_else(|_| name.to_string()),
         }
+    } else if is_full_write_tool(bare) {
+        let len = input
+            .get("content")
+            .or_else(|| input.get("Content"))
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        format!("{bare}  ({len} bytes)")
+    } else {
+        compact_label(Some(harness), name, crate::json::JsonView::from(input), 120).unwrap_or_else(|_| name.to_string())
     };
     truncate(l.trim(), 140)
 }
@@ -1522,30 +1496,22 @@ fn analyze_with_policy(
         for b in &m.content {
             if let Block::ToolUse { id, name, input, .. } = b {
                 let summary = ToolInput::new(session.harness, name, input, false, false)?;
-                let mut hit: Option<String> = match name.as_str() {
-                    "Read" => summary
-                        .fields
-                        .get("file_path")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                        .filter(|p| referenced.contains(p)),
-                    _ => None,
-                };
-                if hit.is_none() && name != "Read" {
-                    hit = summary.ops.iter().find_map(|sem| match &sem.op {
+                let hit = summary
+                    .ops
+                    .iter()
+                    .find_map(|sem| match &sem.op {
                         crate::tools::classify::ToolOp::FileRead { path } if referenced.contains(path.as_ref()) => {
                             Some(path.as_ref().to_owned())
                         }
                         _ => None,
+                    })
+                    .or_else(|| {
+                        summary
+                            .commands()
+                            .into_iter()
+                            .find_map(simple_shell_read)
+                            .filter(|p| referenced.contains(p))
                     });
-                }
-                if hit.is_none() && name != "Read" {
-                    hit = summary
-                        .commands()
-                        .into_iter()
-                        .find_map(simple_shell_read)
-                        .filter(|p| referenced.contains(p));
-                }
                 if let Some(p) = hit {
                     doc_reads.insert(id.as_str(), p);
                 }
@@ -1573,7 +1539,7 @@ fn analyze_with_policy(
     for m in msgs[..tail_start].iter().filter(|_| demand != Demand::Findings) {
         for b in &m.content {
             if let Block::ToolUse { name, input, .. } = b {
-                if name != "Write" {
+                if !crate::tools::classify::is_full_write_tool(name) {
                     let summary = ToolInput::new(session.harness, name, input, false, false)?;
                     for cmd in summary.commands() {
                         for file in crate::tools::git::commit_message_files(cmd) {
@@ -1746,16 +1712,7 @@ fn analyze_with_policy(
                 && demand != Demand::Findings
                 && is_sync_spawn_return(session.harness, &name, out)
             {
-                let desc = if name == "Agent" || name == "Task" {
-                    summary
-                        .fields
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                } else {
-                    summary.spawn_hint().unwrap_or("").trim()
-                };
+                let desc = summary.spawn_hint().unwrap_or("").trim();
                 let excerpt = head_tail(out, opts.note_max, &format!("cv cat {retrieve_ref} {tool_use_id}"));
                 timeline.push(Entry {
                     idx: i,
@@ -3344,64 +3301,6 @@ fn shorten_commit_note(e: &mut Entry, summary: &ToolInput<'_>, commit_files: &Ha
     }
 }
 
-fn view_first_string(view: crate::json::JsonView<'_>, keys: &[&str]) -> anyhow::Result<Option<String>> {
-    if view.is_string()? {
-        return Ok(None);
-    }
-    for &key in keys {
-        if let Some(val) = view.get(key)? {
-            if val.is_string()? {
-                return Ok(val.resolve()?.as_str().map(str::to_owned));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Extract a string property value from a simple JS object literal inside a Codex `exec` script
-/// (such as `tools.send_message({ target: "...", message: "..." })`).
-fn js_string_prop(script: &str, keys: &[&str]) -> Option<String> {
-    for &key in keys {
-        for pat in [format!("\"{key}\""), format!("'{key}'"), key.to_string()] {
-            let mut rest = script;
-            while let Some(pos) = rest.find(&pat) {
-                let before_ok =
-                    pos == 0 || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric() && rest.as_bytes()[pos - 1] != b'_';
-                let after = &rest[pos + pat.len()..];
-                let trimmed = after.trim_start();
-                if before_ok {
-                    if let Some(after_colon) = trimmed.strip_prefix(':') {
-                        let val = after_colon.trim_start();
-                        let quote = val.chars().next()?;
-                        if matches!(quote, '"' | '\'' | '`') {
-                            let mut out = String::new();
-                            let mut chars = val[quote.len_utf8()..].chars();
-                            while let Some(ch) = chars.next() {
-                                if ch == '\\' {
-                                    if let Some(esc) = chars.next() {
-                                        match esc {
-                                            'n' => out.push('\n'),
-                                            't' => out.push('\t'),
-                                            'r' => out.push('\r'),
-                                            other => out.push(other),
-                                        }
-                                    }
-                                } else if ch == quote {
-                                    return Some(out);
-                                } else {
-                                    out.push(ch);
-                                }
-                            }
-                        }
-                    }
-                }
-                rest = &rest[pos + pat.len()..];
-            }
-        }
-    }
-    None
-}
-
 fn extract_tool_field(
     summary: &ToolInput<'_>,
     raw_input: &crate::Json,
@@ -3412,20 +3311,7 @@ fn extract_tool_field(
             return Ok(Some(s.to_owned()));
         }
     }
-    raw_input.with_view(|view| {
-        if let Some(found) = view_first_string(view, keys)? {
-            return Ok(Some(found));
-        }
-        let script = if view.is_string()? {
-            view.resolve()?.as_str().map(str::to_owned)
-        } else {
-            match view.get("raw")? {
-                Some(raw) if raw.is_string()? => raw.resolve()?.as_str().map(str::to_owned),
-                _ => None,
-            }
-        };
-        Ok(script.and_then(|s| js_string_prop(&s, keys)))
-    })
+    raw_input.with_view(|view| crate::tools::classify::tool_string_arg(view, keys))
 }
 
 /// The agent's own words carried by a tool call: messages it sent, notes it wrote, agents it spawned.
@@ -3437,103 +3323,63 @@ fn own_words_from_tool(
     raw_input: &crate::Json,
     opts: &DistillOptions,
 ) -> anyhow::Result<Option<Entry>> {
-    use crate::tools::classify::ToolOp;
+    use crate::tools::classify::{is_full_write_tool, ToolOp};
     let input = &summary.fields;
-    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
-    match name {
-        "SendMessage" => {
-            return Ok(Some(Entry {
-                idx: i,
-                when: when(m),
-                heading: format!("agent sent a message → {}", crate::sanitize::sanitize_line(s("to"))),
-                body: crate::render::neutralize_forged_headers(s("message")).into_owned(),
-            }))
-        }
-        "Write" if is_note_path(s("file_path")) => {
-            let excerpt = head_tail(s("content"), opts.note_max, "the full file is on disk");
-            return Ok(Some(Entry {
-                idx: i,
-                when: when(m),
-                heading: format!("agent wrote {}", crate::sanitize::sanitize_line(s("file_path"))),
-                body: crate::render::neutralize_forged_headers(&excerpt).into_owned(),
-            }));
-        }
-        "Write" => {}
-        "Agent" | "Task" => {
-            let excerpt = head_tail(
-                s("prompt"),
-                opts.note_max.min(2000),
-                "the full prompt is in the source transcript",
-            );
-            return Ok(Some(Entry {
-                idx: i,
-                when: when(m),
-                heading: format!(
-                    "agent spawned a sub-agent: {}",
-                    crate::sanitize::sanitize_line(s("description"))
-                ),
-                body: crate::render::neutralize_forged_headers(&excerpt).into_owned(),
-            }));
-        }
-        _ => {
-            for sem in &summary.ops {
-                match &sem.op {
-                    ToolOp::AgentMessage { recipient } => {
-                        let to = crate::sanitize::sanitize_line(recipient.as_deref().unwrap_or(""));
-                        let body = extract_tool_field(
-                            summary,
-                            raw_input,
-                            &["message", "Message", "content", "text", "input"],
-                        )?
-                        .unwrap_or_default();
-                        return Ok(Some(Entry {
-                            idx: i,
-                            when: when(m),
-                            heading: format!("agent sent a message → {to}"),
-                            body: crate::render::neutralize_forged_headers(&body).into_owned(),
-                        }));
-                    }
-                    ToolOp::FileEdit {
-                        path,
-                        is_full_write: true,
-                    } if is_note_path(path) => {
-                        let content = input
-                            .get("content")
-                            .or_else(|| input.get("Content"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let excerpt = head_tail(content, opts.note_max, "the full file is on disk");
-                        return Ok(Some(Entry {
-                            idx: i,
-                            when: when(m),
-                            heading: format!("agent wrote {}", crate::sanitize::sanitize_line(path)),
-                            body: crate::render::neutralize_forged_headers(&excerpt).into_owned(),
-                        }));
-                    }
-                    ToolOp::SubagentSpawn { target_hint, .. } => {
-                        let desc = crate::sanitize::sanitize_line(target_hint.as_deref().unwrap_or(""));
-                        let prompt = extract_tool_field(
-                            summary,
-                            raw_input,
-                            &["prompt", "Prompt", "message", "task", "instructions"],
-                        )?
-                        .unwrap_or_default();
-                        let excerpt = head_tail(
-                            &prompt,
-                            opts.note_max.min(2000),
-                            "the full prompt is in the source transcript",
-                        );
-                        return Ok(Some(Entry {
-                            idx: i,
-                            when: when(m),
-                            heading: format!("agent spawned a sub-agent: {desc}"),
-                            body: crate::render::neutralize_forged_headers(&excerpt).into_owned(),
-                        }));
-                    }
-                    _ => {}
-                }
+    for sem in &summary.ops {
+        match &sem.op {
+            ToolOp::AgentMessage { recipient } => {
+                let to = crate::sanitize::sanitize_line(recipient.as_deref().unwrap_or(""));
+                let body = extract_tool_field(summary, raw_input, &["message", "Message", "content", "text", "input"])?
+                    .unwrap_or_default();
+                return Ok(Some(Entry {
+                    idx: i,
+                    when: when(m),
+                    heading: format!("agent sent a message → {to}"),
+                    body: crate::render::neutralize_forged_headers(&body).into_owned(),
+                }));
             }
+            ToolOp::FileEdit {
+                path,
+                is_full_write: true,
+            } if is_note_path(path) => {
+                let content = input
+                    .get("content")
+                    .or_else(|| input.get("Content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let excerpt = head_tail(content, opts.note_max, "the full file is on disk");
+                return Ok(Some(Entry {
+                    idx: i,
+                    when: when(m),
+                    heading: format!("agent wrote {}", crate::sanitize::sanitize_line(path)),
+                    body: crate::render::neutralize_forged_headers(&excerpt).into_owned(),
+                }));
+            }
+            ToolOp::SubagentSpawn { target_hint, .. } => {
+                let desc = crate::sanitize::sanitize_line(target_hint.as_deref().unwrap_or(""));
+                let prompt = extract_tool_field(
+                    summary,
+                    raw_input,
+                    &["prompt", "Prompt", "message", "task", "instructions", "brief"],
+                )?
+                .unwrap_or_default();
+                let excerpt = head_tail(
+                    &prompt,
+                    opts.note_max.min(2000),
+                    "the full prompt is in the source transcript",
+                );
+                return Ok(Some(Entry {
+                    idx: i,
+                    when: when(m),
+                    heading: format!("agent spawned a sub-agent: {desc}"),
+                    body: crate::render::neutralize_forged_headers(&excerpt).into_owned(),
+                }));
+            }
+            _ => {}
         }
+    }
+    if is_full_write_tool(name) {
+        return Ok(None);
     }
     for cmd in summary.commands() {
         let Some(caps) = re(Re::HeredocTarget).captures(cmd) else {
@@ -3649,15 +3495,11 @@ fn scan_result_facts(
     if let (false, Some(run)) = (is_error, &run) {
         f.ok_at.insert(run.clone(), i);
     }
-    let is_gate = if name == "Bash" {
-        command_of(&summary.fields).is_some_and(is_gate_command)
-    } else {
-        summary
-            .ops
-            .iter()
-            .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }))
-            && cmds.iter().copied().any(is_gate_command)
-    };
+    let is_gate = summary
+        .ops
+        .iter()
+        .any(|sem| matches!(sem.op, crate::tools::classify::ToolOp::Command { .. }))
+        && cmds.iter().copied().any(is_gate_command);
     if is_gate {
         let passed = !is_error && !gate_failed(out);
         let verdict = truncate(gate_verdict(out), 160);
@@ -3738,7 +3580,7 @@ fn scan_result_facts(
         f.gate_runs.push(run);
         return format!("⚑ {verdict}");
     }
-    if name != "Agent" && name != "Task" && summary.has_spawn() && !is_sync_spawn_return(harness, name, out) {
+    if summary.has_spawn() && !is_sync_spawn_return(harness, name, out) {
         if let Some(child_id) = crate::tools::classify::spawn_return_id(harness, name, out, false) {
             return format!("spawned {}", code(&child_id));
         }
@@ -4134,95 +3976,45 @@ fn ground(
             let words: String = match block {
                 Block::Text { .. } => cache.text_block(i, index)?.to_string(),
                 Block::ToolUse { name, input, .. } => {
-                    let bare = name.rsplit(':').next().unwrap_or(name);
-                    let could_message = matches!(
-                        bare,
-                        "SendMessage" | "send_message" | "followup_task" | "send_input" | "team_send_message" | "exec"
-                    );
-                    if i < window && !could_message {
+                    if i < window && !crate::tools::classify::may_carry_agent_message(Some(harness), name) {
                         continue;
                     }
                     let msg_words: Option<String> = input.with_view(|view| {
-                        let string_field = |key: &str| -> anyhow::Result<Option<String>> {
-                            if view.is_string()? {
-                                return Ok(None);
-                            }
-                            match view.get(key)? {
-                                Some(v) if v.is_string()? => Ok(v.resolve()?.as_str().map(str::to_owned)),
-                                _ => Ok(None),
-                            }
-                        };
                         let mut ops = Vec::new();
                         visit_tool_ops(Some(harness), name, view, ClassifyOpts::FULL, |sem| {
                             ops.push(sem.into_owned());
                         })?;
                         if i >= window {
-                            match name.as_str() {
-                                "Write" => {
-                                    let path = string_field("file_path")?.unwrap_or_default();
-                                    if is_state(&path, &named, session_cwd) {
-                                        let content = string_field("content")?.unwrap_or_default();
-                                        g.state = Some((i, path, "Write".into(), Some(content)));
+                            for sem in &ops {
+                                match &sem.op {
+                                    ToolOp::FileEdit { path, is_full_write } if is_state(path, &named, session_cwd) => {
+                                        let content = if *is_full_write {
+                                            Some(
+                                                crate::tools::classify::tool_string_arg(view, &["content", "Content"])?
+                                                    .unwrap_or_default(),
+                                            )
+                                        } else {
+                                            None
+                                        };
+                                        let how = if sem.tool == "MultiEdit" {
+                                            "Edit".to_string()
+                                        } else {
+                                            sem.tool.to_string()
+                                        };
+                                        g.state = Some((i, path.as_ref().to_owned(), how, content));
                                     }
-                                }
-                                "Edit" | "MultiEdit" => {
-                                    let path = string_field("file_path")?.unwrap_or_default();
-                                    if is_state(&path, &named, session_cwd) {
-                                        g.state = Some((i, path, "Edit".into(), None));
+                                    ToolOp::Command { cmd: Some(cmd), .. } => {
+                                        note_shell_state(i, cmd, &named, session_cwd, &mut g.state);
                                     }
-                                }
-                                "Bash" => {
-                                    if let Some(cmd) = string_field("command")? {
-                                        note_shell_state(i, &cmd, &named, session_cwd, &mut g.state);
-                                    }
-                                }
-                                _ => {
-                                    for sem in &ops {
-                                        match &sem.op {
-                                            ToolOp::FileEdit { path, is_full_write }
-                                                if is_state(path, &named, session_cwd) =>
-                                            {
-                                                let content = if *is_full_write {
-                                                    let c = match string_field("content")? {
-                                                        Some(c) => Some(c),
-                                                        None => string_field("Content")?,
-                                                    };
-                                                    Some(c.unwrap_or_default())
-                                                } else {
-                                                    None
-                                                };
-                                                g.state =
-                                                    Some((i, path.as_ref().to_owned(), sem.tool.to_string(), content));
-                                            }
-                                            ToolOp::Command { cmd: Some(cmd), .. } => {
-                                                note_shell_state(i, cmd, &named, session_cwd, &mut g.state);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
+                                    _ => {}
                                 }
                             }
                         }
-                        if name == "SendMessage" {
-                            string_field("message")
-                        } else if ops.iter().any(|sem| matches!(sem.op, ToolOp::AgentMessage { .. })) {
-                            if let Some(found) =
-                                view_first_string(view, &["message", "Message", "content", "text", "input"])?
-                            {
-                                Ok(Some(found))
-                            } else {
-                                let script = if view.is_string()? {
-                                    view.resolve()?.as_str().map(str::to_owned)
-                                } else {
-                                    match view.get("raw")? {
-                                        Some(raw) if raw.is_string()? => raw.resolve()?.as_str().map(str::to_owned),
-                                        _ => None,
-                                    }
-                                };
-                                Ok(script.and_then(|s| {
-                                    js_string_prop(&s, &["message", "Message", "content", "text", "input"])
-                                }))
-                            }
+                        if ops.iter().any(|sem| matches!(sem.op, ToolOp::AgentMessage { .. })) {
+                            crate::tools::classify::tool_string_arg(
+                                view,
+                                &["message", "Message", "content", "text", "input"],
+                            )
                         } else {
                             Ok(None)
                         }
