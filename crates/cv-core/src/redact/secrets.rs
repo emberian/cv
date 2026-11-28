@@ -770,6 +770,19 @@ mod tests {
             scrub_cow(basic, &opts, &mut RedactStats::default()),
             r#"{"note":"Basic [REDACTED:api_key]"}"#
         );
+        // #tooth Words and paths after "token"/"basic" are prose, not credentials.
+        for prose in [
+            "the token internationalization pass",
+            "a basic src/harness/claude/emit.rs walkthrough",
+            "Token Responsibilities-And-Ownership",
+            "token usage.iterations is nested",
+        ] {
+            assert_eq!(scrub_cow(prose, &opts, &mut RedactStats::default()), prose);
+        }
+        for credential in ["Basic dXNlcjpwYXNzd29yZA==", "token AbCdEfGhIjKlMnOpQrSt", "basic abcdefghijklmnop1"] {
+            let out = scrub_cow(credential, &opts, &mut RedactStats::default());
+            assert!(out.ends_with("[REDACTED:api_key]"), "{out}");
+        }
         for envelope in [input.to_owned(), serde_json::to_string(input).unwrap()] {
             let mut stats = RedactStats::default();
             assert!(str_needs_scrub(&envelope, &opts));

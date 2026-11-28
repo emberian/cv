@@ -1807,6 +1807,17 @@ fn whole(s: &str, c: &Captures) -> Option<(usize, usize)> {
 }
 
 /// Group `g` as the redacted value (the rest of the match is kept), unless already redacted.
+/// Whether a candidate credential is made of ordinary words: no digit, no base64 `+`/`=`, and
+/// every run of letters lowercase, UPPERCASE or Capitalized. An encoded credential mixes case
+/// inside a run (`YWJjOmRlZmdoaWpr`) or carries digits or padding.
+fn reads_as_words(candidate: &str) -> bool {
+    !candidate.bytes().any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'='))
+        && candidate.split(|c: char| !c.is_ascii_alphabetic()).all(|word| {
+            let tail = word.get(1..).unwrap_or("");
+            tail.bytes().all(|b| b.is_ascii_lowercase()) || word.bytes().all(|b| b.is_ascii_uppercase())
+        })
+}
+
 fn value(c: &Captures, g: usize) -> Option<(usize, usize)> {
     let v = c.get(g)?;
     (!v.as_str().starts_with(PLACEHOLDER_OPEN)).then_some((v.start(), v.end()))
@@ -1955,7 +1966,10 @@ fn rules() -> &'static [Rule] {
                 (t.len() >= 16 || !t.bytes().all(|b| b.is_ascii_alphabetic())).then_some(())?;
                 whole(s, c)
             }),
+            // `Basic <base64>` / `Token <opaque>`. Prose guard: "token internationalization",
+            // "basic src/harness/emit.rs" are words and paths, not credentials.
             rule(Kind::ApiKey, r"(?i)\b(?:basic|token)[ \t]+([A-Za-z0-9._~+/=-]{16,})", |_, c| {
+                (!reads_as_words(c.get(1)?.as_str())).then_some(())?;
                 value(c, 1)
             }),
             // AWS access key ids (`AKIA` long-term and `ASIA` STS temporary, the whole uppercase
