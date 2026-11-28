@@ -402,7 +402,7 @@ pub fn index_all(
         cv_core::catalog::record_index_pass();
     }
     let threads = cv_core::resolve_worker_threads(None)?;
-    let res = cv_core::with_worker_threads(threads, || {
+    cv_core::with_worker_threads(threads, || {
         let (swept, refs) = if let Some(migration) = migration::Migration::prepare(dir, rebuild)? {
             // Migration requires authoritative discovery before ingest. The ordinary compatible
             // path keeps its decode-once handoff and partial-success behavior.
@@ -415,11 +415,7 @@ pub fn index_all(
             sweep_all(dir, rebuild, subagents)?
         };
         Ok((report(swept, rebuild, strict)?, refs))
-    });
-    if default_index {
-        cv_core::catalog::finish_pass();
-    }
-    res
+    })
 }
 
 /// Discovery beside [`sweep_decoded`], then the full sweep over what discovery found.
@@ -2650,15 +2646,13 @@ impl cv_core::MessageSink for ChunkSink<'_> {
     /// no boundary checkpoint is offered between that record and the end.
     fn wants_final_checkpoint(&mut self, _offset: u64) -> bool {
         const MAX_OPEN_MARK_BYTES: usize = 4096;
-        let text_bytes = self.buf.len().saturating_add(self.other.len());
-        let open_bytes = text_bytes
+        let open_bytes = self
+            .buf
+            .len()
+            .saturating_add(self.other.len())
             .saturating_add(self.facets.len())
             .saturating_add(self.other_facets.len());
-        self.keep_open = !self.failed
-            && self.err.is_none()
-            && !self.boundary_due
-            && text_bytes <= MAX_OPEN_MARK_BYTES
-            && open_bytes <= MAX_OPEN_MARK_BYTES;
+        self.keep_open = !self.failed && self.err.is_none() && !self.boundary_due && open_bytes <= MAX_OPEN_MARK_BYTES;
         self.keep_open
     }
 
@@ -5432,6 +5426,33 @@ mod tests {
         writer.commit().unwrap();
         assert_eq!((ran.changed, ran.unreadable.len()), (1, 0), "the next pass reads it");
         assert_eq!((hits("zqbefore"), hits("zqafter")), (0, 1));
+    }
+
+    #[test]
+    fn oversized_open_checkpoint_keeps_all_text_for_publication() {
+        use cv_core::MessageSink as _;
+        let f = fields_of(&build_schema()).unwrap();
+        let reference = cv_core::SessionRef::new("checkpoint", cv_core::Harness::Claude, "input.jsonl");
+        let text = "界".repeat(1365);
+        let mut bodies = Vec::new();
+        let mut out = |doc: TantivyDocument| -> Result<()> {
+            if let Some(body) = doc.get_first(f.body).and_then(|v| v.as_str()) {
+                bodies.push(body.to_owned());
+            }
+            Ok(())
+        };
+        let mut sink = ChunkSink::new(&mut out, &f, &reference, 1, 1, Default::default());
+        sink.last_checkpoint = 8192;
+        sink.buf.clone_from(&text);
+        sink.facets.push('x');
+        assert!(sink.wants_final_checkpoint(16384));
+        sink.buf.push('é');
+        // #tooth Reject the end mark as a unit. The existing replay boundary stays valid.
+        assert!(!sink.wants_final_checkpoint(16384));
+        assert_eq!(sink.last_checkpoint, 8192);
+        sink.finish().unwrap();
+        drop(sink);
+        assert_eq!(bodies, [format!("{text}é")]);
     }
 
     #[test]

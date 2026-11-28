@@ -535,17 +535,6 @@ pub const MAX_COMMAND_TARGET_BYTES: usize = 512;
 /// Maximum UTF-8 bytes stored in `Event.detail` for a failed tool result.
 pub const MAX_ERROR_DETAIL_BYTES: usize = 1024;
 
-fn floor_utf8_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
-    }
-    let mut i = max;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 /// Cap a shell/command string at [`MAX_COMMAND_TARGET_BYTES`] UTF-8 bytes while collapsing
 /// multiline heredocs and oversized `-c` bodies into `head … [+N bytes]`.
 fn cap_command_target(cmd: &str) -> String {
@@ -565,45 +554,29 @@ fn cap_command_target(cmd: &str) -> String {
     let digits_cap = 20usize;
     let suffix_budget = 7 + digits_cap + 7;
     let max_head = MAX_COMMAND_TARGET_BYTES.saturating_sub(suffix_budget);
-    let head_end = floor_utf8_boundary(first_line, max_head);
+    let head_end = first_line.floor_char_boundary(max_head);
     let head = first_line[..head_end].trim_end();
     let omitted = trimmed.len().saturating_sub(head.len());
-    let formatted = format!("{head} … [+{omitted} bytes]");
-    if formatted.len() <= MAX_COMMAND_TARGET_BYTES {
-        formatted
-    } else {
-        formatted[..floor_utf8_boundary(&formatted, MAX_COMMAND_TARGET_BYTES)].to_owned()
-    }
+    format!("{head} … [+{omitted} bytes]")
 }
 
 fn extract_capped_detail(content: &crate::lazy::Text, resolver: &crate::lazy::Resolver) -> Result<Option<String>> {
     let mut head = String::new();
-    let mut started = false;
-    content.try_for_each_chunk(resolver, 4096, |piece| {
-        if head.len() > MAX_ERROR_DETAIL_BYTES + 64 {
-            return Ok(());
-        }
-        let slice = if started {
-            piece
-        } else {
-            let trimmed = piece.trim_start();
-            if trimmed.is_empty() {
-                return Ok(());
-            }
-            started = true;
-            trimmed
-        };
-        let room = (MAX_ERROR_DETAIL_BYTES + 64).saturating_sub(head.len());
-        let take = floor_utf8_boundary(slice, room);
+    let result = content.try_for_each_chunk(resolver, 4096, |piece| {
+        let slice = if head.is_empty() { piece.trim_start() } else { piece };
+        let take = slice.floor_char_boundary(MAX_ERROR_DETAIL_BYTES - head.len());
         head.push_str(&slice[..take]);
+        if take < slice.len() || head.len() == MAX_ERROR_DETAIL_BYTES {
+            return Err(crate::stream::Stop.into());
+        }
         Ok(())
-    })?;
-    let trimmed = head.trim_end();
-    if trimmed.is_empty() {
-        return Ok(None);
+    });
+    match result {
+        Err(error) if error.is::<crate::stream::Stop>() => {}
+        other => other?,
     }
-    let capped = &trimmed[..floor_utf8_boundary(trimmed, MAX_ERROR_DETAIL_BYTES)];
-    Ok(Some(capped.to_owned()))
+    head.truncate(head.trim_end().len());
+    Ok((!head.is_empty()).then_some(head))
 }
 
 fn classify_tool_view(
@@ -851,22 +824,23 @@ mod db {
     /// * `idx_events_session` serves [`events_for`] and `record`'s delete; `idx_events_target`
     ///   joins event rows back from a matched target.
     pub(crate) fn open() -> Option<Connection> {
-        let conn = crate::catalog::open_db()?;
-        if crate::env::frozen() {
+        let mut conn = crate::catalog::open_db()?;
+        if crate::env::frozen() || conn.is_readonly(rusqlite::MAIN_DB).ok()? {
             return Some(conn);
         }
         if table_has_column(&conn, "event_sessions", "harness") && !has_selector(&conn) {
-            conn.execute_batch(
-                "BEGIN IMMEDIATE;
-                 DROP TABLE IF EXISTS events;
-                 DROP TABLE IF EXISTS event_sessions;
-                 COMMIT;",
-            )
-            .ok()?;
-            if table_has_column(&conn, "source_dependencies", "consumer") {
-                conn.execute("DELETE FROM source_dependencies WHERE consumer='events'", [])
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .ok()?;
+            if table_has_column(&tx, "event_sessions", "harness") && !has_selector(&tx) {
+                tx.execute_batch("DROP TABLE IF EXISTS events; DROP TABLE event_sessions;")
                     .ok()?;
+                if table_has_column(&tx, "source_dependencies", "consumer") {
+                    tx.execute("DELETE FROM source_dependencies WHERE consumer='events'", [])
+                        .ok()?;
+                }
             }
+            tx.commit().ok()?;
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS event_sessions(
@@ -902,7 +876,9 @@ mod db {
         if !has_hunk_col {
             let _ = conn.execute("ALTER TABLE events ADD COLUMN hunk_hashes BLOB", []);
         }
-        ensure_rev_targets(&conn);
+        if let Err(error) = ensure_rev_targets(&conn) {
+            crate::env::warn_once("event suffix index", error);
+        }
         Some(conn)
     }
 
@@ -910,57 +886,34 @@ mod db {
         s.chars().rev().collect()
     }
 
-    fn ensure_rev_targets(conn: &Connection) {
-        if !table_has_column(conn, "event_targets", "rev_target")
-            && conn
-                .execute("ALTER TABLE event_targets ADD COLUMN rev_target TEXT", [])
-                .is_err()
-        {
-            return;
-        }
-        let _ = conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_event_targets_rev ON event_targets(rev_target);");
-        let needs_backfill = conn
-            .query_row(
-                "SELECT 1 FROM event_targets WHERE rev_target IS NULL LIMIT 1",
-                [],
-                |_| Ok(()),
-            )
-            .is_ok();
-        if !needs_backfill {
-            return;
-        }
-        let _ = conn.execute_batch("BEGIN IMMEDIATE;").and_then(|()| {
-            let res = (|| -> rusqlite::Result<()> {
-                let pending: Vec<(i64, String)> = {
-                    let mut stmt = conn.prepare("SELECT id, target FROM event_targets WHERE rev_target IS NULL")?;
-                    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                    rows.collect::<rusqlite::Result<_>>()?
-                };
-                let mut upd = conn.prepare("UPDATE event_targets SET rev_target = ?1 WHERE id = ?2")?;
-                for (id, target) in pending {
-                    upd.execute(params![reverse_chars(&target), id])?;
-                }
-                Ok(())
-            })();
-            match res {
-                Ok(()) => conn.execute_batch("COMMIT;"),
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK;");
-                    Err(e)
-                }
+    fn ensure_rev_targets(conn: &Connection) -> rusqlite::Result<()> {
+        if !table_has_column(conn, "event_targets", "rev_target") {
+            let tx = conn.unchecked_transaction()?;
+            if !table_has_column(&tx, "event_targets", "rev_target") {
+                tx.execute("ALTER TABLE event_targets ADD COLUMN rev_target TEXT", [])?;
             }
-        });
-    }
-
-    fn has_rev_target_ready(conn: &Connection) -> bool {
-        table_has_column(conn, "event_targets", "rev_target")
-            && conn
-                .query_row(
-                    "SELECT 1 FROM event_targets WHERE rev_target IS NULL LIMIT 1",
-                    [],
-                    |_| Ok(()),
-                )
-                .is_err()
+            tx.commit()?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_event_targets_suffix ON event_targets(rev_target COLLATE NOCASE);
+             DROP INDEX IF EXISTS idx_event_targets_rev;",
+        )?;
+        loop {
+            let tx = conn.unchecked_transaction()?;
+            let pending = tx
+                .prepare("SELECT id,target FROM event_targets WHERE rev_target IS NULL LIMIT 256")?
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let mut update = tx.prepare("UPDATE event_targets SET rev_target=?1 WHERE id=?2")?;
+            for (id, target) in pending {
+                update.execute(params![reverse_chars(&target), id])?;
+            }
+            drop(update);
+            tx.commit()?;
+        }
     }
 
     fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -1430,9 +1383,7 @@ mod db {
     /// `edits_only` keeps only sessions with at least one `file_edit`. Titles come from a join
     /// against the `sessions` catalog. Empty on a cold catalog; a catalog error is an error.
     ///
-    /// The leading-`%` LIKE can never use an index; it scans `event_targets` (the
-    /// distinct targets, ~⅓ of the event rows) and joins matches back through `idx_events_target`
-    /// instead of scanning every event row.
+    /// The reversed suffix uses the target prefix index. A legacy catalog scans its interned targets.
     pub fn sessions_touching(path: &str, edits_only: bool) -> Result<Vec<TouchedSession>> {
         let abs = absolutize(path, crate::env::current_dir().as_deref());
         let trimmed = path.trim_start_matches("./");
@@ -1547,27 +1498,41 @@ mod db {
         s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
     }
 
+    /// Keep the original SQLite LIKE semantics, including ASCII case folding. A legacy
+    /// writer can insert a NULL after migration, so include those rows in the same snapshot.
+    fn target_query(
+        conn: &Connection,
+        abs: &str,
+        rel: Option<&str>,
+        suffix: Option<&str>,
+    ) -> (&'static str, Vec<String>) {
+        let Some(suffix) = suffix else {
+            return ("SELECT id FROM event_targets WHERE target=?1", vec![abs.to_owned()]);
+        };
+        let mut args = vec![
+            abs.to_owned(),
+            rel.unwrap_or(abs).to_owned(),
+            format!("%{}", escape_like(suffix)),
+        ];
+        if !table_has_column(conn, "event_targets", "rev_target") {
+            return (
+                "SELECT id FROM event_targets WHERE target IN (?1,?2) OR target LIKE ?3 ESCAPE '\\'",
+                args,
+            );
+        }
+        args.push(format!("{}%", escape_like(&reverse_chars(suffix))));
+        (
+            "SELECT id FROM event_targets WHERE target IN (?1,?2)
+          UNION ALL SELECT id FROM event_targets WHERE rev_target LIKE ?4 ESCAPE '\\'
+          UNION ALL SELECT id FROM event_targets WHERE rev_target IS NULL AND target LIKE ?3 ESCAPE '\\'",
+            args,
+        )
+    }
+
     fn touching(abs: &str, suffix: Option<&str>, edits_only: bool) -> Result<Vec<TouchedSession>> {
         let conn = open().context("the event catalog cannot be opened")?;
         let having = if edits_only { "HAVING edits > 0" } else { "" };
-        let use_rev = suffix.is_some() && has_rev_target_ready(&conn);
-        let rev_bounds = suffix.filter(|_| use_rev).map(|sfx| {
-            let rev = reverse_chars(sfx);
-            let upper = crate::catalog::prefix_end(&rev);
-            (rev, upper)
-        });
-        let target_subquery = match (suffix, &rev_bounds) {
-            (None, _) => "SELECT id FROM event_targets WHERE target = ?1",
-            (Some(_), Some((_, Some(_)))) => {
-                "SELECT id FROM event_targets WHERE target = ?1 \
-                 UNION SELECT id FROM event_targets WHERE rev_target >= ?2 AND rev_target < ?3"
-            }
-            (Some(_), Some((_, None))) => {
-                "SELECT id FROM event_targets WHERE target = ?1 \
-                 UNION SELECT id FROM event_targets WHERE rev_target >= ?2"
-            }
-            (Some(_), None) => "SELECT id FROM event_targets WHERE target = ?1 OR target LIKE ?2 ESCAPE '\\'",
-        };
+        let (target_subquery, args) = target_query(&conn, abs, None, suffix);
         let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         let sql = format!(
             "SELECT es.harness, es.session_id,
@@ -1582,7 +1547,7 @@ mod db {
                AND e.target_id IN ({target_subquery})
              GROUP BY es.id
              {having}
-             ORDER BY last_ts DESC, es.session_id"
+             ORDER BY last_ts DESC, es.session_id, es.id"
         );
         let mut stmt = conn.prepare(&sql)?;
         let map = |row: &rusqlite::Row| {
@@ -1601,20 +1566,9 @@ mod db {
                 },
             ))
         };
-        let raw: Vec<(Option<String>, TouchedSession)> = match (suffix, &rev_bounds) {
-            (None, _) => stmt.query_map(params![abs], map)?.collect::<rusqlite::Result<_>>()?,
-            (Some(_), Some((rev, Some(upper)))) => stmt
-                .query_map(params![abs, rev, upper], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            (Some(_), Some((rev, None))) => stmt
-                .query_map(params![abs, rev], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            (Some(sfx), None) => {
-                let pat = format!("%{}", escape_like(sfx));
-                stmt.query_map(params![abs, pat], map)?
-                    .collect::<rusqlite::Result<_>>()?
-            }
-        };
+        let raw: Vec<(Option<String>, TouchedSession)> = stmt
+            .query_map(rusqlite::params_from_iter(args), map)?
+            .collect::<rusqlite::Result<_>>()?;
         let lookup = CatalogMetaLookup::load(
             &conn,
             raw.iter().map(|(_, s)| (s.harness.as_str(), s.session_id.as_str())),
@@ -1640,20 +1594,7 @@ mod db {
     pub fn edits_touching_file(abs: &str, rel: &str) -> Result<Vec<EditEvent>> {
         let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
-        let use_rev = has_rev_target_ready(&conn);
-        let rev_prefix = reverse_chars(&format!("/{rel}"));
-        let rev_upper = crate::catalog::prefix_end(&rev_prefix);
-        let target_subquery = match (use_rev, &rev_upper) {
-            (true, Some(_)) => {
-                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
-                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3 AND rev_target < ?4"
-            }
-            (true, None) => {
-                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
-                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3"
-            }
-            (false, _) => "SELECT id FROM event_targets WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\'",
-        };
+        let (target_subquery, args) = target_query(&conn, &abs, Some(rel), Some(&format!("/{rel}")));
         let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         let mut stmt = conn.prepare(&format!(
             "SELECT es.harness, es.session_id, e.msg_idx, e.ts, t.target,
@@ -1664,7 +1605,7 @@ mod db {
              WHERE e.kind = 'file_edit'
                AND e.target_id IN ({target_subquery})
              GROUP BY es.id, e.msg_idx, e.ts, t.target
-             ORDER BY e.ts, e.msg_idx, es.id"
+             ORDER BY e.ts, e.msg_idx, es.id, MIN(e.rowid)"
         ))?;
         let map = |row: &rusqlite::Row| {
             Ok((
@@ -1683,19 +1624,9 @@ mod db {
                 },
             ))
         };
-        let raw: Vec<(Option<String>, EditEvent)> = match (use_rev, &rev_upper) {
-            (true, Some(upper)) => stmt
-                .query_map(params![&abs, rel, &rev_prefix, upper], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            (true, None) => stmt
-                .query_map(params![&abs, rel, &rev_prefix], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            (false, _) => {
-                let suffix = format!("%/{}", escape_like(rel));
-                stmt.query_map(params![&abs, rel, suffix], map)?
-                    .collect::<rusqlite::Result<_>>()?
-            }
-        };
+        let raw: Vec<(Option<String>, EditEvent)> = stmt
+            .query_map(rusqlite::params_from_iter(args), map)?
+            .collect::<rusqlite::Result<_>>()?;
         let lookup = CatalogMetaLookup::load(
             &conn,
             raw.iter().map(|(_, e)| (e.harness.as_str(), e.session_id.as_str())),
@@ -1719,20 +1650,7 @@ mod db {
     pub fn edits_with_hunks_touching_file(abs: &str, rel: &str) -> Result<Vec<EditHunkEvent>> {
         let abs = absolutize(abs, None);
         let conn = open().context("the event catalog cannot be opened")?;
-        let use_rev = has_rev_target_ready(&conn);
-        let rev_prefix = reverse_chars(&format!("/{rel}"));
-        let rev_upper = crate::catalog::prefix_end(&rev_prefix);
-        let target_subquery = match (use_rev, &rev_upper) {
-            (true, Some(_)) => {
-                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
-                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3 AND rev_target < ?4"
-            }
-            (true, None) => {
-                "SELECT id FROM event_targets WHERE target IN (?1, ?2) \
-                 UNION SELECT id FROM event_targets WHERE rev_target >= ?3"
-            }
-            (false, _) => "SELECT id FROM event_targets WHERE target = ?1 OR target = ?2 OR target LIKE ?3 ESCAPE '\\'",
-        };
+        let (target_subquery, args) = target_query(&conn, &abs, Some(rel), Some(&format!("/{rel}")));
         let selector_expr = if has_selector(&conn) { "es.selector" } else { "NULL" };
         let mut stmt = conn.prepare(&format!(
             "SELECT es.id, es.harness, es.session_id, e.msg_idx, e.ts, t.target,
@@ -1766,19 +1684,9 @@ mod db {
                 },
             ))
         };
-        let raw_rows: Vec<(i64, Option<String>, EditHunkEvent)> = match (use_rev, &rev_upper) {
-            (true, Some(upper)) => stmt
-                .query_map(params![&abs, rel, &rev_prefix, upper], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            (true, None) => stmt
-                .query_map(params![&abs, rel, &rev_prefix], map)?
-                .collect::<rusqlite::Result<_>>()?,
-            (false, _) => {
-                let suffix = format!("%/{}", escape_like(rel));
-                stmt.query_map(params![&abs, rel, suffix], map)?
-                    .collect::<rusqlite::Result<_>>()?
-            }
-        };
+        let raw_rows: Vec<(i64, Option<String>, EditHunkEvent)> = stmt
+            .query_map(rusqlite::params_from_iter(args), map)?
+            .collect::<rusqlite::Result<_>>()?;
         let lookup = CatalogMetaLookup::load(
             &conn,
             raw_rows
@@ -2620,9 +2528,15 @@ await tools.view_image({ path: "docs/arch.png" });
                  );
                  INSERT INTO event_sessions(id, selector, harness, session_id) VALUES(1, 'leg', 'claude', 'leg');
                  INSERT INTO event_targets(id, target) VALUES(1, '/work/%2Fweird_dir/src/ir.rs');
+                 WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i+1 FROM n WHERE i<300)
+                 INSERT INTO event_targets(id,target) SELECT i, '/old/' || i FROM n;
                  INSERT INTO events(session, msg_idx, ts, kind, tool, target_id) VALUES(1, 0, 10, 'file_edit', 'Edit', 1);",
             )
             .unwrap();
+        }
+        {
+            let _frozen = (*crate::env::Env::current()).clone().with_frozen().enter();
+            assert_eq!(sessions_touching("src/ir.rs", true).unwrap()[0].edits, 1);
         }
         let touched = sessions_touching("src/ir.rs", true).unwrap();
         assert_eq!(touched.len(), 1);
@@ -2630,11 +2544,32 @@ await tools.view_image({ path: "docs/arch.png" });
         let weird = sessions_touching("%2Fweird_dir/src/ir.rs", true).unwrap();
         assert_eq!(weird.len(), 1);
 
+        // #tooth The indexed suffix keeps LIKE's ASCII case folding and literal metacharacters.
+        let folded = "%2fWEIRD_dir/SRC/IR.RS";
+        assert_eq!(sessions_touching(folded, true).unwrap().len(), 1);
+        assert_eq!(edits_touching_file("", folded).unwrap().len(), 1);
+        assert_eq!(edits_with_hunks_touching_file("", folded).unwrap().len(), 1);
         let conn = db::open().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(rev_target) FROM event_targets", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            300
+        );
+        conn.execute_batch(
+            "INSERT INTO event_targets(id,target) VALUES (301,'/other/%2Fweird_dir/src/ir.rs');
+             INSERT INTO events(session,msg_idx,kind,target_id) VALUES (1,1,'file_edit',301);",
+        )
+        .unwrap();
+        {
+            let _frozen = (*crate::env::Env::current()).clone().with_frozen().enter();
+            // #tooth A legacy writer can add a NULL after migration. A read-only query sees both edits once.
+            assert_eq!(sessions_touching(folded, true).unwrap()[0].edits, 2);
+        }
         let plan: Vec<String> = conn
             .prepare(
                 "EXPLAIN QUERY PLAN SELECT id FROM event_targets \
-                 WHERE rev_target >= 'sr.ri/crs/' AND rev_target < 'sr.ri/crs0'",
+                 WHERE rev_target LIKE 'sr.ri/crs/%' ESCAPE '\\'",
             )
             .unwrap()
             .query_map([], |r| r.get::<_, String>(3))
@@ -2643,7 +2578,7 @@ await tools.view_image({ path: "docs/arch.png" });
             .unwrap();
         let joined = plan.join(" | ");
         assert!(
-            joined.contains("idx_event_targets_rev") && !joined.contains("SCAN"),
+            joined.contains("idx_event_targets_suffix") && !joined.contains("SCAN"),
             "expected B-tree index range scan without table SCAN, got: {joined}"
         );
     }

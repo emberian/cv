@@ -607,23 +607,6 @@ fn child_ref(
     })
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct SessionListing(Vec<ListedSession>);
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct ListedSession {
-    id: String,
-    cwd: Option<PathBuf>,
-    title: Option<String>,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
-    updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    message_count: Option<usize>,
-}
-
-impl super::store::sqlite::listing::Listing for SessionListing {
-    const TAG: &'static str = "devin-listing";
-}
-
 struct DiscoverRow {
     id: String,
     wd: Option<String>,
@@ -635,10 +618,11 @@ struct DiscoverRow {
 
 fn discover_session_sql(
     conn: &Connection,
+    db: &Path,
     has_subagent_heads: bool,
     has_node_meta: bool,
     row: DiscoverRow,
-) -> Result<Vec<ListedSession>> {
+) -> Result<Vec<SessionRef>> {
     let DiscoverRow {
         id,
         wd,
@@ -686,14 +670,13 @@ fn discover_session_sql(
         let mut stmt = conn.prepare_cached(
             "SELECT created_at, chat_message FROM message_nodes \
              WHERE session_id = ?1 AND typeof(chat_message) = 'text' \
-             AND instr(chat_message, 'subagent/chain_node_id') > 0 \
+             AND (instr(chat_message, 'subagent/chain_node_id') > 0 OR instr(chat_message, '\\u') > 0 OR instr(chat_message, '\\/') > 0) \
              ORDER BY node_id",
         )?;
         let mut rows = stmt.query([id])?;
         while let Some(row) = rows.next()? {
             let at = row.get::<_, Option<i64>>(0).ok().flatten();
-            let raw: String = row.get(1)?;
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            let Ok(val) = serde_json::from_slice::<Value>(row.get_ref(1)?.as_bytes()?) else {
                 continue;
             };
             if val.get("role").and_then(Value::as_str) != Some("tool") {
@@ -785,13 +768,13 @@ fn discover_session_sql(
     let parent_count = parent_chain.iter().filter(|n| turn_nodes.contains(n)).count();
 
     let mut out = Vec::with_capacity(1 + live_children.len());
-    out.push(ListedSession {
-        id: id.to_string(),
+    out.push(SessionRef {
         cwd: cwd.clone(),
         title: parent_title.clone(),
         created_at,
         updated_at,
         message_count: Some(parent_count),
+        ..SessionRef::new(id, Harness::Devin, db)
     });
     for (agent, chain, updated) in live_children {
         let child_title = match &parent_title {
@@ -799,13 +782,13 @@ fn discover_session_sql(
             None => format!("[{agent}]"),
         };
         let child_count = chain.iter().filter(|n| turn_nodes.contains(n)).count();
-        out.push(ListedSession {
-            id: format!("{id}/{agent}"),
+        out.push(SessionRef {
             cwd: cwd.clone(),
             title: Some(crate::ir::truncate(&child_title, crate::projection::Head::TITLE)),
             created_at,
             updated_at: updated.and_then(ts_from_epoch).or(updated_at),
             message_count: Some(child_count),
+            ..SessionRef::new(format!("{id}/{agent}"), Harness::Devin, db)
         });
     }
     Ok(out)
@@ -831,12 +814,11 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
     })?;
     let has_subagent_heads = table_exists(conn, "subagent_heads");
     let has_node_meta = super::store::sqlite::columns(conn, "message_nodes").contains("metadata");
-    let certificates = rows_conn(conn).unwrap_or_default();
-    let mut pass = super::store::sqlite::listing::Pass::<SessionListing>::begin(Harness::Devin, db);
+    // cached_discover already memoizes the store snapshot. Row lengths alone
+    // cannot certify JSON roles, summary flags or subagent receipts.
     let mut out = Vec::new();
     for row in rows {
         let (id, wd, title, created, last, main_chain_id) = row?;
-        let cert = certificates.get(&id).copied();
         let row = DiscoverRow {
             id: id.clone(),
             wd,
@@ -845,24 +827,10 @@ fn discover_conn(conn: &Connection, db: &Path) -> Result<Vec<SessionRef>> {
             last,
             main_chain_id,
         };
-        let listed = pass.list(&id, cert, || {
-            discover_session_sql(conn, has_subagent_heads, has_node_meta, row)
-                .map(SessionListing)
-                .map_err(|_| ())
-        });
-        let Ok(SessionListing(items)) = listed else {
-            anyhow::bail!("failed to list Devin session {id}");
-        };
-        for item in items {
-            out.push(SessionRef {
-                cwd: item.cwd,
-                title: item.title,
-                created_at: item.created_at,
-                updated_at: item.updated_at,
-                message_count: item.message_count,
-                ..SessionRef::new(item.id, Harness::Devin, db.to_path_buf())
-            });
-        }
+        out.extend(
+            discover_session_sql(conn, db, has_subagent_heads, has_node_meta, row)
+                .with_context(|| format!("listing Devin session {id}"))?,
+        );
     }
     Ok(out)
 }
@@ -1625,8 +1593,10 @@ mod tests {
         conn.execute(
             "INSERT INTO message_nodes(session_id,node_id,parent_node_id,chat_message,created_at) \
             VALUES('fixture-alpha',30,16,?1,2000)",
-            [receipt.to_string()],
+            [receipt.to_string().replace("subagent/", r"subagent\/")],
         )?;
+        // #tooth A cyclic child still visits each real node only once.
+        assert_eq!(chain_to_root(&HashMap::from([(1, Some(2)), (2, Some(1))]), 2), [1, 2]);
         let refs = discover_conn(&conn, &path)?;
         let child = refs.iter().find(|r| r.id == "fixture-alpha/sidekick").unwrap();
         assert_eq!(child.message_count, Some(5));

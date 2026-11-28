@@ -986,18 +986,13 @@ fn read_session_facts(
     })
 }
 
-/// The compression continuation of `id`, if any: the child whose `parent_session_id` is `id` and
-/// that carries no branch / reset / delegate marker (`_COMPRESSION_CHILD_SQL`). Only meaningful for
-/// a session that ended in compression; `None` when the store does not say, an error when it
-/// cannot be asked. A child whose id is not text is no session cv can name.
 /// Every session's [`Rows`](crate::source::Rows) certificate: what a read of it consults besides
 /// message bodies. The message rows of its compression chain (count, highest id and, from schema
 /// v11 on, the `active` flags: a rewind or an in-place compaction flips them), each chain
 /// session's whole `sessions` row (title, prompt hash, lineage, counters), the end reason of the
 /// parent that stopped the walk, the `(id, model_config, started_at)` of its children (the
-/// compression continuation), and its `state_meta` rows. Store-wide `rows_from` reads only
-/// B-tree leaf metadata (`typeof`, `octet_length`, and `<= 256`-byte inline cells), never
-/// chasing overflow page chains.
+/// compression continuation), and its `state_meta` rows. Large message cells are hashed
+/// incrementally so an in-place edit also invalidates consumers of that session.
 #[cfg(test)]
 fn rows_conn(conn: &Connection) -> Result<std::collections::HashMap<String, crate::source::Rows>> {
     rows_from(conn, &walk_conn(conn)?)
@@ -1032,6 +1027,17 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
             },
         );
     }
+    if columns.contains("system_prompt_hash") && table_exists(conn, "system_prompts") {
+        let mut stmt = conn.prepare(
+            "SELECT s.id, sp.prompt FROM sessions s JOIN system_prompts sp ON sp.hash = s.system_prompt_hash",
+        )?;
+        let mut prompts = stmt.query([])?;
+        while let Some(row) = prompts.next()? {
+            if let Some(meta) = row.get::<_, Option<String>>(0)?.and_then(|id| sessions.get_mut(&id)) {
+                meta.row = fold_value(meta.row, row.get_ref(1)?);
+            }
+        }
+    }
     let mut by_parent: Vec<(&str, &str, u64)> = sessions
         .iter()
         .filter_map(|(id, meta)| Some((meta.parent.as_deref()?, id.as_str(), meta.child)))
@@ -1041,7 +1047,7 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
         let digest = children.entry(parent.to_owned()).or_insert(Rows::SEED);
         *digest = Rows::fold(*digest, &child.to_le_bytes());
     }
-    let msg_plan = MessageRevisionPlan::leaf_only(conn);
+    let msg_plan = MessageRevisionPlan::new(conn);
     let mut messages: HashMap<String, (u64, i64, u64)> = HashMap::new();
     {
         let mut exprs = vec!["session_id".to_string()];
@@ -1121,7 +1127,6 @@ fn rows_from(conn: &Connection, walk: &Walk) -> Result<std::collections::HashMap
 }
 
 const INLINE_REVISION_MAX: i64 = 2048;
-const LEAF_REVISION_MAX: i64 = 256;
 
 const MESSAGE_BODY_COLS: &[&str] = &[
     "content",
@@ -1204,30 +1209,15 @@ fn fold_bounded_col(
     Ok(digest)
 }
 
-/// Message-row revision projection for [`rows_from`] (`deep_overflow = false`) and
-/// [`session_revision`] (`deep_overflow = true`):
-/// - `leaf_only` (whole-DB freshness scans): folds scalar columns, `typeof(col)`, `octet_length(col)`,
-///   and `CASE WHEN octet_length(col) <= 256 THEN col END`, reading zero overflow pages across
-///   multi-GB databases while still catching inline cell edits and any length change.
-/// - `deep` (single-session `read_session` guard): reads `<= 2 KiB` inline cells and streams
-///   `> 2 KiB` overflow cells via `sqlite3_blob_open` so mid-stream same-length mutations fail.
+/// Both freshness checks cover the same message columns, including large payloads.
 struct MessageRevisionPlan {
     has_rowid: bool,
-    deep_overflow: bool,
     scalar_cols: Vec<String>,
     body_cols: Vec<&'static str>,
 }
 
 impl MessageRevisionPlan {
-    fn leaf_only(conn: &Connection) -> Self {
-        Self::build(conn, false)
-    }
-
-    fn deep(conn: &Connection) -> Self {
-        Self::build(conn, true)
-    }
-
-    fn build(conn: &Connection, deep_overflow: bool) -> Self {
+    fn new(conn: &Connection) -> Self {
         let msg_cols = super::store::sqlite::columns(conn, "messages");
         let mut scalar_cols = vec![
             "id".to_string(),
@@ -1259,8 +1249,7 @@ impl MessageRevisionPlan {
             .filter(|col| msg_cols.contains(*col))
             .collect();
         Self {
-            has_rowid: deep_overflow && table_has_rowid(conn, "messages"),
-            deep_overflow,
+            has_rowid: table_has_rowid(conn, "messages"),
             scalar_cols,
             body_cols,
         }
@@ -1273,11 +1262,7 @@ impl MessageRevisionPlan {
         for col in &self.body_cols {
             exprs.push(format!("typeof({col})"));
             exprs.push(format!("octet_length({col})"));
-            if !self.deep_overflow {
-                exprs.push(format!(
-                    "CASE WHEN octet_length({col}) <= {LEAF_REVISION_MAX} THEN {col} END"
-                ));
-            } else if self.has_rowid {
+            if self.has_rowid {
                 exprs.push(format!(
                     "CASE WHEN octet_length({col}) <= {INLINE_REVISION_MAX} THEN {col} END"
                 ));
@@ -1308,13 +1293,7 @@ impl MessageRevisionPlan {
         let base = offset + 1 + self.scalar_cols.len();
         for (idx, col) in self.body_cols.iter().enumerate() {
             let at = base + idx * 3;
-            if self.deep_overflow {
-                digest = fold_bounded_col(conn, "messages", col, rowid, row, at, digest)?;
-            } else {
-                digest = fold_value(digest, row.get_ref(at)?);
-                digest = fold_value(digest, row.get_ref(at + 1)?);
-                digest = fold_value(digest, row.get_ref(at + 2)?);
-            }
+            digest = fold_bounded_col(conn, "messages", col, rowid, row, at, digest)?;
         }
         Ok((msg_id, digest))
     }
@@ -1369,7 +1348,7 @@ fn session_revision(conn: &Connection, id: &str) -> Result<crate::source::Rows> 
         }
     }
     let session_sql = format!("SELECT {} FROM sessions WHERE id = ?1", session_exprs.join(", "));
-    let msg_plan = MessageRevisionPlan::deep(conn);
+    let msg_plan = MessageRevisionPlan::new(conn);
     let msg_sql = format!(
         "SELECT {} FROM messages WHERE session_id = ?1 ORDER BY id ASC",
         msg_plan.exprs().join(", ")
@@ -3877,6 +3856,10 @@ mod tests {
             !smeta(&s).as_object().unwrap().contains_key("system_prompt"),
             "the system prompt is first-class, not a session fact"
         );
+        let before = rows_conn(&conn).unwrap();
+        conn.execute("UPDATE system_prompts SET prompt='New shared prompt'", [])
+            .unwrap();
+        assert_ne!(before["s"], rows_conn(&conn).unwrap()["s"]);
         // the old direct column still wins on a v14 DB
         let old = mk_conn("schema-v14.sql");
         old.execute_batch(&fixture("system_prompt_resolves_via_system_prompts_table-2.sql"))
@@ -5013,8 +4996,10 @@ mod tests {
             .unwrap();
         let rev2 = session_revision(&writer, "target").unwrap();
         assert_ne!(rev2, rev1, "same-length overflow body edit must move session_revision");
-        // Store-wide `rows_conn` intentionally avoids chasing overflow pages; any length change
-        // on an overflow cell moves `octet_length(col)` immediately.
+        // #tooth The edit is in the middle. Length and both ends are unchanged.
+        let edited = rows_conn(&writer).unwrap();
+        assert_ne!(edited["target"], rows1["target"]);
+        assert_eq!(edited["other"], rows1["other"]);
         let overflow_grown = format!("{overflow_after}!");
         writer
             .execute(
@@ -5024,8 +5009,8 @@ mod tests {
             .unwrap();
         let rows2 = rows_conn(&writer).unwrap();
         assert_ne!(
-            rows2["target"], rows1["target"],
-            "overflow length edit must move rows_conn without reading overflow chains"
+            rows2["target"], edited["target"],
+            "overflow length edit must move rows_conn"
         );
         assert_eq!(rows2["other"], rows1["other"]);
         writer

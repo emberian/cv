@@ -36,6 +36,11 @@ mod writer;
 use std::path::{Path, PathBuf};
 pub use writer::Writer;
 
+fn codec_version(h: Harness) -> u32 {
+    // These adapters changed which rows certify a session in a shared database.
+    crate::source::VERSION + u32::from(matches!(h, Harness::Hermes | Harness::Devin))
+}
+
 pub(crate) type PrimaryReads = std::collections::HashMap<std::path::PathBuf, crate::source::ReadSet>;
 
 pub(crate) type Publication<'a> = (
@@ -325,8 +330,7 @@ mod imp {
         {
             return v;
         }
-        let _ = h;
-        crate::source::VERSION
+        super::codec_version(h)
     }
 
     /// Current event-extractor revision, tracked in `harness_versions.events_v`.
@@ -1909,7 +1913,11 @@ mod imp {
     }
 
     pub(crate) fn record_index_pass_at_in(conn: &Connection, now_secs: i64) -> rusqlite::Result<()> {
-        let prev: Option<i64> = conn
+        if conn.is_readonly(rusqlite::MAIN_DB)? {
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        let prev: Option<i64> = tx
             .query_row("SELECT value FROM catalog_meta WHERE key='last_index_pass'", [], |r| {
                 r.get::<_, String>(0)
             })
@@ -1922,17 +1930,17 @@ mod imp {
                 return Ok(());
             }
             if (60..=86_400).contains(&delta) {
-                conn.execute(
+                tx.execute(
                     "INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('pass_period_secs',?1)",
                     params![delta.to_string()],
                 )?;
             }
         }
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('last_index_pass',?1)",
             params![now_secs.to_string()],
         )?;
-        Ok(())
+        tx.commit()
     }
 
     /// Record an index pass timestamp in `catalog_meta` and update `pass_period_secs` when two
@@ -1947,17 +1955,20 @@ mod imp {
         }
     }
 
-    pub(crate) fn finish_pass_in(conn: &Connection) {
-        if crate::env::frozen() {
-            return;
+    fn finish_pass_in(conn: &Connection) -> rusqlite::Result<()> {
+        if crate::env::frozen() || conn.is_readonly(rusqlite::MAIN_DB)? {
+            return Ok(());
         }
-        let _ = conn.busy_timeout(Duration::from_millis(100));
-        let auto_vac: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap_or(0);
-        if auto_vac == 2 {
-            let _ = conn.execute_batch("PRAGMA incremental_vacuum(256);");
+        // This connection belongs to maintenance. An active writer or WAL reader can
+        // defer reclamation to the next pass without delaying search publication.
+        conn.busy_timeout(Duration::from_millis(100))?;
+        if conn.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))? == 2 {
+            // SQLite returns one row per reclaimed page. execute_batch stops at the first.
+            let mut vacuum = conn.prepare("PRAGMA incremental_vacuum(256)")?;
+            let mut pages = vacuum.query([])?;
+            while pages.next()?.is_some() {}
         }
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        let _ = conn.busy_timeout(Duration::from_secs(5));
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
     }
 
     /// Reclaim up to 256 free pages and truncate an idle `catalog.db-wal` to `0` bytes so
@@ -1967,7 +1978,14 @@ mod imp {
             return;
         }
         let Some(conn) = open() else { return };
-        finish_pass_in(&conn);
+        if let Err(error) = finish_pass_in(&conn) {
+            if !matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            ) {
+                note_sql(&error);
+            }
+        }
     }
 
     use crate::source::Payload as _;
@@ -2485,7 +2503,7 @@ mod imp {
     /// UTF-8 lexicographic successor of a literal prefix for SQLite's binary text index.
     /// A suffix of maximal scalars carries into the preceding scalar; empty/all-maximal
     /// prefixes need no upper bound. Skip the surrogate gap, which Rust strings cannot contain.
-    pub(crate) fn prefix_end(prefix: &str) -> Option<String> {
+    fn prefix_end(prefix: &str) -> Option<String> {
         for (offset, ch) in prefix.char_indices().rev() {
             if ch != char::MAX {
                 let next = if ch == '\u{d7ff}' {
@@ -3112,6 +3130,18 @@ mod imp {
                 assert_eq!(av, 2, "fresh catalog.db must enable INCREMENTAL auto_vacuum");
                 conn.execute("INSERT OR REPLACE INTO catalog_meta(key,value) VALUES('pad','1')", [])
                     .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE padding(b); INSERT INTO padding VALUES(zeroblob(4194304)); DROP TABLE padding;",
+                )
+                .unwrap();
+                let free_pages = || {
+                    conn.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+                        .unwrap()
+                };
+                let before = free_pages();
+                assert!(before > 256);
+                finish_pass_in(&conn).unwrap();
+                assert_eq!(before - free_pages(), 256);
                 record_index_pass_at_in(&conn, 10_000).unwrap();
                 record_index_pass_at_in(&conn, 10_005).unwrap(); // sub-minute re-entry ignored
                 assert_eq!(pass_period_secs_in(&conn), None);
@@ -3123,6 +3153,21 @@ mod imp {
                 checkpoint_only(&db),
                 "finish_pass must truncate idle WAL so --frozen uses open_checkpoint"
             );
+            let readonly = open_read_only(&db).unwrap();
+            finish_pass_in(&readonly).unwrap();
+            let conn = open_db().unwrap();
+            let blocker = open_db().unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            // #tooth Contention can defer maintenance without disturbing the writer.
+            if let Err(error) = finish_pass_in(&conn) {
+                assert!(matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ));
+            }
+            blocker.execute_batch("ROLLBACK").unwrap();
+            finish_pass_in(&conn).unwrap();
+            drop((conn, blocker, readonly));
             assert!(open_checkpoint(&db).is_some());
 
             let reader = Reader::open();
@@ -4146,7 +4191,7 @@ mod imp {
 }
 
 #[cfg(feature = "sqlite")]
-pub(crate) use imp::{all_sessions, db_path, finish_pass_in, open_at, open_db, prefix_end, watches_for};
+pub(crate) use imp::{all_sessions, db_path, open_at, open_db, watches_for};
 
 #[cfg(feature = "sqlite")]
 pub use imp::{
@@ -4177,8 +4222,8 @@ pub fn record_index_pass() {}
 #[cfg(not(feature = "sqlite"))]
 pub fn finish_pass() {}
 #[cfg(not(feature = "sqlite"))]
-pub fn harness_codec_version(_h: Harness) -> u32 {
-    crate::source::VERSION
+pub fn harness_codec_version(h: Harness) -> u32 {
+    codec_version(h)
 }
 #[cfg(not(feature = "sqlite"))]
 pub fn events_codec_version() -> u32 {
