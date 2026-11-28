@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Large SQLite cells spill directly to disk during capture, keeping doctor metadata inspection within its heap budget.
 - `GET /api/session/{harness}/{id}/prompts` serves windowed `PromptRow`s for `?kind=prompt,answer`, matching `cv prompts`.
 - `GET /api/search` collapses derived-session chains to the fullest hit unless `?all=1`, matching `cv search` and `cv pack`.
 - `/api/session/{harness}/{id}/subagent/{agent}` resolves a unique stem prefix; `/subagents?returns` adds each agent's last unsummarized text.

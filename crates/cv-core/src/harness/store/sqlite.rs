@@ -652,7 +652,7 @@ pub(crate) fn append_cell(
     arena: &super::bytes::ByteSource,
 ) -> Result<(u64, u64)> {
     if let Ok(mut blob) = conn.blob_open(rusqlite::MAIN_DB, table, column, rowid, true) {
-        return arena.append(|writer| {
+        return arena.append_sized(blob.len(), |writer| {
             let mut buffer = [0u8; super::IO_CHUNK];
             loop {
                 let read = std::io::Read::read(&mut blob, &mut buffer)?;
@@ -668,15 +668,12 @@ pub(crate) fn append_cell(
         &format!("SELECT {column} FROM {table} WHERE rowid = ?1"),
         [rowid],
         |row| {
-            Ok(arena.append(|writer| {
-                match row.get_ref(0)? {
-                    rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => {
-                        writer.write_all(bytes)?
-                    }
-                    _ => anyhow::bail!("SQLite source cell is not TEXT or BLOB"),
+            Ok(match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => {
+                    arena.append_sized(bytes.len(), |writer| Ok(writer.write_all(bytes)?))
                 }
-                Ok(())
-            }))
+                _ => Err(anyhow::anyhow!("SQLite source cell is not TEXT or BLOB")),
+            })
         },
     )?
 }
@@ -772,7 +769,9 @@ impl Cells {
         } else {
             match row.get_ref(i)? {
                 ValueRef::Null => return Ok(None),
-                ValueRef::Text(bytes) => self.arena.append(|writer| Ok(writer.write_all(bytes)?))?,
+                ValueRef::Text(bytes) => self
+                    .arena
+                    .append_sized(bytes.len(), |writer| Ok(writer.write_all(bytes)?))?,
                 ValueRef::Blob(_) | ValueRef::Integer(_) | ValueRef::Real(_) => {
                     *malformed = true;
                     return Ok(None);

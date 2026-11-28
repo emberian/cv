@@ -139,6 +139,21 @@ struct ArenaState {
 }
 
 impl ArenaState {
+    fn spill_if_needed(&mut self, incoming: usize) -> std::io::Result<()> {
+        if self.spill.is_none() && self.memory.len().saturating_add(incoming) > MEMORY_LIMIT {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        match (&self.spill, self.private_spill_len) {
+            (_, Some(len)) => Ok(len),
+            (Some(spill), None) => Ok(spill.file.as_ref().unwrap().metadata()?.len()),
+            (None, None) => Ok(self.memory.len() as u64),
+        }
+    }
+
     fn spill(&mut self) -> std::io::Result<()> {
         use std::io::Write;
         let spill = Spill::create(true)?;
@@ -160,9 +175,7 @@ impl std::io::Write for ArenaSink<'_> {
             .state
             .lock()
             .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
-        if state.spill.is_none() && state.memory.len().saturating_add(bytes.len()) > MEMORY_LIMIT {
-            state.spill()?;
-        }
+        state.spill_if_needed(bytes.len())?;
         if let Some(spill) = &state.spill {
             let mut file = spill.file.as_ref().unwrap();
             let written = file.write(bytes)?;
@@ -206,12 +219,23 @@ impl std::io::Write for ArenaSink<'_> {
 }
 
 impl Arena {
-    fn append(&self, f: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>) -> anyhow::Result<(u64, u64)> {
+    fn append(
+        &self,
+        size_hint: usize,
+        f: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(u64, u64)> {
         let _append_guard = self
             .append
             .lock()
             .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
-        let offset = self.byte_len()?;
+        let offset = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
+            state.spill_if_needed(size_hint)?;
+            state.byte_len()?
+        };
         // `self.state` is acquired only per chunk inside `ArenaSink`, never held across `f`, so
         // producer closures reading an earlier range of this same `Arena` cannot deadlock.
         {
@@ -234,11 +258,7 @@ impl Arena {
             .state
             .lock()
             .map_err(|_| std::io::Error::other("decoded arena poisoned"))?;
-        match (&state.spill, state.private_spill_len) {
-            (_, Some(len)) => Ok(len),
-            (Some(spill), None) => Ok(spill.file.as_ref().unwrap().metadata()?.len()),
-            (None, None) => Ok(state.memory.len() as u64),
-        }
+        state.byte_len()
     }
 
     fn file(&self) -> std::io::Result<(std::fs::File, crate::io_admission::DeviceId)> {
@@ -453,10 +473,20 @@ impl ByteSource {
         &self,
         f: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
     ) -> anyhow::Result<(u64, u64)> {
+        self.append_sized(0, f)
+    }
+
+    /// A known output size lets a large append spill before copying its first chunk. Its
+    /// published extent still comes from the actual writes under the append lock.
+    pub(crate) fn append_sized(
+        &self,
+        size_hint: usize,
+        f: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(u64, u64)> {
         let Bytes::Arena(arena) = &self.bytes else {
             anyhow::bail!("not an append arena")
         };
-        arena.append(f)
+        arena.append(size_hint, f)
     }
     /// Length of the immutable backing without reading its payload.
     pub fn byte_len(&self) -> std::io::Result<u64> {
@@ -686,6 +716,26 @@ mod tests {
         let mut actual = Vec::new();
         std::io::Read::read_to_end(&mut source.reader().unwrap(), &mut actual).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sized_append_spills_before_reading_and_publishes_only_written_bytes() {
+        let source = ByteSource::arena().unwrap();
+        source.append(|out| Ok(out.write_all(b"first")?)).unwrap();
+        let range = source
+            .append_sized(MEMORY_LIMIT, |out| {
+                let Bytes::Arena(arena) = &source.bytes else {
+                    unreachable!()
+                };
+                assert!(arena.state.lock().unwrap().spill.is_some());
+                out.write_all(b"next")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(range, (5, 4));
+        let mut bytes = Vec::new();
+        source.copy_to(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"firstnext");
     }
 
     #[test]
