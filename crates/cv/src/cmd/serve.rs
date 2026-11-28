@@ -1272,6 +1272,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
     };
     let scan = flag("scan");
     let exact = flag("exact");
+    let all = flag("all");
     if scan && exact {
         return bad(400, "scan=1 and exact=1 conflict; exact=1 uses the trigram index");
     }
@@ -1386,6 +1387,12 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
     }
 
     let tantivy_dir = cv_search::default_tantivy_dir();
+    let live_allowed = !index_only && live_bytes != Some(0);
+    let fetch_limit = if resolved_as_of_gen.is_some() {
+        limit
+    } else {
+        cv_search::chain_fetch_limit(limit, all)
+    };
     let result = if let Some(gen) = resolved_as_of_gen {
         super::search::search_pinned_generation(
             gen,
@@ -1402,7 +1409,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
             filter,
             false,
             allowed_ids.as_ref(),
-            limit,
+            fetch_limit,
             live_bytes,
         )
     } else if !scan && index_only && tantivy_dir.join("meta.json").is_file() {
@@ -1410,7 +1417,7 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
             .and_then(|reader| {
                 reader.search(
                     &q,
-                    limit,
+                    fetch_limit,
                     filter,
                     allowed_ids.as_ref().map(|s| std::sync::Arc::new(s.clone())),
                 )
@@ -1422,9 +1429,9 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
                 total: ans.total,
             })
     } else {
-        searcher.search_allowed(&q, filter, allowed_ids.as_ref(), limit, source, live_bytes)
+        searcher.search_allowed(&q, filter, allowed_ids.as_ref(), fetch_limit, source, live_bytes)
     };
-    let found = match result {
+    let mut found = match result {
         Ok(found) => found,
         Err(e) if scan => return bad(500, &format!("live scan failed: {e:#}")),
         Err(e) if cv_search::is_invalid_text_query(&e) => return bad(400, &format!("invalid search query: {e:#}")),
@@ -1439,6 +1446,9 @@ fn search(params: &Query, searcher: &cv_search::Searcher, prepared_index: &Resid
             )
         }
     };
+    if resolved_as_of_gen.is_none() {
+        cv_search::collapse_found_hits(&mut found, limit, all, live_allowed);
+    }
     let context = cv_core::rows::SearchRowContext::new();
     let rows: Vec<Value> = found.hits.iter().map(|h| cv_search::row(h, &context)).collect();
 
@@ -3034,6 +3044,63 @@ mod search_service_tests {
             );
             assert_eq!(status, 400, "{flags}: {body}");
         }
+    }
+
+    #[test]
+    fn api_search_collapses_derived_chains_and_all_flag_opts_out() {
+        let world = crate::test_world("api-search-collapse-chains");
+        let turn = |sid: &str, idx: usize, text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "sessionId": sid,
+                "uuid": format!("u{idx}"),
+                "timestamp": "2026-10-01T12:00:00Z",
+                "message": {"role": "user", "content": text}
+            })
+        };
+        let parent_id = "chain-parent-001";
+        let child_id = "chain-distilled-002";
+        world.write_session(
+            parent_id,
+            &[
+                turn(parent_id, 0, "uniquequasarneedle initial design"),
+                turn(parent_id, 1, "turn two details"),
+                turn(parent_id, 2, "turn three details"),
+                turn(parent_id, 3, "turn four details"),
+            ],
+        );
+        world.write_session(
+            child_id,
+            &[turn(
+                child_id,
+                0,
+                &format!("# Distilled context —\nSource: `claude:{parent_id}`\nuniquequasarneedle summary"),
+            )],
+        );
+        let sessions = cv_core::sessions();
+        cv_search::index_sessions(None, sessions, false, false).unwrap();
+
+        let prepared = std::sync::RwLock::new(None);
+        let (st, collapsed_body, headers) =
+            search(&Query::parse("q=uniquequasarneedle"), &cv_search::Searcher, &prepared);
+        assert_eq!(st, 200, "{collapsed_body}");
+        let collapsed_rows = collapsed_body.as_array().unwrap();
+        assert_eq!(collapsed_rows.len(), 1, "derived copy must collapse into fuller parent");
+        assert_eq!(collapsed_rows[0]["id"], parent_id);
+        assert!(headers.iter().any(|(k, v)| *k == "X-Cv-Search-Total" && v == "1"));
+
+        let (st_all, all_body, all_headers) = search(
+            &Query::parse("q=uniquequasarneedle&all=1"),
+            &cv_search::Searcher,
+            &prepared,
+        );
+        assert_eq!(st_all, 200, "{all_body}");
+        assert_eq!(
+            all_body.as_array().unwrap().len(),
+            2,
+            "all=1 retains every chain member"
+        );
+        assert!(all_headers.iter().any(|(k, v)| *k == "X-Cv-Search-Total" && v == "2"));
     }
 
     #[test]

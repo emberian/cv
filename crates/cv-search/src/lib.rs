@@ -658,6 +658,126 @@ impl Scope {
 pub use cv_core::{BadThreads, THREADS_VAR};
 pub use fts::{BadLiveBytes, Budget, Indexed, LiveRead, Suffix, Unreadable, LIVE_BYTES_VAR};
 
+/// Bounded over-fetch budget before [`collapse_hit_chains`] / [`collapse_found_hits`] so derived
+/// copies dropped during chain collapsing do not starve the caller's requested `limit`.
+pub fn chain_fetch_limit(limit: usize, all: bool) -> usize {
+    if all || limit == 0 {
+        limit
+    } else {
+        limit
+            .saturating_mul(2)
+            .max(limit.saturating_add(4))
+            .min(limit.saturating_add(16))
+    }
+}
+
+/// Collapse connected derived-session chains (`distill`, `splice`, `rewind`, `port`, `continues`)
+/// across `hits` down to each chain's fullest representative, keeping sub-agent hits distinct and
+/// respecting `live_allowed` (when `false`, only custody pack refs and `state.db:lineage_edges`
+/// are consulted, never live transcript files on disk).
+pub fn collapse_hit_chains(hits: Vec<Hit>, live_allowed: bool) -> (Vec<Hit>, Vec<cv_core::lineage::CollapsedCopy>) {
+    if hits.len() <= 1 {
+        return (hits, Vec::new());
+    }
+    let refs: Vec<Option<cv_core::SessionRef>> = hits
+        .iter()
+        .map(|h| {
+            if h.agent_id.is_some() {
+                return None;
+            }
+            if let Some(r) = &h.session {
+                return Some(r.clone());
+            }
+            let sel = h.session_key.as_deref().unwrap_or(&h.id);
+            cv_core::find(sel, cv_core::Harness::parse(&h.harness))
+                .ok()
+                .flatten()
+                .map(|(r, _)| r)
+        })
+        .collect();
+    let derived: Vec<Option<String>> = hits
+        .iter()
+        .enumerate()
+        .map(|(idx, h)| {
+            if h.agent_id.is_some() {
+                return None;
+            }
+            refs[idx]
+                .as_ref()
+                .filter(|s| live_allowed || cv_core::custody::is_pack_ref(s))
+                .and_then(|s| s.derived_from())
+                .or_else(|| cv_core::lineage::state_derived_from(&h.id))
+        })
+        .collect();
+    if derived.iter().all(Option::is_none) {
+        return (hits, Vec::new());
+    }
+    let counts: Vec<Option<usize>> = refs
+        .iter()
+        .map(|r| {
+            if live_allowed {
+                r.as_ref().and_then(cv_core::lineage::effective_message_count)
+            } else {
+                r.as_ref().and_then(|s| s.message_count)
+            }
+        })
+        .collect();
+    let sizes: Vec<Option<u64>> = refs
+        .iter()
+        .map(|r| {
+            if live_allowed {
+                r.as_ref()
+                    .and_then(|s| std::fs::metadata(&s.path).ok().map(|m| m.len()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let indexed: Vec<(usize, Hit)> = hits.into_iter().enumerate().collect();
+    let (kept, collapsed) = cv_core::lineage::collapse_derived_chains_with_lookup(
+        indexed,
+        |(idx, h)| cv_core::lineage::ChainMeta {
+            harness: h.harness.clone(),
+            id: if h.agent_id.is_some() {
+                format!("subagent:{idx}:{}", h.id)
+            } else {
+                h.id.clone()
+            },
+            derived_from: derived[*idx].clone(),
+            message_count: counts[*idx],
+            updated_at: h
+                .updated_at
+                .or_else(|| refs[*idx].as_ref().and_then(|r| r.updated_at.map(|t| t.timestamp()))),
+            size_bytes: sizes[*idx],
+        },
+        |harness, pid| {
+            cv_core::find(pid, cv_core::Harness::parse(harness))
+                .ok()
+                .flatten()
+                .map(|(r, _)| r)
+                .filter(|r| live_allowed || cv_core::custody::is_pack_ref(r))
+                .and_then(|r| r.derived_from())
+                .or_else(|| cv_core::lineage::state_derived_from(pid))
+        },
+    );
+    (kept.into_iter().map(|(_, h)| h).collect(), collapsed)
+}
+
+/// Apply [`collapse_hit_chains`] (unless `all` is set) and truncate `found` to `limit`, adjusting
+/// `found.total` by the number of collapsed duplicate copies.
+pub fn collapse_found_hits(found: &mut Found, limit: usize, all: bool, live_allowed: bool) {
+    if all {
+        found.hits.truncate(limit);
+        return;
+    }
+    let hits = std::mem::take(&mut found.hits);
+    let (mut kept, collapsed) = collapse_hit_chains(hits, live_allowed);
+    found.total = found.total.saturating_sub(collapsed.len());
+    kept.truncate(limit);
+    found.hits = kept;
+}
+
 #[cfg(all(test, feature = "probe-heap"))]
 #[global_allocator]
 static PROBE_ALLOCATOR: cv_testkit::heap::Allocator = cv_testkit::heap::Allocator;
@@ -693,5 +813,63 @@ mod tests {
             assert_eq!(default_tantivy_dir(), PathBuf::from("/fast/cv-cache/tantivy"));
             assert_eq!(default_trigram_dir(), PathBuf::from("/fast/cv-cache/trigram"));
         }
+    }
+
+    #[test]
+    fn collapse_found_hits_deduplicates_derived_chains_and_adjusts_total() {
+        assert_eq!(chain_fetch_limit(0, false), 0);
+        assert_eq!(chain_fetch_limit(5, true), 5);
+        assert_eq!(chain_fetch_limit(5, false), 10);
+        assert_eq!(chain_fetch_limit(20, false), 36);
+
+        let dir = std::env::temp_dir().join(format!("cv-search-collapse-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scope = cv_core::env::Env::from_vars([("CLUSTERVISION_HOME", dir.to_str().unwrap())]).enter();
+
+        let state = cv_core::state::StateStore::at_dir(&dir);
+        state
+            .record_lineage_edge(&cv_core::state::LineageEdge {
+                src_session_id: "root-orig".into(),
+                dst_session_id: "child-copy".into(),
+                edge_kind: "distilled_from".into(),
+                harness: Some("claude".into()),
+                tool_use_id: None,
+                metadata: serde_json::json!({}),
+                created_at: 1_700_000_000,
+            })
+            .unwrap();
+
+        let make_hit = |id: &str, msgs: usize| Hit {
+            harness: "claude".into(),
+            id: id.into(),
+            session_key: None,
+            score: 1.0,
+            title: Some("Chain".into()),
+            cwd: None,
+            created_at: None,
+            updated_at: Some(1_700_000_000),
+            snippet: "needle".into(),
+            agent_id: None,
+            parent_id: None,
+            workflow: None,
+            session: Some({
+                let mut r = cv_core::SessionRef::new(id, cv_core::Harness::Claude, dir.join(format!("{id}.jsonl")));
+                r.message_count = Some(msgs);
+                r
+            }),
+        };
+
+        let mut found = Found {
+            hits: vec![make_hit("child-copy", 2), make_hit("root-orig", 12)],
+            total: 2,
+            source: Source::Index,
+            notes: Vec::new(),
+        };
+        collapse_found_hits(&mut found, 10, false, false);
+        assert_eq!(found.total, 1);
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].id, "root-orig");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

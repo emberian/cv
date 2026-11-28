@@ -735,7 +735,7 @@ fn fuse_with_options(
         return (ordered.into_iter().take(limit).collect(), Vec::new());
     }
 
-    let (collapsed_hits, collapsed_copies) = collapse_hit_chains(ordered);
+    let (collapsed_hits, collapsed_copies) = cv_search::collapse_hit_chains(ordered, !cv_core::env::frozen());
 
     // Near-duplicate suppression: one source per (title, cwd). Untitled sessions never collapse.
     let mut seen_titles: HashSet<(String, Option<String>)> = HashSet::new();
@@ -752,62 +752,6 @@ fn fuse_with_options(
         }
     }
     (picked, collapsed_copies)
-}
-
-fn collapse_hit_chains(hits: Vec<cv_search::Hit>) -> (Vec<cv_search::Hit>, Vec<cv_core::lineage::CollapsedCopy>) {
-    if hits.len() <= 1 {
-        return (hits, Vec::new());
-    }
-    let refs: Vec<Option<cv_core::SessionRef>> = hits
-        .iter()
-        .map(|h| {
-            if let Some(r) = &h.session {
-                return Some(r.clone());
-            }
-            let sel = h.session_key.as_deref().unwrap_or(&h.id);
-            cv_core::find(sel, Harness::parse(&h.harness))
-                .ok()
-                .flatten()
-                .map(|(r, _)| r)
-        })
-        .collect();
-    let derived: Vec<Option<String>> = refs.iter().map(|r| r.as_ref().and_then(|s| s.derived_from())).collect();
-    if derived.iter().all(Option::is_none) {
-        return (hits, Vec::new());
-    }
-    let counts: Vec<Option<usize>> = refs
-        .iter()
-        .map(|r| r.as_ref().and_then(cv_core::lineage::effective_message_count))
-        .collect();
-    let sizes: Vec<Option<u64>> = refs
-        .iter()
-        .map(|r| {
-            r.as_ref()
-                .and_then(|s| std::fs::metadata(&s.path).ok().map(|m| m.len()))
-        })
-        .collect();
-
-    let indexed: Vec<(usize, cv_search::Hit)> = hits.into_iter().enumerate().collect();
-    let (kept, collapsed) = cv_core::lineage::collapse_derived_chains_with_lookup(
-        indexed,
-        |(idx, h)| cv_core::lineage::ChainMeta {
-            harness: h.harness.clone(),
-            id: h.id.clone(),
-            derived_from: derived[*idx].clone(),
-            message_count: counts[*idx],
-            updated_at: h
-                .updated_at
-                .or_else(|| refs[*idx].as_ref().and_then(|r| r.updated_at.map(|t| t.timestamp()))),
-            size_bytes: sizes[*idx],
-        },
-        |harness, pid| {
-            cv_core::find(pid, Harness::parse(harness))
-                .ok()
-                .flatten()
-                .and_then(|(r, _)| r.derived_from())
-        },
-    );
-    (kept.into_iter().map(|(_, h)| h).collect(), collapsed)
 }
 
 /// Length-normalized BM25-style lexical overlap score (scaled to fixed-point `i64` for

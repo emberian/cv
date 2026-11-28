@@ -229,14 +229,7 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
         scope,
     };
     let live_allowed = !cv_core::env::frozen() && live_bytes != Some(0);
-    let fetch_limit = if all || limit == 0 {
-        limit
-    } else {
-        limit
-            .saturating_mul(2)
-            .max(limit.saturating_add(4))
-            .min(limit.saturating_add(16))
-    };
+    let fetch_limit = cv_search::chain_fetch_limit(limit, all);
     // The index (+ live suffix of unindexed changes) answers full-text search: an empty result
     // means "no match", and an unusable index is an error naming the cause and the fix, never a
     // silent full scan of every transcript.
@@ -276,107 +269,8 @@ pub(crate) fn cmd_search(args: SearchArgs<'_>) -> Result<()> {
                 Source::Live => Err(e),
             },
         };
-    if all {
-        found.hits.truncate(limit);
-    } else {
-        collapse_search_hits(&mut found, limit, live_allowed);
-    }
+    cv_search::collapse_found_hits(&mut found, limit, all, live_allowed);
     render(found, work, query, json, stats, auth_envelope.as_ref())
-}
-
-fn collapse_search_hits(found: &mut Found, limit: usize, live_allowed: bool) {
-    if found.hits.len() <= 1 {
-        found.hits.truncate(limit);
-        return;
-    }
-    let refs: Vec<Option<cv_core::SessionRef>> = found
-        .hits
-        .iter()
-        .map(|h| {
-            if h.agent_id.is_some() {
-                return None;
-            }
-            if let Some(r) = &h.session {
-                return Some(r.clone());
-            }
-            let sel = h.session_key.as_deref().unwrap_or(&h.id);
-            cv_core::find(sel, cv_core::Harness::parse(&h.harness))
-                .ok()
-                .flatten()
-                .map(|(r, _)| r)
-        })
-        .collect();
-    let derived: Vec<Option<String>> = found
-        .hits
-        .iter()
-        .enumerate()
-        .map(|(idx, h)| {
-            if h.agent_id.is_some() {
-                return None;
-            }
-            refs[idx]
-                .as_ref()
-                .filter(|s| live_allowed || cv_core::custody::is_pack_ref(s))
-                .and_then(|s| s.derived_from())
-                .or_else(|| cv_core::lineage::state_derived_from(&h.id))
-        })
-        .collect();
-    if derived.iter().all(Option::is_none) {
-        found.hits.truncate(limit);
-        return;
-    }
-    let counts: Vec<Option<usize>> = refs
-        .iter()
-        .map(|r| {
-            if live_allowed {
-                r.as_ref().and_then(cv_core::lineage::effective_message_count)
-            } else {
-                r.as_ref().and_then(|s| s.message_count)
-            }
-        })
-        .collect();
-    let sizes: Vec<Option<u64>> = refs
-        .iter()
-        .map(|r| {
-            if live_allowed {
-                r.as_ref()
-                    .and_then(|s| std::fs::metadata(&s.path).ok().map(|m| m.len()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let hits = std::mem::take(&mut found.hits);
-    let indexed: Vec<(usize, cv_search::Hit)> = hits.into_iter().enumerate().collect();
-    let (kept, collapsed) = cv_core::lineage::collapse_derived_chains_with_lookup(
-        indexed,
-        |(idx, h)| cv_core::lineage::ChainMeta {
-            harness: h.harness.clone(),
-            id: if h.agent_id.is_some() {
-                format!("subagent:{idx}:{}", h.id)
-            } else {
-                h.id.clone()
-            },
-            derived_from: derived[*idx].clone(),
-            message_count: counts[*idx],
-            updated_at: h
-                .updated_at
-                .or_else(|| refs[*idx].as_ref().and_then(|r| r.updated_at.map(|t| t.timestamp()))),
-            size_bytes: sizes[*idx],
-        },
-        |harness, pid| {
-            cv_core::find(pid, cv_core::Harness::parse(harness))
-                .ok()
-                .flatten()
-                .map(|(r, _)| r)
-                .filter(|r| live_allowed || cv_core::custody::is_pack_ref(r))
-                .and_then(|r| r.derived_from())
-                .or_else(|| cv_core::lineage::state_derived_from(pid))
-        },
-    );
-    found.total = found.total.saturating_sub(collapsed.len());
-    found.hits = kept.into_iter().map(|(_, h)| h).take(limit).collect();
 }
 
 #[derive(serde::Deserialize)]
