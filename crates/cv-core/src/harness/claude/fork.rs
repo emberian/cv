@@ -152,9 +152,7 @@ fn read_head(path: &Path) -> Option<Head> {
     found
 }
 
-fn modified(path: &Path) -> Option<DateTime<Utc>> {
-    fs::metadata(path).ok()?.modified().ok().map(DateTime::<Utc>::from)
-}
+use crate::harness::file_mtime as modified;
 
 /// Whether `path` holds `needle` anywhere, over bounded windows that keep the needle's length
 /// minus one byte between reads.

@@ -366,23 +366,8 @@ pub(crate) fn emit_staged(
                         row.field_with("message", |writer| {
                             let mut message = ObjectWriter::new(writer)?;
                             message.field("role", "user")?;
-                            message.field_with("parts", |writer| {
-                                writer.write_all(b"[")?;
-                                let mut part = ObjectWriter::new(writer)?;
-                                part.field_with("functionResponse", |writer| {
-                                    let mut response = ObjectWriter::new(writer)?;
-                                    response.field("id", tool_use_id)?;
-                                    response.field("name", name)?;
-                                    response.field_with("response", |writer| {
-                                        let mut content_row = ObjectWriter::new(writer)?;
-                                        content_row.field_with(key, |w| wire::text(w, content, &resolver))?;
-                                        content_row.finish()
-                                    })?;
-                                    response.finish()
-                                })?;
-                                part.finish()?;
-                                writer.write_all(b"]")?;
-                                Ok(())
+                            message.field_with("parts", |w| {
+                                genai::function_response_parts(w, tool_use_id, name, key, content, &resolver)
                             })?;
                             message.finish()
                         })?;

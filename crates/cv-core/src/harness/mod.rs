@@ -73,6 +73,44 @@ pub(crate) fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
 }
 
+/// Best-effort file modification timestamp in UTC, shared across adapters that fall back to file
+/// `mtime` when native records omit `created_at` / `updated_at`.
+pub(crate) fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    std::fs::metadata(path).ok()?.modified().ok().map(DateTime::<Utc>::from)
+}
+
+/// Strip a leading `/` before a Windows drive prefix (`/C:/...` -> `C:/...`).
+pub(crate) fn normalize_windows_drive_slash(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 3
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\')
+    {
+        &s[1..]
+    } else {
+        s
+    }
+}
+
+/// Convert a `file://` URI (`file:///path`, `file://localhost/path`, `file://host/path`,
+/// `file:///C:/path`, with `%XX` UTF-8 escapes) into a local [`PathBuf`].
+pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        Some(i) if !rest.as_bytes().get(1).is_some_and(|&b| b == b':') => &rest[i..],
+        _ => rest,
+    };
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    Some(PathBuf::from(normalize_windows_drive_slash(&decoded)))
+}
+
 /// Flexible timestamp from a JSON value: an RFC3339 string, or an epoch number as
 /// [`ts_from_epoch`] reads it.
 pub(crate) fn ts_from_value(v: &Value) -> Option<DateTime<Utc>> {

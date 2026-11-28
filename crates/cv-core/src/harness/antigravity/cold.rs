@@ -770,8 +770,7 @@ pub(super) fn publish_staged_app_root(
     if let Ok(m) = index.symlink_metadata() {
         ensure!(m.is_file(), "unsafe destination index");
     }
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let sidecar = out.join(format!("conversation_summaries.db{suffix}"));
+    for sidecar in crate::source::sqlite_runtime_sidecars(&index) {
         if let Ok(m) = sidecar.symlink_metadata() {
             ensure!(m.is_file(), "unsafe destination index sidecar");
         }
@@ -823,9 +822,7 @@ pub(super) fn publish_staged_app_root(
                 out.join(&db),
                 out.join(&sidecar),
             ];
-            for suffix in ["-wal", "-shm", "-journal"] {
-                candidates.push(out.join("conversations").join(format!("{}.db{suffix}", spec.new_id)));
-            }
+            candidates.extend(crate::source::sqlite_runtime_sidecars(&out.join(&db)));
             for orig in candidates {
                 let bak = backup_path(&orig);
                 match fs::rename(&orig, &bak) {
@@ -835,8 +832,7 @@ pub(super) fn publish_staged_app_root(
                 }
             }
         } else {
-            for suffix in ["-wal", "-shm", "-journal"] {
-                let wal_sidecar = out.join("conversations").join(format!("{}.db{suffix}", spec.new_id));
+            for wal_sidecar in crate::source::sqlite_runtime_sidecars(&out.join(&db)) {
                 crate::publish::refuse_existing(&wal_sidecar, "")?;
             }
             crate::publish::refuse_existing(&out.join(&brain), "")?;

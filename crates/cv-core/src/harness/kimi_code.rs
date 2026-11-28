@@ -896,11 +896,7 @@ fn scan_wire_with_title(wire: &Path, title_needed: bool, times_needed: bool) -> 
     Ok(w)
 }
 
-fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    let m = fs::metadata(path).ok()?.modified().ok()?;
-    let d = m.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(DateTime::<Utc>::from_timestamp_nanos(d.as_nanos() as i64))
-}
+use super::file_mtime;
 
 fn loop_request(ty: &str, kind: Option<&str>) -> bool {
     ty == "llm.request" && kind.is_none_or(|kind| kind == "loop")

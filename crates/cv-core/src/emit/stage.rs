@@ -272,12 +272,7 @@ impl Drop for SqliteRollbackGuard {
             let can_unlink = crate::source::FileId::at(&self.db_path)
                 .is_some_and(|cur| same_created_inode(created, cur) && sqlite_is_unpopulated(&self.db_path, cur.len));
             if can_unlink {
-                let _ = fs::remove_file(&self.db_path);
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    let mut os = self.db_path.as_os_str().to_os_string();
-                    os.push(suffix);
-                    let _ = fs::remove_file(PathBuf::from(os));
-                }
+                crate::source::unlink_sqlite_store(&self.db_path);
                 for dir in &self.created_dirs {
                     let _ = fs::remove_dir(dir);
                 }

@@ -805,10 +805,7 @@ fn title(head: crate::projection::Head) -> Option<String> {
     (!head.is_blank()).then(|| head.finish())
 }
 
-fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    let mtime = fs::metadata(path).ok()?.modified().ok()?;
-    Some(DateTime::<Utc>::from(mtime))
-}
+use super::file_mtime;
 
 #[cfg(test)]
 mod tests {

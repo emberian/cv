@@ -238,9 +238,7 @@ impl Drop for ColdSnapshot {
 
 fn record_store_reads(path: &Path) -> crate::source::ReadSet {
     let mut reads = crate::source::ReadSet::default();
-    reads.record(path);
-    reads.record(&sidecar(path, "-wal"));
-    reads.record(&sidecar(path, "-journal"));
+    reads.record_sqlite(path);
     reads
 }
 

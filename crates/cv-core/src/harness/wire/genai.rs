@@ -169,3 +169,31 @@ pub(crate) fn file_fields(
         data.finish()
     })
 }
+
+/// Write a single-element `[{"functionResponse": {"id", "name", "response": {key: content}}}]`
+/// GenAI response array shared by Gemini (`"output"`) and Qwen (`"output"` / `"error"`).
+pub(crate) fn function_response_parts(
+    writer: &mut dyn std::io::Write,
+    id: &str,
+    name: &str,
+    key: &str,
+    content: &Text,
+    resolver: &Resolver,
+) -> Result<()> {
+    writer.write_all(b"[")?;
+    let mut part = ObjectWriter::new(writer)?;
+    part.field_with("functionResponse", |w| {
+        let mut response = ObjectWriter::new(w)?;
+        response.field("id", id)?;
+        response.field("name", name)?;
+        response.field_with("response", |w| {
+            let mut row = ObjectWriter::new(w)?;
+            row.field_with(key, |w| write::text(w, content, resolver))?;
+            row.finish()
+        })?;
+        response.finish()
+    })?;
+    part.finish()?;
+    writer.write_all(b"]")?;
+    Ok(())
+}

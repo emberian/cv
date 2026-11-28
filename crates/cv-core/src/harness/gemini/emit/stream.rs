@@ -68,25 +68,6 @@ fn parts(writer: &mut dyn Write, message: &Message, fates: &[ThinkingFate], reso
     Ok(())
 }
 
-fn response(writer: &mut dyn Write, id: &str, name: &str, text: &Text, resolver: &Resolver) -> Result<()> {
-    writer.write_all(b"[")?;
-    let mut outer = ObjectWriter::new(writer)?;
-    outer.field_with("functionResponse", |w| {
-        let mut response = ObjectWriter::new(w)?;
-        response.field("id", id)?;
-        response.field("name", name)?;
-        response.field_with("response", |w| {
-            let mut output = ObjectWriter::new(w)?;
-            output.field_with("output", |w| write::text(w, text, resolver))?;
-            output.finish()
-        })?;
-        response.finish()
-    })?;
-    outer.finish()?;
-    writer.write_all(b"]")?;
-    Ok(())
-}
-
 fn calls(
     writer: &mut dyn Write,
     message: &Message,
@@ -109,7 +90,9 @@ fn calls(
                 call.field_with("args", |w| input.write_canonical(&mut &mut *w))?;
                 if let Some((text, error)) = results.get(id.as_str()) {
                     call.field("status", if *error { "error" } else { "success" })?;
-                    call.field_with("result", |w| response(w, id, name, text, resolver))?;
+                    call.field_with("result", |w| {
+                        genai::function_response_parts(w, id, name, "output", text, resolver)
+                    })?;
                 }
                 call.finish()?;
             }
@@ -129,7 +112,9 @@ fn calls(
                 call.field("id", tool_use_id)?;
                 call.field("name", name)?;
                 call.field("status", if *is_error { "error" } else { "success" })?;
-                call.field_with("result", |w| response(w, tool_use_id, name, content, resolver))?;
+                call.field_with("result", |w| {
+                    genai::function_response_parts(w, tool_use_id, name, "output", content, resolver)
+                })?;
                 call.finish()?;
             }
             _ => {}

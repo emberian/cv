@@ -245,10 +245,8 @@ impl Adapter for Cursor {
     fn stream(&self, r: &SessionRef, opts: &Demand, sink: &mut dyn MessageSink) -> Result<Session> {
         crate::stream::checked(sink, |sink| {
             // `path` is the DB the thread lives in. Legacy refs carry a `legacy:` id prefix.
-            for suffix in ["-wal", "-journal"] {
-                let mut path = r.path.as_os_str().to_os_string();
-                path.push(suffix);
-                sink.dependency(&PathBuf::from(path));
+            for sidecar in crate::source::sqlite_sidecars(&r.path) {
+                sink.dependency(&sidecar);
             }
             let conn = open_ro(&r.path)?;
             conn.read(|conn, reads| {
@@ -333,38 +331,7 @@ fn workspace_cwd(ws: &Path) -> Option<PathBuf> {
     file_uri_to_path(uri)
 }
 
-/// `file:///Users/x/p%20q` -> `/Users/x/p q`. Returns None for non-file URIs.
-fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    // Drop an authority component if present (file://host/path); keep the leading '/'.
-    let path = match rest.find('/') {
-        Some(0) => rest,
-        Some(i) => &rest[i..],
-        None => rest,
-    };
-    Some(PathBuf::from(percent_decode(path)))
-}
-
-/// Minimal percent-decoder (Cursor URIs use %XX for spaces etc.).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+pub(super) use super::file_uri_to_path;
 
 // ---------------------------------------------------------------------------
 // Global (cursorDiskKV) format

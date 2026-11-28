@@ -51,6 +51,22 @@ pub(crate) fn sqlite_sidecars(path: &Path) -> [PathBuf; 2] {
     })
 }
 
+pub(crate) fn sqlite_runtime_sidecars(path: &Path) -> [PathBuf; 3] {
+    ["-wal", "-shm", "-journal"].map(|suffix| {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    })
+}
+
+/// Best-effort unlink of a SQLite database and its `-wal`, `-shm`, and `-journal` sidecars.
+pub(crate) fn unlink_sqlite_store(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for sidecar in sqlite_runtime_sidecars(path) {
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
+
 // Preserve the path spelling: canonicalize cannot represent missing files and would hide a
 // symlink's later retargeting. Relative reads belong to the cwd of the pass that consulted them.
 fn absolute(path: &Path) -> Option<PathBuf> {

@@ -41,11 +41,7 @@ pub(super) fn discover(home: &Path, out: &mut crate::Discovered) {
             }
             let path = entry.path();
             let mut reads = crate::source::ReadSet::default();
-            for suffix in ["", "-wal", "-journal"] {
-                let mut dependency = path.as_os_str().to_os_string();
-                dependency.push(suffix);
-                reads.record(&PathBuf::from(dependency));
-            }
+            reads.record_sqlite(path);
             if let Some(meta) = path.parent().map(|parent| parent.join("meta.json")) {
                 reads.record(&meta);
             }

@@ -4363,24 +4363,7 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
     }
 }
 
-pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    if rest.is_empty() {
-        return None;
-    }
-    // Windows `file:///C:/...` -> `C:/...`
-    let path_part = if rest.len() >= 3
-        && rest.as_bytes()[0] == b'/'
-        && rest.as_bytes()[1].is_ascii_alphabetic()
-        && rest.as_bytes()[2] == b':'
-    {
-        &rest[1..]
-    } else {
-        rest
-    };
-    Some(PathBuf::from(percent_decode(path_part)))
-}
+pub(crate) use super::file_uri_to_path;
 
 /// A media reference to a local file that no longer exists. A reference that is not a
 /// path or `file:` URI cannot be checked and is not reported.
@@ -4388,36 +4371,6 @@ pub(crate) fn attachment_missing(uri: &str) -> bool {
     file_uri_to_path(uri)
         .or_else(|| uri.starts_with('/').then(|| PathBuf::from(uri)))
         .is_some_and(|path| !path.exists())
-}
-
-fn percent_decode(input: &str) -> String {
-    if !input.contains('%') {
-        return input.to_string();
-    }
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 pub(crate) const MAX_PBTXT_BYTES: usize = 256 * 1024;
@@ -4557,8 +4510,10 @@ fn unescape_pbtxt_quoted(rest: &str) -> Option<(String, &str)> {
                     b'"' => bytes.push(b'"'),
                     b'\'' => bytes.push(b'\''),
                     b'x' if i + 2 < raw.len() => {
-                        if let (Some(hi), Some(lo)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
-                            bytes.push((hi << 4) | lo);
+                        if let (Some(hi), Some(lo)) =
+                            ((raw[i + 1] as char).to_digit(16), (raw[i + 2] as char).to_digit(16))
+                        {
+                            bytes.push(((hi << 4) | lo) as u8);
                             i += 2;
                         }
                     }

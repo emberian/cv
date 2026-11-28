@@ -22,7 +22,6 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Array text joined from several strings stays in the source above this many bytes when spans
@@ -568,9 +567,7 @@ fn fallback_id(path: &Path) -> String {
         .to_string()
 }
 
-fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
-    fs::metadata(path).ok().and_then(|m| m.modified().ok()).map(Into::into)
-}
+use crate::harness::file_mtime;
 
 fn is_known_entry_kind(kind: &str) -> bool {
     matches!(

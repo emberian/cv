@@ -61,6 +61,7 @@ use crate::json::{JsonSource, JsonView};
 use crate::json::{ReadInput, Validation};
 use crate::stream::{Demand, Flow, MessageSink};
 use anyhow::{Context, Result};
+#[cfg(feature = "sqlite")]
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::fs;
@@ -146,9 +147,7 @@ fn manifest(dir: &Path, sid: &str) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(dir.join(format!("{sid}.json"))).ok()?).ok()
 }
 
-fn mtime(path: &Path) -> Option<DateTime<Utc>> {
-    fs::metadata(path).ok()?.modified().ok().map(DateTime::<Utc>::from)
-}
+use super::file_mtime as mtime;
 
 /// Whether a `messages[]` entry is a turn ([`Message::is_turn`]) as [`message_with_blocks`] kinds
 /// it: an assistant reply that is not a display-only error, or a user entry that does not hold

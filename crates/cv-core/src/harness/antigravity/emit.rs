@@ -337,19 +337,12 @@ pub(crate) fn emit_staged(
 /// annotation and brain dir, and its catalog row (or the whole catalog, and the root's empty
 /// subdirectories, when the root held nothing before).
 pub(crate) fn retract(out_dir: &Path, out_existed: bool, out_was_empty: bool, res: &EmitResult) {
-    let remove_db = |db: &Path| {
-        for suffix in ["", "-wal", "-shm", "-journal"] {
-            let mut p = db.as_os_str().to_os_string();
-            p.push(suffix);
-            let _ = fs::remove_file(std::path::PathBuf::from(p));
-        }
-    };
-    remove_db(&res.path);
+    crate::source::unlink_sqlite_store(&res.path);
     let _ = fs::remove_file(out_dir.join("annotations").join(format!("{}.pbtxt", res.new_id)));
     let _ = fs::remove_dir_all(out_dir.join("brain").join(&res.new_id));
     let sum_db = out_dir.join("conversation_summaries.db");
     if out_was_empty {
-        remove_db(&sum_db);
+        crate::source::unlink_sqlite_store(&sum_db);
         for sub in ["annotations", "brain", "conversations"] {
             let _ = fs::remove_dir(out_dir.join(sub));
         }

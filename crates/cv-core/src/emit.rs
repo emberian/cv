@@ -781,11 +781,7 @@ pub fn retract_emitted(
     );
     if is_db {
         if out_was_empty {
-            for suffix in ["", "-wal", "-shm"] {
-                let mut p = res.path.as_os_str().to_os_string();
-                p.push(suffix);
-                let _ = fs::remove_file(PathBuf::from(p));
-            }
+            crate::source::unlink_sqlite_store(&res.path);
         } else {
             #[cfg(feature = "sqlite")]
             {

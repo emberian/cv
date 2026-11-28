@@ -975,25 +975,14 @@ fn task_id_to_time(id: &str) -> Option<DateTime<Utc>> {
 
 /// Newest mtime among the task dir's known files (history + sidecars).
 fn newest_mtime(dir: &Path) -> Option<DateTime<Utc>> {
-    let mut newest: Option<DateTime<Utc>> = None;
-    for name in [
+    [
         "api_conversation_history.json",
         "ui_messages.json",
         "task_metadata.json",
-    ] {
-        let p = dir.join(name);
-        if let Ok(meta) = fs::metadata(&p) {
-            if let Ok(t) = meta.modified() {
-                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                    let dt = DateTime::<Utc>::from_timestamp_nanos(d.as_nanos() as i64);
-                    if newest.map(|n| dt > n).unwrap_or(true) {
-                        newest = Some(dt);
-                    }
-                }
-            }
-        }
-    }
-    newest
+    ]
+    .into_iter()
+    .filter_map(|name| super::file_mtime(&dir.join(name)))
+    .max()
 }
 
 /// Best-effort cwd from `task_metadata.json`. Different Cline/Roo versions key it differently

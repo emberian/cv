@@ -189,7 +189,7 @@ impl Adapter for Continue {
                 cwd: r.cwd.clone(),
                 title: r.title.clone(),
                 created_at: r.created_at,
-                updated_at: r.updated_at.or_else(|| mtime(&r.path)),
+                updated_at: r.updated_at.or_else(|| super::file_mtime(&r.path)),
                 source_path: Some(r.path.clone()),
                 ..Session::new(r.id.clone(), Harness::Continue)
             };
@@ -508,7 +508,7 @@ fn index_rows(store: &Path) -> std::collections::HashMap<String, crate::source::
 
 /// Build a `SessionRef` from index metadata + the on-disk transcript path.
 fn ref_from(meta: &IndexMeta, path: &Path) -> SessionRef {
-    let updated = mtime(path);
+    let updated = super::file_mtime(path);
     SessionRef {
         cwd: meta.cwd.clone(),
         title: meta.title.clone(),
@@ -626,50 +626,7 @@ pub(crate) fn parse_str(id: &str, text: &str) -> Result<Session> {
 /// Continue's `workspaceDirectory` may be a `file://` URI (including `file://localhost/...`,
 /// Windows `file:///C:/...`, and percent-encoded UTF-8 like `%20`) or a plain path. Normalize to a path.
 fn workspace_to_path(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("file://") {
-        let path_part = rest.strip_prefix("localhost").unwrap_or(rest);
-        let decoded = percent_decode_utf8(path_part);
-        PathBuf::from(normalize_windows_drive_slash(&decoded))
-    } else {
-        PathBuf::from(normalize_windows_drive_slash(s))
-    }
-}
-
-fn percent_decode_utf8(s: &str) -> String {
-    if !s.as_bytes().contains(&b'%') {
-        return s.to_string();
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(((h << 4) | l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
-}
-
-fn normalize_windows_drive_slash(s: &str) -> &str {
-    let b = s.as_bytes();
-    if b.len() >= 3
-        && b[0] == b'/'
-        && b[1].is_ascii_alphabetic()
-        && b[2] == b':'
-        && (b.len() == 3 || b[3] == b'/' || b[3] == b'\\')
-    {
-        &s[1..]
-    } else {
-        s
-    }
+    super::file_uri_to_path(s).unwrap_or_else(|| PathBuf::from(super::normalize_windows_drive_slash(s)))
 }
 
 /// Parse a `dateCreated` value: a number or numeric-string of **milliseconds** since epoch, or an
@@ -686,14 +643,6 @@ fn parse_date(v: &Value) -> Option<DateTime<Utc>> {
         }
         _ => None,
     }
-}
-
-fn mtime(path: &Path) -> Option<DateTime<Utc>> {
-    fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| DateTime::<Utc>::from_timestamp_nanos(d.as_nanos() as i64))
 }
 
 #[cfg(test)]
