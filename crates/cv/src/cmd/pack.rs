@@ -1328,6 +1328,15 @@ fn best_window(
     best_window_observing(adapter, r, task, limit, None, None)
 }
 
+enum WindowObserver<'a> {
+    None,
+    Strict(&'a mut cv_core::events::EventSink),
+    BestEffort {
+        sink: &'a mut cv_core::events::SpoolingSink,
+        failed: bool,
+    },
+}
+
 fn best_window_with_event_sink(
     adapter: &dyn cv_core::Adapter,
     r: &cv_core::SessionRef,
@@ -1336,77 +1345,7 @@ fn best_window_with_event_sink(
     events: &mut cv_core::events::EventSink,
     metadata: Option<&mut cv_core::SessionRef>,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
-    let needle = task.to_lowercase();
-    let words = query_tokens(task);
-
-    struct CombinedSink<'a> {
-        events: &'a mut cv_core::events::EventSink,
-        words: Vec<String>,
-        needle: String,
-        resolver: Resolver,
-        limit: usize,
-        window: cv_core::api::MessageWindow<(Role, cv_core::ir::Origin, String, bool)>,
-        error: Option<anyhow::Error>,
-    }
-    impl MessageSink for CombinedSink<'_> {
-        fn meta(&mut self, session: &Session) {
-            self.events.meta(session);
-        }
-        fn dependency(&mut self, path: &Path) {
-            self.events.dependency(path);
-        }
-        fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take().or_else(|| self.events.take_error())
-        }
-        fn message(&mut self, m: Message) -> Flow {
-            let (text, cut) = match capped_text(&m, &self.resolver, self.limit) {
-                Ok(text) => text,
-                Err(error) => {
-                    self.error = Some(error);
-                    return Flow::Stop;
-                }
-            };
-            let role = m.role;
-            let origin = m.origin;
-            if self.events.message(m) == Flow::Stop {
-                return Flow::Stop;
-            }
-            if text.trim().is_empty() {
-                self.window.skip();
-                return Flow::Continue;
-            }
-            let low = text.to_lowercase();
-            let mut score = lexical_score(&low, &self.needle, self.words.iter().map(String::as_str));
-            if role == Role::Tool {
-                score /= 2;
-            }
-            self.window.scored((role, origin, text, cut), score);
-            Flow::Continue
-        }
-    }
-
-    let mut sink = CombinedSink {
-        events,
-        words,
-        needle,
-        resolver: Resolver::new(Some(r.path.clone())),
-        limit,
-        window: cv_core::api::MessageWindow::best(),
-        error: None,
-    };
-    let meta = adapter.try_stream(r, &Demand::LEAN.with_spans(), &mut sink)?;
-    if let Some(r) = metadata {
-        r.cwd = meta.cwd.or_else(|| r.cwd.take());
-        r.title = meta.title.or_else(|| r.title.take());
-        r.created_at = meta.created_at.or(r.created_at);
-        r.updated_at = meta.updated_at.or(r.updated_at);
-    }
-    let selected = sink.window.finish();
-    let range = selected
-        .first()
-        .zip(selected.last())
-        .map(|((lo, _), (hi, _))| (*lo, hi + 1));
-    Ok((selected.into_iter().map(|(_, value)| value).collect(), range))
+    best_window_inner(adapter, r, task, limit, WindowObserver::Strict(events), metadata)
 }
 
 fn best_window_observing(
@@ -1417,12 +1356,23 @@ fn best_window_observing(
     events: Option<&mut cv_core::events::SpoolingSink>,
     metadata: Option<&mut cv_core::SessionRef>,
 ) -> Result<(Excerpt, Option<(usize, usize)>)> {
-    let needle = task.to_lowercase();
-    let words = query_tokens(task);
+    let observer = match events {
+        Some(sink) => WindowObserver::BestEffort { sink, failed: false },
+        None => WindowObserver::None,
+    };
+    best_window_inner(adapter, r, task, limit, observer, metadata)
+}
 
+fn best_window_inner(
+    adapter: &dyn cv_core::Adapter,
+    r: &cv_core::SessionRef,
+    task: &str,
+    limit: usize,
+    observer: WindowObserver<'_>,
+    metadata: Option<&mut cv_core::SessionRef>,
+) -> Result<(Excerpt, Option<(usize, usize)>)> {
     struct WindowSink<'a> {
-        events: Option<&'a mut cv_core::events::SpoolingSink>,
-        events_failed: bool,
+        observer: WindowObserver<'a>,
         words: Vec<String>,
         needle: String,
         resolver: Resolver,
@@ -1432,26 +1382,29 @@ fn best_window_observing(
     }
     impl MessageSink for WindowSink<'_> {
         fn meta(&mut self, session: &Session) {
-            if !self.events_failed {
-                if let Some(events) = &mut self.events {
-                    events.meta(session);
-                }
+            match &mut self.observer {
+                WindowObserver::Strict(events) => events.meta(session),
+                WindowObserver::BestEffort { sink, failed: false } => sink.meta(session),
+                WindowObserver::None | WindowObserver::BestEffort { failed: true, .. } => {}
             }
         }
         fn dependency(&mut self, path: &Path) {
-            if !self.events_failed {
-                if let Some(events) = &mut self.events {
-                    events.dependency(path);
-                }
+            match &mut self.observer {
+                WindowObserver::Strict(events) => events.dependency(path),
+                WindowObserver::BestEffort { sink, failed: false } => sink.dependency(path),
+                WindowObserver::None | WindowObserver::BestEffort { failed: true, .. } => {}
             }
         }
         fn take_error(&mut self) -> Option<anyhow::Error> {
-            self.error.take()
+            self.error.take().or_else(|| match &mut self.observer {
+                WindowObserver::Strict(events) => events.take_error(),
+                _ => None,
+            })
         }
         fn message(&mut self, m: Message) -> Flow {
-            if !self.events_failed {
-                if let Some(events) = &mut self.events {
-                    self.events_failed = events.observe_message(&m) == Flow::Stop;
+            if let WindowObserver::BestEffort { sink, failed } = &mut self.observer {
+                if !*failed {
+                    *failed = sink.observe_message(&m) == Flow::Stop;
                 }
             }
             let (text, cut) = match capped_text(&m, &self.resolver, self.limit) {
@@ -1461,27 +1414,32 @@ fn best_window_observing(
                     return Flow::Stop;
                 }
             };
+            let (role, origin) = (m.role, m.origin);
+            if let WindowObserver::Strict(events) = &mut self.observer {
+                if events.message(m) == Flow::Stop {
+                    return Flow::Stop;
+                }
+            }
             if text.trim().is_empty() {
                 self.window.skip();
                 return Flow::Continue;
             }
             let low = text.to_lowercase();
             let mut score = lexical_score(&low, &self.needle, self.words.iter().map(String::as_str));
-            if m.role == Role::Tool {
+            if role == Role::Tool {
                 // Conversational explanations win ties over raw tool logs while still admitting
                 // tool results when they hold the matching evidence.
                 score /= 2;
             }
-            self.window.scored((m.role, m.origin, text, cut), score);
+            self.window.scored((role, origin, text, cut), score);
             Flow::Continue
         }
     }
 
     let mut sink = WindowSink {
-        events,
-        events_failed: false,
-        words,
-        needle,
+        observer,
+        words: query_tokens(task),
+        needle: task.to_lowercase(),
         resolver: Resolver::new(Some(r.path.clone())),
         limit,
         window: cv_core::api::MessageWindow::best(),

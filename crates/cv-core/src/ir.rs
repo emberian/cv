@@ -1973,6 +1973,49 @@ pub fn home_rel(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
+/// Index record IDs (`id` / `uuid`) to slice positions and walk `parent_id` / `parentUuid` chains
+/// backward from an active tip with cycle protection.
+pub(crate) struct ParentIndex<'a> {
+    by_id: std::collections::HashMap<&'a str, usize>,
+}
+
+impl<'a> ParentIndex<'a> {
+    pub(crate) fn from_iter(iter: impl IntoIterator<Item = (usize, Option<&'a str>)>) -> Self {
+        let mut by_id = std::collections::HashMap::new();
+        for (idx, id) in iter {
+            if let Some(id) = id.filter(|s| !s.is_empty()) {
+                by_id.insert(id, idx);
+            }
+        }
+        Self { by_id }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<usize> {
+        self.by_id.get(id).copied()
+    }
+
+    pub(crate) fn spine_from(
+        &self,
+        tip: usize,
+        parent_of: impl Fn(usize) -> Option<&'a str>,
+    ) -> std::collections::HashSet<usize> {
+        let mut spine = std::collections::HashSet::new();
+        let mut cur = Some(tip);
+        while let Some(idx) = cur.filter(|i| spine.insert(*i)) {
+            cur = parent_of(idx).and_then(|pid| self.get(pid));
+        }
+        spine
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

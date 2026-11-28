@@ -48,6 +48,114 @@ pub struct ToolStat {
     pub is_mcp: bool,
 }
 
+/// Scalar estimated token equivalents by content source, shared across lifetime reports,
+/// post-compaction active windows, and per-message attribution facts.
+#[derive(Default, Debug, Clone, Copy, Serialize)]
+pub struct TokenCounts {
+    pub user_text: u64,
+    pub assistant_text: u64,
+    /// Stored thinking text plus opaque signature/encrypted payload byte estimates.
+    pub thinking: u64,
+    pub tool_call_args: u64,
+    pub tool_results: u64,
+    pub images: u64,
+    pub system_text: u64,
+    /// System reminders / `InjectedContext` records appended to the prompt.
+    pub attachments: u64,
+}
+
+impl TokenCounts {
+    pub fn sum(&self) -> u64 {
+        self.user_text
+            + self.assistant_text
+            + self.thinking
+            + self.tool_call_args
+            + self.tool_results
+            + self.images
+            + self.system_text
+            + self.attachments
+    }
+
+    fn add_assign(&mut self, rhs: &Self) {
+        self.user_text += rhs.user_text;
+        self.assistant_text += rhs.assistant_text;
+        self.thinking += rhs.thinking;
+        self.tool_call_args += rhs.tool_call_args;
+        self.tool_results += rhs.tool_results;
+        self.images += rhs.images;
+        self.system_text += rhs.system_text;
+        self.attachments += rhs.attachments;
+    }
+}
+
+/// Scalar token counts paired with per-attachment and per-tool breakdowns.
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct TokenBuckets {
+    #[serde(flatten)]
+    pub counts: TokenCounts,
+    pub by_attachment: BTreeMap<String, u64>,
+    pub by_tool: BTreeMap<String, ToolStat>,
+}
+
+impl std::ops::Deref for TokenBuckets {
+    type Target = TokenCounts;
+    fn deref(&self) -> &Self::Target {
+        &self.counts
+    }
+}
+
+impl std::ops::DerefMut for TokenBuckets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.counts
+    }
+}
+
+impl TokenBuckets {
+    /// Tool-result tokens attributable to MCP tools ([`is_mcp_tool`]).
+    pub fn mcp_tool_results(&self) -> u64 {
+        self.by_tool
+            .values()
+            .filter(|s| s.is_mcp)
+            .map(|s| s.result_tokens)
+            .sum()
+    }
+
+    fn insert_attribution_json(&self, out: &mut serde_json::Map<String, Value>, compaction_summary: Option<u64>) {
+        let mut conv = serde_json::Map::new();
+        conv.insert(
+            "total".into(),
+            json!(compaction_summary.unwrap_or(0) + self.counts.sum()),
+        );
+        if let Some(cs) = compaction_summary {
+            conv.insert("compaction_summary".into(), json!(cs));
+        }
+        conv.extend([
+            ("tool_results".into(), json!(self.tool_results)),
+            ("thinking".into(), json!(self.thinking)),
+            ("assistant_text".into(), json!(self.assistant_text)),
+            ("user_text".into(), json!(self.user_text)),
+            ("tool_call_args".into(), json!(self.tool_call_args)),
+            ("images".into(), json!(self.images)),
+            ("system_msgs".into(), json!(self.system_text)),
+            ("system_reminders".into(), json!(self.attachments)),
+        ]);
+        let tools: Vec<Value> = self
+            .by_tool
+            .iter()
+            .map(|(name, s)| json!({"tool": name, "mcp": s.is_mcp, "calls": s.calls, "result_tokens": s.result_tokens}))
+            .collect();
+        let mcp = self.mcp_tool_results();
+        out.insert("conversational".into(), Value::Object(conv));
+        out.insert("by_attachment".into(), json!(self.by_attachment));
+        out.insert("tool_results_mcp".into(), json!(mcp));
+        out.insert(
+            "tool_results_builtin".into(),
+            json!(self.tool_results.saturating_sub(mcp)),
+        );
+        out.insert("by_tool".into(), Value::Array(tools));
+    }
+}
+
 /// Attribution and usage sizing for the **active post-compaction context window** (sliced along
 /// the active branch from the latest `CompactionBoundary` / `CompactionSummary` to tip).
 #[derive(Default, Debug, Clone, Serialize)]
@@ -62,17 +170,8 @@ pub struct ActiveWindowReport {
     pub turns: u64,
     /// Seed summary tokens from [`MessageKind::CompactionSummary`] in the active window.
     pub compaction_summary: u64,
-    pub user_text: u64,
-    pub assistant_text: u64,
-    pub thinking: u64,
-    pub tool_call_args: u64,
-    pub tool_results: u64,
-    pub images: u64,
-    pub system_text: u64,
-    /// Current-window system reminders (`InjectedContext` records).
-    pub attachments: u64,
-    pub by_attachment: BTreeMap<String, u64>,
-    pub by_tool: BTreeMap<String, ToolStat>,
+    #[serde(flatten)]
+    pub buckets: TokenBuckets,
     /// First nonzero recorded prompt usage in the active window (latest folded session when >1).
     pub first_prompt_tokens: Option<u64>,
     /// Reconstructed visible transcript tokens preceding that first prompt usage reading.
@@ -94,44 +193,27 @@ pub struct ActiveWindowReport {
     measured_burn_steps: u64,
 }
 
+impl std::ops::Deref for ActiveWindowReport {
+    type Target = TokenBuckets;
+    fn deref(&self) -> &Self::Target {
+        &self.buckets
+    }
+}
+
+impl std::ops::DerefMut for ActiveWindowReport {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buckets
+    }
+}
+
 impl ActiveWindowReport {
     /// Total estimated model-visible tokens currently surviving in the active window.
     pub fn conv_total(&self) -> u64 {
-        self.compaction_summary
-            + self.user_text
-            + self.assistant_text
-            + self.thinking
-            + self.tool_call_args
-            + self.tool_results
-            + self.images
-            + self.system_text
-            + self.attachments
-    }
-
-    /// Surviving MCP tool-result tokens in the active window.
-    pub fn mcp_tool_results(&self) -> u64 {
-        self.by_tool
-            .values()
-            .filter(|s| s.is_mcp)
-            .map(|s| s.result_tokens)
-            .sum()
+        self.compaction_summary + self.buckets.sum()
     }
 
     pub fn to_json(&self) -> Value {
-        let tools: Vec<Value> = self
-            .by_tool
-            .iter()
-            .map(|(name, s)| {
-                json!({
-                    "tool": name,
-                    "mcp": s.is_mcp,
-                    "calls": s.calls,
-                    "result_tokens": s.result_tokens,
-                })
-            })
-            .collect();
-        let mcp = self.mcp_tool_results();
-        json!({
+        let mut out = json!({
             "from_compaction": self.from_compaction,
             "compacted_sessions": self.compacted_sessions,
             "messages": self.messages,
@@ -142,23 +224,10 @@ impl ActiveWindowReport {
             "reconstructed_visible_turn_tokens": self.reconstructed_visible_turn_tokens,
             "system_and_tools_overhead": self.system_and_tools_overhead,
             "token_burn_per_turn": self.token_burn_per_turn,
-            "conversational": {
-                "total": self.conv_total(),
-                "compaction_summary": self.compaction_summary,
-                "tool_results": self.tool_results,
-                "thinking": self.thinking,
-                "assistant_text": self.assistant_text,
-                "user_text": self.user_text,
-                "tool_call_args": self.tool_call_args,
-                "images": self.images,
-                "system_msgs": self.system_text,
-                "system_reminders": self.attachments,
-            },
-            "by_attachment": self.by_attachment,
-            "tool_results_mcp": mcp,
-            "tool_results_builtin": self.tool_results.saturating_sub(mcp),
-            "by_tool": tools,
-        })
+        });
+        self.buckets
+            .insert_attribution_json(out.as_object_mut().unwrap(), Some(self.compaction_summary));
+        out
     }
 }
 
@@ -186,20 +255,8 @@ pub struct Report {
     pub read_coverage: Vec<crate::coverage::SessionCoverage>,
     pub sessions: u64,
     pub messages: u64,
-    // Estimated token equivalents of cumulative stored content, by source (lifetime history)
-    pub user_text: u64,
-    pub assistant_text: u64,
-    /// Stored thinking text plus opaque signature/encrypted payload byte estimates.
-    pub thinking: u64,
-    pub tool_call_args: u64,
-    pub tool_results: u64,
-    pub images: u64,
-    pub system_text: u64,
-    /// System reminders Claude Code appended to the prompt (model-visible `attachment` records).
-    pub attachments: u64,
-    /// The same, by attachment kind (`hook_success`, `edited_text_file`, `queued_command`, …).
-    pub by_attachment: BTreeMap<String, u64>,
-    pub by_tool: BTreeMap<String, ToolStat>,
+    #[serde(flatten)]
+    pub buckets: TokenBuckets,
     // compaction
     pub compactions: u64,
     pub auto_compactions: u64,
@@ -223,6 +280,19 @@ pub struct Report {
     pub compaction_laundering: Vec<CompactionLaundering>,
     /// Sessions whose last assistant report claims passing builds or tests against the record.
     pub diary_ledger_divergence: Vec<DiaryLedgerDivergence>,
+}
+
+impl std::ops::Deref for Report {
+    type Target = TokenBuckets;
+    fn deref(&self) -> &Self::Target {
+        &self.buckets
+    }
+}
+
+impl std::ops::DerefMut for Report {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buckets
+    }
 }
 
 impl Report {
@@ -264,60 +334,24 @@ impl Report {
 
     /// Total estimated token equivalents across stored transcript history, including compactions.
     pub fn conv_total(&self) -> u64 {
-        self.user_text
-            + self.assistant_text
-            + self.thinking
-            + self.tool_call_args
-            + self.tool_results
-            + self.images
-            + self.system_text
-            + self.attachments
-    }
-
-    /// Tool-result tokens attributable to MCP tools ([`is_mcp_tool`]).
-    pub fn mcp_tool_results(&self) -> u64 {
-        self.by_tool
-            .values()
-            .filter(|s| s.is_mcp)
-            .map(|s| s.result_tokens)
-            .sum()
+        self.buckets.sum()
     }
 
     /// The machine-readable diagnosis — `cv doctor --json` and the MCP `doctor` tool share this.
     /// Top-level cumulative fields remain intact alongside explicit `active_window` (post-compaction
     /// active branch) and `history` (lifetime transcript totals).
     pub fn to_json(&self) -> Value {
-        let tools: Vec<Value> = self
-            .by_tool
-            .iter()
-            .map(|(name, s)| json!({"tool": name, "mcp": s.is_mcp, "calls": s.calls, "result_tokens": s.result_tokens}))
-            .collect();
-        let mcp = self.mcp_tool_results();
-        let lifetime_conv = json!({
-            "total": self.conv_total(),
-            "tool_results": self.tool_results,
-            "thinking": self.thinking,
-            "assistant_text": self.assistant_text,
-            "user_text": self.user_text,
-            "tool_call_args": self.tool_call_args,
-            "images": self.images,
-            "system_msgs": self.system_text,
-            "system_reminders": self.attachments,
-        });
-        let history = json!({
+        let mut history = json!({
             "messages": self.messages,
             "compactions": self.compactions,
             "auto_compactions": self.auto_compactions,
             "pre_tokens": self.pre_tokens,
             "fixed_overhead_est": self.startup_ctx,
             "peak_context": self.peak_ctx,
-            "conversational": lifetime_conv.clone(),
-            "by_attachment": self.by_attachment,
-            "tool_results_mcp": mcp,
-            "tool_results_builtin": self.tool_results.saturating_sub(mcp),
-            "by_tool": tools.clone(),
         });
-        json!({
+        self.buckets
+            .insert_attribution_json(history.as_object_mut().unwrap(), None);
+        let mut out = json!({
             "read_coverage": self.read_coverage,
             "whisper_uptake": self.whisper_uptake,
             "sessions": self.sessions,
@@ -327,20 +361,23 @@ impl Report {
             "pre_tokens": self.pre_tokens,
             "fixed_overhead_est": self.startup_ctx,
             "peak_context": self.peak_ctx,
-            "conversational": lifetime_conv,
-            "by_attachment": self.by_attachment,
-            "tool_results_mcp": mcp,
-            "tool_results_builtin": self.tool_results.saturating_sub(mcp),
-            "by_tool": tools,
-            "active_window": self.active_window.to_json(),
-            "history": history,
-            "post_compaction_churn": self.post_compaction_churn,
-            "summary_provenance_contrast": self.summary_provenance_contrast,
-            "compaction_laundering": self.compaction_laundering,
-            "diary_ledger_divergence": self.diary_ledger_divergence,
-            "spin_episodes": self.spin_episodes,
-            "instruction_bloat": self.instruction_bloat,
-        })
+        });
+        let map = out.as_object_mut().unwrap();
+        self.buckets.insert_attribution_json(map, None);
+        map.extend([
+            ("active_window".into(), self.active_window.to_json()),
+            ("history".into(), history),
+            ("post_compaction_churn".into(), json!(self.post_compaction_churn)),
+            (
+                "summary_provenance_contrast".into(),
+                json!(self.summary_provenance_contrast),
+            ),
+            ("compaction_laundering".into(), json!(self.compaction_laundering)),
+            ("diary_ledger_divergence".into(), json!(self.diary_ledger_divergence)),
+            ("spin_episodes".into(), json!(self.spin_episodes)),
+            ("instruction_bloat".into(), json!(self.instruction_bloat)),
+        ]);
+        out
     }
 }
 
@@ -432,14 +469,7 @@ struct MsgFact {
     sidechain: bool,
     prompt_tokens: Option<u64>,
     compaction_summary: u64,
-    user_text: u64,
-    assistant_text: u64,
-    thinking: u64,
-    tool_call_args: u64,
-    tool_results: u64,
-    images: u64,
-    system_text: u64,
-    attachments: u64,
+    counts: TokenCounts,
     by_attachment: Vec<(String, u64)>,
     tool_calls: Vec<(String, bool)>,
     named_tool_results: Vec<(String, u64)>,
@@ -448,18 +478,11 @@ struct MsgFact {
 
 impl MsgFact {
     fn visible_tokens(&self) -> u64 {
-        if !self.visible {
-            return 0;
+        if self.visible {
+            self.compaction_summary + self.counts.sum()
+        } else {
+            0
         }
-        self.compaction_summary
-            + self.user_text
-            + self.assistant_text
-            + self.thinking
-            + self.tool_call_args
-            + self.tool_results
-            + self.images
-            + self.system_text
-            + self.attachments
     }
 }
 
@@ -658,14 +681,7 @@ impl SessionPass<'_> {
             sidechain,
             prompt_tokens,
             compaction_summary: 0,
-            user_text: 0,
-            assistant_text: 0,
-            thinking: 0,
-            tool_call_args: 0,
-            tool_results: 0,
-            images: 0,
-            system_text: 0,
-            attachments: 0,
+            counts: TokenCounts::default(),
             by_attachment: Vec::new(),
             tool_calls: Vec::new(),
             named_tool_results: Vec::new(),
@@ -691,9 +707,8 @@ impl SessionPass<'_> {
                         // used to hide inside "fixed overhead".
                         (_, MessageKind::InjectedContext) => {
                             let kind = injected_kind(m);
-                            rep.attachments += t;
                             *rep.by_attachment.entry(kind.clone()).or_default() += t;
-                            fact.attachments += t;
+                            fact.counts.attachments += t;
                             fact.by_attachment.push((kind, t));
                         }
                         (_, MessageKind::CompactionSummary) => {
@@ -704,29 +719,14 @@ impl SessionPass<'_> {
                             }
                             fact.compaction_summary += t;
                         }
-                        (Role::Assistant, _) => {
-                            rep.assistant_text += t;
-                            fact.assistant_text += t;
-                        }
-                        (Role::System, _) => {
-                            rep.system_text += t;
-                            fact.system_text += t;
-                        }
-                        _ => {
-                            rep.user_text += t;
-                            fact.user_text += t;
-                        }
+                        (Role::Assistant, _) => fact.counts.assistant_text += t,
+                        (Role::System, _) => fact.counts.system_text += t,
+                        _ => fact.counts.user_text += t,
                     }
                 }
-                Block::Thinking { .. } => {
-                    let t = tokens()?;
-                    rep.thinking += t;
-                    fact.thinking += t;
-                }
+                Block::Thinking { .. } => fact.counts.thinking += tokens()?,
                 Block::ToolUse { id, name, .. } => {
-                    let t = tokens()?;
-                    rep.tool_call_args += t;
-                    fact.tool_call_args += t;
+                    fact.counts.tool_call_args += tokens()?;
                     let mcp = is_mcp_tool(name);
                     self.names.insert(id.clone(), name.clone());
                     let e = rep.by_tool.entry(name.clone()).or_default();
@@ -738,8 +738,7 @@ impl SessionPass<'_> {
                     tool_name, tool_use_id, ..
                 } => {
                     let t = tokens()?;
-                    rep.tool_results += t;
-                    fact.tool_results += t;
+                    fact.counts.tool_results += t;
                     match tool_name {
                         Some(name) => {
                             let e = rep.by_tool.entry(name.clone()).or_default();
@@ -753,14 +752,11 @@ impl SessionPass<'_> {
                         }
                     }
                 }
-                Block::Image { .. } => {
-                    let t = tokens()?;
-                    rep.images += t;
-                    fact.images += t;
-                }
+                Block::Image { .. } => fact.counts.images += tokens()?,
                 Block::File { .. } | Block::Opaque { .. } => {}
             }
         }
+        rep.buckets.counts.add_assign(&fact.counts);
         self.msg_facts.push(fact);
         Ok(())
     }
@@ -840,14 +836,7 @@ fn fold_active_window(out: &mut ActiveWindowReport, facts: &[MsgFact], names: &H
         }
 
         out.compaction_summary += m.compaction_summary;
-        out.user_text += m.user_text;
-        out.assistant_text += m.assistant_text;
-        out.thinking += m.thinking;
-        out.tool_call_args += m.tool_call_args;
-        out.tool_results += m.tool_results;
-        out.images += m.images;
-        out.system_text += m.system_text;
-        out.attachments += m.attachments;
+        out.buckets.counts.add_assign(&m.counts);
         session_win_conv_total += m.visible_tokens();
 
         for (kind, tok) in &m.by_attachment {
@@ -939,31 +928,16 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
         .iter()
         .filter(|m| !m.inactive_branch && !(has_main_visible && m.sidechain))
         .collect();
-    if eligible.is_empty() {
+    let index = crate::ir::ParentIndex::from_iter(eligible.iter().enumerate().map(|(i, m)| (i, m.id.as_deref())));
+    if index.is_empty()
+        || !eligible
+            .iter()
+            .any(|m| m.parent_id.as_deref().is_some_and(|pid| index.contains(pid)))
+    {
         return eligible;
     }
 
-    let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
-    for (idx, m) in eligible.iter().enumerate() {
-        if let Some(id) = m.id.as_deref().filter(|s| !s.is_empty()) {
-            id_to_idx.insert(id, idx);
-        }
-    }
-    if id_to_idx.is_empty() {
-        return eligible;
-    }
-
-    // Only treat `eligible` as a tree when at least one message links to a parent in `id_to_idx`
-    // (linear transcripts whose adapter/fixture sets `id` with `parent_id = None` on every line
-    // have no tree links to prune).
-    let has_parent_links = eligible
-        .iter()
-        .any(|m| m.parent_id.as_deref().is_some_and(|pid| id_to_idx.contains_key(pid)));
-    if !has_parent_links {
-        return eligible;
-    }
-
-    // Detect whether any parent in `id_to_idx` has >= 2 non-injected children, OR >= 2 root
+    // Detect whether any parent in `index` has >= 2 non-injected children, OR >= 2 root
     // conversational messages (`id.is_some() && parent_id.is_none()`) appear in the same
     // compaction epoch (e.g. a Turn-1 rewind).
     let mut child_counts: HashMap<usize, usize> = HashMap::new();
@@ -978,7 +952,7 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
             continue;
         }
         if let Some(pid) = m.parent_id.as_deref() {
-            if let Some(&p_idx) = id_to_idx.get(pid) {
+            if let Some(p_idx) = index.get(pid) {
                 let c = child_counts.entry(p_idx).or_insert(0);
                 *c += 1;
                 if *c >= 2 {
@@ -996,47 +970,30 @@ fn slice_active_branch(facts: &[MsgFact]) -> Vec<&MsgFact> {
         return eligible;
     }
 
-    // Walk `parent_id` backwards from the last chain-participating message to mark the active spine.
-    let tip_idx = eligible
+    let Some(tip) = eligible
         .iter()
-        .rposition(|m| m.parent_id.as_deref().is_some_and(|pid| id_to_idx.contains_key(pid)))
-        .or_else(|| eligible.iter().rposition(|m| m.id.is_some()));
-
-    let Some(mut cur) = tip_idx else {
+        .rposition(|m| m.parent_id.as_deref().is_some_and(|pid| index.contains(pid)))
+        .or_else(|| eligible.iter().rposition(|m| m.id.is_some()))
+    else {
         return eligible;
     };
 
-    let mut on_spine = vec![false; eligible.len()];
-    let mut visited = HashSet::new();
-    let mut first_spine_idx = cur;
-    loop {
-        if !visited.insert(cur) {
-            break;
-        }
-        on_spine[cur] = true;
-        first_spine_idx = first_spine_idx.min(cur);
-        let Some(pid) = eligible[cur].parent_id.as_deref() else {
-            break;
-        };
-        let Some(&p_idx) = id_to_idx.get(pid) else {
-            break;
-        };
-        cur = p_idx;
-    }
+    let spine = index.spine_from(tip, |i| eligible[i].parent_id.as_deref());
+    let first_spine_idx = spine.iter().copied().min().unwrap_or(tip);
 
     eligible
         .into_iter()
         .enumerate()
         .filter_map(|(idx, m)| {
-            if on_spine[idx] {
+            if spine.contains(&idx) {
                 return Some(m);
             }
             // Retain leaf attachments / compaction summaries attached directly to an active-spine node.
             if matches!(m.kind, MessageKind::InjectedContext | MessageKind::CompactionSummary)
                 && m.parent_id
                     .as_deref()
-                    .and_then(|pid| id_to_idx.get(pid))
-                    .is_some_and(|&p_idx| on_spine[p_idx])
+                    .and_then(|pid| index.get(pid))
+                    .is_some_and(|p_idx| spine.contains(&p_idx))
             {
                 return Some(m);
             }

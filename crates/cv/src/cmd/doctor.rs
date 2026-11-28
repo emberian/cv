@@ -753,42 +753,54 @@ fn verdict(rep: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cv_core::doctor::{TokenBuckets, TokenCounts};
+
+    fn rep_with(counts: TokenCounts) -> Report {
+        Report {
+            buckets: TokenBuckets {
+                counts,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn verdict_distinguishes_tool_output_from_other_dominant_sources() {
-        for report in [
-            Report {
+        for counts in [
+            TokenCounts {
                 tool_results: 100,
                 system_text: 900,
                 ..Default::default()
             },
-            Report {
+            TokenCounts {
                 tool_results: 100,
                 images: 900,
                 ..Default::default()
             },
-            Report {
+            TokenCounts {
                 tool_results: 100,
                 attachments: 900,
                 ..Default::default()
             },
         ] {
-            let text = verdict(&report);
+            let text = verdict(&rep_with(counts));
             assert!(!text.contains("tool output is the largest"), "{text}");
             assert!(!text.contains("balanced"), "{text}");
         }
-        let report = Report {
+        let report = rep_with(TokenCounts {
             tool_results: 100,
             tool_call_args: 900,
             ..Default::default()
-        };
+        });
         let text = verdict(&report);
         assert!(text.contains("tool calls and output account for 100%"), "{text}");
         assert!(!text.contains("tool output is the largest"), "{text}");
-        let report = Report {
+        let report = rep_with(TokenCounts {
             tool_results: 900,
             assistant_text: 100,
             ..Default::default()
-        };
+        });
         assert!(verdict(&report).contains("tool output is the largest"));
     }
 }

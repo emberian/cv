@@ -3051,26 +3051,16 @@ fn anchored_window_tokens(
 /// `logicalParentUuid`) back. `None` when the newest turn records no `parentUuid` (no tree to walk).
 fn resumed_branch(parsed: &[Option<Decision>], window: usize) -> Option<HashSet<usize>> {
     let facts = |i: usize| parsed[i].as_ref().map(|v| &v.facts);
-    let mut by_id = HashMap::new();
-    for i in window..parsed.len() {
-        if let Some(uuid) = facts(i).and_then(|f| f.uuid.as_deref()) {
-            by_id.insert(uuid, i);
-        }
-    }
+    let idx = crate::ir::ParentIndex::from_iter(
+        (window..parsed.len()).map(|i| (i, facts(i).and_then(|f| f.uuid.as_deref()))),
+    );
     let leaf = (window..parsed.len()).rev().find(|&i| {
         parsed[i].as_ref().is_some_and(|v| {
             !v.sidechain() && matches!(v.facts.ty.as_str(), "user" | "assistant") && v.facts.uuid.is_some()
         })
     })?;
     facts(leaf)?.link()?;
-    let mut chain = HashSet::new();
-    let mut at = Some(leaf);
-    while let Some(i) = at.filter(|i| chain.insert(*i)) {
-        at = facts(i)
-            .and_then(|f| f.link().flatten())
-            .and_then(|p| by_id.get(p).copied());
-    }
-    Some(chain)
+    Some(idx.spine_from(leaf, |i| facts(i).and_then(|f| f.link().flatten())))
 }
 
 /// Honest post-prune token size of `parsed[window..]`, combining recorded-usage deltas with byte
