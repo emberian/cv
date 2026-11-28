@@ -39,6 +39,17 @@ pub(super) struct Navigation {
 /// The facts the forest keeps per node: role, turn, sub-agent receipt and model. Body and
 /// telemetry are skipped by the view, never decoded.
 pub(super) fn navigation(view: JsonView<'_>) -> Result<Navigation> {
+    let mut facts = listing(view)?;
+    match facts.role.as_deref() {
+        Some("tool") => facts.tool_call_id = string(view.get("tool_call_id")?)?,
+        Some("assistant") => facts.model = string(get(view.get("metadata")?, "generation_model")?)?,
+        _ => {}
+    }
+    Ok(facts)
+}
+
+/// The turn and child-chain markers needed to list the session.
+pub(super) fn listing(view: JsonView<'_>) -> Result<Navigation> {
     let mut role = String::new();
     let mut too_long = false;
     if let Some(value) = view.get("role")? {
@@ -76,20 +87,6 @@ pub(super) fn navigation(view: JsonView<'_>) -> Result<Navigation> {
         } else {
             None
         },
-        tool_call_id: if role == "tool" {
-            string(view.get("tool_call_id")?)?
-        } else {
-            None
-        },
-        model: if role == "assistant" {
-            string(
-                metadata
-                    .and_then(|v| v.get("generation_model").transpose())
-                    .transpose()?,
-            )?
-        } else {
-            None
-        },
         is_turn: role == "assistant"
             || (role == "user"
                 && metadata
@@ -99,6 +96,7 @@ pub(super) fn navigation(view: JsonView<'_>) -> Result<Navigation> {
                     .transpose()?
                     .unwrap_or(false)),
         role: Some(role),
+        ..Navigation::default()
     })
 }
 

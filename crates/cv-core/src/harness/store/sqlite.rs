@@ -731,6 +731,57 @@ impl Cells {
         }
     }
 
+    /// A projected TEXT cell: inline when small, its rowid when an incremental read is needed.
+    /// CASE is lazy in SQLite. No expression consuming the large value runs in the row query.
+    pub(crate) fn select_projection(&self, column: &str) -> String {
+        if self.incremental {
+            format!(
+                "CASE WHEN typeof({column}) = 'text' THEN CASE WHEN octet_length({column}) > {} THEN rowid ELSE {column} END END",
+                super::IO_CHUNK
+            )
+        } else {
+            format!("CASE WHEN typeof({column}) = 'text' THEN {column} END")
+        }
+    }
+
+    /// Read one projected value. The scan retains only the callback result across rows.
+    pub(crate) fn project<T>(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        value: rusqlite::types::ValueRef<'_>,
+        f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        use super::bytes::ByteSource;
+        use rusqlite::types::ValueRef;
+        let (bytes, len) = match value {
+            ValueRef::Text(bytes) => {
+                // Most rows fit in the query buffer. Project those without a source recheck
+                // per cell. The checked reader below also accepts deeply nested native JSON.
+                if bytes.len() <= super::IO_CHUNK {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                        return f((&value).into()).map(Some);
+                    }
+                }
+                let backing = ByteSource::arena()?;
+                let (_, len) = backing.append_sized(bytes.len(), |out| Ok(out.write_all(bytes)?))?;
+                (backing, len)
+            }
+            ValueRef::Integer(rowid) => {
+                let bytes = ByteSource::arena()?;
+                let (_, len) = append_cell(conn, table, column, rowid, &bytes)?;
+                (bytes, len)
+            }
+            _ => return Ok(None),
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut malformed = false;
+        self.read_backing(std::sync::Arc::new(bytes), Cell(0, len), &mut malformed, f)
+    }
+
     /// The cell `select(column)` put at column `i` of `row`. None for a cell that is not TEXT,
     /// is empty or is not UTF-8 (UTF-8 is checked when it is read).
     pub(crate) fn cell(
@@ -927,11 +978,20 @@ impl Cells {
         malformed: &mut bool,
         f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
     ) -> Result<Option<T>> {
-        match self.source.read(
-            ReadInput::Backing(self.arena.clone(), cell.0, cell.1),
-            Validation::Value,
-            f,
-        ) {
+        self.read_backing(self.arena.clone(), cell, malformed, f)
+    }
+
+    fn read_backing<T>(
+        &self,
+        backing: std::sync::Arc<super::bytes::ByteSource>,
+        cell: Cell,
+        malformed: &mut bool,
+        f: impl for<'a> FnOnce(crate::json::JsonView<'a>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        match self
+            .source
+            .read(ReadInput::Backing(backing, cell.0, cell.1), Validation::Value, f)
+        {
             Err(error) if error.downcast_ref::<crate::json::InvalidJson>().is_some() => {
                 *malformed = true;
                 Ok(None)

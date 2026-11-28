@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Devin discovery counts turns and finds child sessions with bounded memory when a message or its metadata occupies a large SQLite cell.
 - Hermes keeps replay detection exact while bounding the memory used by consecutive large prompts.
 - Large SQLite cells spill directly to disk during capture, keeping doctor metadata inspection within its heap budget.
 - `GET /api/session/{harness}/{id}/prompts` serves windowed `PromptRow`s for `?kind=prompt,answer`, matching `cv prompts`.
